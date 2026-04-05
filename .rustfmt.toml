@@ -1,0 +1,8 @@
+unstable_features = true
+format_strings = true
+wrap_comments = true
+group_imports = "StdExternalCrate"
+imports_granularity = "item"
+reorder_impl_items = true
+use_field_init_shorthand = true
+use_try_shorthand = true
