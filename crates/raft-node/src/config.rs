@@ -60,42 +60,46 @@ impl Config {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_valid_config() {
-        let toml_str = r#"
+    mod validate {
+        use super::*;
+
+        #[test]
+        fn returns_ok_when_valid_config() {
+            let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
             listen_addr = "127.0.0.1:50051"
             [peers]
             2 = "127.0.0.1:50052"
         "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.validate().is_ok());
-    }
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_ok());
+        }
 
-    #[test]
-    fn test_self_loop_validation() {
-        let toml_str = r#"
+        #[test]
+        fn returns_err_when_self_loop() {
+            let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
             listen_addr = "127.0.0.1:50051"
             [peers]
             1 = "127.0.0.1:50051"
         "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.validate().is_err());
-    }
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_err());
+        }
 
-    #[test]
-    fn test_empty_cluster_id() {
-        let toml_str = r#"
+        #[test]
+        fn returns_err_when_empty_cluster_id() {
+            let toml_str = r#"
             cluster_id = ""
             node_id = 1
             listen_addr = "127.0.0.1:50051"
             [peers]
             2 = "127.0.0.1:50052"
         "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.validate().is_err());
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_err());
+        }
     }
 }
