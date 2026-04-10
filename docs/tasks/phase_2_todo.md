@@ -10,8 +10,8 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ### 1. Node Identity & Environmental Context [ ]
 
-- **1.1. Configuration Engine** [ ]
-  - *Status:* Pending
+- **1.1. Configuration Engine** [x]
+  - *Status:* Completed
   - *Acceptance:* Load `cluster_id`, `node_id`, and peer addresses from a `config.toml`.
 - **1.2. Identity Persistence (ADR 004)** [ ]
   - *Status:* Pending
@@ -57,5 +57,5 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 📈 Completion Status
 
-- **Total Progress:** 0%
-- **Current Focus:** 1.1. Configuration Engine
+- **Total Progress:** 8%
+- **Current Focus:** 1.2. Identity Persistence (ADR 004)

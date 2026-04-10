@@ -27,3 +27,6 @@ uuid = { version = "1.23.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 rust_decimal = { version = "1.41.0", features = ["serde", "proptest"] }
 strum = { version = "0.28.0", features = ["derive"] }
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
