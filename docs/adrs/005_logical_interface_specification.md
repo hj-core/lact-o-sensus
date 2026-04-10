@@ -31,22 +31,24 @@ Used for Raft peer-to-peer communication.
 Used for user mutations and queries.
 
 * **`ProposeMutation`**:
-  * **Input**: `cluster_id`, `client_id`, `sequence_id`, `operation`, `item_data`.
+  * **Input**: `cluster_id`, `client_id`, `sequence_id`, `MutationIntent` (contains `operation`, `item_key`, `quantity`, `unit?`, `category?`).
   * **Output**: `cluster_id`, `status` (Committed/Rejected/Vetoed), `state_version`, `leader_hint` (for redirection), `error_message`.
 * **`QueryState`**:
-  * **Input**: `cluster_id`, `query_type`, `filter`, `min_state_version` (optional).
-  * **Output**: `cluster_id`, `item_list[]`, `current_state_version`.
+  * **Input**: `cluster_id`, `query_filter`, `min_state_version` (optional).
+  * **Output**: `cluster_id`, `item_list[]` (of `GroceryItem`), `current_state_version`.
 
 ### 3. The Policy Service (Leader-to-AI)
 
 Used for automated evaluation and classification.
 
 * **`EvaluateProposal`**:
-  * **Input**: `cluster_id`, `item_data`, `request_context`.
+  * **Input**: `cluster_id`, `client_id`, `MutationIntent`, `current_inventory[]` (full list of `GroceryItem`), `request_context`.
   * **Output**: `cluster_id`, `is_approved`, `category_assignment`, `moral_justification`.
 
 ## Rationale
 
+* **Intent vs. Record Separation**: By using `MutationIntent` for ingress, we strictly separate the user's desire (e.g., "Add 2 Milk") from the system's record (which includes `state_version` and `last_modifier_id`).
+* **Holistic Vetoing**: Providing the AI with the `current_inventory` allows for relational policy enforcement (e.g., "reject chocolate if sugar count is already high").
 * **Cluster Isolation**: Mandating the `cluster_id` in every request/response provides a lightweight but effective security boundary at the application layer.
 * **Protocol Completeness**: The Consensus Service provides the minimum necessary methods to implement the Raft protocol as defined in the original paper.
 * **Leader-Centricity**: The Ingress and Policy services are designed to be handled primarily by the Leader, reinforcing the topology defined in ADR 002.

@@ -47,6 +47,7 @@ This represents the current state of the grocery list that all nodes must agree 
 * **unit (`String`):** The unit of measurement (e.g., "liters", "grams").
 * **category (`Enum`):** Mapping to the **12-Point Authorized Taxonomy**.
 * **last_modifier_id (`String`):** The identifier of the client who performed the last mutation.
+* **last_activity (`Timestamp`):** The logical or wall-clock time of the last successful mutation.
 * **state_version (`u64`):** The monotonic version of the state machine (Raft log index) at the time of the mutation.
 
 ### 2. The Session Table (Exactly-Once Semantics)
