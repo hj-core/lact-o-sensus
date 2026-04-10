@@ -1,0 +1,20 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tonic.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+tonic-prost.workspace = true
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+strum.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+tonic-prost-build.workspace = true

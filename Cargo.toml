@@ -1,6 +1,29 @@
-[package]
-name = "lact-o-sensus"
+[workspace]
+members = [
+    "crates/common",
+    "crates/raft-node",
+    "crates/client-cli",
+    "crates/ai-veto",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+tokio = { version = "1.51.1", features = ["full"] }
+tonic = "0.14.5"
+prost = "0.14.3"
+prost-types = "0.14.3"
+tonic-prost = "0.14.5"
+tonic-prost-build = "0.14.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+sled = "0.34.7"
+uuid = { version = "1.23.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
+rust_decimal = { version = "1.41.0", features = ["serde", "proptest"] }
+strum = { version = "0.28.0", features = ["derive"] }
