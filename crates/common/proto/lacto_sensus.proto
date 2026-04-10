@@ -1,0 +1,139 @@
+syntax = "proto3";
+
+package lacto_sensus.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// --- Common Data Models ---
+
+message GroceryItem {
+    string item_key = 1;
+    string quantity = 2; // Using string to transport Decimal safely
+    string unit = 3;
+    string category = 4; // Matches the 12-Point Taxonomy
+    string last_modifier_id = 5;
+    google.protobuf.Timestamp last_activity = 6;
+    uint64 state_version = 7;
+}
+
+enum OperationType {
+    OPERATION_TYPE_UNSPECIFIED = 0;
+    OPERATION_TYPE_ADD = 1;      // Incremental: Add to current quantity
+    OPERATION_TYPE_SUBTRACT = 2; // Decremental: Subtract from current quantity
+    OPERATION_TYPE_SET = 3;      // Absolute: Overwrite current quantity
+    OPERATION_TYPE_DELETE = 4;   // Removal: Remove item from inventory
+}
+
+message MutationIntent {
+    string item_key = 1;
+    string quantity = 2;
+    optional string unit = 3; // Optional: If omitted, the system retains the existing unit for the item
+    optional string category = 4; // Optional override by client
+    OperationType operation = 5;
+}
+
+// --- Consensus Service (Raft Peer-to-Peer) ---
+
+service ConsensusService {
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message RequestVoteRequest {
+    string cluster_id = 1;
+    uint64 term = 2;
+    string candidate_id = 3;
+    uint64 last_log_index = 4;
+    uint64 last_log_term = 5;
+}
+
+message RequestVoteResponse {
+    string cluster_id = 1;
+    uint64 term = 2;
+    bool vote_granted = 3;
+}
+
+message LogEntry {
+    uint64 term = 1;
+    uint64 index = 2;
+    bytes data = 3; // Serialized mutation command
+}
+
+message AppendEntriesRequest {
+    string cluster_id = 1;
+    uint64 term = 2;
+    string leader_id = 3;
+    uint64 prev_log_index = 4;
+    uint64 prev_log_term = 5;
+    repeated LogEntry entries = 6;
+    uint64 leader_commit = 7;
+}
+
+message AppendEntriesResponse {
+    string cluster_id = 1;
+    uint64 term = 2;
+    bool success = 3;
+    uint64 last_log_index = 4; // Optimization for catch-up
+}
+
+// --- Ingress Service (Client-to-Leader) ---
+
+service IngressService {
+    rpc ProposeMutation(ProposeMutationRequest) returns (ProposeMutationResponse);
+    rpc QueryState(QueryStateRequest) returns (QueryStateResponse);
+}
+
+message ProposeMutationRequest {
+    string cluster_id = 1;
+    string client_id = 2;
+    uint64 sequence_id = 3;
+    MutationIntent intent = 4;
+}
+
+enum MutationStatus {
+    MUTATION_STATUS_UNSPECIFIED = 0;
+    MUTATION_STATUS_COMMITTED = 1;
+    MUTATION_STATUS_REJECTED = 2;
+    MUTATION_STATUS_VETOED = 3;
+}
+
+message ProposeMutationResponse {
+    string cluster_id = 1;
+    MutationStatus status = 2;
+    uint64 state_version = 3;
+    string leader_hint = 4;
+    string error_message = 5;
+}
+
+message QueryStateRequest {
+    string cluster_id = 1;
+    string query_filter = 2;
+    optional uint64 min_state_version = 3;
+}
+
+message QueryStateResponse {
+    string cluster_id = 1;
+    repeated GroceryItem items = 2;
+    uint64 current_state_version = 3;
+}
+
+// --- Policy Service (Leader-to-AI) ---
+
+service PolicyService {
+    rpc EvaluateProposal(EvaluateProposalRequest) returns (EvaluateProposalResponse);
+}
+
+message EvaluateProposalRequest {
+    string cluster_id = 1;
+    string client_id = 2;
+    MutationIntent intent = 3;
+    repeated GroceryItem current_inventory = 4;
+    string request_context = 5; // Optional: Flexible metadata (e.g., temporal context, economic constraints) to influence AI moral judgement
+}
+
+message EvaluateProposalResponse {
+    string cluster_id = 1;
+    bool is_approved = 2;
+    string category_assignment = 3;
+    string moral_justification = 4;
+}
