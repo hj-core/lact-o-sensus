@@ -25,8 +25,8 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 - **2.1. Internal Consensus Service (ADR 005)** [x]
   - *Status:* Completed
   - *Acceptance:* Functional `RequestVote` and `AppendEntries` stubs returning valid gRPC responses.
-- **2.2. External Ingress Service (ADR 002/005)** [ ]
-  - *Status:* Pending
+- **2.2. External Ingress Service (ADR 002/005)** [x]
+  - *Status:* Completed
   - *Acceptance:* Functional `ProposeMutation` and `QueryState` stubs returning `NotImplemented` or `Follower` status.
 - **2.3. Veto Relay Stub** [ ]
   - *Status:* Pending
@@ -57,5 +57,5 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 📈 Completion Status
 
-- **Total Progress:** 33%
-- **Current Focus:** 2.2. External Ingress Service (ADR 002/005)
+- **Total Progress:** 41%
+- **Current Focus:** 2.3. Veto Relay Stub
