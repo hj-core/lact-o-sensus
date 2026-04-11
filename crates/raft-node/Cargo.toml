@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+async-trait.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 prost.workspace = true

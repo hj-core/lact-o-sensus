@@ -28,8 +28,8 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 - **2.2. External Ingress Service (ADR 002/005)** [x]
   - *Status:* Completed
   - *Acceptance:* Functional `ProposeMutation` and `QueryState` stubs returning `NotImplemented` or `Follower` status.
-- **2.3. Veto Relay Stub** [ ]
-  - *Status:* Pending
+- **2.3. Veto Relay Stub** [x]
+  - *Status:* Completed
   - *Acceptance:* Internal trait/bridge defined for future `ai-veto` communication.
 
 ### 3. Transport & Peer Orchestration [ ]
@@ -57,5 +57,5 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 📈 Completion Status
 
-- **Total Progress:** 41%
-- **Current Focus:** 2.3. Veto Relay Stub
+- **Total Progress:** 50%
+- **Current Focus:** 3.1. Async Server Listener
