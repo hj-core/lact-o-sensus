@@ -86,22 +86,27 @@ async fn main() -> Result<()> {
         let addr = config.listen_addr;
         info!("Starting gRPC server on {}", addr);
 
-        // Define the graceful shutdown signal (Task 3.3 preview)
+        // Define the graceful shutdown signal
         let shutdown = async {
             tokio::signal::ctrl_c()
                 .await
                 .expect("failed to install CTRL+C handler");
-            info!("Shutdown signal received. Starting graceful exit...");
+            info!("Shutdown signal received. Commencing graceful exit...");
         };
 
-        // 8. Start the gRPC Server
+        // 9. Start the gRPC Server
         Server::builder()
             .add_service(ConsensusServiceServer::new(consensus_dispatcher))
             .add_service(IngressServiceServer::new(ingress_dispatcher))
             .serve_with_shutdown(addr, shutdown)
             .await?;
 
-        info!("Node lifecycle finished successfully.");
+        // 10. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
+        info!("gRPC server stopped. Flushing database to disk...");
+        db.flush_async().await?;
+        info!("Database synchronized successfully.");
+
+        info!("Node lifecycle finished successfully. Goodbye.");
         Ok(())
     }
     .instrument(root_span)
