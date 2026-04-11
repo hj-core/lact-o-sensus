@@ -1,6 +1,7 @@
 mod config;
 mod identity;
 mod node;
+mod peer;
 mod service;
 
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use identity::NodeIdentity;
 use node::Follower;
 use node::RaftNode;
 use node::RaftNodeState;
+use peer::PeerManager;
 use service::consensus::ConsensusDispatcher;
 use service::ingress::IngressDispatcher;
 use tokio::sync::RwLock;
@@ -68,7 +70,10 @@ async fn main() -> Result<()> {
     let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
     let ingress_dispatcher = IngressDispatcher::new(identity.clone(), shared_state.clone());
 
-    // 7. Create the Root Node Span
+    // 7. Initialize Peer Manager (Outbound Registry)
+    let _peer_manager = Arc::new(PeerManager::new(identity.clone(), &config.peers));
+
+    // 8. Create the Root Node Span
     let root_span = info_span!(
         "node",
         cluster = %identity.cluster_id,
