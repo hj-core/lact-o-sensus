@@ -16,8 +16,8 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 - **1.2. Identity Persistence (ADR 004)** [x]
   - *Status:* Completed
   - *Acceptance:* Verify `(cluster_id, node_id)` matches the persisted state on disk.
-- **1.3. Logging & Observability** [ ]
-  - *Status:* Pending
+- **1.3. Logging & Observability** [x]
+  - *Status:* Completed
   - *Acceptance:* Structured `tracing` output including the `node_id` in every log span.
 
 ### 2. gRPC Service Implementation (Skeletal Traits) [ ]
@@ -57,5 +57,5 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 📈 Completion Status
 
-- **Total Progress:** 16%
-- **Current Focus:** 1.3. Logging & Observability
+- **Total Progress:** 25%
+- **Current Focus:** 2.1. Internal Consensus Service (ADR 005)
