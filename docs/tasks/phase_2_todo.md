@@ -34,14 +34,14 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ### 3. Transport & Peer Orchestration [ ]
 
-- **3.1. Async Server Listener** [ ]
-  - *Status:* Pending
+- **3.1. Async Server Listener** [x]
+  - *Status:* Completed
   - *Acceptance:* `tonic` server successfully binds to the configured port using `tokio`.
 - **3.2. Outbound Client Registry** [ ]
   - *Status:* Pending
   - *Acceptance:* Lazy-initialized gRPC channels to all configured peer nodes.
-- **3.3. Graceful Shutdown** [ ]
-  - *Status:* Pending
+- **3.3. Graceful Shutdown** [x]
+  - *Status:* Completed
   - *Acceptance:* Node handles SIGTERM/SIGINT by closing active connections and flushing logs.
 
 ### 4. Cluster Validation & "Smoke Tests" [ ]
@@ -57,5 +57,5 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 📈 Completion Status
 
-- **Total Progress:** 50%
-- **Current Focus:** 3.1. Async Server Listener
+- **Total Progress:** 66%
+- **Current Focus:** 3.2. Outbound Client Registry
