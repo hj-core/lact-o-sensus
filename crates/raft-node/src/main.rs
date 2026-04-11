@@ -1,5 +1,6 @@
 mod config;
 mod identity;
+mod node;
 
 use anyhow::Result;
 use config::Config;
