@@ -30,12 +30,8 @@ pub struct ConsensusDispatcher {
 }
 
 impl ConsensusDispatcher {
-    pub fn new(identity: Arc<NodeIdentity>) -> Self {
-        let initial_node = RaftNode::<Follower>::new(identity.clone());
-        Self {
-            identity,
-            state: Arc::new(RwLock::new(RaftNodeState::Follower(initial_node))),
-        }
+    pub fn new(identity: Arc<NodeIdentity>, state: Arc<RwLock<RaftNodeState>>) -> Self {
+        Self { identity, state }
     }
 }
 
@@ -139,13 +135,18 @@ mod tests {
         })
     }
 
+    fn mock_dispatcher() -> ConsensusDispatcher {
+        let id = mock_identity();
+        let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+        ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)))
+    }
+
     mod identity_guard {
         use super::*;
 
         #[tokio::test]
         async fn returns_err_when_cluster_id_mismatches() {
-            let identity = mock_identity();
-            let dispatcher = ConsensusDispatcher::new(identity);
+            let dispatcher = mock_dispatcher();
 
             let req = Request::new(RequestVoteRequest {
                 cluster_id: "wrong-cluster".to_string(),
@@ -166,8 +167,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_err_when_poisoned() {
-            let identity = mock_identity();
-            let dispatcher = ConsensusDispatcher::new(identity);
+            let dispatcher = mock_dispatcher();
 
             // Force the node into a poisoned state for testing
             {
@@ -194,8 +194,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_skeletal_reject_when_follower() {
-            let identity = mock_identity();
-            let dispatcher = ConsensusDispatcher::new(identity);
+            let dispatcher = mock_dispatcher();
 
             let req = Request::new(RequestVoteRequest {
                 cluster_id: "test-cluster".to_string(),
@@ -216,8 +215,7 @@ mod tests {
 
         #[tokio::test]
         async fn returns_skeletal_failure_when_follower() {
-            let identity = mock_identity();
-            let dispatcher = ConsensusDispatcher::new(identity);
+            let dispatcher = mock_dispatcher();
 
             let req = Request::new(AppendEntriesRequest {
                 cluster_id: "test-cluster".to_string(),
