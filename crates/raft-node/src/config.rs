@@ -20,6 +20,9 @@ pub struct Config {
     /// Network address to listen on for gRPC traffic.
     pub listen_addr: SocketAddr,
 
+    /// Directory for persistent storage (sled db).
+    pub data_dir: String,
+
     /// Mapping of node IDs to their network addresses for all peers.
     pub peers: HashMap<u64, SocketAddr>,
 }
@@ -69,6 +72,7 @@ mod tests {
             cluster_id = "test-cluster"
             node_id = 1
             listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
             [peers]
             2 = "127.0.0.1:50052"
         "#;
@@ -82,6 +86,7 @@ mod tests {
             cluster_id = "test-cluster"
             node_id = 1
             listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
             [peers]
             1 = "127.0.0.1:50051"
         "#;
@@ -95,6 +100,7 @@ mod tests {
             cluster_id = ""
             node_id = 1
             listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
             [peers]
             2 = "127.0.0.1:50052"
         "#;
