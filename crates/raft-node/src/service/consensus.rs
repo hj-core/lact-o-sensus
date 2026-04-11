@@ -12,12 +12,12 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 use tracing::info_span;
-use tracing::warn;
 
 use crate::identity::NodeIdentity;
 use crate::node::Follower;
 use crate::node::RaftNode;
 use crate::node::RaftNodeState;
+use crate::service::common::ServiceState;
 
 /// Implementation of the internal Raft consensus RPCs.
 ///
@@ -36,24 +36,15 @@ impl ConsensusDispatcher {
             state: Arc::new(RwLock::new(RaftNodeState::Follower(initial_node))),
         }
     }
+}
 
-    /// Centralized Identity Guard (ADR 004).
-    fn verify_cluster_id(&self, cluster_id: &str) -> Result<(), Status> {
-        if cluster_id != self.identity.cluster_id {
-            warn!("Rejecting request from mismatching cluster: {}", cluster_id);
-            return Err(Status::invalid_argument("Cluster ID mismatch"));
-        }
-        Ok(())
+impl ServiceState for ConsensusDispatcher {
+    fn identity(&self) -> &NodeIdentity {
+        &self.identity
     }
 
-    /// Centralized health check for the Type-State engine.
-    fn check_state_health(&self, state: &RaftNodeState) -> Result<(), Status> {
-        if let RaftNodeState::Poisoned = state {
-            return Err(Status::internal(
-                "Node is in an unrecoverable state due to a failed transition",
-            ));
-        }
-        Ok(())
+    fn state(&self) -> &Arc<RwLock<RaftNodeState>> {
+        &self.state
     }
 }
 
