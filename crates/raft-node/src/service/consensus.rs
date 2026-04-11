@@ -23,6 +23,7 @@ use crate::service::common::ServiceState;
 ///
 /// This service acts as a dispatcher, delegating logic to the underlying
 /// Type-State node engine while enforcing cluster identity and node health.
+#[derive(Debug)]
 pub struct ConsensusDispatcher {
     identity: Arc<NodeIdentity>,
     state: Arc<RwLock<RaftNodeState>>,

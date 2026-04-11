@@ -4,6 +4,7 @@ use crate::identity::NodeIdentity;
 
 // --- Type-State Markers (Role-Specific Volatile State) ---
 
+#[derive(Debug, Default)]
 pub struct Follower {
     leader_id: Option<u64>,
 }
@@ -14,21 +15,24 @@ impl Follower {
     }
 }
 
+#[derive(Debug)]
 pub struct Candidate {
     // Phase 3: Will hold votes_received HashSet
 }
 
+#[derive(Debug)]
 pub struct Leader {
     // Phase 3: Will hold next_index and match_index Maps
 }
 
-pub trait NodeState {}
+pub trait NodeState: std::fmt::Debug {}
 impl NodeState for Follower {}
 impl NodeState for Candidate {}
 impl NodeState for Leader {}
 
 // --- Generic Node Struct (Persistent State) ---
 
+#[derive(Debug)]
 pub struct RaftNode<S: NodeState> {
     /// Verified identity of the node (ADR 004).
     identity: Arc<NodeIdentity>,
@@ -68,13 +72,14 @@ impl RaftNode<Follower> {
         Self {
             identity,
             current_term: 0,
-            state: Follower { leader_id: None },
+            state: Follower::default(),
         }
     }
 }
 
 // --- The Dispatcher Enum (Logical State Machine) ---
 
+#[derive(Debug)]
 pub enum RaftNodeState {
     Follower(RaftNode<Follower>),
     Candidate(RaftNode<Candidate>),

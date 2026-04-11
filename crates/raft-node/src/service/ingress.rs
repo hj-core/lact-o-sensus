@@ -21,6 +21,7 @@ use crate::service::common::ServiceState;
 ///
 /// This service handles user mutations and state queries, enforcing
 /// cluster identity and redirecting clients to the current leader.
+#[derive(Debug)]
 pub struct IngressDispatcher {
     identity: Arc<NodeIdentity>,
     state: Arc<RwLock<RaftNodeState>>,

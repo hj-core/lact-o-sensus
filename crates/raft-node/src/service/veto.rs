@@ -28,6 +28,7 @@ pub trait VetoRelay: Send + Sync {
 
 /// A skeletal mock implementation that approves everything.
 /// Used for Phase 2 and 3 infrastructure verification.
+#[derive(Debug)]
 pub struct MockVetoRelay;
 
 #[async_trait]
