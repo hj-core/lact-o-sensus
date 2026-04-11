@@ -1,16 +1,18 @@
 use std::sync::Arc;
 
+use common::types::NodeId;
+
 use crate::identity::NodeIdentity;
 
 // --- Type-State Markers (Role-Specific Volatile State) ---
 
 #[derive(Debug, Default)]
 pub struct Follower {
-    leader_id: Option<u64>,
+    leader_id: Option<NodeId>,
 }
 
 impl Follower {
-    pub fn leader_id(&self) -> Option<u64> {
+    pub fn leader_id(&self) -> Option<NodeId> {
         self.leader_id
     }
 }

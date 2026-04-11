@@ -1,5 +1,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use common::types::ClusterId;
+use common::types::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
 use sled::Db;
@@ -10,13 +12,28 @@ use crate::config::Config;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct NodeIdentity {
-    pub cluster_id: String,
-    pub node_id: u64,
+    cluster_id: ClusterId,
+    node_id: NodeId,
 }
 
 impl NodeIdentity {
     const KEY: &'static [u8] = b"node_identity";
     const TREE_NAME: &'static str = "_system_metadata";
+
+    pub fn new(cluster_id: ClusterId, node_id: NodeId) -> Self {
+        Self {
+            cluster_id,
+            node_id,
+        }
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
 
     /// Initializes the node's identity on disk or verifies it against the
     /// provided configuration.
@@ -71,8 +88,8 @@ mod tests {
 
     fn mock_config(cluster_id: &str, node_id: u64) -> Config {
         Config {
-            cluster_id: cluster_id.to_string(),
-            node_id,
+            cluster_id: ClusterId::try_new(cluster_id).unwrap(),
+            node_id: NodeId::new(node_id),
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             data_dir: "".to_string(),
             peers: HashMap::new(),
@@ -89,8 +106,11 @@ mod tests {
 
             let id = NodeIdentity::initialize_or_verify(&db, &config)?;
 
-            assert_eq!(id.cluster_id, "test-cluster");
-            assert_eq!(id.node_id, 1);
+            assert_eq!(
+                id.cluster_id(),
+                &ClusterId::try_new("test-cluster").unwrap()
+            );
+            assert_eq!(id.node_id(), NodeId::new(1));
             Ok(())
         }
 
@@ -104,8 +124,11 @@ mod tests {
 
             // Verification
             let id = NodeIdentity::initialize_or_verify(&db, &config)?;
-            assert_eq!(id.cluster_id, "test-cluster");
-            assert_eq!(id.node_id, 1);
+            assert_eq!(
+                id.cluster_id(),
+                &ClusterId::try_new("test-cluster").unwrap()
+            );
+            assert_eq!(id.node_id(), NodeId::new(1));
             Ok(())
         }
 

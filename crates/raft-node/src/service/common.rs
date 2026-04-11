@@ -12,9 +12,14 @@ pub trait ServiceState {
     fn identity(&self) -> &NodeIdentity;
     fn state(&self) -> &Arc<RwLock<RaftNodeState>>;
 
+    /// Helper to get the cluster ID as a borrowed string.
+    fn cluster_id_as_str(&self) -> &str {
+        self.identity().cluster_id().as_str()
+    }
+
     /// Centralized Identity Guard (ADR 004).
     fn verify_cluster_id(&self, cluster_id: &str) -> Result<(), Status> {
-        if cluster_id != self.identity().cluster_id {
+        if cluster_id != self.cluster_id_as_str() {
             warn!("Rejecting request from mismatching cluster: {}", cluster_id);
             return Err(Status::invalid_argument("Cluster ID mismatch"));
         }

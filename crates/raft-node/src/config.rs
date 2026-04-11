@@ -5,6 +5,8 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use common::types::ClusterId;
+use common::types::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::warn;
@@ -12,10 +14,10 @@ use tracing::warn;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Unique identifier for the entire consensus group.
-    pub cluster_id: String,
+    pub cluster_id: ClusterId,
 
     /// Unique identifier for this specific node within its cluster.
-    pub node_id: u64,
+    pub node_id: NodeId,
 
     /// Network address to listen on for gRPC traffic.
     pub listen_addr: SocketAddr,
@@ -24,7 +26,7 @@ pub struct Config {
     pub data_dir: String,
 
     /// Mapping of node IDs to their network addresses for all peers.
-    pub peers: HashMap<u64, SocketAddr>,
+    pub peers: HashMap<NodeId, SocketAddr>,
 }
 
 impl Config {
@@ -40,10 +42,6 @@ impl Config {
 
     /// Performs basic validation of the configuration.
     fn validate(&self) -> Result<()> {
-        if self.cluster_id.trim().is_empty() {
-            return Err(anyhow!("cluster_id cannot be empty"));
-        }
-
         if self.peers.contains_key(&self.node_id) {
             return Err(anyhow!(
                 "Self-loop detected: node_id {} found in peers list",
@@ -104,8 +102,9 @@ mod tests {
             [peers]
             2 = "127.0.0.1:50052"
         "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_err());
+            // This will now fail during deserialization because of #[serde(try_from)]
+            let result: Result<Config, _> = toml::from_str(toml_str);
+            assert!(result.is_err());
         }
     }
 }

@@ -68,7 +68,7 @@ impl ConsensusService for ConsensusDispatcher {
                 );
                 // TODO: Phase 3 - Actual voting logic
                 Ok(Response::new(RequestVoteResponse {
-                    cluster_id: self.identity.cluster_id.clone(),
+                    cluster_id: self.cluster_id_as_str().to_string(),
                     term: node.current_term(),
                     vote_granted: false,
                 }))
@@ -78,7 +78,7 @@ impl ConsensusService for ConsensusDispatcher {
                 // Candidates and Leaders also need to handle votes, but for the
                 // skeleton we return a basic rejection.
                 Ok(Response::new(RequestVoteResponse {
-                    cluster_id: self.identity.cluster_id.clone(),
+                    cluster_id: self.cluster_id_as_str().to_string(),
                     term: 0,
                     vote_granted: false,
                 }))
@@ -107,7 +107,7 @@ impl ConsensusService for ConsensusDispatcher {
                 );
                 // TODO: Phase 3 - Log replication logic
                 Ok(Response::new(AppendEntriesResponse {
-                    cluster_id: self.identity.cluster_id.clone(),
+                    cluster_id: self.cluster_id_as_str().to_string(),
                     term: node.current_term(),
                     success: false,
                     last_log_index: 0,
@@ -115,7 +115,7 @@ impl ConsensusService for ConsensusDispatcher {
             }
             RaftNodeState::Poisoned => unreachable!("Caught by check_state_health"),
             _ => Ok(Response::new(AppendEntriesResponse {
-                cluster_id: self.identity.cluster_id.clone(),
+                cluster_id: self.cluster_id_as_str().to_string(),
                 term: 0,
                 success: false,
                 last_log_index: 0,
@@ -126,13 +126,15 @@ impl ConsensusService for ConsensusDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use common::types::ClusterId;
+
     use super::*;
 
     fn mock_identity() -> Arc<NodeIdentity> {
-        Arc::new(NodeIdentity {
-            cluster_id: "test-cluster".to_string(),
-            node_id: 1,
-        })
+        Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            1.into(),
+        ))
     }
 
     fn mock_dispatcher() -> ConsensusDispatcher {

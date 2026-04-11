@@ -76,8 +76,8 @@ async fn main() -> Result<()> {
     // 8. Create the Root Node Span
     let root_span = info_span!(
         "node",
-        cluster = %identity.cluster_id,
-        id = identity.node_id
+        cluster = %identity.cluster_id(),
+        id = %identity.node_id()
     );
 
     async move {

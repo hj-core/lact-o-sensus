@@ -64,7 +64,7 @@ impl IngressService for IngressDispatcher {
                 info!("Rejecting mutation: Node is in Follower state.");
                 // TODO: Phase 4 - Provide actual leader_hint for redirection
                 Ok(Response::new(ProposeMutationResponse {
-                    cluster_id: self.identity.cluster_id.clone(),
+                    cluster_id: self.cluster_id_as_str().to_string(),
                     status: MutationStatus::Rejected as i32,
                     state_version: 0,
                     leader_hint: String::new(),
@@ -75,7 +75,7 @@ impl IngressService for IngressDispatcher {
             _ => {
                 // TODO: Phase 4 - Implement Leader proposal logic
                 Ok(Response::new(ProposeMutationResponse {
-                    cluster_id: self.identity.cluster_id.clone(),
+                    cluster_id: self.cluster_id_as_str().to_string(),
                     status: MutationStatus::Rejected as i32,
                     state_version: 0,
                     leader_hint: String::new(),
@@ -100,7 +100,7 @@ impl IngressService for IngressDispatcher {
 
         // TODO: Phase 5 - Implement State Machine queries
         Ok(Response::new(QueryStateResponse {
-            cluster_id: self.identity.cluster_id.clone(),
+            cluster_id: self.cluster_id_as_str().to_string(),
             items: Vec::new(),
             current_state_version: 0,
         }))
@@ -109,15 +109,17 @@ impl IngressService for IngressDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use common::types::ClusterId;
+
     use super::*;
     use crate::node::Follower;
     use crate::node::RaftNode;
 
     fn mock_identity() -> Arc<NodeIdentity> {
-        Arc::new(NodeIdentity {
-            cluster_id: "test-cluster".to_string(),
-            node_id: 1,
-        })
+        Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            1.into(),
+        ))
     }
 
     fn mock_dispatcher() -> IngressDispatcher {
