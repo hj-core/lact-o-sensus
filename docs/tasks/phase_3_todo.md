@@ -6,16 +6,16 @@
 
 ## Step 1: State Machine Expansion (`node.rs`)
 
-- [ ] Expand the base `RaftNode` to include standard Raft persistent state (`voted_for`).
-- [ ] Expand the volatile state structs:
-  - [ ] `Follower`: Track `leader_id` and maintain the election timer state.
-  - [ ] `Candidate`: Track `votes_received` (using a `HashSet` of `NodeId`).
-  - [ ] `Leader`: Track `next_index` and `match_index` for each peer (skeletal).
-- [ ] Implement safe state transition methods on the `RaftNodeState` enum:
-  - [ ] `to_candidate`
-  - [ ] `to_leader`
-  - [ ] `to_follower`
-- [ ] Ensure `std::mem::replace` is used for atomic, memory-safe transitions within the `RwLock`.
+- [x] Expand the base `RaftNode` to include standard Raft persistent state (`voted_for`).
+- [x] Expand the volatile state structs:
+  - [x] `Follower`: Track `leader_id` and maintain the election timer state.
+  - [x] `Candidate`: Track `votes_received` (using a `HashSet` of `NodeId`).
+  - [x] `Leader`: Track `next_index` and `match_index` for each peer (skeletal).
+- [x] Implement safe state transition methods on the `RaftNodeState` enum:
+  - [x] `to_candidate` (via `into_candidate`)
+  - [x] `to_leader` (via `into_leader`)
+  - [x] `to_follower` (via `into_follower`)
+- [x] Ensure `std::mem::replace` is used for atomic, memory-safe transitions within the `RwLock` (via `transition` helper).
 
 ## Step 2: Randomized Election Timeouts (ADR 003)
 
