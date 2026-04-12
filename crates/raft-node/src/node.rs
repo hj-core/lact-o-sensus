@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use common::types::NodeId;
 
@@ -8,19 +9,40 @@ use crate::identity::NodeIdentity;
 
 // --- Type-State Markers (Role-Specific Volatile State) ---
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Follower {
     /// The ID of the current leader (if known).
     leader_id: Option<NodeId>,
+
+    /// The instant when the last valid heartbeat was received.
+    last_heartbeat: Instant,
 }
 
 impl Follower {
     pub fn new(leader_id: Option<NodeId>) -> Self {
-        Self { leader_id }
+        Self {
+            leader_id,
+            last_heartbeat: Instant::now(),
+        }
     }
 
     pub fn leader_id(&self) -> Option<NodeId> {
         self.leader_id
+    }
+
+    pub fn last_heartbeat(&self) -> Instant {
+        self.last_heartbeat
+    }
+
+    /// Resets the heartbeat timer.
+    pub fn reset_heartbeat(&mut self) {
+        self.last_heartbeat = Instant::now();
+    }
+}
+
+impl Default for Follower {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
