@@ -1,0 +1,48 @@
+# Phase 3 Task List: The Consensus Heart
+
+## Step 0: Documentation
+
+- [x] Save this plan as a task list to `docs/tasks/phase_3_todo.md` for progress tracking.
+
+## Step 1: State Machine Expansion (`node.rs`)
+
+- [ ] Expand the base `RaftNode` to include standard Raft persistent state (`voted_for`).
+- [ ] Expand the volatile state structs:
+  - [ ] `Follower`: Track `leader_id` and maintain the election timer state.
+  - [ ] `Candidate`: Track `votes_received` (using a `HashSet` of `NodeId`).
+  - [ ] `Leader`: Track `next_index` and `match_index` for each peer (skeletal).
+- [ ] Implement safe state transition methods on the `RaftNodeState` enum:
+  - [ ] `to_candidate`
+  - [ ] `to_leader`
+  - [ ] `to_follower`
+- [ ] Ensure `std::mem::replace` is used for atomic, memory-safe transitions within the `RwLock`.
+
+## Step 2: Randomized Election Timeouts (ADR 003)
+
+- [ ] Implement `tokio::spawn` background task for randomized election timeout (150ms - 300ms).
+- [ ] Trigger transition to Candidate on timeout.
+- [ ] Ensure timer resets on valid heartbeats.
+
+## Step 3: Leader Campaign and Voting (`consensus.rs`)
+
+- [ ] Implement `RequestVote` RPC logic in `ConsensusDispatcher`.
+  - [ ] Term validation.
+  - [ ] `voted_for` validation.
+- [ ] Implement Candidate campaign loop.
+  - [ ] Concurrent `RequestVote` calls to all peers.
+  - [ ] Majority vote handling.
+
+## Step 4: Heartbeat Mechanism and Leadership Maintenance
+
+- [ ] Implement `tokio::spawn` heartbeat task for Leaders (50ms).
+- [ ] Update `AppendEntries` handler to act as heartbeat receiver.
+  - [ ] Reset election timer.
+  - [ ] Update `leader_id`.
+  - [ ] Transition Candidate back to Follower on receipt of valid heartbeat.
+
+## Step 5: Verification & Testing
+
+- [ ] Add BDD unit tests for voting logic and term increments.
+- [ ] Add BDD unit tests for state transitions.
+- [ ] Update `scripts/smoke_test.sh` to verify leader election and failover.
+- [ ] Verify MTTR < 500ms for leadership re-election.
