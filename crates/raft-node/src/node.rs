@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::types::ClusterId;
 use common::types::NodeId;
 use thiserror::Error;
 
@@ -239,6 +240,26 @@ impl RaftNodeState {
             RaftNodeState::Follower(node) => Ok(node.voted_for()),
             RaftNodeState::Candidate(node) => Ok(node.voted_for()),
             RaftNodeState::Leader(node) => Ok(node.voted_for()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
+    /// Returns the cluster ID this node belongs to.
+    pub fn cluster_id(&self) -> Result<&ClusterId, RaftError> {
+        match self {
+            RaftNodeState::Follower(n) => Ok(n.identity().cluster_id()),
+            RaftNodeState::Candidate(n) => Ok(n.identity().cluster_id()),
+            RaftNodeState::Leader(n) => Ok(n.identity().cluster_id()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
+    /// Returns this node's ID.
+    pub fn node_id(&self) -> Result<NodeId, RaftError> {
+        match self {
+            RaftNodeState::Follower(n) => Ok(n.identity().node_id()),
+            RaftNodeState::Candidate(n) => Ok(n.identity().node_id()),
+            RaftNodeState::Leader(n) => Ok(n.identity().node_id()),
             RaftNodeState::Poisoned => Err(RaftError::Poisoned),
         }
     }

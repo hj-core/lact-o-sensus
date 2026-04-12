@@ -45,6 +45,9 @@ pub struct RaftConfig {
 
     /// Maximum election timeout (in milliseconds).
     pub election_timeout_max_ms: u64,
+
+    /// Timeout for internal peer-to-peer RPC calls (in milliseconds).
+    pub rpc_timeout_ms: u64,
 }
 
 impl Default for RaftConfig {
@@ -53,6 +56,7 @@ impl Default for RaftConfig {
             heartbeat_interval_ms: 50,
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
+            rpc_timeout_ms: 40,
         }
     }
 }
@@ -70,10 +74,18 @@ impl RaftConfig {
         Duration::from_millis(self.election_timeout_max_ms)
     }
 
+    pub fn rpc_timeout(&self) -> Duration {
+        Duration::from_millis(self.rpc_timeout_ms)
+    }
+
     /// Validates Raft-specific timing invariants.
     pub fn validate(&self) -> Result<()> {
         if self.heartbeat_interval_ms == 0 {
             return Err(anyhow!("heartbeat_interval_ms must be greater than 0"));
+        }
+
+        if self.rpc_timeout_ms == 0 {
+            return Err(anyhow!("rpc_timeout_ms must be greater than 0"));
         }
 
         if self.election_timeout_min_ms <= self.heartbeat_interval_ms {

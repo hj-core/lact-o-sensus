@@ -1,4 +1,5 @@
 mod config;
+mod consensus;
 mod identity;
 mod node;
 mod peer;
@@ -6,23 +7,21 @@ mod service;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 use common::proto::v1::consensus_service_server::ConsensusServiceServer;
 use common::proto::v1::ingress_service_server::IngressServiceServer;
 use config::Config;
+use consensus::spawn_election_timer;
 use identity::NodeIdentity;
 use node::Follower;
 use node::RaftNode;
 use node::RaftNodeState;
 use peer::PeerManager;
-use rand::RngExt;
 use service::consensus::ConsensusDispatcher;
 use service::ingress::IngressDispatcher;
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 use tonic::transport::Server;
 use tracing::Instrument;
 use tracing::error;
@@ -88,7 +87,7 @@ async fn main() -> Result<()> {
     // 8. Initialize Peer Manager (Outbound Registry)
     let peer_manager = Arc::new(PeerManager::new(identity.clone(), &config.peers));
 
-    // 9. Spawn Election Timer (Background Task)
+    // 9. Spawn Consensus Background Tasks (Election Timer)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
 
     // 10. Create the Root Node Span
@@ -129,70 +128,4 @@ async fn main() -> Result<()> {
     }
     .instrument(root_span)
     .await
-}
-
-/// Spawns a background task that manages randomized election timeouts.
-fn spawn_election_timer(
-    config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
-    _peer_manager: Arc<PeerManager>,
-) {
-    tokio::spawn(async move {
-        loop {
-            // Determine timeout for this "tick". We don't hold the RNG across the await.
-            let timeout = {
-                let mut rng = rand::rng();
-                Duration::from_millis(rng.random_range(
-                    config.raft.election_timeout_min_ms..config.raft.election_timeout_max_ms,
-                ))
-            };
-
-            sleep(timeout).await;
-
-            let mut state_guard = state.write().await;
-            match &*state_guard {
-                RaftNodeState::Follower(node) => {
-                    let elapsed = node.state().last_heartbeat().elapsed();
-                    if elapsed >= timeout {
-                        info!(
-                            "Election timeout reached ({:?}). Transitioning to Candidate for term \
-                             {}",
-                            elapsed,
-                            node.current_term() + 1
-                        );
-                        state_guard.transition(|old| match old {
-                            RaftNodeState::Follower(n) => {
-                                RaftNodeState::Candidate(n.into_candidate())
-                            }
-                            other => other,
-                        });
-                        // TODO: Phase 3 Step 3 - Trigger parallel RequestVote
-                        // RPCs
-                    }
-                }
-                RaftNodeState::Candidate(node) => {
-                    // Candidates also have an election timeout; if they don't
-                    // win, they start a new term.
-                    info!(
-                        "Election timeout reached as Candidate. Restarting election for term {}",
-                        node.current_term() + 1
-                    );
-                    state_guard.transition(|old| match old {
-                        RaftNodeState::Candidate(n) => {
-                            RaftNodeState::Candidate(n.into_restarted_candidate())
-                        }
-                        other => other,
-                    });
-                    // TODO: Phase 3 Step 3 - Trigger parallel RequestVote RPCs
-                }
-                RaftNodeState::Leader(_) => {
-                    // Leaders don't have election timeouts
-                }
-                RaftNodeState::Poisoned => {
-                    error!("Node is poisoned. Election timer stopping.");
-                    break;
-                }
-            }
-        }
-    });
 }
