@@ -9,6 +9,7 @@ use rand::RngExt;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tonic::Request;
+use tonic::Status;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -110,14 +111,14 @@ async fn initiate_election(
     state: Arc<RwLock<RaftNodeState>>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
-    // 1. Gather election parameters from the current state
-    let (term, cluster_id, candidate_id) = {
+    // 1. Gather election parameters from the current state.
+    // Identity is immutable, so we can pre-allocate strings once outside the
+    // loop.
+    let (term, cluster_id_arc, node_id_str) = {
         let guard = state.read().await;
-        (
-            guard.current_term()?,
-            guard.cluster_id()?.to_string(),
-            guard.node_id()?.to_string(),
-        )
+        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str()); // Arc<str> for cheap sharing
+        let nid = guard.node_id()?.to_string();
+        (guard.current_term()?, cid, nid)
     };
 
     info!("Campaigning for leadership in term {}...", term);
@@ -126,32 +127,40 @@ async fn initiate_election(
     let peer_ids = peer_manager.peer_ids();
     let vote_requests = peer_ids.into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
-        let request = RequestVoteRequest {
-            cluster_id: cluster_id.clone(),
-            term,
-            candidate_id: candidate_id.clone(),
-            last_log_index: 0, // TODO: Phase 3 Step 3 - Real log state
-            last_log_term: 0,
-        };
+        let cluster_id = cluster_id_arc.clone();
+        let node_id = node_id_str.clone();
         let rpc_timeout = config.raft.rpc_timeout();
 
         async move {
             match peer_manager.get_client(peer_id) {
                 Ok(mut client) => {
-                    let mut request = Request::new(request);
+                    let mut request = Request::new(RequestVoteRequest {
+                        cluster_id: cluster_id.to_string(),
+                        term,
+                        candidate_id: node_id,
+                        last_log_index: 0, // TODO: Phase 3 Step 3 - Real log state
+                        last_log_term: 0,
+                    });
                     request.set_timeout(rpc_timeout);
 
                     match client.request_vote(request).await {
-                        Ok(resp) => Ok(resp.into_inner()),
+                        Ok(resp) => {
+                            let resp = resp.into_inner();
+                            // ADR 004 / Security: Verify cluster identity in response
+                            if resp.cluster_id != *cluster_id {
+                                return Err(unauthorized_response_status());
+                            }
+                            Ok(resp)
+                        }
                         Err(e) => Err(e),
                     }
                 }
-                Err(e) => Err(tonic::Status::internal(e.to_string())),
+                Err(e) => Err(Status::internal(e.to_string())),
             }
         }
     });
 
-    let results: Vec<Result<RequestVoteResponse, tonic::Status>> = join_all(vote_requests).await;
+    let results: Vec<Result<RequestVoteResponse, Status>> = join_all(vote_requests).await;
 
     // 3. Tally votes and handle term updates
     let mut votes_granted = 1; // Vote for self
@@ -198,4 +207,10 @@ async fn initiate_election(
     }
 
     Ok(())
+}
+
+/// Returns a standard gRPC PermissionDenied status for responses from
+/// unauthorized clusters.
+fn unauthorized_response_status() -> Status {
+    Status::permission_denied("Received response from unauthorized cluster")
 }
