@@ -8,7 +8,7 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
 
 ## 🏗 Task Hierarchy
 
-### 1. Node Identity & Environmental Context [ ]
+### 1. Node Identity & Environmental Context [x]
 
 - **1.1. Configuration Engine** [x]
   - *Status:* Completed
@@ -20,7 +20,7 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
   - *Status:* Completed
   - *Acceptance:* Structured `tracing` output including the `node_id` in every log span.
 
-### 2. gRPC Service Implementation (Skeletal Traits) [ ]
+### 2. gRPC Service Implementation (Skeletal Traits) [x]
 
 - **2.1. Internal Consensus Service (ADR 005)** [x]
   - *Status:* Completed
@@ -32,7 +32,7 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
   - *Status:* Completed
   - *Acceptance:* Internal trait/bridge defined for future `ai-veto` communication.
 
-### 3. Transport & Peer Orchestration [ ]
+### 3. Transport & Peer Orchestration [x]
 
 - **3.1. Async Server Listener** [x]
   - *Status:* Completed
@@ -44,18 +44,18 @@ Establish the network mesh, identity verification, and skeletal RPC handlers for
   - *Status:* Completed
   - *Acceptance:* Node handles SIGTERM/SIGINT by closing active connections and flushing logs.
 
-### 4. Cluster Validation & "Smoke Tests" [ ]
+### 4. Cluster Validation & "Smoke Tests" [x]
 
-- **4.1. Network Mesh Verification** [ ]
-  - *Status:* Pending
+- **4.1. Network Mesh Verification** [x]
+  - *Status:* Completed
   - *Acceptance:* A multi-node startup script confirms all nodes can reach each other via gRPC.
-- **4.2. Protocol Invariant Verification** [ ]
-  - *Status:* Pending
+- **4.2. Protocol Invariant Verification** [x]
+  - *Status:* Completed
   - *Acceptance:* Nodes reject requests containing an incorrect `cluster_id`.
 
 ---
 
 ## 📈 Completion Status
 
-- **Total Progress:** 75%
-- **Current Focus:** 4.1. Network Mesh Verification
+- **Total Progress:** 100%
+- **Current Focus:** Phase 2 Complete - Ready for Phase 3
