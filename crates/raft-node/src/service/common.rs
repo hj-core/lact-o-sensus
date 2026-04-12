@@ -21,7 +21,7 @@ pub trait ServiceState {
     fn verify_cluster_id(&self, cluster_id: &str) -> Result<(), Status> {
         if cluster_id != self.cluster_id_as_str() {
             warn!("Rejecting request from mismatching cluster: {}", cluster_id);
-            return Err(Status::invalid_argument("Cluster ID mismatch"));
+            return Err(self.invalid_cluster_id_status(cluster_id));
         }
         Ok(())
     }
@@ -29,10 +29,29 @@ pub trait ServiceState {
     /// Centralized health check for the Type-State engine.
     fn check_state_health(&self, state: &RaftNodeState) -> Result<(), Status> {
         if let RaftNodeState::Poisoned = state {
-            return Err(Status::internal(
-                "Node is in an unrecoverable state due to a failed transition",
-            ));
+            return Err(self.poisoned_status());
         }
         Ok(())
+    }
+
+    /// Returns a standard gRPC Internal status for a poisoned node.
+    fn poisoned_status(&self) -> Status {
+        Status::internal("Node is in an unrecoverable state due to a failed transition")
+    }
+
+    /// Returns a standard gRPC InvalidArgument status for a malformed NodeId.
+    fn invalid_node_id_status(&self, id: &str) -> Status {
+        Status::invalid_argument(format!("'{}' is not a valid NodeId (must be u64)", id))
+    }
+
+    /// Returns a standard gRPC InvalidArgument status for a mismatching
+    /// ClusterId.
+    fn invalid_cluster_id_status(&self, cluster_id: &str) -> Status {
+        // ADR 004 / Security: Do not leak the expected cluster_id to the outside world.
+        // We log the details internally for debugging, but return an opaque error.
+        Status::invalid_argument(format!(
+            "Provided cluster_id '{}' is not authorized for this node",
+            cluster_id
+        ))
     }
 }

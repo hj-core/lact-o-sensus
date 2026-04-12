@@ -4,8 +4,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::types::NodeId;
+use thiserror::Error;
 
 use crate::identity::NodeIdentity;
+
+#[derive(Error, Debug)]
+pub enum RaftError {
+    #[error("Node is in an unrecoverable state due to a failed transition")]
+    Poisoned,
+}
 
 // --- Type-State Markers (Role-Specific Volatile State) ---
 
@@ -216,6 +223,26 @@ pub enum RaftNodeState {
 }
 
 impl RaftNodeState {
+    /// Returns the current term of the node, regardless of its state.
+    pub fn current_term(&self) -> Result<u64, RaftError> {
+        match self {
+            RaftNodeState::Follower(node) => Ok(node.current_term()),
+            RaftNodeState::Candidate(node) => Ok(node.current_term()),
+            RaftNodeState::Leader(node) => Ok(node.current_term()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
+    /// Returns who the node voted for in the current term.
+    pub fn voted_for(&self) -> Result<Option<NodeId>, RaftError> {
+        match self {
+            RaftNodeState::Follower(node) => Ok(node.voted_for()),
+            RaftNodeState::Candidate(node) => Ok(node.voted_for()),
+            RaftNodeState::Leader(node) => Ok(node.voted_for()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
     /// Safely transitions the node state using an ownership-consuming closure.
     /// This is the bridge between the Type-State pattern and the RwLock
     /// storage.
@@ -225,5 +252,18 @@ impl RaftNodeState {
     {
         let old_state = std::mem::replace(self, RaftNodeState::Poisoned);
         *self = f(old_state);
+    }
+
+    /// Consumes the current state and returns a Follower state for the given
+    /// term.
+    pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNodeState {
+        match self {
+            RaftNodeState::Follower(n) => RaftNodeState::Follower(n.into_follower(term, leader_id)),
+            RaftNodeState::Candidate(n) => {
+                RaftNodeState::Follower(n.into_follower(term, leader_id))
+            }
+            RaftNodeState::Leader(n) => RaftNodeState::Follower(n.into_follower(term, leader_id)),
+            RaftNodeState::Poisoned => RaftNodeState::Poisoned,
+        }
     }
 }

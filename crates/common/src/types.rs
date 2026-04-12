@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -28,6 +29,23 @@ impl fmt::Display for NodeId {
 impl From<u64> for NodeId {
     fn from(id: u64) -> Self {
         Self::new(id)
+    }
+}
+
+impl FromStr for NodeId {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let id = s.parse::<u64>()?;
+        Ok(Self::new(id))
+    }
+}
+
+impl TryFrom<String> for NodeId {
+    type Error = std::num::ParseIntError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
     }
 }
 
