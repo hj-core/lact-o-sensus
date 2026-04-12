@@ -40,14 +40,16 @@ impl From<u64> for NodeId {
 pub struct ClusterId(String);
 
 impl ClusterId {
-    /// Constructs a new ClusterId, trimming whitespace and verifying it is not
-    /// empty.
-    pub fn try_new(id: impl Into<String>) -> Result<Self, String> {
-        let trimmed = id.into().trim().to_string();
+    /// Constructs a new ClusterId from a string-like type.
+    ///
+    /// Trims whitespace and verifies it is not empty. Avoids allocation
+    /// if the validation fails.
+    pub fn try_new(id: impl AsRef<str>) -> Result<Self, String> {
+        let trimmed = id.as_ref().trim();
         if trimmed.is_empty() {
             return Err("ClusterId cannot be empty or only whitespace".to_string());
         }
-        Ok(Self(trimmed))
+        Ok(Self(trimmed.to_string()))
     }
 
     pub fn as_str(&self) -> &str {
