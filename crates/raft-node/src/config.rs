@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -27,6 +28,68 @@ pub struct Config {
 
     /// Mapping of node IDs to their network addresses for all peers.
     pub peers: HashMap<NodeId, SocketAddr>,
+
+    /// Raft-specific timing and protocol configuration.
+    #[serde(default)]
+    pub raft: RaftConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RaftConfig {
+    /// Interval between heartbeats sent by the leader (in milliseconds).
+    pub heartbeat_interval_ms: u64,
+
+    /// Minimum election timeout (in milliseconds).
+    pub election_timeout_min_ms: u64,
+
+    /// Maximum election timeout (in milliseconds).
+    pub election_timeout_max_ms: u64,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 150,
+            election_timeout_max_ms: 300,
+        }
+    }
+}
+
+impl RaftConfig {
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_millis(self.heartbeat_interval_ms)
+    }
+
+    pub fn election_timeout_min(&self) -> Duration {
+        Duration::from_millis(self.election_timeout_min_ms)
+    }
+
+    pub fn election_timeout_max(&self) -> Duration {
+        Duration::from_millis(self.election_timeout_max_ms)
+    }
+
+    /// Validates Raft-specific timing invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.heartbeat_interval_ms == 0 {
+            return Err(anyhow!("heartbeat_interval_ms must be greater than 0"));
+        }
+
+        if self.election_timeout_min_ms <= self.heartbeat_interval_ms {
+            return Err(anyhow!(
+                "election_timeout_min_ms must be greater than heartbeat_interval_ms"
+            ));
+        }
+
+        if self.election_timeout_max_ms <= self.election_timeout_min_ms {
+            return Err(anyhow!(
+                "election_timeout_max_ms must be greater than election_timeout_min_ms"
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 impl Config {
@@ -48,6 +111,9 @@ impl Config {
                 self.node_id
             ));
         }
+
+        // Delegate Raft timing validation
+        self.raft.validate()?;
 
         if self.peers.is_empty() {
             warn!("Configuration loaded with 0 peers. This node will be a single-node cluster.");
@@ -105,6 +171,43 @@ mod tests {
             // This will now fail during deserialization because of #[serde(try_from)]
             let result: Result<Config, _> = toml::from_str(toml_str);
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn returns_err_when_invalid_raft_timing() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "127.0.0.1:50052"
+            [raft]
+            heartbeat_interval_ms = 100
+            election_timeout_min_ms = 50
+            election_timeout_max_ms = 200
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_err());
+        }
+
+        #[test]
+        fn returns_ok_when_partial_raft_timing() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "127.0.0.1:50052"
+            [raft]
+            heartbeat_interval_ms = 100
+            # election_timeout fields missing, should default
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_ok());
+            assert_eq!(config.raft.heartbeat_interval_ms, 100);
+            assert_eq!(config.raft.election_timeout_min_ms, 150); // Default
         }
     }
 }

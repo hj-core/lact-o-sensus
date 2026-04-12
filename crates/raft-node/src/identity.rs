@@ -93,6 +93,7 @@ mod tests {
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             data_dir: "".to_string(),
             peers: HashMap::new(),
+            raft: Default::default(),
         }
     }
 
