@@ -24,10 +24,9 @@
 - [x] Ensure timer resets on valid heartbeats (structure in place, logic finalized in Step 4).
 
 ## Step 3: Leader Campaign and Voting (`consensus.rs`)
-
-- [ ] Implement `RequestVote` RPC logic in `ConsensusDispatcher`.
-  - [ ] Term validation.
-  - [ ] `voted_for` validation.
+- [x] Implement `RequestVote` RPC logic in `ConsensusDispatcher`.
+  - [x] Term validation.
+  - [x] `voted_for` validation.
 - [ ] Implement Candidate campaign loop.
   - [ ] Concurrent `RequestVote` calls to all peers.
   - [ ] Majority vote handling.
