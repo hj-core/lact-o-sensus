@@ -19,9 +19,9 @@
 
 ## Step 2: Randomized Election Timeouts (ADR 003)
 
-- [ ] Implement `tokio::spawn` background task for randomized election timeout (150ms - 300ms).
-- [ ] Trigger transition to Candidate on timeout.
-- [ ] Ensure timer resets on valid heartbeats.
+- [x] Implement `tokio::spawn` background task for randomized election timeout (150ms - 300ms).
+- [x] Trigger transition to Candidate on timeout.
+- [x] Ensure timer resets on valid heartbeats (structure in place, logic finalized in Step 4).
 
 ## Step 3: Leader Campaign and Voting (`consensus.rs`)
 
