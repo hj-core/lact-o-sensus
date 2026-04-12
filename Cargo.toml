@@ -29,5 +29,6 @@ rust_decimal = { version = "1.41.0", features = ["serde", "proptest"] }
 strum = { version = "0.28.0", features = ["derive"] }
 toml = "1.1.2"
 async-trait = "0.1.89"
+clap = { version = "4.6.0", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -4,9 +4,11 @@ mod node;
 mod peer;
 mod service;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::Parser;
 use common::proto::v1::consensus_service_server::ConsensusServiceServer;
 use common::proto::v1::ingress_service_server::IngressServiceServer;
 use config::Config;
@@ -25,9 +27,20 @@ use tracing::info;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Path to the configuration file
+    #[arg(short, long, default_value = "config.toml")]
+    config: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Initialize logging with EnvFilter (default to INFO)
+    // 1. Parse CLI Arguments
+    let args = Args::parse();
+
+    // 2. Initialize logging with EnvFilter (default to INFO)
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tonic=warn"));
 
@@ -39,21 +52,20 @@ async fn main() -> Result<()> {
 
     info!("Lact-O-Sensus Node Initializing...");
 
-    // 2. Load Configuration
-    let config_path = "config.toml";
-    let config = match Config::load(config_path) {
+    // 3. Load Configuration
+    let config = match Config::load(&args.config) {
         Ok(cfg) => Arc::new(cfg),
         Err(e) => {
-            error!("Failed to load configuration from {}: {}", config_path, e);
+            error!("Failed to load configuration from {:?}: {}", args.config, e);
             return Err(e);
         }
     };
 
-    // 3. Initialize Persistence (sled)
+    // 4. Initialize Persistence (sled)
     info!("Opening database at: {}", config.data_dir);
     let db = sled::open(&config.data_dir)?;
 
-    // 4. Verify or Initialize Identity (ADR 004)
+    // 5. Verify or Initialize Identity (ADR 004)
     let identity = match NodeIdentity::initialize_or_verify(&db, &config) {
         Ok(id) => Arc::new(id),
         Err(e) => {
@@ -62,18 +74,18 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 5. Initialize the Shared Node State (Type-State Engine)
+    // 6. Initialize the Shared Node State (Type-State Engine)
     let initial_node = RaftNode::<Follower>::new(identity.clone());
     let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
 
-    // 6. Initialize RPC Service Dispatchers
+    // 7. Initialize RPC Service Dispatchers
     let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
     let ingress_dispatcher = IngressDispatcher::new(identity.clone(), shared_state.clone());
 
-    // 7. Initialize Peer Manager (Outbound Registry)
+    // 8. Initialize Peer Manager (Outbound Registry)
     let _peer_manager = Arc::new(PeerManager::new(identity.clone(), &config.peers));
 
-    // 8. Create the Root Node Span
+    // 9. Create the Root Node Span
     let root_span = info_span!(
         "node",
         cluster = %identity.cluster_id(),
@@ -94,14 +106,14 @@ async fn main() -> Result<()> {
             info!("Shutdown signal received. Commencing graceful exit...");
         };
 
-        // 9. Start the gRPC Server
+        // 10. Start the gRPC Server
         Server::builder()
             .add_service(ConsensusServiceServer::new(consensus_dispatcher))
             .add_service(IngressServiceServer::new(ingress_dispatcher))
             .serve_with_shutdown(addr, shutdown)
             .await?;
 
-        // 10. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
+        // 11. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
         info!("gRPC server stopped. Flushing database to disk...");
         db.flush_async().await?;
         info!("Database synchronized successfully.");

@@ -1,0 +1,8 @@
+cluster_id = "lacto-dev-01"
+node_id = 3
+listen_addr = "127.0.0.1:50053"
+data_dir = "data/node_3"
+
+[peers]
+1 = "127.0.0.1:50051"
+2 = "127.0.0.1:50052"
