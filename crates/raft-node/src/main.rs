@@ -14,6 +14,7 @@ use common::proto::v1::consensus_service_server::ConsensusServiceServer;
 use common::proto::v1::ingress_service_server::IngressServiceServer;
 use config::Config;
 use consensus::spawn_election_timer;
+use consensus::spawn_heartbeat_task;
 use identity::NodeIdentity;
 use node::Follower;
 use node::RaftNode;
@@ -87,8 +88,9 @@ async fn main() -> Result<()> {
     // 8. Initialize Peer Manager (Outbound Registry)
     let peer_manager = Arc::new(PeerManager::new(identity.clone(), &config.peers));
 
-    // 9. Spawn Consensus Background Tasks (Election Timer)
+    // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
+    spawn_heartbeat_task(config.clone(), shared_state.clone(), peer_manager.clone());
 
     // 10. Create the Root Node Span
     let root_span = info_span!(

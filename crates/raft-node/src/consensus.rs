@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use common::proto::v1::AppendEntriesRequest;
+use common::proto::v1::AppendEntriesResponse;
 use common::proto::v1::RequestVoteRequest;
 use common::proto::v1::RequestVoteResponse;
 use futures::future::join_all;
@@ -138,7 +140,7 @@ async fn initiate_election(
                         cluster_id: cluster_id.to_string(),
                         term,
                         candidate_id: node_id,
-                        last_log_index: 0, // TODO: Phase 3 Step 3 - Real log state
+                        last_log_index: 0, // TODO: Phase 5 - Real log state
                         last_log_term: 0,
                     });
                     request.set_timeout(rpc_timeout);
@@ -213,4 +215,110 @@ async fn initiate_election(
 /// unauthorized clusters.
 fn unauthorized_response_status() -> Status {
     Status::permission_denied("Received response from unauthorized cluster")
+}
+
+/// Spawns a background task that periodically sends heartbeats if the node is a
+/// Leader.
+pub fn spawn_heartbeat_task(
+    config: Arc<Config>,
+    state: Arc<RwLock<RaftNodeState>>,
+    peer_manager: Arc<PeerManager>,
+) {
+    let interval = Duration::from_millis(config.raft.heartbeat_interval_ms);
+    tokio::spawn(async move {
+        loop {
+            sleep(interval).await;
+
+            let is_leader = matches!(&*state.read().await, RaftNodeState::Leader(_));
+            if is_leader {
+                let state_clone = state.clone();
+                let peer_manager_clone = peer_manager.clone();
+                let config_clone = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        send_heartbeats(config_clone, state_clone, peer_manager_clone).await
+                    {
+                        error!("Failed to send heartbeats: {}", e);
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// Sends AppendEntries RPCs (heartbeats) to all peers.
+async fn send_heartbeats(
+    config: Arc<Config>,
+    state: Arc<RwLock<RaftNodeState>>,
+    peer_manager: Arc<PeerManager>,
+) -> Result<()> {
+    // 1. Gather heartbeat parameters
+    let (term, cluster_id_arc, node_id_str) = {
+        let guard = state.read().await;
+        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
+        let nid = guard.node_id()?.to_string();
+        (guard.current_term()?, cid, nid)
+    };
+
+    // 2. Send heartbeats to all peers concurrently
+    let peer_ids = peer_manager.peer_ids();
+    let heartbeat_requests = peer_ids.into_iter().map(|peer_id| {
+        let peer_manager = peer_manager.clone();
+        let cluster_id = cluster_id_arc.clone();
+        let node_id = node_id_str.clone();
+        let rpc_timeout = config.raft.rpc_timeout();
+
+        async move {
+            match peer_manager.get_client(peer_id) {
+                Ok(mut client) => {
+                    let mut request = Request::new(AppendEntriesRequest {
+                        cluster_id: cluster_id.to_string(),
+                        term,
+                        leader_id: node_id,
+                        prev_log_index: 0, // TODO: Phase 5 - Real log state
+                        prev_log_term: 0,
+                        entries: Vec::new(),
+                        leader_commit: 0,
+                    });
+                    request.set_timeout(rpc_timeout);
+
+                    match client.append_entries(request).await {
+                        Ok(resp) => {
+                            let resp = resp.into_inner();
+                            if resp.cluster_id != *cluster_id {
+                                return Err(unauthorized_response_status());
+                            }
+                            Ok(resp)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(Status::internal(e.to_string())),
+            }
+        }
+    });
+
+    let results: Vec<Result<AppendEntriesResponse, Status>> = join_all(heartbeat_requests).await;
+
+    // 3. Handle responses (primarily term updates)
+    for res in results {
+        match res {
+            Ok(resp) => {
+                if resp.term > term {
+                    info!(
+                        "Found higher term ({}) in heartbeat response. Demoting to Follower.",
+                        resp.term
+                    );
+                    let mut guard = state.write().await;
+                    guard.transition(|old| old.into_follower(resp.term, None));
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                debug!("Heartbeat failed for a peer: {}", e);
+            }
+        }
+    }
+
+    Ok(())
 }

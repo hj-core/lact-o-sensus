@@ -11,6 +11,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
 
@@ -89,7 +90,7 @@ impl ConsensusService for ConsensusDispatcher {
                 if req.term >= node.current_term()
                     && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
                 {
-                    // TODO: Phase 3 Step 3 - Add log up-to-date check (§5.4)
+                    // TODO: Phase 5 - Add log up-to-date check (§5.4)
                     vote_granted = true;
                     node.vote_for(candidate_id);
                     info!(
@@ -122,34 +123,80 @@ impl ConsensusService for ConsensusDispatcher {
         let req = request.into_inner();
         self.verify_cluster_id(&req.cluster_id)?;
 
-        let state_guard = self.state.read().await;
+        let mut state_guard = self.state.write().await;
         self.check_state_health(&state_guard)?;
 
         let span = info_span!("append_entries", term = req.term, leader = %req.leader_id);
         let _enter = span.enter();
 
-        match &*state_guard {
-            RaftNodeState::Follower(node) => {
-                debug!(
-                    "Received heartbeat as Follower (term: {})",
-                    node.current_term()
-                );
-                // TODO: Phase 3 - Log replication logic
-                Ok(Response::new(AppendEntriesResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
-                    term: node.current_term(),
-                    success: false,
-                    last_log_index: 0,
-                }))
-            }
-            RaftNodeState::Poisoned => unreachable!("Caught by check_state_health"),
-            _ => Ok(Response::new(AppendEntriesResponse {
+        let current_term = state_guard
+            .current_term()
+            .map_err(|_| self.poisoned_status())?;
+
+        // 1. Reply false if term < currentTerm (§5.1)
+        if req.term < current_term {
+            debug!(
+                "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
+                req.leader_id, req.term, current_term
+            );
+            return Ok(Response::new(AppendEntriesResponse {
                 cluster_id: self.cluster_id_as_str().to_string(),
-                term: 0,
+                term: current_term,
                 success: false,
                 last_log_index: 0,
-            })),
+            }));
         }
+
+        // 2. Term-based state transitions
+        let leader_id = req.leader_id.parse::<NodeId>().ok();
+
+        if req.term > current_term {
+            // §5.1: If term > currentTerm, transition to follower
+            info!(
+                "Received higher term ({}) from leader {}. Demoting to Follower.",
+                req.term, req.leader_id
+            );
+            state_guard.transition(|old| old.into_follower(req.term, leader_id));
+        } else if req.term == current_term {
+            match &*state_guard {
+                RaftNodeState::Candidate(_) => {
+                    // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
+                    // it recognizes the leader as legitimate and returns to follower state.
+                    info!(
+                        "Candidate recognizing leader {} for term {}. Returning to Follower.",
+                        req.leader_id, req.term
+                    );
+                    state_guard.transition(|old| old.into_follower(req.term, leader_id));
+                }
+                RaftNodeState::Leader(_) => {
+                    // INVARIANT VIOLATION: Two leaders for the same term!
+                    error!(
+                        "CRITICAL SAFETY VIOLATION: Another node {} claims leadership for term \
+                         {}. This node is also a Leader. This indicates a failure in Raft's \
+                         safety guarantees.",
+                        req.leader_id, req.term
+                    );
+                    // Defensive demotion to resolve split-brain
+                    // TODO: Phase 5 - dump existing log entries to a temperory file to prevent data
+                    // loss
+                    state_guard.transition(|old| old.into_follower(req.term, leader_id));
+                }
+                _ => {} // Followers just accept heartbeats from their leader
+            }
+        }
+
+        // 3. Reset election timer to acknowledge the leader's presence
+        state_guard.reset_heartbeat();
+
+        // Note: Real log consistency checks (prev_log_index/term) and log replication
+        // will be implemented in Phase 5. For Phase 3, we acknowledge the heartbeat.
+
+        Ok(Response::new(AppendEntriesResponse {
+            cluster_id: self.cluster_id_as_str().to_string(),
+            term: req.term,
+            success: true,
+            last_log_index: 0,
+        }))
     }
 }
 
@@ -265,15 +312,42 @@ mod tests {
     }
 
     mod append_entries {
+        use std::time::Duration;
+
         use super::*;
 
         #[tokio::test]
-        async fn returns_skeletal_failure_when_follower() {
+        async fn returns_success_when_term_is_current() {
             let dispatcher = mock_dispatcher();
 
             let req = Request::new(AppendEntriesRequest {
                 cluster_id: "test-cluster".to_string(),
-                term: 1,
+                term: 0,
+                leader_id: "2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            });
+
+            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+            assert_eq!(response.success, true);
+            assert_eq!(response.term, 0);
+        }
+
+        #[tokio::test]
+        async fn rejects_when_term_is_older() {
+            let dispatcher = mock_dispatcher();
+
+            // Update node to term 2
+            {
+                let mut state = dispatcher.state.write().await;
+                state.transition(|old| old.into_follower(2, None));
+            }
+
+            let req = Request::new(AppendEntriesRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1, // Older
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
                 prev_log_term: 0,
@@ -283,7 +357,105 @@ mod tests {
 
             let response = dispatcher.append_entries(req).await.unwrap().into_inner();
             assert_eq!(response.success, false);
-            assert_eq!(response.cluster_id, "test-cluster");
+            assert_eq!(response.term, 2);
+        }
+
+        #[tokio::test]
+        async fn demotes_candidate_on_equal_term() {
+            let id = mock_identity();
+            // Start as Follower term 0, transition to Candidate term 1
+            let follower = RaftNode::<Follower>::new(id.clone());
+            let candidate = follower.into_candidate();
+            let dispatcher = ConsensusDispatcher::new(
+                id,
+                Arc::new(RwLock::new(RaftNodeState::Candidate(candidate))),
+            );
+
+            let req = Request::new(AppendEntriesRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1, // Equal to candidate term
+                leader_id: "2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            });
+
+            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+            assert_eq!(response.success, true);
+
+            let state_guard = dispatcher.state.read().await;
+            assert!(matches!(&*state_guard, RaftNodeState::Follower(_)));
+            assert_eq!(state_guard.current_term().unwrap(), 1);
+        }
+
+        #[tokio::test]
+        async fn demotes_leader_on_equal_term() {
+            let id = mock_identity();
+            // Start as Leader term 1
+            let follower = RaftNode::<Follower>::new(id.clone());
+            let candidate = follower.into_candidate();
+            let leader = candidate.into_leader();
+            let dispatcher =
+                ConsensusDispatcher::new(id, Arc::new(RwLock::new(RaftNodeState::Leader(leader))));
+
+            let req = Request::new(AppendEntriesRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1, // Rival leader for same term
+                leader_id: "2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            });
+
+            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+            assert_eq!(response.success, true); // We demoted, so we successfully acknowledged
+
+            let state_guard = dispatcher.state.read().await;
+            assert!(matches!(&*state_guard, RaftNodeState::Follower(_)));
+        }
+
+        #[tokio::test]
+        async fn resets_election_timer() {
+            let dispatcher = mock_dispatcher();
+
+            // 1. Get initial heartbeat time
+            let initial_heartbeat = {
+                let guard = dispatcher.state.read().await;
+                if let RaftNodeState::Follower(node) = &*guard {
+                    node.state().last_heartbeat()
+                } else {
+                    panic!("Should be follower");
+                }
+            };
+
+            // Small sleep to ensure time moves forward
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            let req = Request::new(AppendEntriesRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 0,
+                leader_id: "2".to_string(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            });
+
+            dispatcher.append_entries(req).await.unwrap();
+
+            // 2. Verify heartbeat time was updated
+            let updated_heartbeat = {
+                let guard = dispatcher.state.read().await;
+                if let RaftNodeState::Follower(node) = &*guard {
+                    node.state().last_heartbeat()
+                } else {
+                    panic!("Should be follower");
+                }
+            };
+
+            assert!(updated_heartbeat > initial_heartbeat);
         }
     }
 }

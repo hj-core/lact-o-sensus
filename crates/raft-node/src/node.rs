@@ -287,4 +287,11 @@ impl RaftNodeState {
             RaftNodeState::Poisoned => RaftNodeState::Poisoned,
         }
     }
+
+    /// Resets the election timer if the node is a Follower.
+    pub fn reset_heartbeat(&mut self) {
+        if let RaftNodeState::Follower(node) = self {
+            node.state_mut().reset_heartbeat();
+        }
+    }
 }
