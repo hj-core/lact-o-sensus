@@ -5,9 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Unique identifier for a node within a cluster.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct NodeId(u64);
 
 impl NodeId {
@@ -53,7 +51,7 @@ impl TryFrom<String> for NodeId {
 ///
 /// This type is self-validating: it can only be constructed if the ID is
 /// non-empty. Serde deserialization is also guarded by this validation.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct ClusterId(String);
 
