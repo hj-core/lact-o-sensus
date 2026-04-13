@@ -65,10 +65,8 @@ mod tests {
     use super::*;
 
     fn mock_identity() -> Arc<NodeIdentity> {
-        Arc::new(NodeIdentity::new(
-            ClusterId::try_new("test-cluster").unwrap(),
-            1.into(),
-        ))
+        let id = NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(1));
+        Arc::new(id)
     }
 
     mod get_client {

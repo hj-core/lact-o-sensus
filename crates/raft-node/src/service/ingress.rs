@@ -110,6 +110,7 @@ impl IngressService for IngressDispatcher {
 #[cfg(test)]
 mod tests {
     use common::types::ClusterId;
+    use common::types::NodeId;
 
     use super::*;
     use crate::node::Follower;
@@ -118,7 +119,7 @@ mod tests {
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            1.into(),
+            NodeId::new(1),
         ))
     }
 
