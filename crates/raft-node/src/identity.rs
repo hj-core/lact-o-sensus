@@ -1,10 +1,9 @@
-use anyhow::Result;
-use anyhow::anyhow;
 use common::types::ClusterId;
 use common::types::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
 use sled::Db;
+use thiserror::Error;
 use tracing::error;
 use tracing::info;
 
@@ -14,6 +13,18 @@ use crate::config::Config;
 /// Centralizing these here prevents collision hazards with other sled clients.
 const IDENTITY_KEY: &[u8] = b"node_identity";
 const IDENTITY_TREE: &str = "_system_metadata";
+
+#[derive(Debug, Error)]
+pub enum IdentityError {
+    #[error("Persistence failure: {0}")]
+    Storage(#[from] sled::Error),
+
+    #[error("Identity metadata corruption: {0}")]
+    Corruption(#[from] serde_json::Error),
+
+    #[error("Safety Violation: Config ID ({config}) does not match Disk ID ({disk})")]
+    Mismatch { disk: String, config: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeIdentity {
@@ -43,24 +54,24 @@ impl NodeIdentity {
 ///
 /// This is a "Bootstrap Guard" that enforces ADR 004: identity must be
 /// immutable across restarts to prevent data corruption.
-pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity> {
+pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity, IdentityError> {
     let tree = db.open_tree(IDENTITY_TREE)?;
 
     match tree.get(IDENTITY_KEY)? {
         Some(bytes) => {
             let existing: NodeIdentity = serde_json::from_slice(&bytes)?;
             if existing.cluster_id() != &config.cluster_id || existing.node_id() != config.node_id {
+                let config_id = format!("({}, {})", config.cluster_id, config.node_id);
+                let disk_id = format!("({}, {})", existing.cluster_id(), existing.node_id());
+
                 error!(
-                    "IDENTITY MISMATCH: Config({}, {}) does not match Disk({}, {})",
-                    config.cluster_id,
-                    config.node_id,
-                    existing.cluster_id(),
-                    existing.node_id()
+                    "IDENTITY MISMATCH: Config {} does not match Disk {}",
+                    config_id, disk_id
                 );
-                return Err(anyhow!(
-                    "Node identity on disk does not match configuration. Refusing to start to \
-                     prevent data corruption."
-                ));
+                return Err(IdentityError::Mismatch {
+                    disk: disk_id,
+                    config: config_id,
+                });
             }
             info!(
                 "Identity verified: Cluster={}, NodeID={}",
@@ -87,6 +98,8 @@ pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use anyhow::Result;
 
     use super::*;
 
@@ -138,7 +151,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_cluster_id_mismatches() -> Result<()> {
+        fn returns_mismatch_error_when_cluster_id_mismatches() -> Result<()> {
             let db = sled::Config::new().temporary(true).open()?;
             let config = mock_config("test-cluster", 1);
 
@@ -149,18 +162,12 @@ mod tests {
             let mismatch_config = mock_config("wrong-cluster", 1);
             let result = initialize_node_identity(&db, &mismatch_config);
 
-            assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("does not match configuration")
-            );
+            assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
             Ok(())
         }
 
         #[test]
-        fn returns_err_when_node_id_mismatches() -> Result<()> {
+        fn returns_mismatch_error_when_node_id_mismatches() -> Result<()> {
             let db = sled::Config::new().temporary(true).open()?;
             let config = mock_config("test-cluster", 1);
 
@@ -171,13 +178,7 @@ mod tests {
             let mismatch_config = mock_config("test-cluster", 2);
             let result = initialize_node_identity(&db, &mismatch_config);
 
-            assert!(result.is_err());
-            assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("does not match configuration")
-            );
+            assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
             Ok(())
         }
     }

@@ -15,7 +15,6 @@ use common::proto::v1::ingress_service_server::IngressServiceServer;
 use config::Config;
 use consensus::spawn_election_timer;
 use consensus::spawn_heartbeat_task;
-use identity::NodeIdentity;
 use identity::initialize_node_identity;
 use node::Follower;
 use node::RaftNode;
@@ -74,7 +73,7 @@ async fn main() -> Result<()> {
         Ok(id) => Arc::new(id),
         Err(e) => {
             error!("Fatal Error during identity verification: {}", e);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
