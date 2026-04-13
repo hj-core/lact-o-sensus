@@ -169,17 +169,17 @@ impl ConsensusService for ConsensusDispatcher {
                     state_guard.transition(|old| old.into_follower(req.term, leader_id));
                 }
                 RaftNodeState::Leader(_) => {
-                    // INVARIANT VIOLATION: Two leaders for the same term!
-                    error!(
-                        "CRITICAL SAFETY VIOLATION: Another node {} claims leadership for term \
-                         {}. This node is also a Leader. This indicates a failure in Raft's \
-                         safety guarantees.",
+                    // FATAL INVARIANT VIOLATION: Two leaders for the same term!
+                    // We prioritize Safety over Liveness. Detecting another leader for our own term
+                    // implies a failure in the consensus logic or persistence layer. We must halt
+                    // to prevent data corruption.
+                    let msg = format!(
+                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
+                         node to prevent state corruption.",
                         req.leader_id, req.term
                     );
-                    // Defensive demotion to resolve split-brain
-                    // TODO: Phase 5 - dump existing log entries to a temperory file to prevent data
-                    // loss
-                    state_guard.transition(|old| old.into_follower(req.term, leader_id));
+                    error!("{}", msg);
+                    panic!("{}", msg);
                 }
                 _ => {} // Followers just accept heartbeats from their leader
             }
@@ -390,7 +390,8 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn demotes_leader_on_equal_term() {
+        #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+        async fn panics_on_rival_leader_same_term() {
             let id = mock_identity();
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new(id.clone());
@@ -409,11 +410,8 @@ mod tests {
                 leader_commit: 0,
             });
 
-            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert_eq!(response.success, true); // We demoted, so we successfully acknowledged
-
-            let state_guard = dispatcher.state.read().await;
-            assert!(matches!(&*state_guard, RaftNodeState::Follower(_)));
+            // This should panic
+            let _ = dispatcher.append_entries(req).await;
         }
 
         #[tokio::test]
