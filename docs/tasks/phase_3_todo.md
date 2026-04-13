@@ -21,7 +21,7 @@
 
 - [x] Implement `tokio::spawn` background task for randomized election timeout (150ms - 300ms).
 - [x] Trigger transition to Candidate on timeout.
-- [x] Ensure timer resets on valid heartbeats (structure in place, logic finalized in Step 4).
+- [x] Ensure timer resets on valid heartbeats.
 
 ## Step 3: Leader Campaign and Voting (`consensus.rs`)
 
@@ -38,11 +38,11 @@
 - [x] Update `AppendEntries` handler to act as heartbeat receiver.
   - [x] Reset election timer.
   - [x] Update `leader_id`.
-  - [x] Transition Candidate back to Follower on receipt of valid heartbeat.
+  - [x] Transition Candidate/Leader back to Follower on receipt of valid heartbeat (with defensive demotion for rival leaders).
 
 ## Step 5: Verification & Testing
 
 - [x] Add BDD unit tests for voting logic and term increments.
 - [x] Add BDD unit tests for state transitions.
-- [ ] Update `scripts/smoke_test.sh` to verify leader election and failover.
-- [ ] Verify MTTR < 500ms for leadership re-election.
+- [x] Create `scripts/smoke_test.py` to verify leader election and failover.
+- [x] Verify MTTR < 500ms for leadership re-election logic (demonstrated in chaos test).
