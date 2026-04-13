@@ -34,15 +34,15 @@
 
 ## Step 4: Heartbeat Mechanism and Leadership Maintenance
 
-- [ ] Implement `tokio::spawn` heartbeat task for Leaders (50ms).
-- [ ] Update `AppendEntries` handler to act as heartbeat receiver.
-  - [ ] Reset election timer.
-  - [ ] Update `leader_id`.
-  - [ ] Transition Candidate back to Follower on receipt of valid heartbeat.
+- [x] Implement `tokio::spawn` heartbeat task for Leaders (50ms).
+- [x] Update `AppendEntries` handler to act as heartbeat receiver.
+  - [x] Reset election timer.
+  - [x] Update `leader_id`.
+  - [x] Transition Candidate back to Follower on receipt of valid heartbeat.
 
 ## Step 5: Verification & Testing
 
-- [ ] Add BDD unit tests for voting logic and term increments.
-- [ ] Add BDD unit tests for state transitions.
+- [x] Add BDD unit tests for voting logic and term increments.
+- [x] Add BDD unit tests for state transitions.
 - [ ] Update `scripts/smoke_test.sh` to verify leader election and failover.
 - [ ] Verify MTTR < 500ms for leadership re-election.
