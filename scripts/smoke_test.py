@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, TypedDict, TextIO, Generator
+
+# Lact-O-Sensus: Consensus Verification Suite
+# Verifies the Raft "Consensus Heart" logic via isolated test cases.
+
+
+class NodeConfig(TypedDict):
+    id: int
+    port: int
+    config: str
+    log: str
+
+
+NODES: List[NodeConfig] = [
+    {
+        "id": 1,
+        "port": 50051,
+        "config": "crates/raft-node/configs/node_1.toml",
+        "log": "node_1.log",
+    },
+    {
+        "id": 2,
+        "port": 50052,
+        "config": "crates/raft-node/configs/node_2.toml",
+        "log": "node_2.log",
+    },
+    {
+        "id": 3,
+        "port": 50053,
+        "config": "crates/raft-node/configs/node_3.toml",
+        "log": "node_3.log",
+    },
+]
+
+# --- Helper Library ---
+
+
+def now_ms() -> float:
+    """Returns current wall-clock time in milliseconds."""
+    return time.time() * 1000
+
+
+class ClusterManager:
+    """Manages the lifecycle of a local 3-node Raft cluster."""
+
+    processes: Dict[int, subprocess.Popen]
+    log_files: Dict[int, TextIO]
+
+    def __init__(self) -> None:
+        self.processes = {}
+        self.log_files = {}
+
+    def start_all(self) -> None:
+        """Starts all nodes defined in NODES."""
+        print("--- Starting 3-node cluster ---")
+
+        # Capture and prepare environment once to ensure consistency across the cluster.
+        cluster_env = os.environ.copy()
+        cluster_env["RUST_LOG"] = "info"
+
+        for node in NODES:
+            if os.path.exists(node["log"]):
+                os.remove(node["log"])
+
+            log_file = open(node["log"], "w", encoding="utf-8")
+            self.log_files[node["id"]] = log_file
+
+            cmd = [
+                "cargo",
+                "run",
+                "-p",
+                "raft-node",
+                "--",
+                "--config",
+                node["config"],
+            ]
+            # Nodes inherit their own copy of the file descriptor from the Popen call.
+            p = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=cluster_env,
+            )
+            self.processes[node["id"]] = p
+
+    def kill_node(self, node_id: int) -> float:
+        """Kills a specific node and returns kill timestamp in ms."""
+        if node_id in self.processes:
+            p = self.processes[node_id]
+            print(f"Action: Killing Node {node_id} (PID {p.pid})...")
+            kill_time = now_ms()
+            p.kill()
+            p.wait()
+            del self.processes[node_id]
+            if node_id in self.log_files:
+                self.log_files[node_id].close()
+                del self.log_files[node_id]
+            return kill_time
+        return 0.0
+
+    def cleanup(self) -> None:
+        """
+        Performs deterministic resource reclamation for the cluster nodes.
+        Uses a two-stage shutdown process: SIGTERM (graceful) -> Wait -> SIGKILL (forced).
+        """
+        print("--- Cleaning up cluster ---")
+        for p in self.processes.values():
+            p.terminate()
+        for p in self.processes.values():
+            try:
+                p.wait(timeout=2)
+            except (
+                subprocess.TimeoutExpired,
+                subprocess.SubprocessError,
+            ):
+                p.kill()
+        for f in self.log_files.values():
+            try:
+                f.close()
+            except (OSError, IOError):
+                pass
+        self.processes.clear()
+        self.log_files.clear()
+
+
+def get_complete_lines(
+    log_path: str, offset: int = 0
+) -> Generator[str, None, int]:
+    """Yields only complete lines from a log file."""
+    if not os.path.exists(log_path):
+        return offset
+    with open(log_path, "r", encoding="utf-8") as f:
+        f.seek(offset)
+        while True:
+            line = f.readline()
+            if not line or not line.endswith("\n"):
+                break
+            yield line
+            offset = f.tell()
+    return offset
+
+
+def parse_log_timestamp(line: str) -> float:
+    try:
+        ts_str = line.split(" ")[0]
+        ts = datetime.datetime.fromisoformat(
+            ts_str.replace("Z", "+00:00")
+        )
+        return ts.timestamp() * 1000
+    except Exception:
+        return 0.0
+
+
+def find_current_leader() -> Optional[int]:
+    """Robust leader discovery using most recent election event."""
+    leader_id: Optional[int] = None
+    latest_ts: float = -1.0
+    for node in NODES:
+        for line in get_complete_lines(node["log"], 0):
+            ts = parse_log_timestamp(line)
+            if "Transitioning to Leader" in line and ts > latest_ts:
+                latest_ts, leader_id = ts, node["id"]
+            if (
+                "Demoting to Follower" in line
+                and ts >= latest_ts
+                and leader_id == node["id"]
+            ):
+                leader_id = None
+    return leader_id
+
+
+def wait_for_leader(timeout: float = 15.0) -> int:
+    """Helper to wait for a leader to emerge without printing a test header."""
+    print(
+        f"Waiting for leader to emerge (max {timeout}s)...",
+        end="",
+        flush=True,
+    )
+    start = time.time()
+    while (time.time() - start) < timeout:
+        leader_id = find_current_leader()
+        if leader_id:
+            print(f" OK (Node {leader_id})")
+            return leader_id
+        time.sleep(0.5)
+    print(" FAILED")
+    raise RuntimeError(f"No leader emerged within {timeout}s.")
+
+
+def count_elections() -> int:
+    return sum(
+        1
+        for node in NODES
+        for line in get_complete_lines(node["log"], 0)
+        if "Transitioning to Leader" in line
+    )
+
+
+def print_cluster_logs(lines: int = 5) -> None:
+    print(f"\n--- Diagnostic Tail (Last {lines} lines) ---")
+    for node in NODES:
+        if os.path.exists(node["log"]):
+            print(f"\n--- Node {node['id']} ---")
+            subprocess.run(
+                ["tail", "-n", str(lines), node["log"]], check=False
+            )
+
+
+def check_connectivity(
+    target_node_id: int,
+    port: int,
+    cluster_id: str = "probe-unauthorized",
+) -> bool:
+    """Side-effect free probe via Identity Guard."""
+    peer_id = 2 if target_node_id == 1 else 1
+    cmd = [
+        "grpcurl",
+        "-plaintext",
+        "-import-path",
+        "crates/common/proto",
+        "-proto",
+        "lacto_sensus.proto",
+        "-d",
+        json.dumps(
+            {
+                "cluster_id": cluster_id,
+                "term": 1,
+                "candidate_id": str(peer_id),
+            }
+        ),
+        f"127.0.0.1:{port}",
+        "lacto_sensus.v1.ConsensusService/RequestVote",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False
+    )
+    if cluster_id == "lacto-dev-01":
+        return result.returncode == 0
+    else:
+        return "is not authorized for this node" in result.stderr
+
+
+# --- Test Cases ---
+
+
+def test_leader_election() -> None:
+    """Explicitly tests that a leader can be elected."""
+    wait_for_leader()
+
+
+def test_leadership_stability() -> None:
+    """Verifies that heartbeats maintain a stable leader without re-elections."""
+    wait_for_leader()
+    initial_count = count_elections()
+    print("Verifying stability for 3s...")
+    time.sleep(3)
+    if count_elections() > initial_count:
+        raise RuntimeError(
+            "Leadership was unstable (unnecessary re-election detected)."
+        )
+    print("SUCCESS: Leadership stable.")
+
+
+def test_leader_failover(cluster: ClusterManager) -> None:
+    """Verifies that killing the leader triggers a successful re-election."""
+    leader_id = wait_for_leader()
+    base_count = count_elections()
+
+    log_offsets = {
+        n["id"]: (
+            os.path.getsize(n["log"]) if os.path.exists(n["log"]) else 0
+        )
+        for n in NODES
+    }
+    kill_time = cluster.kill_node(leader_id)
+
+    print("Waiting for re-election...")
+    max_wait, elapsed = 10.0, 0.0
+    while elapsed < max_wait:
+        time.sleep(0.1)
+        elapsed += 0.1
+        if count_elections() > base_count:
+            for node in NODES:
+                if node["id"] == leader_id:
+                    continue
+                for line in get_complete_lines(
+                    node["log"], log_offsets.get(node["id"], 0)
+                ):
+                    if "Transitioning to Leader" in line:
+                        log_ts = parse_log_timestamp(line)
+                        duration = int(
+                            (log_ts if log_ts > 0 else now_ms())
+                            - kill_time
+                        )
+                        print(
+                            f"SUCCESS: New leader (Node {node['id']}) elected in {duration}ms."
+                        )
+                        return
+    raise RuntimeError("No re-election occurred after failover.")
+
+
+def test_identity_guard() -> None:
+    """Verifies that the Identity Guard (ADR 004) rejects unauthorized cluster IDs."""
+    wait_for_leader()
+    if check_connectivity(1, 50051, cluster_id="wrong-cluster"):
+        print(
+            "SUCCESS: Identity Guard correctly rejected unauthorized request."
+        )
+    else:
+        raise RuntimeError(
+            "Identity Guard failed to reject unauthorized request."
+        )
+
+
+# --- Runner Logic ---
+
+
+def main() -> None:
+    print("=== Lact-O-Sensus Consensus Verification Suite ===")
+    tests = [
+        ("Leader Election", lambda c: test_leader_election()),
+        ("Leadership Stability", lambda c: test_leadership_stability()),
+        ("Chaos Failover", lambda c: test_leader_failover(c)),
+        ("Identity Guard (ADR 004)", lambda c: test_identity_guard()),
+    ]
+
+    passed = 0
+    for name, test_func in tests:
+        print(f"\n[TEST] {name}")
+        cluster = ClusterManager()
+        try:
+            cluster.start_all()
+            test_func(cluster)
+            passed += 1
+        except Exception as e:
+            print(f"RESULT: FAILED -> {e}")
+            print_cluster_logs()
+        finally:
+            cluster.cleanup()
+            # Cooldown Period: Ensures that OS network sockets (in TIME_WAIT state)
+            # are fully released before the next test attempts to bind to the same ports.
+            time.sleep(1)
+
+    print(f"\n=== Final Result: {passed}/{len(tests)} Tests Passed ===")
+    if passed < len(tests):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
