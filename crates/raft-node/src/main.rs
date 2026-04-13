@@ -16,6 +16,7 @@ use config::Config;
 use consensus::spawn_election_timer;
 use consensus::spawn_heartbeat_task;
 use identity::NodeIdentity;
+use identity::initialize_node_identity;
 use node::Follower;
 use node::RaftNode;
 use node::RaftNodeState;
@@ -69,7 +70,7 @@ async fn main() -> Result<()> {
     let db = sled::open(&config.data_dir)?;
 
     // 5. Verify or Initialize Identity (ADR 004)
-    let identity = match NodeIdentity::initialize_or_verify(&db, &config) {
+    let identity = match initialize_node_identity(&db, &config) {
         Ok(id) => Arc::new(id),
         Err(e) => {
             error!("Fatal Error during identity verification: {}", e);

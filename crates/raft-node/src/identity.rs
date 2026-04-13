@@ -10,16 +10,18 @@ use tracing::info;
 
 use crate::config::Config;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+/// Constants defining the location of node identity in the persistent store.
+/// Centralizing these here prevents collision hazards with other sled clients.
+const IDENTITY_KEY: &[u8] = b"node_identity";
+const IDENTITY_TREE: &str = "_system_metadata";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeIdentity {
     cluster_id: ClusterId,
     node_id: NodeId,
 }
 
 impl NodeIdentity {
-    const KEY: &'static [u8] = b"node_identity";
-    const TREE_NAME: &'static str = "_system_metadata";
-
     pub fn new(cluster_id: ClusterId, node_id: NodeId) -> Self {
         Self {
             cluster_id,
@@ -34,48 +36,50 @@ impl NodeIdentity {
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
+}
 
-    /// Initializes the node's identity on disk or verifies it against the
-    /// provided configuration.
-    ///
-    /// Per ADR 004, the identity must be persistent and immutable across
-    /// restarts.
-    pub fn initialize_or_verify(db: &Db, config: &Config) -> Result<Self> {
-        let tree = db.open_tree(Self::TREE_NAME)?;
+/// Orchestrates the initialization and verification of the node's persistent
+/// identity.
+///
+/// This is a "Bootstrap Guard" that enforces ADR 004: identity must be
+/// immutable across restarts to prevent data corruption.
+pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity> {
+    let tree = db.open_tree(IDENTITY_TREE)?;
 
-        match tree.get(Self::KEY)? {
-            Some(bytes) => {
-                let existing: NodeIdentity = serde_json::from_slice(&bytes)?;
-                if existing.cluster_id != config.cluster_id || existing.node_id != config.node_id {
-                    error!(
-                        "IDENTITY MISMATCH: Config({}, {}) does not match Disk({}, {})",
-                        config.cluster_id, config.node_id, existing.cluster_id, existing.node_id
-                    );
-                    return Err(anyhow!(
-                        "Node identity on disk does not match configuration. Refusing to start to \
-                         prevent data corruption."
-                    ));
-                }
-                info!(
-                    "Identity verified: Cluster={}, NodeID={}",
-                    existing.cluster_id, existing.node_id
+    match tree.get(IDENTITY_KEY)? {
+        Some(bytes) => {
+            let existing: NodeIdentity = serde_json::from_slice(&bytes)?;
+            if existing.cluster_id() != &config.cluster_id || existing.node_id() != config.node_id {
+                error!(
+                    "IDENTITY MISMATCH: Config({}, {}) does not match Disk({}, {})",
+                    config.cluster_id,
+                    config.node_id,
+                    existing.cluster_id(),
+                    existing.node_id()
                 );
-                Ok(existing)
+                return Err(anyhow!(
+                    "Node identity on disk does not match configuration. Refusing to start to \
+                     prevent data corruption."
+                ));
             }
-            None => {
-                let identity = NodeIdentity {
-                    cluster_id: config.cluster_id.clone(),
-                    node_id: config.node_id,
-                };
-                let bytes = serde_json::to_vec(&identity)?;
-                tree.insert(Self::KEY, bytes)?;
-                tree.flush()?; // Ensure fsync
-                info!(
-                    "New identity persisted to disk: Cluster={}, NodeID={}",
-                    identity.cluster_id, identity.node_id
-                );
-                Ok(identity)
-            }
+            info!(
+                "Identity verified: Cluster={}, NodeID={}",
+                existing.cluster_id(),
+                existing.node_id()
+            );
+            Ok(existing)
+        }
+        None => {
+            let identity = NodeIdentity::new(config.cluster_id.clone(), config.node_id);
+            let bytes = serde_json::to_vec(&identity)?;
+            tree.insert(IDENTITY_KEY, bytes)?;
+            tree.flush()?; // Ensure fsync
+            info!(
+                "New identity persisted to disk: Cluster={}, NodeID={}",
+                identity.cluster_id(),
+                identity.node_id()
+            );
+            Ok(identity)
         }
     }
 }
@@ -97,7 +101,7 @@ mod tests {
         }
     }
 
-    mod initialize_or_verify {
+    mod initialize_node_identity {
         use super::*;
 
         #[test]
@@ -105,7 +109,7 @@ mod tests {
             let db = sled::Config::new().temporary(true).open()?;
             let config = mock_config("test-cluster", 1);
 
-            let id = NodeIdentity::initialize_or_verify(&db, &config)?;
+            let id = initialize_node_identity(&db, &config)?;
 
             assert_eq!(
                 id.cluster_id(),
@@ -121,10 +125,10 @@ mod tests {
             let config = mock_config("test-cluster", 1);
 
             // Initial setup
-            NodeIdentity::initialize_or_verify(&db, &config)?;
+            initialize_node_identity(&db, &config)?;
 
             // Verification
-            let id = NodeIdentity::initialize_or_verify(&db, &config)?;
+            let id = initialize_node_identity(&db, &config)?;
             assert_eq!(
                 id.cluster_id(),
                 &ClusterId::try_new("test-cluster").unwrap()
@@ -139,11 +143,11 @@ mod tests {
             let config = mock_config("test-cluster", 1);
 
             // Initial setup
-            NodeIdentity::initialize_or_verify(&db, &config)?;
+            initialize_node_identity(&db, &config)?;
 
             // Attempt with mismatch
             let mismatch_config = mock_config("wrong-cluster", 1);
-            let result = NodeIdentity::initialize_or_verify(&db, &mismatch_config);
+            let result = initialize_node_identity(&db, &mismatch_config);
 
             assert!(result.is_err());
             assert!(
@@ -161,11 +165,11 @@ mod tests {
             let config = mock_config("test-cluster", 1);
 
             // Initial setup
-            NodeIdentity::initialize_or_verify(&db, &config)?;
+            initialize_node_identity(&db, &config)?;
 
             // Attempt with mismatch
             let mismatch_config = mock_config("test-cluster", 2);
-            let result = NodeIdentity::initialize_or_verify(&db, &mismatch_config);
+            let result = initialize_node_identity(&db, &mismatch_config);
 
             assert!(result.is_err());
             assert!(
