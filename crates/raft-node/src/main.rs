@@ -81,11 +81,7 @@ async fn main() -> Result<()> {
     let initial_node = RaftNode::<Follower>::new(identity.clone());
     let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
 
-    // 7. Initialize RPC Service Dispatchers
-    let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
-    let ingress_dispatcher = IngressDispatcher::new(identity.clone(), shared_state.clone());
-
-    // 8. Initialize Peer Manager (Outbound Registry)
+    // 7. Initialize Peer Manager (Outbound Registry)
     let peer_manager =
         match PeerManager::new(identity.clone(), &config.peers, config.raft.rpc_timeout()) {
             Ok(pm) => Arc::new(pm),
@@ -94,6 +90,11 @@ async fn main() -> Result<()> {
                 return Err(e.into());
             }
         };
+
+    // 8. Initialize RPC Service Dispatchers
+    let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
+    let ingress_dispatcher =
+        IngressDispatcher::new(identity.clone(), shared_state.clone(), peer_manager.clone());
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
