@@ -18,6 +18,13 @@ pub enum PeerError {
     InvalidUri { node_id: NodeId, uri: String },
 }
 
+/// Represents a persistent connection to a peer node.
+#[derive(Debug, Clone)]
+struct PeerConnection {
+    channel: Channel,
+    address: String,
+}
+
 /// Manages outbound gRPC connections to other nodes in the cluster.
 ///
 /// Peer connections are lazy-initialized using `connect_lazy`. This ensures
@@ -27,8 +34,8 @@ pub enum PeerError {
 #[derive(Debug)]
 pub struct PeerManager {
     identity: Arc<NodeIdentity>,
-    /// Pre-populated cache of gRPC channels.
-    channels: HashMap<NodeId, Channel>,
+    /// Pre-populated cache of peer connections.
+    peers: HashMap<NodeId, PeerConnection>,
     /// The default timeout for consensus RPCs, pulled from config.
     default_rpc_timeout: Duration,
 }
@@ -39,7 +46,7 @@ impl PeerManager {
         peer_map: &HashMap<NodeId, std::net::SocketAddr>,
         default_rpc_timeout: Duration,
     ) -> Result<Self, PeerError> {
-        let mut channels = HashMap::new();
+        let mut peers = HashMap::new();
 
         for (id, addr) in peer_map {
             let uri = format!("http://{}", addr);
@@ -50,12 +57,18 @@ impl PeerManager {
                 })?
                 .connect_lazy();
 
-            channels.insert(*id, channel);
+            peers.insert(
+                *id,
+                PeerConnection {
+                    channel,
+                    address: uri,
+                },
+            );
         }
 
         Ok(Self {
             identity,
-            channels,
+            peers,
             default_rpc_timeout,
         })
     }
@@ -71,13 +84,21 @@ impl PeerManager {
         &self,
         node_id: NodeId,
     ) -> Result<ConsensusServiceClient<Channel>, PeerError> {
-        let channel = self
-            .channels
+        let peer = self
+            .peers
             .get(&node_id)
             .ok_or(PeerError::NodeNotFound(node_id))?;
 
         // Cloning a Channel is cheap as it is an Arc-wrapped connection pool.
-        Ok(ConsensusServiceClient::new(channel.clone()))
+        Ok(ConsensusServiceClient::new(peer.channel.clone()))
+    }
+
+    /// Returns the network address (URL) for a specific peer.
+    pub fn get_address(&self, node_id: NodeId) -> Result<String, PeerError> {
+        self.peers
+            .get(&node_id)
+            .map(|p| p.address.clone())
+            .ok_or(PeerError::NodeNotFound(node_id))
     }
 
     /// Returns the configured default timeout for consensus RPCs.
@@ -87,7 +108,7 @@ impl PeerManager {
 
     /// Returns a list of all peer IDs configured for this cluster.
     pub fn peer_ids(&self) -> Vec<NodeId> {
-        self.channels.keys().copied().collect()
+        self.peers.keys().copied().collect()
     }
 }
 
@@ -130,6 +151,26 @@ mod tests {
             let result = manager.get_client(NodeId::new(99));
 
             assert!(matches!(result, Err(PeerError::NodeNotFound(_))));
+        }
+    }
+
+    mod peer_manager_get_address {
+        use super::*;
+
+        #[tokio::test]
+        async fn returns_address_when_id_exists() {
+            let mut peers = HashMap::new();
+            peers.insert(
+                NodeId::new(2),
+                "127.0.0.1:50052".parse::<SocketAddr>().unwrap(),
+            );
+
+            let manager =
+                PeerManager::new(mock_identity(), &peers, Duration::from_millis(40)).unwrap();
+            let result = manager.get_address(NodeId::new(2));
+
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap(), "http://127.0.0.1:50052");
         }
     }
 }
