@@ -86,11 +86,14 @@ async fn main() -> Result<()> {
     let ingress_dispatcher = IngressDispatcher::new(identity.clone(), shared_state.clone());
 
     // 8. Initialize Peer Manager (Outbound Registry)
-    let peer_manager = Arc::new(PeerManager::new(
-        identity.clone(),
-        &config.peers,
-        config.raft.rpc_timeout(),
-    ));
+    let peer_manager =
+        match PeerManager::new(identity.clone(), &config.peers, config.raft.rpc_timeout()) {
+            Ok(pm) => Arc::new(pm),
+            Err(e) => {
+                error!("Fatal Error during Peer Manager initialization: {}", e);
+                return Err(e.into());
+            }
+        };
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
