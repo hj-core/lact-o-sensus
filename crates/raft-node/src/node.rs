@@ -149,17 +149,10 @@ impl<S: NodeState> RaftNode<S> {
         // TODO: Phase 5 - fsync to sled
     }
 
-    /// Universal transition to Follower (can happen from any state if a higher
-    /// term is seen).
-    pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNode<Follower> {
-        let mut node = RaftNode {
-            identity: self.identity,
-            current_term: self.current_term,
-            voted_for: self.voted_for,
-            state: Follower::new(leader_id),
-        };
-        node.set_term(term);
-        node
+    /// Decomposes the node into its persistent components.
+    /// This allows for universal transitions in the RaftNodeState dispatcher.
+    fn into_parts(self) -> (Arc<NodeIdentity>, u64, Option<NodeId>) {
+        (self.identity, self.current_term, self.voted_for)
     }
 }
 
@@ -276,16 +269,27 @@ impl RaftNodeState {
     }
 
     /// Consumes the current state and returns a Follower state for the given
-    /// term.
+    /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNodeState {
-        match self {
-            RaftNodeState::Follower(n) => RaftNodeState::Follower(n.into_follower(term, leader_id)),
-            RaftNodeState::Candidate(n) => {
-                RaftNodeState::Follower(n.into_follower(term, leader_id))
-            }
-            RaftNodeState::Leader(n) => RaftNodeState::Follower(n.into_follower(term, leader_id)),
-            RaftNodeState::Poisoned => RaftNodeState::Poisoned,
-        }
+        let (identity, current_term, voted_for) = match self {
+            RaftNodeState::Follower(n) => n.into_parts(),
+            RaftNodeState::Candidate(n) => n.into_parts(),
+            RaftNodeState::Leader(n) => n.into_parts(),
+            RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
+        };
+
+        let mut new_node = RaftNode {
+            identity,
+            current_term,
+            voted_for,
+            state: Follower::new(leader_id),
+        };
+
+        // If the new term is higher, the persistent state logic (set_term)
+        // ensures the term is updated and the vote is reset.
+        new_node.set_term(term);
+
+        RaftNodeState::Follower(new_node)
     }
 
     /// Resets the election timer if the node is a Follower.
