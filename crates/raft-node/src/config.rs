@@ -107,10 +107,31 @@ impl RaftConfig {
             ));
         }
 
+        // The Congestion Invariant: RPC timeout must be shorter than heartbeat
+        // interval to prevent heartbeat stacking and network congestion.
+        if self.rpc_timeout_ms >= self.heartbeat_interval_ms {
+            return Err(ConfigError::TimingInvariant(
+                "rpc_timeout_ms must be less than heartbeat_interval_ms to prevent heartbeat \
+                 stacking"
+                    .to_string(),
+            ));
+        }
+
+        // The Stability Invariant: Heartbeat interval should be significantly
+        // shorter than the minimum election timeout.
         if self.election_timeout_min_ms <= self.heartbeat_interval_ms {
             return Err(ConfigError::TimingInvariant(
                 "election_timeout_min_ms must be greater than heartbeat_interval_ms".to_string(),
             ));
+        }
+
+        // Heuristic check: Minimum election timeout should ideally be at least
+        // 2x heartbeat interval for basic stability.
+        if self.election_timeout_min_ms < self.heartbeat_interval_ms * 2 {
+            warn!(
+                "Narrow heartbeat-to-election ratio ({}ms : {}ms). Stability may be compromised.",
+                self.heartbeat_interval_ms, self.election_timeout_min_ms
+            );
         }
 
         if self.election_timeout_max_ms <= self.election_timeout_min_ms {
@@ -197,9 +218,30 @@ mod tests {
             [peers]
             2 = "127.0.0.1:50052"
         "#;
-            // This fails during deserialization because of #[serde(try_from)] on ClusterId
+            // Fails during deserialization because of #[serde(try_from)] on ClusterId
             let result: Result<Config, toml::de::Error> = toml::from_str(toml_str);
             assert!(result.is_err());
+        }
+
+        #[test]
+        fn returns_err_when_rpc_timeout_exceeds_heartbeat() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "127.0.0.1:50052"
+            [raft]
+            heartbeat_interval_ms = 50
+            rpc_timeout_ms = 60
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("stacking")
+            ));
         }
 
         #[test]
