@@ -108,7 +108,7 @@ mod tests {
             cluster_id: ClusterId::try_new(cluster_id).unwrap(),
             node_id: NodeId::new(node_id),
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
-            data_dir: "".to_string(),
+            data_dir: "".into(),
             peers: HashMap::new(),
             raft: Default::default(),
         }

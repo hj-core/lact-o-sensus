@@ -60,13 +60,13 @@ async fn main() -> Result<()> {
         Ok(cfg) => Arc::new(cfg),
         Err(e) => {
             error!("Failed to load configuration from {:?}: {}", args.config, e);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
     // 4. Initialize Persistence (sled)
-    info!("Opening database at: {}", config.data_dir);
-    let db = sled::open(&config.data_dir)?;
+    info!("Opening database at: {}", config.data_dir.display());
+    let db = sled::open(&config.data_dir).map_err(anyhow::Error::from)?;
 
     // 5. Verify or Initialize Identity (ADR 004)
     let identity = match initialize_node_identity(&db, &config) {
@@ -118,11 +118,12 @@ async fn main() -> Result<()> {
             .add_service(ConsensusServiceServer::new(consensus_dispatcher))
             .add_service(IngressServiceServer::new(ingress_dispatcher))
             .serve_with_shutdown(addr, shutdown)
-            .await?;
+            .await
+            .map_err(anyhow::Error::from)?;
 
         // 12. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
         info!("gRPC server stopped. Flushing database to disk...");
-        db.flush_async().await?;
+        db.flush_async().await.map_err(anyhow::Error::from)?;
         info!("Database synchronized successfully.");
 
         info!("Node lifecycle finished successfully. Goodbye.");

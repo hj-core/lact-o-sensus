@@ -2,15 +2,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
-use anyhow::anyhow;
 use common::types::ClusterId;
 use common::types::NodeId;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 use tracing::warn;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("Failed to read configuration file: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Failed to parse TOML configuration: {0}")]
+    Parse(#[from] toml::de::Error),
+
+    #[error("Self-loop detected: node_id {0} found in peers list")]
+    SelfLoop(NodeId),
+
+    #[error("Invalid Raft timing: {0}")]
+    TimingInvariant(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -24,7 +39,7 @@ pub struct Config {
     pub listen_addr: SocketAddr,
 
     /// Directory for persistent storage (sled db).
-    pub data_dir: String,
+    pub data_dir: PathBuf,
 
     /// Mapping of node IDs to their network addresses for all peers.
     pub peers: HashMap<NodeId, SocketAddr>,
@@ -79,24 +94,28 @@ impl RaftConfig {
     }
 
     /// Validates Raft-specific timing invariants.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.heartbeat_interval_ms == 0 {
-            return Err(anyhow!("heartbeat_interval_ms must be greater than 0"));
+            return Err(ConfigError::TimingInvariant(
+                "heartbeat_interval_ms must be greater than 0".to_string(),
+            ));
         }
 
         if self.rpc_timeout_ms == 0 {
-            return Err(anyhow!("rpc_timeout_ms must be greater than 0"));
+            return Err(ConfigError::TimingInvariant(
+                "rpc_timeout_ms must be greater than 0".to_string(),
+            ));
         }
 
         if self.election_timeout_min_ms <= self.heartbeat_interval_ms {
-            return Err(anyhow!(
-                "election_timeout_min_ms must be greater than heartbeat_interval_ms"
+            return Err(ConfigError::TimingInvariant(
+                "election_timeout_min_ms must be greater than heartbeat_interval_ms".to_string(),
             ));
         }
 
         if self.election_timeout_max_ms <= self.election_timeout_min_ms {
-            return Err(anyhow!(
-                "election_timeout_max_ms must be greater than election_timeout_min_ms"
+            return Err(ConfigError::TimingInvariant(
+                "election_timeout_max_ms must be greater than election_timeout_min_ms".to_string(),
             ));
         }
 
@@ -106,7 +125,7 @@ impl RaftConfig {
 
 impl Config {
     /// Loads the configuration from a TOML file.
-    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
 
@@ -116,12 +135,9 @@ impl Config {
     }
 
     /// Performs basic validation of the configuration.
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<(), ConfigError> {
         if self.peers.contains_key(&self.node_id) {
-            return Err(anyhow!(
-                "Self-loop detected: node_id {} found in peers list",
-                self.node_id
-            ));
+            return Err(ConfigError::SelfLoop(self.node_id));
         }
 
         // Delegate Raft timing validation
@@ -139,7 +155,7 @@ impl Config {
 mod tests {
     use super::*;
 
-    mod validate {
+    mod config_validate {
         use super::*;
 
         #[test]
@@ -167,7 +183,8 @@ mod tests {
             1 = "127.0.0.1:50051"
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_err());
+            let result = config.validate();
+            assert!(matches!(result, Err(ConfigError::SelfLoop(_))));
         }
 
         #[test]
@@ -180,8 +197,8 @@ mod tests {
             [peers]
             2 = "127.0.0.1:50052"
         "#;
-            // This will now fail during deserialization because of #[serde(try_from)]
-            let result: Result<Config, _> = toml::from_str(toml_str);
+            // This fails during deserialization because of #[serde(try_from)] on ClusterId
+            let result: Result<Config, toml::de::Error> = toml::from_str(toml_str);
             assert!(result.is_err());
         }
 
@@ -200,7 +217,8 @@ mod tests {
             election_timeout_max_ms = 200
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_err());
+            let result = config.validate();
+            assert!(matches!(result, Err(ConfigError::TimingInvariant(_))));
         }
 
         #[test]
