@@ -18,7 +18,7 @@ pub trait ServiceState {
     }
 
     /// Centralized Identity Guard (ADR 004).
-    fn verify_cluster_id(&self, cluster_id: &str) -> Result<(), Status> {
+    fn verify_identity(&self, cluster_id: &str) -> Result<(), Status> {
         if cluster_id != self.cluster_id_as_str() {
             warn!("Rejecting request from mismatching cluster: {}", cluster_id);
             return Err(self.invalid_cluster_id_status(cluster_id));
@@ -27,7 +27,7 @@ pub trait ServiceState {
     }
 
     /// Centralized health check for the Type-State engine.
-    fn check_state_health(&self, state: &RaftNodeState) -> Result<(), Status> {
+    fn verify_health(&self, state: &RaftNodeState) -> Result<(), Status> {
         if let RaftNodeState::Poisoned = state {
             return Err(self.poisoned_status());
         }
@@ -41,7 +41,10 @@ pub trait ServiceState {
 
     /// Returns a standard gRPC InvalidArgument status for a malformed NodeId.
     fn invalid_node_id_status(&self, id: &str) -> Status {
-        Status::invalid_argument(format!("'{}' is not a valid NodeId (must be u64)", id))
+        Status::invalid_argument(format!(
+            "'{}' is not a valid NodeId (must be a non-zero 64-bit integer)",
+            id
+        ))
     }
 
     /// Returns a standard gRPC InvalidArgument status for a mismatching

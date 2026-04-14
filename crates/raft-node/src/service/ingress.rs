@@ -50,10 +50,10 @@ impl IngressService for IngressDispatcher {
         request: Request<ProposeMutationRequest>,
     ) -> Result<Response<ProposeMutationResponse>, Status> {
         let req = request.into_inner();
-        self.verify_cluster_id(&req.cluster_id)?;
+        self.verify_identity(&req.cluster_id)?;
 
         let state_guard = self.state.read().await;
-        self.check_state_health(&state_guard)?;
+        self.verify_health(&state_guard)?;
 
         let span = info_span!("propose_mutation", client = %req.client_id, seq = req.sequence_id);
         let _enter = span.enter();
@@ -90,10 +90,10 @@ impl IngressService for IngressDispatcher {
         request: Request<QueryStateRequest>,
     ) -> Result<Response<QueryStateResponse>, Status> {
         let req = request.into_inner();
-        self.verify_cluster_id(&req.cluster_id)?;
+        self.verify_identity(&req.cluster_id)?;
 
         let state_guard = self.state.read().await;
-        self.check_state_health(&state_guard)?;
+        self.verify_health(&state_guard)?;
 
         let span = info_span!("query_state");
         let _enter = span.enter();

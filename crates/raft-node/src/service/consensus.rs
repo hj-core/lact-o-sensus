@@ -54,10 +54,10 @@ impl ConsensusService for ConsensusDispatcher {
         request: Request<RequestVoteRequest>,
     ) -> Result<Response<RequestVoteResponse>, Status> {
         let req = request.into_inner();
-        self.verify_cluster_id(&req.cluster_id)?;
+        self.verify_identity(&req.cluster_id)?;
 
         let mut state_guard = self.state.write().await;
-        self.check_state_health(&state_guard)?;
+        self.verify_health(&state_guard)?;
 
         let span = info_span!("request_vote", term = req.term, candidate = %req.candidate_id);
         let _enter = span.enter();
@@ -121,10 +121,10 @@ impl ConsensusService for ConsensusDispatcher {
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
         let req = request.into_inner();
-        self.verify_cluster_id(&req.cluster_id)?;
+        self.verify_identity(&req.cluster_id)?;
 
         let mut state_guard = self.state.write().await;
-        self.check_state_health(&state_guard)?;
+        self.verify_health(&state_guard)?;
 
         let span = info_span!("append_entries", term = req.term, leader = %req.leader_id);
         let _enter = span.enter();
