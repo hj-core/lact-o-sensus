@@ -6,6 +6,7 @@ use std::time::Instant;
 use common::types::ClusterId;
 use common::types::NodeId;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::identity::NodeIdentity;
 
@@ -24,6 +25,9 @@ pub struct Follower {
 
     /// The instant when the last valid heartbeat was received.
     last_heartbeat: Instant,
+
+    /// Signal used to notify the election timer that a heartbeat was received.
+    heartbeat_signal: Arc<Notify>,
 }
 
 impl Follower {
@@ -31,6 +35,7 @@ impl Follower {
         Self {
             leader_id,
             last_heartbeat: Instant::now(),
+            heartbeat_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -42,9 +47,14 @@ impl Follower {
         self.last_heartbeat
     }
 
-    /// Resets the heartbeat timer.
+    pub fn heartbeat_signal(&self) -> &Arc<Notify> {
+        &self.heartbeat_signal
+    }
+
+    /// Resets the heartbeat timer and signals the election timer.
     pub fn reset_heartbeat(&mut self) {
         self.last_heartbeat = Instant::now();
+        self.heartbeat_signal.notify_one();
     }
 }
 

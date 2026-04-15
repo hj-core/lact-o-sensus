@@ -30,7 +30,7 @@ pub fn spawn_election_timer(
 ) {
     tokio::spawn(async move {
         loop {
-            // Determine timeout for this "tick". We don't hold the RNG across the await.
+            // 1. Randomize timeout for this "tick".
             let timeout = {
                 let mut rng = rand::rng();
                 Duration::from_millis(rng.random_range(
@@ -38,43 +38,60 @@ pub fn spawn_election_timer(
                 ))
             };
 
-            sleep(timeout).await;
-
-            let mut state_guard = state.write().await;
-            match &*state_guard {
-                RaftNodeState::Follower(node) => {
-                    let elapsed = node.state().last_heartbeat().elapsed();
-                    if elapsed >= timeout {
-                        info!(
-                            "Election timeout reached ({:?}). Transitioning to Candidate for term \
-                             {}",
-                            elapsed,
-                            node.current_term() + 1
-                        );
-                        state_guard.transition(|old| match old {
-                            RaftNodeState::Follower(n) => {
-                                RaftNodeState::Candidate(n.into_candidate())
-                            }
-                            other => other,
-                        });
-
-                        // Initiate election in a separate task to avoid holding the lock
-                        let state_clone = state.clone();
-                        let peer_manager_clone = peer_manager.clone();
-                        let config_clone = config.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) =
-                                initiate_election(config_clone, state_clone, peer_manager_clone)
-                                    .await
-                            {
-                                error!("Failed to initiate election: {}", e);
-                            }
-                        });
+            // 2. Extract the heartbeat signal if we are a Follower.
+            let heartbeat_signal = {
+                let guard = state.read().await;
+                match &*guard {
+                    RaftNodeState::Follower(node) => Some(node.state().heartbeat_signal().clone()),
+                    RaftNodeState::Candidate(_) => None, // Candidates use standard timeout
+                    RaftNodeState::Leader(_) => return,  // Leaders don't need the timer
+                    RaftNodeState::Poisoned => {
+                        error!("Node is poisoned. Election timer stopping.");
+                        return;
                     }
                 }
-                RaftNodeState::Candidate(node) => {
-                    // Candidates also have an election timeout; if they don't
-                    // win, they start a new term.
+            };
+
+            // 3. Reactive Wait: Either the timeout expires OR a heartbeat arrives.
+            if let Some(signal) = heartbeat_signal {
+                tokio::select! {
+                    _ = sleep(timeout) => {
+                        // Timeout reached. Verify it hasn't been reset just before the lock.
+                        let mut state_guard = state.write().await;
+                        if let RaftNodeState::Follower(node) = &*state_guard {
+                            let elapsed = node.state().last_heartbeat().elapsed();
+                            if elapsed >= timeout {
+                                info!(
+                                    "Election timeout reached ({:?}). Transitioning to Candidate for term {}",
+                                    elapsed,
+                                    node.current_term() + 1
+                                );
+                                state_guard.transition(|old| match old {
+                                    RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
+                                    other => other,
+                                });
+
+                                let state_clone = state.clone();
+                                let peer_manager_clone = peer_manager.clone();
+                                let config_clone = config.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = initiate_election(config_clone, state_clone, peer_manager_clone).await {
+                                        error!("Failed to initiate election: {}", e);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    _ = signal.notified() => {
+                        // Heartbeat received! We restart the loop and pick a new timeout.
+                        continue;
+                    }
+                }
+            } else {
+                // We are a Candidate. Standard sleep without signal reactivity.
+                sleep(timeout).await;
+                let mut state_guard = state.write().await;
+                if let RaftNodeState::Candidate(node) = &*state_guard {
                     info!(
                         "Election timeout reached as Candidate. Restarting election for term {}",
                         node.current_term() + 1
@@ -96,13 +113,6 @@ pub fn spawn_election_timer(
                             error!("Failed to initiate election: {}", e);
                         }
                     });
-                }
-                RaftNodeState::Leader(_) => {
-                    // Leaders don't have election timeouts
-                }
-                RaftNodeState::Poisoned => {
-                    error!("Node is poisoned. Election timer stopping.");
-                    break;
                 }
             }
         }
