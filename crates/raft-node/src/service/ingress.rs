@@ -76,7 +76,7 @@ impl IngressDispatcher {
 }
 
 impl ServiceState for IngressDispatcher {
-    fn identity(&self) -> &NodeIdentity {
+    fn identity_arc(&self) -> &Arc<NodeIdentity> {
         &self.identity
     }
 
@@ -95,7 +95,7 @@ impl IngressService for IngressDispatcher {
         self.verify_identity(&req.cluster_id)?;
 
         let state_guard = self.state.read().await;
-        self.verify_health(&state_guard)?;
+        self.verify_node_integrity(&state_guard)?;
 
         let span = info_span!("propose_mutation", client = %req.client_id, seq = req.sequence_id);
         let _enter = span.enter();
@@ -150,7 +150,7 @@ impl IngressService for IngressDispatcher {
         self.verify_identity(&req.cluster_id)?;
 
         let state_guard = self.state.read().await;
-        self.verify_health(&state_guard)?;
+        self.verify_node_integrity(&state_guard)?;
 
         let span = info_span!("query_state");
         let _enter = span.enter();

@@ -38,7 +38,7 @@ impl ConsensusDispatcher {
 }
 
 impl ServiceState for ConsensusDispatcher {
-    fn identity(&self) -> &NodeIdentity {
+    fn identity_arc(&self) -> &Arc<NodeIdentity> {
         &self.identity
     }
 
@@ -57,7 +57,7 @@ impl ConsensusService for ConsensusDispatcher {
         self.verify_identity(&req.cluster_id)?;
 
         let mut state_guard = self.state.write().await;
-        self.verify_health(&state_guard)?;
+        self.verify_node_integrity(&state_guard)?;
 
         let span = info_span!("request_vote", term = req.term, candidate = %req.candidate_id);
         let _enter = span.enter();
@@ -124,7 +124,7 @@ impl ConsensusService for ConsensusDispatcher {
         self.verify_identity(&req.cluster_id)?;
 
         let mut state_guard = self.state.write().await;
-        self.verify_health(&state_guard)?;
+        self.verify_node_integrity(&state_guard)?;
 
         let span = info_span!("append_entries", term = req.term, leader = %req.leader_id);
         let _enter = span.enter();
@@ -240,7 +240,7 @@ mod tests {
         }
     }
 
-    mod health_check {
+    mod integrity_check {
         use super::*;
 
         #[tokio::test]
@@ -263,6 +263,29 @@ mod tests {
 
             let result = dispatcher.request_vote(req).await;
             assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+
+        #[tokio::test]
+        async fn returns_err_when_identity_mismatches() {
+            let id = mock_identity();
+            // Create a node with a DIFFERENT identity (different node_id)
+            let wrong_id = Arc::new(NodeIdentity::new(id.cluster_id().clone(), NodeId::new(99)));
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(wrong_id));
+
+            let dispatcher = ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)));
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            let result = dispatcher.request_vote(req).await;
+            assert!(result.is_err());
+            // Should return Internal due to identity divergence
             assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
         }
     }

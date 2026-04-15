@@ -119,6 +119,11 @@ impl<S: NodeState> RaftNode<S> {
         &self.identity
     }
 
+    /// Returns a reference to the node's identity Arc.
+    pub fn identity_arc(&self) -> &Arc<NodeIdentity> {
+        &self.identity
+    }
+
     pub fn current_term(&self) -> u64 {
         self.current_term
     }
@@ -217,6 +222,16 @@ pub enum RaftNodeState {
 }
 
 impl RaftNodeState {
+    /// Returns the logical identity of the node as a reference to its Arc.
+    pub fn identity_arc(&self) -> Result<&Arc<NodeIdentity>, RaftError> {
+        match self {
+            RaftNodeState::Follower(n) => Ok(n.identity_arc()),
+            RaftNodeState::Candidate(n) => Ok(n.identity_arc()),
+            RaftNodeState::Leader(n) => Ok(n.identity_arc()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
     /// Returns the current term of the node, regardless of its state.
     pub fn current_term(&self) -> Result<u64, RaftError> {
         match self {

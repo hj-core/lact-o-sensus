@@ -7,10 +7,16 @@ use tracing::warn;
 use crate::identity::NodeIdentity;
 use crate::node::RaftNodeState;
 
-/// Shared trait for gRPC services to enforce cluster identity and node health.
+/// Shared trait for gRPC services to enforce cluster identity and node
+/// integrity.
 pub trait ServiceState {
-    fn identity(&self) -> &NodeIdentity;
+    fn identity_arc(&self) -> &Arc<NodeIdentity>;
     fn state(&self) -> &Arc<RwLock<RaftNodeState>>;
+
+    /// Helper to get the underlying NodeIdentity reference.
+    fn identity(&self) -> &NodeIdentity {
+        self.identity_arc()
+    }
 
     /// Helper to get the cluster ID as a borrowed string.
     fn cluster_id_as_str(&self) -> &str {
@@ -26,11 +32,44 @@ pub trait ServiceState {
         Ok(())
     }
 
-    /// Centralized health check for the Type-State engine.
-    fn verify_health(&self, state: &RaftNodeState) -> Result<(), Status> {
+    /// Centralized integrity check for the Type-State engine.
+    ///
+    /// This ensures the node is neither poisoned nor in an inconsistent
+    /// identity state before proceeding with an operation.
+    fn verify_node_integrity(&self, state: &RaftNodeState) -> Result<(), Status> {
         if let RaftNodeState::Poisoned = state {
             return Err(self.poisoned_status());
         }
+
+        // Hard Guard: Ensure Dispatcher Identity is consistent with Node State.
+        self.verify_consistency(state)?;
+
+        Ok(())
+    }
+
+    /// Hard Guard: Verifies that the dispatcher's identity matches the node
+    /// state's identity. Uses pointer equality as a fast-path before
+    /// falling back to content comparison.
+    fn verify_consistency(&self, state: &RaftNodeState) -> Result<(), Status> {
+        let state_identity = state.identity_arc().map_err(|_| self.poisoned_status())?;
+
+        // Fast Path: Pointer Equality
+        if Arc::ptr_eq(self.identity_arc(), state_identity) {
+            return Ok(());
+        }
+
+        // Slow Path: Content Comparison (NodeId and ClusterId)
+        if self.identity().node_id() != state_identity.node_id()
+            || self.identity().cluster_id() != state_identity.cluster_id()
+        {
+            tracing::error!(
+                "CRITICAL IDENTITY DIVERGENCE: Dispatcher ({:?}) vs State ({:?})",
+                self.identity(),
+                state_identity
+            );
+            return Err(Status::internal("Internal Identity Mismatch"));
+        }
+
         Ok(())
     }
 
