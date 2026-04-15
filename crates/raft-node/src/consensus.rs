@@ -243,18 +243,28 @@ pub fn spawn_heartbeat_task(
         loop {
             sleep(interval).await;
 
-            let is_leader = matches!(&*state.read().await, RaftNodeState::Leader(_));
-            if is_leader {
-                let state_clone = state.clone();
-                let peer_manager_clone = peer_manager.clone();
-                let config_clone = config.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        send_heartbeats(config_clone, state_clone, peer_manager_clone).await
-                    {
-                        error!("Failed to send heartbeats: {}", e);
-                    }
-                });
+            let node_state = state.read().await;
+            match &*node_state {
+                RaftNodeState::Leader(_) => {
+                    let state_clone = state.clone();
+                    let peer_manager_clone = peer_manager.clone();
+                    let config_clone = config.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            send_heartbeats(config_clone, state_clone, peer_manager_clone).await
+                        {
+                            error!("Failed to send heartbeats: {}", e);
+                        }
+                    });
+                }
+                RaftNodeState::Poisoned => {
+                    error!("Node is poisoned. Heartbeat task stopping.");
+                    return;
+                }
+                _ => {
+                    // Not a leader, but the loop continues in case we become
+                    // one
+                }
             }
         }
     });
@@ -266,11 +276,11 @@ async fn send_heartbeats(
     state: Arc<RwLock<RaftNodeState>>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
-    // 1. Gather heartbeat parameters
-    let (term, cluster_id_arc, node_id_str) = {
+    // 1. Gather heartbeat parameters. Use Arc<str> for zero-allocation sharing.
+    let (term, cluster_id, node_id) = {
         let guard = state.read().await;
         let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
-        let nid = guard.node_id()?.to_string();
+        let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
         (guard.current_term()?, cid, nid)
     };
 
@@ -278,8 +288,8 @@ async fn send_heartbeats(
     let peer_ids = peer_manager.peer_ids();
     let heartbeat_requests = peer_ids.into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
-        let cluster_id = cluster_id_arc.clone();
-        let node_id = node_id_str.clone();
+        let cluster_id = cluster_id.clone();
+        let node_id = node_id.clone();
         let rpc_timeout = config.raft.rpc_timeout();
 
         async move {
@@ -288,7 +298,7 @@ async fn send_heartbeats(
                     let mut request = Request::new(AppendEntriesRequest {
                         cluster_id: cluster_id.to_string(),
                         term,
-                        leader_id: node_id,
+                        leader_id: node_id.to_string(),
                         prev_log_index: 0, // TODO: Phase 5 - Real log state
                         prev_log_term: 0,
                         entries: Vec::new(),
@@ -312,10 +322,11 @@ async fn send_heartbeats(
         }
     });
 
-    let results: Vec<Result<AppendEntriesResponse, Status>> = join_all(heartbeat_requests).await;
+    let mut heartbeat_stream = heartbeat_requests.collect::<FuturesUnordered<_>>();
 
-    // 3. Handle responses (primarily term updates)
-    for res in results {
+    // 3. Handle responses (primarily term updates). We demote as soon as any peer
+    // responds with a higher term.
+    while let Some(res) = heartbeat_stream.next().await {
         match res {
             Ok(resp) => {
                 if resp.term > term {
