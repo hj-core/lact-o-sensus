@@ -36,33 +36,58 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   * Verify: Killing the leader triggers a successful re-election.
 * **Success Metric:** Stable leadership and failover in < 500ms.
 
-## 🚪 Phase 4: Ingress & Egress (`client-cli` & `ai-veto`)
+## 🚪 Phase 4: Ingress & Mock Egress (`client-cli` & Mock `ai-veto`)
 
-* **Goal:** Connect external actors and verify the full request lifecycle.
+* **Goal:** Connect external actors and verify the full request lifecycle using mock policy logic.
 * **Key Actions:**
-  * Initialize `crates/client-cli` (Mutation requests and Leader discovery).
-  * Initialize `crates/ai-veto` (Mock response -> OpenAI/Ollama).
-  * Implement **Leader Redirection** logic (ADR 002).
-  * Verify: Client -> Leader -> Mock AI -> Consensus -> Commit.
-* **Success Metric:** A "Full Round Trip" from user input to committed state.
+  * Implement the in-memory Log and `AppendEntries` replication logic in `raft-node`.
+  * Initialize `crates/client-cli` as an interactive REPL with "Smart Client" redirection logic.
+  * Implement the `GrpcVetoRelay` in `raft-node` to bridge the Leader to the `ai-veto` node.
+  * Implement a skeletal gRPC server in `crates/ai-veto` that returns deterministic mock approvals/vetoes.
+  * Verify: Client -> Leader -> Mock AI -> Consensus -> Commit (Round Trip).
+* **Success Metric:** A client mutation is "Committed" to the cluster after successful replication and a mock veto.
 
-## 🏰 Phase 5: The "Fortress" Layer (Final Polish)
+## 🧠 Phase 5: The AI Moral Advocate (Real `ai-veto` Integration)
 
-* **Goal:** Implement Persistence, Exactly-Once Semantics (EOS), and real AI logic.
+* **Goal:** Transition from mock logic to a relational AI evaluation engine.
+* **Key Actions:**
+  * Integrate OpenAI API or local Llama via `ollama-rs` into `crates/ai-veto`.
+  * Implement the **12-Point Authorized Taxonomy** classifier.
+  * Develop relational "Moral Heuristics" (e.g., rejecting sweets based on existing inventory).
+  * Verify: The AI correctly categorizes and vetoes items based on the "Moral Advocate" persona.
+* **Success Metric:** Deterministic classification and context-aware vetoing by the LLM.
+
+## 🏰 Phase 6: The "Fortress" Layer (Persistence & EOS)
+
+* **Goal:** Implement Persistence, Exactly-Once Semantics (EOS), and crash-recovery.
 * **Key Actions:**
   * Integrate **`sled`** for persistent Raft logs and State Machine.
   * Implement the **Session Table** and Deduplication logic (ADR 006).
-  * Implement the real **AI Moral Advocate** logic in `ai-veto`.
   * Perform "Chaos Testing" (ADR 001) to verify recovery from crashes.
 * **Success Metric:** 100% data integrity after cluster-wide power-off/restart.
 
-## 🚀 Phase 6: Future Horizons (Advanced Reliability & Scaling)
+## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting)
+
+* **Goal:** Implement state machine snapshots to manage log growth and accelerate recovery.
+* **Key Actions:**
+  * Implement State Machine serialization and `InstallSnapshot` RPC.
+  * Implement log truncation logic once a snapshot is persisted.
+  * Verify: A new node can catch up to the cluster using a snapshot.
+* **Success Metric:** Successful log truncation and snapshot-based peer synchronization.
+
+## 🔄 Phase 8: Elastic Consensus (Dynamic Membership & Reconfiguration)
+
+* **Goal:** Safely add and remove nodes from the cluster at runtime using Joint Consensus.
+* **Key Actions:**
+  * Implement the two-phase configuration change ($C_{old} \rightarrow C_{old,new} \rightarrow C_{new}$).
+  * Update quorum calculation logic to handle overlapping configurations.
+  * Verify: Adding/removing a node does not break safety or liveness invariants.
+* **Success Metric:** Seamless cluster expansion/contraction without downtime.
+
+## 🚀 Phase 9: Future Horizons (Advanced Reliability & Scaling)
 
 * **Goal:** Extend the system's operational efficiency and dynamic flexibility.
 * **Proposed Future Works:**
-  * **Log Compaction (Snapshotting):** Implementation of full state machine snapshots to manage disk usage and accelerate node recovery.
-  * **Dynamic Membership:** Implementing the **Joint Consensus** protocol to safely add/remove nodes from the cluster at runtime (ADR 004 Phase 3).
-  * **Dynamic Discovery:** Moving from a static seed list to an automated discovery mechanism (e.g., mDNS or dedicated registry).
-  * **Causal History & Rollback:** Leveraging the `state_version` to provide an immutable audit trail and "point-in-time" recovery for the grocery state.
-  * **Security & Access Control:** Implementing robust client authentication (e.g., mutual TLS or token-based auth) and authorization policies (RBAC) to restrict access to sensitive categories or administrative operations.
-  * **Multi-Tenancy:** Utilizing the `cluster_id` to support multiple isolated consensus groups on shared physical infrastructure.
+  * **Security & Access Control:** mutual TLS and RBAC for cluster access.
+  * **Multi-Tenancy:** Utilizing `cluster_id` for isolated groups on shared infrastructure.
+  * **Causal History:** Immutable audit trail and "point-in-time" recovery.
