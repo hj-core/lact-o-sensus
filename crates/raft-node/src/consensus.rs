@@ -6,7 +6,9 @@ use common::proto::v1::AppendEntriesRequest;
 use common::proto::v1::AppendEntriesResponse;
 use common::proto::v1::RequestVoteRequest;
 use common::proto::v1::RequestVoteResponse;
+use futures::StreamExt;
 use futures::future::join_all;
+use futures::stream::FuturesUnordered;
 use rand::RngExt;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -114,12 +116,12 @@ async fn initiate_election(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather election parameters from the current state.
-    // Identity is immutable, so we can pre-allocate strings once outside the
-    // loop.
-    let (term, cluster_id_arc, node_id_str) = {
+    // Identity is immutable, so we can pre-allocate Arc<str> once outside the
+    // loop for zero-allocation sharing across RPC tasks.
+    let (term, cluster_id, node_id) = {
         let guard = state.read().await;
-        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str()); // Arc<str> for cheap sharing
-        let nid = guard.node_id()?.to_string();
+        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
+        let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
         (guard.current_term()?, cid, nid)
     };
 
@@ -129,8 +131,8 @@ async fn initiate_election(
     let peer_ids = peer_manager.peer_ids();
     let vote_requests = peer_ids.into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
-        let cluster_id = cluster_id_arc.clone();
-        let node_id = node_id_str.clone();
+        let cluster_id = cluster_id.clone();
+        let node_id = node_id.clone();
         let rpc_timeout = config.raft.rpc_timeout();
 
         async move {
@@ -139,7 +141,7 @@ async fn initiate_election(
                     let mut request = Request::new(RequestVoteRequest {
                         cluster_id: cluster_id.to_string(),
                         term,
-                        candidate_id: node_id,
+                        candidate_id: node_id.to_string(),
                         last_log_index: 0, // TODO: Phase 5 - Real log state
                         last_log_term: 0,
                     });
@@ -162,14 +164,14 @@ async fn initiate_election(
         }
     });
 
-    let results: Vec<Result<RequestVoteResponse, Status>> = join_all(vote_requests).await;
+    let mut vote_stream = vote_requests.collect::<FuturesUnordered<_>>();
 
     // 3. Tally votes and handle term updates
     let mut votes_granted = 1; // Vote for self
     let total_nodes = peer_manager.peer_ids().len() + 1;
     let quorum = (total_nodes / 2) + 1;
 
-    for res in results {
+    while let Some(res) = vote_stream.next().await {
         match res {
             Ok(resp) => {
                 if resp.term > term {
@@ -183,6 +185,20 @@ async fn initiate_election(
                 }
                 if resp.vote_granted {
                     votes_granted += 1;
+                    if votes_granted >= quorum {
+                        info!(
+                            "Quorum reached early ({} votes)! Transitioning to Leader for term {}.",
+                            votes_granted, term
+                        );
+                        let mut guard = state.write().await;
+                        guard.transition(|old| match old {
+                            RaftNodeState::Candidate(n) if n.current_term() == term => {
+                                RaftNodeState::Leader(n.into_leader())
+                            }
+                            other => other,
+                        });
+                        return Ok(());
+                    }
                 }
             }
             Err(e) => {
@@ -192,21 +208,9 @@ async fn initiate_election(
     }
 
     info!(
-        "Election tally for term {}: {}/{} votes granted.",
+        "Election finalized for term {}: {}/{} votes granted.",
         term, votes_granted, quorum
     );
-
-    // 4. If majority granted, become Leader
-    if votes_granted >= quorum {
-        info!("Quorum reached! Transitioning to Leader for term {}.", term);
-        let mut guard = state.write().await;
-        guard.transition(|old| match old {
-            RaftNodeState::Candidate(n) if n.current_term() == term => {
-                RaftNodeState::Leader(n.into_leader())
-            }
-            other => other, // Could have changed state during RPCs (e.g. saw higher term)
-        });
-    }
 
     Ok(())
 }
