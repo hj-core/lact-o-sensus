@@ -128,18 +128,27 @@ async fn initiate_election(
     // 1. Gather election parameters from the current state.
     // Identity is immutable, so we can pre-allocate Arc<str> once outside the
     // loop for zero-allocation sharing across RPC tasks.
-    let (term, cluster_id, node_id) = {
+    let (term, cluster_id, node_id, last_log_index, last_log_term) = {
         let guard = state.read().await;
         let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
         let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
-        (guard.current_term()?, cid, nid)
+
+        let (last_idx, last_term) = match &*guard {
+            RaftNodeState::Candidate(n) => (n.last_log_index(), n.last_log_term()),
+            _ => (0, 0), // Should be Candidate
+        };
+
+        (guard.current_term()?, cid, nid, last_idx, last_term)
     };
 
-    info!("Campaigning for leadership in term {}...", term);
+    info!(
+        "Campaigning for leadership in term {} (last_log: {}/{})",
+        term, last_log_index, last_log_term
+    );
 
     // 2. Request votes from all peers concurrently
     let peer_ids = peer_manager.peer_ids();
-    let vote_requests = peer_ids.into_iter().map(|peer_id| {
+    let vote_requests = peer_ids.clone().into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
         let cluster_id = cluster_id.clone();
         let node_id = node_id.clone();
@@ -152,8 +161,8 @@ async fn initiate_election(
                         cluster_id: cluster_id.to_string(),
                         term,
                         candidate_id: node_id.to_string(),
-                        last_log_index: 0, // TODO: Phase 5 - Real log state
-                        last_log_term: 0,
+                        last_log_index,
+                        last_log_term,
                     });
                     request.set_timeout(rpc_timeout);
 
@@ -178,7 +187,7 @@ async fn initiate_election(
 
     // 3. Tally votes and handle term updates
     let mut votes_granted = 1; // Vote for self
-    let total_nodes = peer_manager.peer_ids().len() + 1;
+    let total_nodes = peer_ids.len() + 1;
     let quorum = (total_nodes / 2) + 1;
 
     while let Some(res) = vote_stream.next().await {
@@ -201,9 +210,10 @@ async fn initiate_election(
                             votes_granted, term
                         );
                         let mut guard = state.write().await;
+                        let peer_ids_clone = peer_ids.clone();
                         guard.transition(|old| match old {
                             RaftNodeState::Candidate(n) if n.current_term() == term => {
-                                RaftNodeState::Leader(n.into_leader())
+                                RaftNodeState::Leader(n.into_leader(peer_ids_clone))
                             }
                             other => other,
                         });

@@ -3,10 +3,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use common::proto::v1::LogEntry;
 use common::types::ClusterId;
 use common::types::NodeId;
 use thiserror::Error;
 use tokio::sync::Notify;
+use tracing::debug;
 
 use crate::identity::NodeIdentity;
 
@@ -97,8 +99,39 @@ pub struct Leader {
 }
 
 impl Leader {
-    pub fn new() -> Self {
-        Self::default()
+    /// Initializes leader-specific volatile state.
+    ///
+    /// nextIndex is initialized to (lastLogIndex + 1), and matchIndex is
+    /// initialized to 0 for all peers.
+    pub fn new(peer_ids: Vec<NodeId>, last_log_index: u64) -> Self {
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+
+        for peer_id in peer_ids {
+            next_index.insert(peer_id, last_log_index + 1);
+            match_index.insert(peer_id, 0);
+        }
+
+        Self {
+            next_index,
+            match_index,
+        }
+    }
+
+    pub fn next_index(&self) -> &HashMap<NodeId, u64> {
+        &self.next_index
+    }
+
+    pub fn next_index_mut(&mut self) -> &mut HashMap<NodeId, u64> {
+        &mut self.next_index
+    }
+
+    pub fn match_index(&self) -> &HashMap<NodeId, u64> {
+        &self.match_index
+    }
+
+    pub fn match_index_mut(&mut self) -> &mut HashMap<NodeId, u64> {
+        &mut self.match_index
     }
 }
 
@@ -107,20 +140,32 @@ impl NodeState for Follower {}
 impl NodeState for Candidate {}
 impl NodeState for Leader {}
 
-// --- Generic Node Struct (Persistent State) ---
+// --- Generic Node Struct (Persistent & Volatile State) ---
 
+/// Container for Raft state that is shared across all roles or must persist.
 #[derive(Debug)]
 pub struct RaftNode<S: NodeState> {
     /// Verified identity of the node (ADR 004).
     identity: Arc<NodeIdentity>,
 
+    // --- Persistent State ---
     /// Persistent term across role transitions.
     current_term: u64,
 
     /// CandidateId that received vote in current term (or None if none).
     voted_for: Option<NodeId>,
 
-    /// Role-specific volatile state.
+    /// The replicated log (1-based indexing used logically).
+    log: Vec<LogEntry>,
+
+    // --- Volatile State (Shared) ---
+    /// Index of highest log entry known to be committed.
+    commit_index: u64,
+
+    /// Index of highest log entry applied to state machine.
+    last_applied: u64,
+
+    /// Role-specific volatile state marker.
     state: S,
 }
 
@@ -142,12 +187,105 @@ impl<S: NodeState> RaftNode<S> {
         self.voted_for
     }
 
+    pub fn log(&self) -> &Vec<LogEntry> {
+        &self.log
+    }
+
+    pub fn log_mut(&mut self) -> &mut Vec<LogEntry> {
+        &mut self.log
+    }
+
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
+    }
+
+    /// Updates the commit index.
+    ///
+    /// Adheres to the monotonicity requirement: stale updates (e.g., from
+    /// delayed heartbeats) are ignored.
+    ///
+    /// # Panics
+    /// Panics if the new index exceeds the current log boundaries, which
+    /// indicates a fundamental protocol violation.
+    pub fn set_commit_index(&mut self, index: u64) {
+        if index < self.commit_index {
+            debug!(
+                "Ignoring stale commit_index update: {} < current {}",
+                index, self.commit_index
+            );
+            return;
+        }
+
+        let last_idx = self.last_log_index();
+        if index > last_idx {
+            panic!(
+                "CRITICAL: Protocol violation. Attempted to commit index {} but last_log_index is \
+                 {}",
+                index, last_idx
+            );
+        }
+
+        self.commit_index = index;
+    }
+
+    pub fn last_applied(&self) -> u64 {
+        self.last_applied
+    }
+
+    /// Updates the last applied index.
+    ///
+    /// # Panics
+    /// Panics if the new index regresses or exceeds the commit index, as
+    /// the state machine must strictly follow the committed log.
+    pub fn set_last_applied(&mut self, index: u64) {
+        if index < self.last_applied {
+            panic!(
+                "CRITICAL: State machine regression. Attempted to set last_applied to {} but \
+                 current is {}",
+                index, self.last_applied
+            );
+        }
+
+        if index > self.commit_index {
+            panic!(
+                "CRITICAL: State machine violation. Attempted to apply index {} but commit_index \
+                 is only {}",
+                index, self.commit_index
+            );
+        }
+
+        self.last_applied = index;
+    }
+
     pub fn state(&self) -> &S {
         &self.state
     }
 
     pub fn state_mut(&mut self) -> &mut S {
         &mut self.state
+    }
+
+    /// Returns the index of the last entry in the log (0 if empty).
+    pub fn last_log_index(&self) -> u64 {
+        self.log.last().map(|e| e.index).unwrap_or(0)
+    }
+
+    /// Returns the term of the last entry in the log (0 if empty).
+    pub fn last_log_term(&self) -> u64 {
+        self.log.last().map(|e| e.term).unwrap_or(0)
+    }
+
+    /// Returns the term of the log entry at the given index.
+    /// Returns 0 if index is 0 or out of bounds.
+    pub fn get_term_at(&self, index: u64) -> u64 {
+        if index == 0 {
+            return 0;
+        }
+        // Assuming contiguous log entries starting at index 1.
+        self.log
+            .get((index - 1) as usize)
+            .map(|e| e.term)
+            .unwrap_or(0)
     }
 
     /// Internal helper to update term and reset vote.
@@ -164,10 +302,25 @@ impl<S: NodeState> RaftNode<S> {
         // TODO: Phase 5 - fsync to sled
     }
 
-    /// Decomposes the node into its persistent components.
-    /// This allows for universal transitions in the RaftNodeState dispatcher.
-    fn into_parts(self) -> (Arc<NodeIdentity>, u64, Option<NodeId>) {
-        (self.identity, self.current_term, self.voted_for)
+    /// Decomposes the node into its transition-invariant components.
+    fn into_parts(
+        self,
+    ) -> (
+        Arc<NodeIdentity>,
+        u64,
+        Option<NodeId>,
+        Vec<LogEntry>,
+        u64,
+        u64,
+    ) {
+        (
+            self.identity,
+            self.current_term,
+            self.voted_for,
+            self.log,
+            self.commit_index,
+            self.last_applied,
+        )
     }
 }
 
@@ -177,6 +330,9 @@ impl RaftNode<Follower> {
             identity,
             current_term: 0,
             voted_for: None,
+            log: Vec::new(),
+            commit_index: 0,
+            last_applied: 0,
             state: Follower::default(),
         }
     }
@@ -190,6 +346,9 @@ impl RaftNode<Follower> {
             identity: self.identity.clone(),
             current_term: self.current_term + 1,
             voted_for: Some(self.identity.node_id()),
+            log: self.log,
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
             state,
         }
     }
@@ -206,17 +365,24 @@ impl RaftNode<Candidate> {
             identity: self.identity.clone(),
             current_term: self.current_term + 1,
             voted_for: Some(self.identity.node_id()),
+            log: self.log,
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
             state,
         }
     }
 
     /// Candidate -> Leader transition (Triggered by Majority Vote).
-    pub fn into_leader(self) -> RaftNode<Leader> {
+    pub fn into_leader(self, peer_ids: Vec<NodeId>) -> RaftNode<Leader> {
+        let last_log_index = self.last_log_index();
         RaftNode {
             identity: self.identity,
             current_term: self.current_term,
             voted_for: self.voted_for,
-            state: Leader::new(),
+            log: self.log,
+            commit_index: self.commit_index,
+            last_applied: self.last_applied,
+            state: Leader::new(peer_ids, last_log_index),
         }
     }
 }
@@ -283,8 +449,6 @@ impl RaftNodeState {
     }
 
     /// Safely transitions the node state using an ownership-consuming closure.
-    /// This is the bridge between the Type-State pattern and the RwLock
-    /// storage.
     pub fn transition<F>(&mut self, f: F)
     where
         F: FnOnce(RaftNodeState) -> RaftNodeState,
@@ -296,7 +460,7 @@ impl RaftNodeState {
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNodeState {
-        let (identity, current_term, voted_for) = match self {
+        let (identity, current_term, voted_for, log, commit_index, last_applied) = match self {
             RaftNodeState::Follower(n) => n.into_parts(),
             RaftNodeState::Candidate(n) => n.into_parts(),
             RaftNodeState::Leader(n) => n.into_parts(),
@@ -307,13 +471,13 @@ impl RaftNodeState {
             identity,
             current_term,
             voted_for,
+            log,
+            commit_index,
+            last_applied,
             state: Follower::new(leader_id),
         };
 
-        // If the new term is higher, the persistent state logic (set_term)
-        // ensures the term is updated and the vote is reset.
         new_node.set_term(term);
-
         RaftNodeState::Follower(new_node)
     }
 

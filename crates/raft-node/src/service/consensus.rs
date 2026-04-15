@@ -419,7 +419,7 @@ mod tests {
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new(id.clone());
             let candidate = follower.into_candidate();
-            let leader = candidate.into_leader();
+            let leader = candidate.into_leader(Vec::new());
             let dispatcher =
                 ConsensusDispatcher::new(id, Arc::new(RwLock::new(RaftNodeState::Leader(leader))));
 
