@@ -185,17 +185,86 @@ impl ConsensusService for ConsensusDispatcher {
             }
         }
 
-        // 3. Reset election timer to acknowledge the leader's presence
-        state_guard.reset_heartbeat();
+        // 3. Log Consistency Check (§5.3)
+        // Note: We perform this only if the node is in a stable Follower state.
+        // If we just transitioned from Candidate/Leader, we are now a Follower.
+        let (success, last_log_index) = match &mut *state_guard {
+            RaftNodeState::Follower(node) => {
+                node.state_mut().reset_heartbeat();
 
-        // Note: Real log consistency checks (prev_log_index/term) and log replication
-        // will be implemented in Phase 5. For Phase 3, we acknowledge the heartbeat.
+                let mut success = true;
+
+                // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
+                //    matches prevLogTerm (§5.3)
+                if req.prev_log_index > 0 {
+                    let local_term = node.get_term_at(req.prev_log_index);
+                    if local_term != req.prev_log_term {
+                        debug!(
+                            "Rejecting AppendEntries: prevLogIndex {} has term mismatch (local \
+                             {}, remote {})",
+                            req.prev_log_index, local_term, req.prev_log_term
+                        );
+                        success = false;
+                    }
+                }
+
+                if success {
+                    // 3. If an existing entry conflicts with a new one (same index but different
+                    //    terms), delete the existing entry and all that follow it (§5.3)
+                    for entry in &req.entries {
+                        let local_term = node.get_term_at(entry.index);
+                        if local_term != 0 && local_term != entry.term {
+                            info!(
+                                "Log conflict detected at index {}. Truncating log.",
+                                entry.index
+                            );
+                            let truncate_at = (entry.index - 1) as usize;
+                            node.log_mut().truncate(truncate_at);
+                            break;
+                        }
+                    }
+
+                    // 4. Append any new entries not already in the log
+                    for entry in req.entries {
+                        let last_idx = node.last_log_index();
+                        if entry.index > last_idx {
+                            if entry.index != last_idx + 1 {
+                                // This should be caught by the prevLogIndex check, but we are
+                                // defensive.
+                                error!(
+                                    "CRITICAL: Non-contiguous log append attempted. index={}, \
+                                     last={}",
+                                    entry.index, last_idx
+                                );
+                                success = false;
+                                break;
+                            }
+                            node.log_mut().push(entry);
+                        }
+                    }
+                }
+
+                if success {
+                    // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index
+                    //    of last new entry)
+                    if req.leader_commit > node.commit_index() {
+                        let last_new_idx = node.last_log_index();
+                        let new_commit = std::cmp::min(req.leader_commit, last_new_idx);
+                        node.set_commit_index(new_commit);
+                        debug!("Updated commit_index to {}", new_commit);
+                    }
+                }
+
+                (success, node.last_log_index())
+            }
+            _ => (false, 0), // Should have demoted above
+        };
 
         Ok(Response::new(AppendEntriesResponse {
             cluster_id: self.cluster_id_as_str().to_string(),
-            term: req.term,
-            success: true,
-            last_log_index: 0,
+            term: state_guard.current_term().unwrap_or(req.term),
+            success,
+            last_log_index,
         }))
     }
 }
