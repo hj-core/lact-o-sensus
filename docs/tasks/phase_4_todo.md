@@ -6,12 +6,12 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 
 ---
 
-## Step 0: Consensus Completion (In-Memory Log)
+## Step 0: Consensus Completion (In-Memory Log) [x]
 
-- [ ] Implement the in-memory Log storage (`Vec<LogEntry>`) in `RaftNode`.
-- [ ] Expand `AppendEntries` handler to process real entries (Index matching, Term validation, and Log conflict resolution).
-- [ ] Implement the Leader's replication loop (using `next_index` and `match_index`).
-- [ ] Acceptance: A Leader can successfully replicate a manual log entry to at least one Follower.
+- [x] Implement the in-memory Log storage (`Vec<LogEntry>`) in `RaftNode`.
+- [x] Expand `AppendEntries` handler to process real entries (Index matching, Term validation, and Log conflict resolution).
+- [x] Implement the Leader's replication loop (using `next_index` and `match_index`).
+- [x] Acceptance: A Leader can successfully replicate a manual log entry to at least one Follower.
 
 ## Step 1: Initialize the AI Veto gRPC Server (Mock Mode)
 
@@ -29,7 +29,7 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 
 - [ ] Update `IngressDispatcher` in `crates/raft-node/src/service/ingress.rs`.
 - [ ] Implement `ProposeMutation` for the `Leader` state:
-  - [ ] Call `ai_veto_relay.evaluate()`.
+  - [ ] Call `ai_vet_relay.evaluate()`.
   - [ ] If approved: Append to log, replicate via `AppendEntries`, and return `COMMITTED` once a quorum acknowledges.
 - [ ] Acceptance: Client receives a final status from the Leader.
 
