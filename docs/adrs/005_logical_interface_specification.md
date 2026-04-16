@@ -24,7 +24,7 @@ Used for Raft peer-to-peer communication.
   * **Output**: `cluster_id`, `term`, `vote_granted`.
 * **`AppendEntries`**:
   * **Input**: `cluster_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
-  * **Output**: `cluster_id`, `term`, `success`.
+  * **Output**: `cluster_id`, `term`, `success`, `last_log_index` (Optimization: allows leader to skip-back to the follower's actual log end during synchronization).
 
 ### 2. The Ingress Service (Client-to-Leader)
 
