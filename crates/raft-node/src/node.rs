@@ -428,6 +428,16 @@ impl RaftNodeState {
         }
     }
 
+    /// Returns the current commit index of the node.
+    pub fn commit_index(&self) -> Result<u64, RaftError> {
+        match self {
+            RaftNodeState::Follower(node) => Ok(node.commit_index()),
+            RaftNodeState::Candidate(node) => Ok(node.commit_index()),
+            RaftNodeState::Leader(node) => Ok(node.commit_index()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
     /// Returns the cluster ID this node belongs to.
     pub fn cluster_id(&self) -> Result<&ClusterId, RaftError> {
         match self {

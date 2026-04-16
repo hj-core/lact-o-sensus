@@ -3,11 +3,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use common::proto::v1::AppendEntriesRequest;
-use common::proto::v1::AppendEntriesResponse;
 use common::proto::v1::RequestVoteRequest;
-use common::proto::v1::RequestVoteResponse;
 use futures::StreamExt;
-use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use rand::RngExt;
 use tokio::sync::RwLock;
@@ -19,6 +16,8 @@ use tracing::error;
 use tracing::info;
 
 use crate::config::Config;
+use crate::node::Leader;
+use crate::node::RaftNode;
 use crate::node::RaftNodeState;
 use crate::peer::PeerManager;
 
@@ -241,8 +240,8 @@ fn unauthorized_response_status() -> Status {
     Status::permission_denied("Received response from unauthorized cluster")
 }
 
-/// Spawns a background task that periodically sends heartbeats if the node is a
-/// Leader.
+/// Spawns a background task that periodically sends heartbeats or replicates
+/// logs if the node is a Leader.
 pub fn spawn_heartbeat_task(
     config: Arc<Config>,
     state: Arc<RwLock<RaftNodeState>>,
@@ -261,9 +260,9 @@ pub fn spawn_heartbeat_task(
                     let config_clone = config.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            send_heartbeats(config_clone, state_clone, peer_manager_clone).await
+                            replicate_to_peers(config_clone, state_clone, peer_manager_clone).await
                         {
-                            error!("Failed to send heartbeats: {}", e);
+                            error!("Failed to replicate to peers: {}", e);
                         }
                     });
                 }
@@ -280,49 +279,86 @@ pub fn spawn_heartbeat_task(
     });
 }
 
-/// Sends AppendEntries RPCs (heartbeats) to all peers.
-async fn send_heartbeats(
+/// Sends AppendEntries RPCs to all peers, including log entries if they are
+/// behind.
+async fn replicate_to_peers(
     config: Arc<Config>,
     state: Arc<RwLock<RaftNodeState>>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
-    // 1. Gather heartbeat parameters. Use Arc<str> for zero-allocation sharing.
-    let (term, cluster_id, node_id) = {
+    // 1. Gather global replication parameters.
+    // Use Arc<str> for zero-allocation identity sharing across concurrent RPC
+    // tasks.
+    let (term, cluster_id, node_id, commit_index) = {
         let guard = state.read().await;
         let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
         let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
-        (guard.current_term()?, cid, nid)
+        (guard.current_term()?, cid, nid, guard.commit_index()?)
     };
 
-    // 2. Send heartbeats to all peers concurrently
     let peer_ids = peer_manager.peer_ids();
-    let heartbeat_requests = peer_ids.into_iter().map(|peer_id| {
+    let rpc_timeout = config.raft.rpc_timeout();
+
+    // 2. Prepare and send AppendEntries concurrently to all peers.
+    let replication_requests = peer_ids.into_iter().map(|peer_id| {
+        let state = state.clone();
         let peer_manager = peer_manager.clone();
         let cluster_id = cluster_id.clone();
         let node_id = node_id.clone();
-        let rpc_timeout = config.raft.rpc_timeout();
 
         async move {
+            // a. Prepare the request for this specific peer
+            let request = {
+                let guard = state.read().await;
+                match &*guard {
+                    RaftNodeState::Leader(node) => {
+                        let next_idx = *node.state().next_index().get(&peer_id).unwrap_or(&1);
+                        let last_log_idx = node.last_log_index();
+
+                        let prev_log_index = next_idx - 1;
+                        let prev_log_term = node.get_term_at(prev_log_index);
+
+                        // Collect entries starting from next_idx
+                        let entries = if last_log_idx >= next_idx {
+                            // Logs are 1-indexed, so index 1 is at Vec index 0.
+                            node.log()[(next_idx as usize - 1)..].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+
+                        AppendEntriesRequest {
+                            cluster_id: cluster_id.to_string(),
+                            term,
+                            leader_id: node_id.to_string(),
+                            prev_log_index,
+                            prev_log_term,
+                            entries,
+                            leader_commit: commit_index,
+                        }
+                    }
+                    _ => return Ok(None), // No longer leader
+                }
+            };
+
+            // Capture metadata before the request is consumed by the tonic::Request
+            let sent_prev_idx = request.prev_log_index;
+            let sent_entries_len = request.entries.len() as u64;
+
+            // b. Execute the RPC
             match peer_manager.get_client(peer_id) {
                 Ok(mut client) => {
-                    let mut request = Request::new(AppendEntriesRequest {
-                        cluster_id: cluster_id.to_string(),
-                        term,
-                        leader_id: node_id.to_string(),
-                        prev_log_index: 0, // TODO: Phase 5 - Real log state
-                        prev_log_term: 0,
-                        entries: Vec::new(),
-                        leader_commit: 0,
-                    });
-                    request.set_timeout(rpc_timeout);
+                    let mut req = Request::new(request);
+                    req.set_timeout(rpc_timeout);
 
-                    match client.append_entries(request).await {
+                    match client.append_entries(req).await {
                         Ok(resp) => {
                             let resp = resp.into_inner();
+                            // ADR 004 / Security: Verify cluster identity
                             if resp.cluster_id != *cluster_id {
                                 return Err(unauthorized_response_status());
                             }
-                            Ok(resp)
+                            // Return peer_id and minimal metadata to avoid cloning log data
+                            Ok(Some((peer_id, sent_prev_idx, sent_entries_len, resp)))
                         }
                         Err(e) => Err(e),
                     }
@@ -332,28 +368,87 @@ async fn send_heartbeats(
         }
     });
 
-    let mut heartbeat_stream = heartbeat_requests.collect::<FuturesUnordered<_>>();
+    let mut response_stream = replication_requests.collect::<FuturesUnordered<_>>();
 
-    // 3. Handle responses (primarily term updates). We demote as soon as any peer
-    // responds with a higher term.
-    while let Some(res) = heartbeat_stream.next().await {
+    // 3. Process responses as they arrive (Opportunistic demotion & index updates).
+    while let Some(res) = response_stream.next().await {
         match res {
-            Ok(resp) => {
+            Ok(Some((peer_id, sent_prev_idx, sent_entries_len, resp))) => {
+                let mut guard = state.write().await;
+
+                // §5.1: If term > currentTerm, demote immediately
                 if resp.term > term {
                     info!(
-                        "Found higher term ({}) in heartbeat response. Demoting to Follower.",
-                        resp.term
+                        "Found higher term ({}) from peer {}. Demoting to Follower.",
+                        resp.term, peer_id
                     );
-                    let mut guard = state.write().await;
                     guard.transition(|old| old.into_follower(resp.term, None));
                     return Ok(());
                 }
+
+                if let RaftNodeState::Leader(node) = &mut *guard {
+                    if resp.success {
+                        // Update nextIndex and matchIndex for follower (§5.3)
+                        let new_match = sent_prev_idx + sent_entries_len;
+                        let new_next = new_match + 1;
+
+                        // Monotonicity check: only update if we are moving forward
+                        let current_match = *node.state().match_index().get(&peer_id).unwrap_or(&0);
+                        if new_match > current_match {
+                            node.state_mut().next_index_mut().insert(peer_id, new_next);
+                            node.state_mut()
+                                .match_index_mut()
+                                .insert(peer_id, new_match);
+                        }
+
+                        // Check for new commit point (§5.3, §5.4)
+                        update_leader_commit_index(node);
+                    } else {
+                        // If AppendEntries fails because of log inconsistency:
+                        // decrement nextIndex and retry (§5.3)
+                        let current_next = *node.state().next_index().get(&peer_id).unwrap_or(&1);
+
+                        // Optimization: jump back based on peer's actual log state
+                        let new_next = if resp.last_log_index > 0 {
+                            std::cmp::min(current_next, resp.last_log_index + 1)
+                        } else {
+                            current_next.saturating_sub(1).max(1)
+                        };
+
+                        node.state_mut().next_index_mut().insert(peer_id, new_next);
+                        debug!(
+                            "Peer {} rejected AppendEntries (log mismatch). Retrying with \
+                             next_index={}",
+                            peer_id, new_next
+                        );
+                    }
+                }
             }
+            Ok(None) => {} // Node was demoted during task preparation
             Err(e) => {
-                debug!("Heartbeat failed for a peer: {}", e);
+                debug!("Replication RPC failed for a peer: {}", e);
             }
         }
     }
 
     Ok(())
+}
+
+/// Helper to update the Leader's commit index based on a quorum of peer
+/// match_indices.
+fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
+    let last_idx = node.last_log_index();
+    let current_term = node.current_term();
+    let mut match_indices: Vec<u64> = node.state().match_index().values().cloned().collect();
+    match_indices.push(last_idx); // Include self
+    match_indices.sort_unstable();
+
+    // The index that is replicated on a majority of nodes.
+    // For 3 nodes, index 1 (middle element of sorted [idx1, idx2, idx3]).
+    let quorum_idx = match_indices[(match_indices.len() - 1) / 2];
+
+    if quorum_idx > node.commit_index() && node.get_term_at(quorum_idx) == current_term {
+        info!("Quorum reached for log index {}. Committing.", quorum_idx);
+        node.set_commit_index(quorum_idx);
+    }
 }
