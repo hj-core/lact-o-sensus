@@ -19,11 +19,11 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 - [x] Return deterministic "Mock Approval" for all requests.
 - [x] Acceptance: `ai-veto` binary starts and responds to `EvaluateProposal` RPCs.
 
-## Step 2: Implement Leader Egress Bridge (`raft-node`)
+## Step 2: Implement Leader Egress Bridge (`raft-node`) [x]
 
-- [ ] Create `GrpcVetoRelay` in `crates/raft-node/src/service/veto.rs`.
-- [ ] Implement the `VetoRelay` trait to call the `ai-veto` gRPC service.
-- [ ] Acceptance: Leader successfully calls out to `ai-veto`.
+- [x] Create `GrpcVetoRelay` in `crates/raft-node/src/service/veto.rs`.
+- [x] Implement the `VetoRelay` trait to call the `ai-veto` gRPC service.
+- [x] Acceptance: Leader successfully calls out to `ai-veto`.
 
 ## Step 3: Implement Leader Proposal Logic (`raft-node`)
 
