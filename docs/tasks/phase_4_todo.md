@@ -13,11 +13,11 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 - [x] Implement the Leader's replication loop (using `next_index` and `match_index`).
 - [x] Acceptance: A Leader can successfully replicate a manual log entry to at least one Follower.
 
-## Step 1: Initialize the AI Veto gRPC Server (Mock Mode)
+## Step 1: Initialize the AI Veto gRPC Server (Mock Mode) [x]
 
-- [ ] Implement `PolicyService` in `crates/ai-veto` using `tonic`.
-- [ ] Return deterministic "Mock Approval" for all requests.
-- [ ] Acceptance: `ai-veto` binary starts and responds to `EvaluateProposal` RPCs.
+- [x] Implement `PolicyService` in `crates/ai-veto` using `tonic`.
+- [x] Return deterministic "Mock Approval" for all requests.
+- [x] Acceptance: `ai-veto` binary starts and responds to `EvaluateProposal` RPCs.
 
 ## Step 2: Implement Leader Egress Bridge (`raft-node`)
 
