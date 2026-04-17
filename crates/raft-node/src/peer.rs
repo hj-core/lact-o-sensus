@@ -43,13 +43,12 @@ pub struct PeerManager {
 impl PeerManager {
     pub fn new(
         identity: Arc<NodeIdentity>,
-        peer_map: &HashMap<NodeId, std::net::SocketAddr>,
+        peer_map: &HashMap<NodeId, String>,
         default_rpc_timeout: Duration,
     ) -> Result<Self, PeerError> {
         let mut peers = HashMap::new();
 
-        for (id, addr) in peer_map {
-            let uri = format!("http://{}", addr);
+        for (id, uri) in peer_map {
             let channel = Channel::from_shared(uri.clone())
                 .map_err(|_| PeerError::InvalidUri {
                     node_id: *id,
@@ -61,7 +60,7 @@ impl PeerManager {
                 *id,
                 PeerConnection {
                     channel,
-                    address: uri,
+                    address: uri.clone(),
                 },
             );
         }
@@ -114,8 +113,6 @@ impl PeerManager {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use common::types::ClusterId;
 
     use super::*;
@@ -131,10 +128,7 @@ mod tests {
         #[tokio::test]
         async fn returns_client_when_id_exists() {
             let mut peers = HashMap::new();
-            peers.insert(
-                NodeId::new(2),
-                "127.0.0.1:50052".parse::<SocketAddr>().unwrap(),
-            );
+            peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
             let manager =
                 PeerManager::new(mock_identity(), &peers, Duration::from_millis(40)).unwrap();
@@ -160,10 +154,7 @@ mod tests {
         #[tokio::test]
         async fn returns_address_when_id_exists() {
             let mut peers = HashMap::new();
-            peers.insert(
-                NodeId::new(2),
-                "127.0.0.1:50052".parse::<SocketAddr>().unwrap(),
-            );
+            peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
             let manager =
                 PeerManager::new(mock_identity(), &peers, Duration::from_millis(40)).unwrap();

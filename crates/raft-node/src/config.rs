@@ -199,7 +199,7 @@ pub struct Config {
     pub data_dir: PathBuf,
 
     /// Mapping of node IDs to their network addresses for all peers.
-    pub peers: HashMap<NodeId, SocketAddr>,
+    pub peers: HashMap<NodeId, String>,
 
     /// Raft-specific timing and protocol configuration.
     #[serde(default)]
@@ -225,6 +225,20 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.peers.contains_key(&self.node_id) {
             return Err(ConfigError::SelfLoop(self.node_id));
+        }
+
+        // Validate all peer URIs
+        for (id, uri) in &self.peers {
+            if uri.is_empty() {
+                return Err(ConfigError::InvalidUri(format!(
+                    "Peer ID {} has an empty URI",
+                    id
+                )));
+            }
+
+            tonic::transport::Endpoint::from_shared(uri.clone()).map_err(|e| {
+                ConfigError::InvalidUri(format!("Peer ID {} URI '{}' is invalid: {}", id, uri, e))
+            })?;
         }
 
         // Delegate sub-config validation
@@ -254,7 +268,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             assert!(config.validate().is_ok());
@@ -268,7 +282,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            1 = "127.0.0.1:50051"
+            1 = "http://127.0.0.1:50051"
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             let result = config.validate();
@@ -283,7 +297,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
         "#;
             // Fails during deserialization because of #[serde(try_from)] on ClusterId
             let result: Result<Config, toml::de::Error> = toml::from_str(toml_str);
@@ -298,7 +312,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 50
             rpc_timeout_ms = 60
@@ -319,7 +333,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 100
             election_timeout_min_ms = 50
@@ -338,7 +352,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 100
         "#;
@@ -356,7 +370,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
             [policy]
             veto_timeout_ms = 0
         "#;
@@ -369,6 +383,21 @@ mod tests {
         }
 
         #[test]
+        fn returns_err_when_invalid_peer_uri() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://invalid uri.com"
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
+        }
+
+        #[test]
         fn returns_err_when_invalid_veto_uri() {
             let toml_str = r#"
             cluster_id = "test-cluster"
@@ -376,7 +405,7 @@ mod tests {
             listen_addr = "127.0.0.1:50051"
             data_dir = "data/node_1"
             [peers]
-            2 = "127.0.0.1:50052"
+            2 = "http://127.0.0.1:50052"
             [policy]
             veto_addr = "http://invalid uri.com" # Spaces are strictly forbidden
         "#;

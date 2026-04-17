@@ -270,7 +270,7 @@ mod tests {
         ))
     }
 
-    fn mock_peer_manager(peers: &HashMap<NodeId, std::net::SocketAddr>) -> Arc<PeerManager> {
+    fn mock_peer_manager(peers: &HashMap<NodeId, String>) -> Arc<PeerManager> {
         Arc::new(PeerManager::new(mock_identity(), peers, Duration::from_millis(40)).unwrap())
     }
 
@@ -325,8 +325,8 @@ mod tests {
         #[tokio::test]
         async fn returns_hint_when_follower_leader_known() {
             let mut peers = HashMap::new();
-            let leader_addr = "127.0.0.1:50052";
-            peers.insert(NodeId::new(2), leader_addr.parse().unwrap());
+            let leader_addr = "http://127.0.0.1:50052";
+            peers.insert(NodeId::new(2), leader_addr.to_string());
 
             let id = mock_identity();
             // Create follower who knows about leader Node 2
