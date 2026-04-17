@@ -22,6 +22,7 @@ use node::RaftNodeState;
 use peer::PeerManager;
 use service::consensus::ConsensusDispatcher;
 use service::ingress::IngressDispatcher;
+use service::veto::GrpcVetoRelay;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::Instrument;
@@ -93,8 +94,22 @@ async fn main() -> Result<()> {
 
     // 8. Initialize RPC Service Dispatchers
     let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
-    let ingress_dispatcher =
-        IngressDispatcher::new(identity.clone(), shared_state.clone(), peer_manager.clone());
+
+    // Initialize the AI Veto Relay (Egress Bridge)
+    let veto_channel = config
+        .policy
+        .veto_endpoint()
+        .map_err(|e| anyhow::anyhow!("Failed to parse AI Veto address: {}", e))?
+        .connect_lazy();
+    let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
+
+    let ingress_dispatcher = IngressDispatcher::new(
+        identity.clone(),
+        shared_state.clone(),
+        peer_manager.clone(),
+        veto_relay,
+        config.policy.veto_timeout(),
+    );
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());

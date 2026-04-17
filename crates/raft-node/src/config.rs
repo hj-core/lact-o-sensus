@@ -25,6 +25,9 @@ pub enum ConfigError {
 
     #[error("Invalid configuration invariant: {0}")]
     TimingInvariant(String),
+
+    #[error("Invalid URI: {0}")]
+    InvalidUri(String),
 }
 
 // --- Raft Protocol Configuration ---
@@ -129,6 +132,9 @@ impl RaftConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PolicyConfig {
+    /// Network address of the AI Veto Node (e.g. "http://127.0.0.1:50060").
+    pub veto_addr: String,
+
     /// Timeout for AI Veto evaluations (in milliseconds).
     pub veto_timeout_ms: u64,
 }
@@ -136,6 +142,7 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
+            veto_addr: "http://127.0.0.1:50060".to_string(),
             veto_timeout_ms: 5000,
         }
     }
@@ -146,6 +153,20 @@ impl PolicyConfig {
         Duration::from_millis(self.veto_timeout_ms)
     }
 
+    /// Returns the veto address as a tonic-compatible Endpoint.
+    /// Performs strict validation via Endpoint::from_shared.
+    pub fn veto_endpoint(&self) -> Result<tonic::transport::Endpoint, ConfigError> {
+        if self.veto_addr.is_empty() {
+            return Err(ConfigError::InvalidUri(
+                "veto_addr cannot be empty".to_string(),
+            ));
+        }
+
+        tonic::transport::Endpoint::from_shared(self.veto_addr.clone()).map_err(|e| {
+            ConfigError::InvalidUri(format!("veto_addr '{}' is invalid: {}", self.veto_addr, e))
+        })
+    }
+
     /// Validates policy-specific invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.veto_timeout_ms == 0 {
@@ -153,6 +174,10 @@ impl PolicyConfig {
                 "veto_timeout_ms must be greater than 0".to_string(),
             ));
         }
+
+        // Delegate URI validation to the conversion logic
+        self.veto_endpoint()?;
+
         Ok(())
     }
 }
@@ -341,6 +366,23 @@ mod tests {
                 result,
                 Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("veto_timeout_ms")
             ));
+        }
+
+        #[test]
+        fn returns_err_when_invalid_veto_uri() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "127.0.0.1:50052"
+            [policy]
+            veto_addr = "http://invalid uri.com" # Spaces are strictly forbidden
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
         }
     }
 }

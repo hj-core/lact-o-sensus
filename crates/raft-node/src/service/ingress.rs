@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::proto::v1::MutationStatus;
 use common::proto::v1::ProposeMutationRequest;
@@ -10,8 +11,10 @@ use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
+use tracing::warn;
 
 use crate::identity::NodeIdentity;
 use crate::node::Follower;
@@ -19,6 +22,8 @@ use crate::node::RaftNode;
 use crate::node::RaftNodeState;
 use crate::peer::PeerManager;
 use crate::service::common::ServiceState;
+use crate::service::veto::VetoError;
+use crate::service::veto::VetoRelay;
 
 /// Implementation of the external client ingress RPCs.
 ///
@@ -29,6 +34,8 @@ pub struct IngressDispatcher {
     identity: Arc<NodeIdentity>,
     state: Arc<RwLock<RaftNodeState>>,
     peer_manager: Arc<PeerManager>,
+    veto_relay: Arc<dyn VetoRelay>,
+    veto_timeout: Duration,
 }
 
 impl IngressDispatcher {
@@ -36,11 +43,15 @@ impl IngressDispatcher {
         identity: Arc<NodeIdentity>,
         state: Arc<RwLock<RaftNodeState>>,
         peer_manager: Arc<PeerManager>,
+        veto_relay: Arc<dyn VetoRelay>,
+        veto_timeout: Duration,
     ) -> Self {
         Self {
             identity,
             state,
             peer_manager,
+            veto_relay,
+            veto_timeout,
         }
     }
 
@@ -129,14 +140,67 @@ impl IngressService for IngressDispatcher {
                 }))
             }
             RaftNodeState::Leader(_) => {
-                // TODO: Phase 4 - Implement real Leader proposal logic
-                Ok(Response::new(ProposeMutationResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
-                    status: MutationStatus::Rejected as i32,
-                    state_version: 0,
-                    leader_hint: String::new(),
-                    error_message: "Leader mutation logic not yet implemented.".to_string(),
-                }))
+                info!("Leader received proposal. Triggering AI Veto evaluation...");
+
+                let outcome = self
+                    .veto_relay
+                    .evaluate(
+                        req.cluster_id.clone(),
+                        req.client_id.clone(),
+                        req.intent.as_ref().unwrap_or(&Default::default()),
+                        &[], // Inventory store implemented in Phase 5
+                        self.veto_timeout,
+                    )
+                    .await;
+
+                match outcome {
+                    Ok(veto) => {
+                        // ADR 004: Centralized identity verification of the AI response.
+                        self.verify_identity(&veto.cluster_id)?;
+
+                        info!(
+                            "AI Veto response received: approved={}, justification='{}'",
+                            veto.is_approved, veto.moral_justification
+                        );
+
+                        // TODO: Phase 4 Step 3 - Handle commit logic
+                        Ok(Response::new(ProposeMutationResponse {
+                            cluster_id: self.cluster_id_as_str().to_string(),
+                            status: MutationStatus::Rejected as i32, // Placeholder
+                            state_version: 0,
+                            leader_hint: String::new(),
+                            error_message: format!(
+                                "AI evaluation successful (Approved: {}). Replication not yet \
+                                 implemented.",
+                                veto.is_approved
+                            ),
+                        }))
+                    }
+                    Err(VetoError::Timeout(d)) => {
+                        // High-signal warning for transient latency.
+                        warn!("AI Veto evaluation timed out after {:?}", d);
+                        Ok(Response::new(ProposeMutationResponse {
+                            cluster_id: self.cluster_id_as_str().to_string(),
+                            status: MutationStatus::Rejected as i32,
+                            state_version: 0,
+                            leader_hint: String::new(),
+                            error_message: "Evaluation timed out. Please retry shortly."
+                                .to_string(),
+                        }))
+                    }
+                    Err(VetoError::RpcFailure(e)) => {
+                        // Error level for actual infrastructure outages.
+                        error!("AI Veto evaluation infrastructure failure: {}", e);
+                        Ok(Response::new(ProposeMutationResponse {
+                            cluster_id: self.cluster_id_as_str().to_string(),
+                            status: MutationStatus::Rejected as i32,
+                            state_version: 0,
+                            leader_hint: String::new(),
+                            error_message: "Internal system error occurred during evaluation."
+                                .to_string(),
+                        }))
+                    }
+                }
             }
             RaftNodeState::Poisoned => unreachable!("Caught by verify_health"),
         }
@@ -197,6 +261,7 @@ mod tests {
     use super::*;
     use crate::node::Follower;
     use crate::node::RaftNode;
+    use crate::service::veto::MockVetoRelay;
 
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
@@ -210,7 +275,13 @@ mod tests {
     }
 
     fn mock_dispatcher(state: RaftNodeState, peer_manager: Arc<PeerManager>) -> IngressDispatcher {
-        IngressDispatcher::new(mock_identity(), Arc::new(RwLock::new(state)), peer_manager)
+        IngressDispatcher::new(
+            mock_identity(),
+            Arc::new(RwLock::new(state)),
+            peer_manager,
+            Arc::new(MockVetoRelay),
+            Duration::from_secs(1),
+        )
     }
 
     mod identity_guard {
