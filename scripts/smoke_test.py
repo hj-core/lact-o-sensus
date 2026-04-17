@@ -8,7 +8,7 @@ import time
 from typing import Dict, List, Optional, TypedDict, TextIO, Generator
 
 # Lact-O-Sensus: Consensus Verification Suite
-# Verifies the Raft "Consensus Heart" logic via isolated test cases.
+# Verifies the Raft "Consensus Heart" and AI Egress logic via isolated test cases.
 
 
 class NodeConfig(TypedDict):
@@ -39,6 +39,10 @@ NODES: List[NodeConfig] = [
     },
 ]
 
+VETO_PORT = 50060
+VETO_LOG = "ai_veto.log"
+
+
 # --- Helper Library ---
 
 
@@ -48,23 +52,49 @@ def now_ms() -> float:
 
 
 class ClusterManager:
-    """Manages the lifecycle of a local 3-node Raft cluster."""
+    """Manages the lifecycle of a local 3-node Raft cluster and an AI Veto Node."""
 
     processes: Dict[int, subprocess.Popen]
     log_files: Dict[int, TextIO]
+    veto_process: Optional[subprocess.Popen]
+    veto_log: Optional[TextIO]
 
     def __init__(self) -> None:
         self.processes = {}
         self.log_files = {}
+        self.veto_process = None
+        self.veto_log = None
 
-    def start_all(self) -> None:
-        """Starts all nodes defined in NODES."""
-        print("--- Starting 3-node cluster ---")
+    def start_all(self, start_veto: bool = False) -> None:
+        """Starts all nodes defined in NODES and optionally the AI Veto Node."""
+        print(f"--- Starting cluster (AI Veto: {start_veto}) ---")
 
         # Capture and prepare environment once to ensure consistency across the cluster.
         cluster_env = os.environ.copy()
         cluster_env["RUST_LOG"] = "info"
 
+        # 1. Start AI Veto Node if requested
+        if start_veto:
+            if os.path.exists(VETO_LOG):
+                os.remove(VETO_LOG)
+
+            self.veto_log = open(VETO_LOG, "w", encoding="utf-8")
+            self.veto_process = subprocess.Popen(
+                [
+                    "cargo",
+                    "run",
+                    "-p",
+                    "ai-veto",
+                    "--",
+                    "--port",
+                    str(VETO_PORT),
+                ],
+                stdout=self.veto_log,
+                stderr=subprocess.STDOUT,
+                env=cluster_env,
+            )
+
+        # 2. Start Raft Nodes
         for node in NODES:
             if os.path.exists(node["log"]):
                 os.remove(node["log"])
@@ -81,7 +111,6 @@ class ClusterManager:
                 "--config",
                 node["config"],
             ]
-            # Nodes inherit their own copy of the file descriptor from the Popen call.
             p = subprocess.Popen(
                 cmd,
                 stdout=log_file,
@@ -89,6 +118,9 @@ class ClusterManager:
                 env=cluster_env,
             )
             self.processes[node["id"]] = p
+
+        # Give nodes time to initialize and Cargo to finish building if necessary
+        time.sleep(2)
 
     def kill_node(self, node_id: int) -> float:
         """Kills a specific node and returns kill timestamp in ms."""
@@ -107,10 +139,25 @@ class ClusterManager:
 
     def cleanup(self) -> None:
         """
-        Performs deterministic resource reclamation for the cluster nodes.
-        Uses a two-stage shutdown process: SIGTERM (graceful) -> Wait -> SIGKILL (forced).
+        Performs deterministic resource reclamation for all nodes.
         """
         print("--- Cleaning up cluster ---")
+
+        # Cleanup AI Veto
+        if self.veto_process:
+            self.veto_process.terminate()
+            try:
+                self.veto_process.wait(timeout=2)
+            except subprocess.SubprocessError:
+                self.veto_process.kill()
+
+        if self.veto_log:
+            try:
+                self.veto_log.close()
+            except (OSError, IOError):
+                pass
+
+        # Cleanup Raft Nodes
         for p in self.processes.values():
             p.terminate()
         for p in self.processes.values():
@@ -121,13 +168,17 @@ class ClusterManager:
                 subprocess.SubprocessError,
             ):
                 p.kill()
+
         for f in self.log_files.values():
             try:
                 f.close()
             except (OSError, IOError):
                 pass
+
         self.processes.clear()
         self.log_files.clear()
+        self.veto_process = None
+        self.veto_log = None
 
 
 def get_complete_lines(
@@ -154,7 +205,7 @@ def parse_log_timestamp(line: str) -> float:
             ts_str.replace("Z", "+00:00")
         )
         return ts.timestamp() * 1000
-    except Exception:
+    except (ValueError, IndexError):
         return 0.0
 
 
@@ -177,7 +228,7 @@ def find_current_leader() -> Optional[int]:
 
 
 def wait_for_leader(timeout: float = 15.0) -> int:
-    """Helper to wait for a leader to emerge without printing a test header."""
+    """Helper to wait for a leader to emerge."""
     print(
         f"Waiting for leader to emerge (max {timeout}s)...",
         end="",
@@ -319,33 +370,84 @@ def test_identity_guard() -> None:
         )
 
 
+def test_ai_veto_egress() -> None:
+    """Verifies that the Leader can successfully call out to the AI Veto Node."""
+    leader_id = wait_for_leader()
+    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+
+    print(
+        f"Action: Sending mutation to Leader (Node {leader_id}) on port {leader_port}..."
+    )
+    cmd = [
+        "grpcurl",
+        "-plaintext",
+        "-import-path",
+        "crates/common/proto",
+        "-proto",
+        "lacto_sensus.proto",
+        "-d",
+        json.dumps(
+            {
+                "cluster_id": "lacto-dev-01",
+                "client_id": "smoke-tester",
+                "sequence_id": 1,
+                "intent": {"item_key": "oat_milk", "quantity": "2"},
+            }
+        ),
+        f"127.0.0.1:{leader_port}",
+        "lacto_sensus.v1.IngressService/ProposeMutation",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False
+    )
+
+    if "AI evaluation successful" in result.stdout:
+        print(
+            "SUCCESS: Leader successfully called out to AI Veto Node."
+        )
+    else:
+        print(
+            f"FAILURE: Unexpected response from leader: {result.stdout} {result.stderr}"
+        )
+        raise RuntimeError(
+            "Leader failed to trigger AI evaluation or received error."
+        )
+
+
 # --- Runner Logic ---
 
 
 def main() -> None:
-    print("=== Lact-O-Sensus Consensus Verification Suite ===")
+    print("=== Lact-O-Sensus Consensus & Integration Suite ===")
     tests = [
-        ("Leader Election", lambda c: test_leader_election()),
-        ("Leadership Stability", lambda c: test_leadership_stability()),
-        ("Chaos Failover", lambda c: test_leader_failover(c)),
-        ("Identity Guard (ADR 004)", lambda c: test_identity_guard()),
+        ("Leader Election", False, lambda c: test_leader_election()),
+        (
+            "Leadership Stability",
+            False,
+            lambda c: test_leadership_stability(),
+        ),
+        ("Chaos Failover", False, lambda c: test_leader_failover(c)),
+        (
+            "Identity Guard (ADR 004)",
+            False,
+            lambda c: test_identity_guard(),
+        ),
+        ("AI Veto Egress", True, lambda c: test_ai_veto_egress()),
     ]
 
     passed = 0
-    for name, test_func in tests:
+    for name, needs_veto, test_func in tests:
         print(f"\n[TEST] {name}")
         cluster = ClusterManager()
         try:
-            cluster.start_all()
+            cluster.start_all(start_veto=needs_veto)
             test_func(cluster)
             passed += 1
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             print(f"RESULT: FAILED -> {e}")
             print_cluster_logs()
         finally:
             cluster.cleanup()
-            # Cooldown Period: Ensures that OS network sockets (in TIME_WAIT state)
-            # are fully released before the next test attempts to bind to the same ports.
             time.sleep(1)
 
     print(f"\n=== Final Result: {passed}/{len(tests)} Tests Passed ===")
