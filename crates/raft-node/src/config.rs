@@ -23,31 +23,11 @@ pub enum ConfigError {
     #[error("Self-loop detected: node_id {0} found in peers list")]
     SelfLoop(NodeId),
 
-    #[error("Invalid Raft timing: {0}")]
+    #[error("Invalid configuration invariant: {0}")]
     TimingInvariant(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    /// Unique identifier for the entire consensus group.
-    pub cluster_id: ClusterId,
-
-    /// Unique identifier for this specific node within its cluster.
-    pub node_id: NodeId,
-
-    /// Network address to listen on for gRPC traffic.
-    pub listen_addr: SocketAddr,
-
-    /// Directory for persistent storage (sled db).
-    pub data_dir: PathBuf,
-
-    /// Mapping of node IDs to their network addresses for all peers.
-    pub peers: HashMap<NodeId, SocketAddr>,
-
-    /// Raft-specific timing and protocol configuration.
-    #[serde(default)]
-    pub raft: RaftConfig,
-}
+// --- Raft Protocol Configuration ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -144,6 +124,67 @@ impl RaftConfig {
     }
 }
 
+// --- External Policy Configuration ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    /// Timeout for AI Veto evaluations (in milliseconds).
+    pub veto_timeout_ms: u64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            veto_timeout_ms: 5000,
+        }
+    }
+}
+
+impl PolicyConfig {
+    pub fn veto_timeout(&self) -> Duration {
+        Duration::from_millis(self.veto_timeout_ms)
+    }
+
+    /// Validates policy-specific invariants.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.veto_timeout_ms == 0 {
+            return Err(ConfigError::TimingInvariant(
+                "veto_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// --- Root Node Configuration ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    /// Unique identifier for the entire consensus group.
+    pub cluster_id: ClusterId,
+
+    /// Unique identifier for this specific node within its cluster.
+    pub node_id: NodeId,
+
+    /// Network address to listen on for gRPC traffic.
+    pub listen_addr: SocketAddr,
+
+    /// Directory for persistent storage (sled db).
+    pub data_dir: PathBuf,
+
+    /// Mapping of node IDs to their network addresses for all peers.
+    pub peers: HashMap<NodeId, SocketAddr>,
+
+    /// Raft-specific timing and protocol configuration.
+    #[serde(default)]
+    pub raft: RaftConfig,
+
+    /// Configuration for external policy evaluation (AI Veto).
+    #[serde(default)]
+    pub policy: PolicyConfig,
+}
+
 impl Config {
     /// Loads the configuration from a TOML file.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
@@ -161,8 +202,9 @@ impl Config {
             return Err(ConfigError::SelfLoop(self.node_id));
         }
 
-        // Delegate Raft timing validation
+        // Delegate sub-config validation
         self.raft.validate()?;
+        self.policy.validate()?;
 
         if self.peers.is_empty() {
             warn!("Configuration loaded with 0 peers. This node will be a single-node cluster.");
@@ -240,7 +282,7 @@ mod tests {
             let result = config.validate();
             assert!(matches!(
                 result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("stacking")
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("Heartbeat") || msg.contains("stacking")
             ));
         }
 
@@ -274,12 +316,31 @@ mod tests {
             2 = "127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 100
-            # election_timeout fields missing, should default
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             assert!(config.validate().is_ok());
             assert_eq!(config.raft.heartbeat_interval_ms, 100);
             assert_eq!(config.raft.election_timeout_min_ms, 150); // Default
+        }
+
+        #[test]
+        fn returns_err_when_zero_veto_timeout() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "127.0.0.1:50052"
+            [policy]
+            veto_timeout_ms = 0
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("veto_timeout_ms")
+            ));
         }
     }
 }

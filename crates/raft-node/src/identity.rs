@@ -111,6 +111,7 @@ mod tests {
             data_dir: "".into(),
             peers: HashMap::new(),
             raft: Default::default(),
+            policy: Default::default(),
         }
     }
 
