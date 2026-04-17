@@ -27,12 +27,15 @@ name = "ai-veto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "common",
  "prost",
  "serde",
  "thiserror",
  "tokio",
  "tonic",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
