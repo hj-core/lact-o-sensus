@@ -34,8 +34,8 @@ Used for user mutations and queries.
   * **Input**: `cluster_id`, `client_id`, `sequence_id`, `MutationIntent` (contains `operation`, `item_key`, `quantity`, `unit?`, `category?`).
   * **Output**: `cluster_id`, `status` (Committed/Rejected/Vetoed), `state_version`, `leader_hint` (for redirection), `error_message`.
 * **`QueryState`**:
-  * **Input**: `cluster_id`, `query_filter`, `min_state_version` (optional).
-  * **Output**: `cluster_id`, `item_list[]` (of `GroceryItem`), `current_state_version`.
+  * **Input**: `cluster_id`, `query_filter` (optional), `min_state_version` (optional).
+  * **Output**: `cluster_id`, `item_list[]` (of `GroceryItem`), `current_state_version`, `status` (Success/Rejected/Error), `leader_hint` (for redirection), `error_message`.
 
 ### 3. The Policy Service (Leader-to-AI)
 
