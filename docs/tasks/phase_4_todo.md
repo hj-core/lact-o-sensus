@@ -25,13 +25,13 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 - [x] Implement the `VetoRelay` trait to call the `ai-veto` gRPC service.
 - [x] Acceptance: Leader successfully calls out to `ai-veto`.
 
-## Step 3: Implement Leader Proposal Logic (`raft-node`)
+## Step 3: Implement Leader Proposal Logic (`raft-node`) [x]
 
-- [ ] Update `IngressDispatcher` in `crates/raft-node/src/service/ingress.rs`.
-- [ ] Implement `ProposeMutation` for the `Leader` state:
-  - [ ] Call `ai_vet_relay.evaluate()`.
-  - [ ] If approved: Append to log, replicate via `AppendEntries`, and return `COMMITTED` once a quorum acknowledges.
-- [ ] Acceptance: Client receives a final status from the Leader.
+- [x] Update `IngressDispatcher` in `crates/raft-node/src/service/ingress.rs`.
+- [x] Implement `ProposeMutation` for the `Leader` state:
+  - [x] Call `ai_vet_relay.evaluate()`.
+  - [x] If approved: Append to log, replicate via `AppendEntries`, and return `COMMITTED` once a quorum acknowledges.
+- [x] Acceptance: Client receives a final status from the Leader.
 
 ## Step 4: Implement the Client CLI REPL (`client-cli`)
 
