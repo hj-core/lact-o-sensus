@@ -16,6 +16,9 @@ use crate::identity::NodeIdentity;
 pub enum RaftError {
     #[error("Node is in an unrecoverable state due to a failed transition")]
     Poisoned,
+
+    #[error("Node is not the leader and cannot propose mutations")]
+    NotLeader,
 }
 
 // --- Type-State Markers (Role-Specific Volatile State) ---
@@ -165,6 +168,9 @@ pub struct RaftNode<S: NodeState> {
     /// Index of highest log entry applied to state machine.
     last_applied: u64,
 
+    /// Signal triggered whenever commit_index increases.
+    commit_signal: Arc<Notify>,
+
     /// Role-specific volatile state marker.
     state: S,
 }
@@ -199,6 +205,10 @@ impl<S: NodeState> RaftNode<S> {
         self.commit_index
     }
 
+    pub fn commit_signal(&self) -> &Arc<Notify> {
+        &self.commit_signal
+    }
+
     /// Updates the commit index.
     ///
     /// Adheres to the monotonicity requirement: stale updates (e.g., from
@@ -225,7 +235,11 @@ impl<S: NodeState> RaftNode<S> {
             );
         }
 
-        self.commit_index = index;
+        if index > self.commit_index {
+            self.commit_index = index;
+            // Notify anyone waiting for this node to reach a specific commit index.
+            self.commit_signal.notify_waiters();
+        }
     }
 
     pub fn last_applied(&self) -> u64 {
@@ -312,6 +326,7 @@ impl<S: NodeState> RaftNode<S> {
         Vec<LogEntry>,
         u64,
         u64,
+        Arc<Notify>,
     ) {
         (
             self.identity,
@@ -320,6 +335,7 @@ impl<S: NodeState> RaftNode<S> {
             self.log,
             self.commit_index,
             self.last_applied,
+            self.commit_signal,
         )
     }
 }
@@ -333,6 +349,7 @@ impl RaftNode<Follower> {
             log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
+            commit_signal: Arc::new(Notify::new()),
             state: Follower::default(),
         }
     }
@@ -349,6 +366,7 @@ impl RaftNode<Follower> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
+            commit_signal: self.commit_signal,
             state,
         }
     }
@@ -368,6 +386,7 @@ impl RaftNode<Candidate> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
+            commit_signal: self.commit_signal,
             state,
         }
     }
@@ -382,6 +401,7 @@ impl RaftNode<Candidate> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
+            commit_signal: self.commit_signal,
             state: Leader::new(peer_ids, last_log_index),
         }
     }
@@ -438,6 +458,36 @@ impl RaftNodeState {
         }
     }
 
+    /// Returns the commit signal of the node.
+    pub fn commit_signal(&self) -> Result<Arc<Notify>, RaftError> {
+        match self {
+            RaftNodeState::Follower(node) => Ok(node.commit_signal().clone()),
+            RaftNodeState::Candidate(node) => Ok(node.commit_signal().clone()),
+            RaftNodeState::Leader(node) => Ok(node.commit_signal().clone()),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    }
+
+    /// Appends a new command to the leader's log.
+    /// Returns the index of the newly appended entry.
+    pub fn propose(&mut self, command: Vec<u8>) -> Result<u64, RaftError> {
+        match self {
+            RaftNodeState::Leader(node) => {
+                let index = node.last_log_index() + 1;
+                let term = node.current_term();
+                let entry = LogEntry {
+                    index,
+                    term,
+                    data: command,
+                };
+                node.log_mut().push(entry);
+                Ok(index)
+            }
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+            _ => Err(RaftError::NotLeader),
+        }
+    }
+
     /// Returns the cluster ID this node belongs to.
     pub fn cluster_id(&self) -> Result<&ClusterId, RaftError> {
         match self {
@@ -470,12 +520,13 @@ impl RaftNodeState {
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNodeState {
-        let (identity, current_term, voted_for, log, commit_index, last_applied) = match self {
-            RaftNodeState::Follower(n) => n.into_parts(),
-            RaftNodeState::Candidate(n) => n.into_parts(),
-            RaftNodeState::Leader(n) => n.into_parts(),
-            RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
-        };
+        let (identity, current_term, voted_for, log, commit_index, last_applied, commit_signal) =
+            match self {
+                RaftNodeState::Follower(n) => n.into_parts(),
+                RaftNodeState::Candidate(n) => n.into_parts(),
+                RaftNodeState::Leader(n) => n.into_parts(),
+                RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
+            };
 
         let mut new_node = RaftNode {
             identity,
@@ -484,6 +535,7 @@ impl RaftNodeState {
             log,
             commit_index,
             last_applied,
+            commit_signal,
             state: Follower::new(leader_id),
         };
 
