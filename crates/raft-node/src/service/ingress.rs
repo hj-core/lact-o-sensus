@@ -9,6 +9,7 @@ use common::proto::v1::ProposeMutationRequest;
 use common::proto::v1::ProposeMutationResponse;
 use common::proto::v1::QueryStateRequest;
 use common::proto::v1::QueryStateResponse;
+use common::proto::v1::QueryStatus;
 use common::proto::v1::ingress_service_server::IngressService;
 use prost::Message;
 use tokio::sync::RwLock;
@@ -91,13 +92,30 @@ impl IngressDispatcher {
     }
 
     /// Helper to construct a standard "Rejected/Redirection" response when the
-    /// node is a Follower.
-    fn follower_response(&self, node: &RaftNode<Follower>) -> Response<ProposeMutationResponse> {
+    /// node is a Follower for mutations.
+    fn mutation_follower_response(
+        &self,
+        node: &RaftNode<Follower>,
+    ) -> Response<ProposeMutationResponse> {
         let (leader_hint, error_message) = self.redirection_hint(node);
         Response::new(ProposeMutationResponse {
             cluster_id: self.cluster_id_as_str().to_string(),
             status: MutationStatus::Rejected as i32,
             state_version: 0,
+            leader_hint,
+            error_message,
+        })
+    }
+
+    /// Helper to construct a standard "Rejected/Redirection" response when the
+    /// node is a Follower for QueryState.
+    fn query_follower_response(&self, node: &RaftNode<Follower>) -> Response<QueryStateResponse> {
+        let (leader_hint, error_message) = self.redirection_hint(node);
+        Response::new(QueryStateResponse {
+            cluster_id: self.cluster_id_as_str().to_string(),
+            items: Vec::new(),
+            current_state_version: 0,
+            status: QueryStatus::Rejected as i32,
             leader_hint,
             error_message,
         })
@@ -172,7 +190,7 @@ impl IngressService for IngressDispatcher {
                         error_message: "Election in progress. No leader established.".to_string(),
                     }));
                 }
-                RaftNodeState::Follower(node) => return Ok(self.follower_response(node)),
+                RaftNodeState::Follower(node) => return Ok(self.mutation_follower_response(node)),
                 _ => return Err(self.poisoned_status()),
             }
         }; // READ LOCK DROPPED
@@ -255,7 +273,7 @@ impl IngressService for IngressDispatcher {
                 Err(RaftError::NotLeader) => {
                     // Node was demoted while we were talking to the AI!
                     if let RaftNodeState::Follower(node) = &*guard {
-                        return Ok(self.follower_response(node));
+                        return Ok(self.mutation_follower_response(node));
                     }
                     return Err(Status::unavailable("Leadership lost during evaluation"));
                 }
@@ -282,7 +300,7 @@ impl IngressService for IngressDispatcher {
                     }
                     RaftNodeState::Follower(node) => {
                         info!("Demoted while waiting for quorum. Redirecting...");
-                        return Ok(self.follower_response(node));
+                        return Ok(self.mutation_follower_response(node));
                     }
                     _ => return Err(self.poisoned_status()),
                 }
@@ -316,27 +334,29 @@ impl IngressService for IngressDispatcher {
 
         match &*state_guard {
             RaftNodeState::Follower(node) => {
-                let (leader_hint, _) = self.redirection_hint(node);
-                // TODO: Phase 6 - Consistency Models (Linearizable vs Stale Reads)
-                info!(
-                    "Redirecting query: Node is a Follower. Hint='{}'",
-                    leader_hint
-                );
-
-                Ok(Response::new(QueryStateResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
-                    items: Vec::new(),
-                    current_state_version: 0,
-                }))
+                info!("Redirecting query: Node is a Follower.");
+                Ok(self.query_follower_response(node))
             }
-            _ => {
+            RaftNodeState::Candidate(_) => Ok(Response::new(QueryStateResponse {
+                cluster_id: self.cluster_id_as_str().to_string(),
+                items: Vec::new(),
+                current_state_version: 0,
+                status: QueryStatus::Rejected as i32,
+                leader_hint: String::new(),
+                error_message: "Election in progress. No leader established.".to_string(),
+            })),
+            RaftNodeState::Leader(_) => {
                 // TODO: Phase 5 - Implement State Machine queries (Item Store)
                 Ok(Response::new(QueryStateResponse {
                     cluster_id: self.cluster_id_as_str().to_string(),
                     items: Vec::new(),
                     current_state_version: 0,
+                    status: QueryStatus::Success as i32,
+                    leader_hint: String::new(),
+                    error_message: String::new(),
                 }))
             }
+            _ => Err(self.poisoned_status()),
         }
     }
 }
@@ -451,6 +471,78 @@ mod tests {
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Rejected as i32);
             assert!(response.error_message.contains("established"));
+        }
+    }
+
+    mod query_state {
+        use super::*;
+
+        #[tokio::test]
+        async fn returns_rejected_when_follower_leader_unknown() {
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
+            let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
+            let req = Request::new(QueryStateRequest {
+                cluster_id: "test-cluster".to_string(),
+                query_filter: None,
+                ..Default::default()
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Rejected as i32);
+            assert!(response.leader_hint.is_empty());
+        }
+
+        #[tokio::test]
+        async fn returns_hint_when_follower_leader_known() {
+            let mut peers = HashMap::new();
+            let leader_addr = "http://127.0.0.1:50052";
+            peers.insert(NodeId::new(2), leader_addr.to_string());
+
+            let id = mock_identity();
+            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id));
+            let follower = initial_state.into_follower(0, Some(NodeId::new(2)));
+
+            let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
+            let req = Request::new(QueryStateRequest {
+                cluster_id: "test-cluster".to_string(),
+                ..Default::default()
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Rejected as i32);
+            assert!(response.leader_hint.contains(leader_addr));
+        }
+
+        #[tokio::test]
+        async fn returns_rejected_when_candidate() {
+            let id = mock_identity();
+            let follower = RaftNode::<Follower>::new(id);
+            let candidate = RaftNodeState::Candidate(follower.into_candidate());
+
+            let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
+            let req = Request::new(QueryStateRequest {
+                cluster_id: "test-cluster".to_string(),
+                ..Default::default()
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Rejected as i32);
+        }
+
+        #[tokio::test]
+        async fn returns_success_when_leader() {
+            let id = mock_identity();
+            let follower = RaftNode::<Follower>::new(id);
+            let leader = RaftNodeState::Leader(follower.into_candidate().into_leader(Vec::new()));
+
+            let dispatcher = mock_dispatcher(leader, mock_peer_manager(&HashMap::new()));
+            let req = Request::new(QueryStateRequest {
+                cluster_id: "test-cluster".to_string(),
+                ..Default::default()
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Success as i32);
         }
     }
 }

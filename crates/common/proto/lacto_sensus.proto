@@ -125,14 +125,24 @@ message ProposeMutationResponse {
 
 message QueryStateRequest {
     string cluster_id = 1;
-    string query_filter = 2;
+    optional string query_filter = 2;
     optional uint64 min_state_version = 3;
+}
+
+enum QueryStatus {
+    QUERY_STATUS_UNSPECIFIED = 0;
+    QUERY_STATUS_SUCCESS = 1;
+    QUERY_STATUS_REJECTED = 2; // Not the leader, use leader_hint
+    QUERY_STATUS_ERROR = 3;    // Internal error, check error_message
 }
 
 message QueryStateResponse {
     string cluster_id = 1;
     repeated GroceryItem items = 2;
     uint64 current_state_version = 3;
+    QueryStatus status = 4;
+    string leader_hint = 5;
+    string error_message = 6;
 }
 
 // --- Policy Service (Leader-to-AI) ---
