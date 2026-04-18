@@ -401,9 +401,9 @@ def test_ai_veto_egress() -> None:
         cmd, capture_output=True, text=True, check=False
     )
 
-    if "AI evaluation successful" in result.stdout:
+    if "MUTATION_STATUS_COMMITTED" in result.stdout:
         print(
-            "SUCCESS: Leader successfully called out to AI Veto Node."
+            "SUCCESS: Leader successfully called out to AI Veto Node and committed the entry."
         )
     else:
         print(

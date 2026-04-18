@@ -1,12 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::proto::v1::CommittedMutation;
+use common::proto::v1::MutationIntent;
 use common::proto::v1::MutationStatus;
+use common::proto::v1::OperationType;
 use common::proto::v1::ProposeMutationRequest;
 use common::proto::v1::ProposeMutationResponse;
 use common::proto::v1::QueryStateRequest;
 use common::proto::v1::QueryStateResponse;
 use common::proto::v1::ingress_service_server::IngressService;
+use prost::Message;
 use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Response;
@@ -18,6 +22,7 @@ use tracing::warn;
 
 use crate::identity::NodeIdentity;
 use crate::node::Follower;
+use crate::node::RaftError;
 use crate::node::RaftNode;
 use crate::node::RaftNodeState;
 use crate::peer::PeerManager;
@@ -84,6 +89,40 @@ impl IngressDispatcher {
             ),
         }
     }
+
+    /// Helper to construct a standard "Rejected/Redirection" response when the
+    /// node is a Follower.
+    fn follower_response(&self, node: &RaftNode<Follower>) -> Response<ProposeMutationResponse> {
+        let (leader_hint, error_message) = self.redirection_hint(node);
+        Response::new(ProposeMutationResponse {
+            cluster_id: self.cluster_id_as_str().to_string(),
+            status: MutationStatus::Rejected as i32,
+            state_version: 0,
+            leader_hint,
+            error_message,
+        })
+    }
+
+    /// Normalizes and validates the user's intent before it is processed by
+    /// the AI or added to the consensus log.
+    fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
+        intent.item_key = intent.item_key.trim().to_lowercase();
+        intent.quantity = intent.quantity.trim().to_string();
+
+        if let Some(unit) = intent.unit.as_mut() {
+            *unit = unit.trim().to_lowercase();
+        }
+
+        if intent.item_key.is_empty() {
+            return Err(Status::invalid_argument("item_key cannot be empty"));
+        }
+
+        if intent.quantity.is_empty() && intent.operation != OperationType::Delete as i32 {
+            return Err(Status::invalid_argument("quantity cannot be empty"));
+        }
+
+        Ok(())
+    }
 }
 
 impl ServiceState for IngressDispatcher {
@@ -105,105 +144,161 @@ impl IngressService for IngressDispatcher {
         let req = request.into_inner();
         self.verify_identity(&req.cluster_id)?;
 
-        let state_guard = self.state.read().await;
-        self.verify_node_integrity(&state_guard)?;
-
         let span = info_span!("propose_mutation", client = %req.client_id, seq = req.sequence_id);
         let _enter = span.enter();
 
-        match &*state_guard {
-            RaftNodeState::Follower(node) => {
-                let (leader_hint, error_message) = self.redirection_hint(node);
-                info!(
-                    "Rejecting mutation: Node is a Follower. Redirecting to leader_hint='{}'",
-                    leader_hint
-                );
+        // --- Phase 1: Leadership & Normalization (Read Lock) ---
+        let intent = {
+            let state_guard = self.state.read().await;
+            self.verify_node_integrity(&state_guard)?;
 
-                Ok(Response::new(ProposeMutationResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
-                    status: MutationStatus::Rejected as i32,
-                    state_version: 0,
-                    leader_hint,
-                    error_message,
-                }))
+            match &*state_guard {
+                RaftNodeState::Leader(_) => {
+                    // TODO: Phase 6 - Exactly-Once Semantics (EOS)
+                    // Check Session Table here before talking to AI.
+
+                    let mut intent = req.intent.clone().ok_or_else(|| {
+                        Status::invalid_argument("ProposeMutationRequest is missing 'intent' field")
+                    })?;
+                    self.normalize_intent(&mut intent)?;
+                    intent
+                }
+                RaftNodeState::Candidate(_) => {
+                    return Ok(Response::new(ProposeMutationResponse {
+                        cluster_id: self.cluster_id_as_str().to_string(),
+                        status: MutationStatus::Rejected as i32,
+                        state_version: 0,
+                        leader_hint: String::new(),
+                        error_message: "Election in progress. No leader established.".to_string(),
+                    }));
+                }
+                RaftNodeState::Follower(node) => return Ok(self.follower_response(node)),
+                _ => return Err(self.poisoned_status()),
             }
-            RaftNodeState::Candidate(_) => {
-                info!("Rejecting mutation: Node is a Candidate (Election in progress).");
-                Ok(Response::new(ProposeMutationResponse {
+        }; // READ LOCK DROPPED
+
+        // --- Phase 2: Policy Egress (I/O - No Locks) ---
+        info!("Triggering AI Veto evaluation for normalized intent...");
+        let outcome = self
+            .veto_relay
+            .evaluate(
+                req.cluster_id.clone(),
+                req.client_id.clone(),
+                &intent,
+                &[], // Inventory store implemented in Phase 5
+                self.veto_timeout,
+            )
+            .await;
+
+        let veto = match outcome {
+            Ok(v) => {
+                self.verify_identity(&v.cluster_id)?;
+                if !v.is_approved {
+                    info!("Mutation VETOED by AI: {}", v.moral_justification);
+                    return Ok(Response::new(ProposeMutationResponse {
+                        cluster_id: self.cluster_id_as_str().to_string(),
+                        status: MutationStatus::Vetoed as i32,
+                        state_version: 0,
+                        leader_hint: String::new(),
+                        error_message: v.moral_justification,
+                    }));
+                }
+                v
+            }
+            Err(VetoError::Timeout(d)) => {
+                warn!("AI Veto evaluation timed out after {:?}", d);
+                return Ok(Response::new(ProposeMutationResponse {
                     cluster_id: self.cluster_id_as_str().to_string(),
                     status: MutationStatus::Rejected as i32,
                     state_version: 0,
                     leader_hint: String::new(),
-                    error_message: "Election in progress. No leader established. Please retry \
-                                    shortly."
-                        .to_string(),
-                }))
+                    error_message: "AI evaluation timed out. Please retry shortly.".to_string(),
+                }));
             }
-            RaftNodeState::Leader(_) => {
-                info!("Leader received proposal. Triggering AI Veto evaluation...");
+            Err(e) => {
+                error!("AI Veto infrastructure failure: {}", e);
+                return Err(Status::internal("Internal policy engine failure"));
+            }
+        };
 
-                let outcome = self
-                    .veto_relay
-                    .evaluate(
-                        req.cluster_id.clone(),
-                        req.client_id.clone(),
-                        req.intent.as_ref().unwrap_or(&Default::default()),
-                        &[], // Inventory store implemented in Phase 5
-                        self.veto_timeout,
-                    )
-                    .await;
+        // --- Phase 3: Consensus Proposal (Write Lock) ---
+        // Resolve the intent into a finalized ledger entry.
+        // TODO: Phase 5 - Item Store Integration (Delta Calculation)
+        let mutation = CommittedMutation::new(
+            req.client_id.clone(),
+            req.sequence_id,
+            intent.item_key.clone(),
+            intent.quantity.clone(),
+            veto.category_assignment,
+            intent.unit.unwrap_or_default(),
+            intent.operation == OperationType::Delete as i32,
+            std::time::SystemTime::now(),
+        );
 
-                match outcome {
-                    Ok(veto) => {
-                        // ADR 004: Centralized identity verification of the AI response.
-                        self.verify_identity(&veto.cluster_id)?;
+        let mut command = Vec::new();
+        mutation
+            .encode(&mut command)
+            .map_err(|e| Status::internal(e.to_string()))?;
 
-                        info!(
-                            "AI Veto response received: approved={}, justification='{}'",
-                            veto.is_approved, veto.moral_justification
-                        );
+        // Precision Synchronization: Get the signal handle BEFORE insertion
+        let commit_signal = self
+            .state
+            .read()
+            .await
+            .commit_signal()
+            .map_err(|_| self.poisoned_status())?;
 
-                        // TODO: Phase 4 Step 3 - Handle commit logic
-                        Ok(Response::new(ProposeMutationResponse {
-                            cluster_id: self.cluster_id_as_str().to_string(),
-                            status: MutationStatus::Rejected as i32, // Placeholder
-                            state_version: 0,
-                            leader_hint: String::new(),
-                            error_message: format!(
-                                "AI evaluation successful (Approved: {}). Replication not yet \
-                                 implemented.",
-                                veto.is_approved
-                            ),
-                        }))
+        let proposal_index = {
+            let mut guard = self.state.write().await;
+            match guard.propose(command) {
+                Ok(idx) => idx,
+                Err(RaftError::NotLeader) => {
+                    // Node was demoted while we were talking to the AI!
+                    if let RaftNodeState::Follower(node) = &*guard {
+                        return Ok(self.follower_response(node));
                     }
-                    Err(VetoError::Timeout(d)) => {
-                        // High-signal warning for transient latency.
-                        warn!("AI Veto evaluation timed out after {:?}", d);
-                        Ok(Response::new(ProposeMutationResponse {
-                            cluster_id: self.cluster_id_as_str().to_string(),
-                            status: MutationStatus::Rejected as i32,
-                            state_version: 0,
-                            leader_hint: String::new(),
-                            error_message: "Evaluation timed out. Please retry shortly."
-                                .to_string(),
-                        }))
+                    return Err(Status::unavailable("Leadership lost during evaluation"));
+                }
+                _ => return Err(self.poisoned_status()),
+            }
+        }; // WRITE LOCK DROPPED
+
+        // --- Phase 4: Wait for Quorum (Reactive Sync) ---
+        info!(
+            "Mutation index {} appended. Waiting for quorum...",
+            proposal_index
+        );
+        loop {
+            // Register interest before checking state to avoid "Lost Wakeup"
+            let next_notification = commit_signal.notified();
+
+            {
+                let guard = self.state.read().await;
+                match &*guard {
+                    RaftNodeState::Leader(node) => {
+                        if node.commit_index() >= proposal_index {
+                            break;
+                        }
                     }
-                    Err(VetoError::RpcFailure(e)) => {
-                        // Error level for actual infrastructure outages.
-                        error!("AI Veto evaluation infrastructure failure: {}", e);
-                        Ok(Response::new(ProposeMutationResponse {
-                            cluster_id: self.cluster_id_as_str().to_string(),
-                            status: MutationStatus::Rejected as i32,
-                            state_version: 0,
-                            leader_hint: String::new(),
-                            error_message: "Internal system error occurred during evaluation."
-                                .to_string(),
-                        }))
+                    RaftNodeState::Follower(node) => {
+                        info!("Demoted while waiting for quorum. Redirecting...");
+                        return Ok(self.follower_response(node));
                     }
+                    _ => return Err(self.poisoned_status()),
                 }
             }
-            RaftNodeState::Poisoned => unreachable!("Caught by verify_health"),
+
+            next_notification.await;
         }
+
+        info!("Mutation index {} committed successfully.", proposal_index);
+        Ok(Response::new(ProposeMutationResponse {
+            cluster_id: self.cluster_id_as_str().to_string(),
+            status: MutationStatus::Committed as i32,
+            state_version: proposal_index,
+            leader_hint: String::new(),
+            error_message: String::new(),
+        }))
     }
 
     async fn query_state(
@@ -222,16 +317,12 @@ impl IngressService for IngressDispatcher {
         match &*state_guard {
             RaftNodeState::Follower(node) => {
                 let (leader_hint, _) = self.redirection_hint(node);
-                // For queries, we return the leader hint but may eventually support
-                // stale reads from followers in Phase 6.
+                // TODO: Phase 6 - Consistency Models (Linearizable vs Stale Reads)
                 info!(
                     "Redirecting query: Node is a Follower. Hint='{}'",
                     leader_hint
                 );
 
-                // In Phase 4, we don't return an error here, but we could return the hint
-                // in metadata or a specific field if the proto allowed it.
-                // For now, we return empty results as a placeholder.
                 Ok(Response::new(QueryStateResponse {
                     cluster_id: self.cluster_id_as_str().to_string(),
                     items: Vec::new(),
@@ -239,7 +330,7 @@ impl IngressService for IngressDispatcher {
                 }))
             }
             _ => {
-                // TODO: Phase 5 - Implement State Machine queries
+                // TODO: Phase 5 - Implement State Machine queries (Item Store)
                 Ok(Response::new(QueryStateResponse {
                     cluster_id: self.cluster_id_as_str().to_string(),
                     items: Vec::new(),
@@ -359,7 +450,7 @@ mod tests {
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Rejected as i32);
-            assert!(response.error_message.contains("Election in progress"));
+            assert!(response.error_message.contains("established"));
         }
     }
 }
