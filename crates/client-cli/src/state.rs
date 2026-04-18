@@ -1,9 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use common::types::ClientId;
 use common::types::ClusterId;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Represents the persistent state of the Lact-O-Sensus client.
 ///
@@ -25,7 +28,8 @@ impl ClientState {
 
     // --- Initialization ---
 
-    /// Loads the client state from the specified path or initializes it if missing.
+    /// Loads the client state from the specified path or initializes it if
+    /// missing.
     ///
     /// # Arguments
     /// * `path` - Path to the persistence file (e.g., .client_state.json).
@@ -33,8 +37,10 @@ impl ClientState {
     /// * `overriding_nodes` - Optional new nodes to add to the discovery list.
     ///
     /// # Behavior
-    /// - If file exists: Validates `cluster_id`, merges `overriding_nodes` (prioritizing them).
-    /// - If file is missing: Requires at least one entry in `overriding_nodes` to bootstrap.
+    /// - If file exists: Validates `cluster_id`, merges `overriding_nodes`
+    ///   (prioritizing them).
+    /// - If file is missing: Requires at least one entry in `overriding_nodes`
+    ///   to bootstrap.
     pub fn load_or_init<P: AsRef<Path>>(
         path: P,
         cluster_id: ClusterId,
@@ -77,7 +83,9 @@ impl ClientState {
             Ok(state)
         } else {
             if overriding_nodes.is_empty() {
-                anyhow::bail!("Bootstrap failed: no state file found and no node addresses provided.");
+                anyhow::bail!(
+                    "Bootstrap failed: no state file found and no node addresses provided."
+                );
             }
 
             let state = Self {
@@ -100,13 +108,16 @@ impl ClientState {
     /// Exactly-Once Semantics across client restarts.
     pub fn next_sequence_id(&mut self) -> Result<u64> {
         self.sequence_id += 1;
-        self.save().context("Failed to persist sequence_id increment")?;
+        self.save()
+            .context("Failed to persist sequence_id increment")?;
         Ok(self.sequence_id)
     }
 
-    /// Records a successful interaction with a node, moving it to the front of the list.
+    /// Records a successful interaction with a node, moving it to the front of
+    /// the list.
     ///
-    /// If the node is already at the front, this is a no-op to avoid unnecessary disk I/O.
+    /// If the node is already at the front, this is a no-op to avoid
+    /// unnecessary disk I/O.
     pub fn record_success(&mut self, node_addr: &str) -> Result<()> {
         if self.known_nodes.first().map(|s| s.as_str()) == Some(node_addr) {
             return Ok(());
@@ -116,7 +127,8 @@ impl ClientState {
         self.known_nodes.retain(|n| n != &addr);
         self.known_nodes.insert(0, addr);
         self.known_nodes.truncate(Self::MAX_KNOWN_NODES);
-        self.save().context("Failed to persist successful node update")
+        self.save()
+            .context("Failed to persist successful node update")
     }
 
     /// Records a new leader hint received from a node.
@@ -155,8 +167,9 @@ impl ClientState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     mod load_or_init {
         use super::*;
@@ -251,7 +264,8 @@ mod tests {
             let dir = tempdir()?;
             let path = dir.path().join("state.json");
             let cluster_id = ClusterId::try_new("test-cluster")?;
-            let mut state = ClientState::load_or_init(&path, cluster_id, vec!["node1".to_string()])?;
+            let mut state =
+                ClientState::load_or_init(&path, cluster_id, vec!["node1".to_string()])?;
 
             let metadata_before = std::fs::metadata(&path)?;
             // Sleep to ensure potential mtime change is detectable
