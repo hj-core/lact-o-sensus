@@ -366,6 +366,8 @@ dependencies = [
  "prost",
  "rust_decimal",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",
