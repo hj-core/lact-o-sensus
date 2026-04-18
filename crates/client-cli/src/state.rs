@@ -8,6 +8,9 @@ use common::types::ClusterId;
 use serde::Deserialize;
 use serde::Serialize;
 
+/// The maximum number of node addresses tracked in the client state.
+pub const MAX_KNOWN_NODES: usize = 10;
+
 /// Represents the persistent state of the Lact-O-Sensus client.
 ///
 /// This state is critical for maintaining Exactly-Once Semantics (EOS)
@@ -24,8 +27,6 @@ pub struct ClientState {
 }
 
 impl ClientState {
-    const MAX_KNOWN_NODES: usize = 10;
-
     // --- Initialization ---
 
     /// Loads the client state from the specified path or initializes it if
@@ -49,7 +50,7 @@ impl ClientState {
         let path_buf = path.as_ref().to_path_buf();
 
         // Defensive: truncate input early if it's too large
-        overriding_nodes.truncate(Self::MAX_KNOWN_NODES);
+        overriding_nodes.truncate(MAX_KNOWN_NODES);
 
         if path_buf.exists() {
             let data = std::fs::read_to_string(&path_buf)
@@ -68,7 +69,7 @@ impl ClientState {
             state.path = path_buf;
 
             // Defensive: ensure loaded nodes are also within limits before merging
-            state.known_nodes.truncate(Self::MAX_KNOWN_NODES);
+            state.known_nodes.truncate(MAX_KNOWN_NODES);
 
             // Merge new nodes: prepend and deduplicate
             if !overriding_nodes.is_empty() {
@@ -76,7 +77,7 @@ impl ClientState {
                     state.known_nodes.retain(|n| n != &node);
                     state.known_nodes.insert(0, node);
                 }
-                state.known_nodes.truncate(Self::MAX_KNOWN_NODES);
+                state.known_nodes.truncate(MAX_KNOWN_NODES);
                 state.save()?;
             }
 
@@ -126,7 +127,7 @@ impl ClientState {
         let addr = node_addr.to_string();
         self.known_nodes.retain(|n| n != &addr);
         self.known_nodes.insert(0, addr);
-        self.known_nodes.truncate(Self::MAX_KNOWN_NODES);
+        self.known_nodes.truncate(MAX_KNOWN_NODES);
         self.save()
             .context("Failed to persist successful node update")
     }
