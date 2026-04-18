@@ -32,6 +32,24 @@ message MutationIntent {
     OperationType operation = 5;
 }
 
+// --- Internal Ledger Entry (Replicated via Raft) ---
+
+message CommittedMutation {
+    // 1. Session Layer (ADR 006)
+    string client_id = 1;
+    uint64 sequence_id = 2;
+
+    // 2. State Layer (Flattened Upsert)
+    string item_key = 3;
+    string updated_quantity = 4;
+    string updated_category = 5;
+    string updated_unit = 6;
+    bool is_delete = 7;
+
+    // 3. Metadata Layer
+    google.protobuf.Timestamp event_time = 8;
+}
+
 // --- Consensus Service (Raft Peer-to-Peer) ---
 
 service ConsensusService {
@@ -56,7 +74,7 @@ message RequestVoteResponse {
 message LogEntry {
     uint64 term = 1;
     uint64 index = 2;
-    bytes data = 3; // Serialized mutation command
+    bytes data = 3; // Serialized mutation command (CommittedMutation)
 }
 
 message AppendEntriesRequest {
