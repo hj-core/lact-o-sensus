@@ -172,7 +172,7 @@ async fn initiate_election(
                             if resp.cluster_id != *cluster_id {
                                 return Err(unauthorized_response_status());
                             }
-                            Ok(resp)
+                            Ok((peer_id, resp))
                         }
                         Err(e) => Err(e),
                     }
@@ -185,13 +185,13 @@ async fn initiate_election(
     let mut vote_stream = vote_requests.collect::<FuturesUnordered<_>>();
 
     // 3. Tally votes and handle term updates
-    let mut votes_granted = 1; // Vote for self
+    let mut votes_granted = 1; // Start with 1 (self-vote)
     let total_nodes = peer_ids.len() + 1;
     let quorum = (total_nodes / 2) + 1;
 
     while let Some(res) = vote_stream.next().await {
         match res {
-            Ok(resp) => {
+            Ok((peer_id, resp)) => {
                 if resp.term > term {
                     info!(
                         "Found higher term ({}) during election. Demoting to Follower.",
@@ -201,21 +201,32 @@ async fn initiate_election(
                     guard.transition(|old| old.into_follower(resp.term, None));
                     return Ok(());
                 }
+
                 if resp.vote_granted {
-                    votes_granted += 1;
-                    if votes_granted >= quorum {
+                    let mut guard = state.write().await;
+                    let mut is_leader = false;
+
+                    guard.transition(|old| match old {
+                        RaftNodeState::Candidate(mut n) if n.current_term() == term => {
+                            n.state_mut().add_vote(peer_id);
+                            // Synchronize local tally from the formal state machine
+                            votes_granted = n.state().vote_count();
+
+                            if votes_granted >= quorum {
+                                is_leader = true;
+                                RaftNodeState::Leader(n.into_leader(peer_ids.clone()))
+                            } else {
+                                RaftNodeState::Candidate(n)
+                            }
+                        }
+                        other => other,
+                    });
+
+                    if is_leader {
                         info!(
                             "Quorum reached early ({} votes)! Transitioning to Leader for term {}.",
                             votes_granted, term
                         );
-                        let mut guard = state.write().await;
-                        let peer_ids_clone = peer_ids.clone();
-                        guard.transition(|old| match old {
-                            RaftNodeState::Candidate(n) if n.current_term() == term => {
-                                RaftNodeState::Leader(n.into_leader(peer_ids_clone))
-                            }
-                            other => other,
-                        });
                         return Ok(());
                     }
                 }
@@ -226,10 +237,18 @@ async fn initiate_election(
         }
     }
 
-    info!(
-        "Election finalized for term {}: {}/{} votes granted.",
-        term, votes_granted, quorum
-    );
+    // Loop finished without reaching quorum or being demoted.
+    let still_candidate = {
+        let guard = state.read().await;
+        matches!(&*guard, RaftNodeState::Candidate(n) if n.current_term() == term)
+    };
+
+    if still_candidate {
+        info!(
+            "Election failed for term {}: only {}/{} votes granted.",
+            term, votes_granted, quorum
+        );
+    }
 
     Ok(())
 }
