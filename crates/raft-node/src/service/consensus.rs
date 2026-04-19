@@ -88,13 +88,37 @@ impl ConsensusService for ConsensusDispatcher {
                 if req.term >= node.current_term()
                     && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
                 {
-                    // TODO: Phase 5 - Add log up-to-date check (§5.4)
-                    vote_granted = true;
-                    node.vote_for(candidate_id);
-                    info!(
-                        "Granting vote to candidate {} for term {}",
-                        req.candidate_id, req.term
-                    );
+                    let local_last_term = node.last_log_term();
+                    let local_last_index = node.last_log_index();
+
+                    // Raft §5.4:
+                    // If the logs have last entries with different terms, then the log with the
+                    // later term is more up-to-date. If the logs end with the same term, then
+                    // whichever log is longer is more up-to-date.
+                    let is_up_to_date = if req.last_log_term != local_last_term {
+                        req.last_log_term > local_last_term
+                    } else {
+                        req.last_log_index >= local_last_index
+                    };
+
+                    if is_up_to_date {
+                        vote_granted = true;
+                        node.vote_for(candidate_id);
+                        info!(
+                            "Granting vote to candidate {} for term {}",
+                            req.candidate_id, req.term
+                        );
+                    } else {
+                        debug!(
+                            "Rejecting vote for candidate {}: candidate's log is not up-to-date \
+                             (local: index {}, term {}; remote: index {}, term {})",
+                            req.candidate_id,
+                            local_last_index,
+                            local_last_term,
+                            req.last_log_index,
+                            req.last_log_term
+                        );
+                    }
                 }
             }
             RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => {
@@ -366,12 +390,34 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn grants_vote_when_term_is_current_and_not_voted() {
+        async fn grants_vote_when_term_is_higher_and_not_voted() {
             let dispatcher = mock_dispatcher();
 
             let req = Request::new(RequestVoteRequest {
                 cluster_id: "test-cluster".to_string(),
-                term: 1, // Follower starts at term 0, so 1 is higher/current
+                term: 1, // Follower starts at term 0, so 1 is higher
+                candidate_id: "2".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+            assert_eq!(response.vote_granted, true);
+            assert_eq!(response.term, 1);
+        }
+
+        #[tokio::test]
+        async fn grants_vote_when_term_is_already_current_and_not_voted() {
+            let dispatcher = mock_dispatcher();
+            // Pre-initialize to term 1
+            {
+                let mut state = dispatcher.state.write().await;
+                state.transition(|old| old.into_follower(1, None));
+            }
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1, // Same as current term
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
                 last_log_term: 0,
@@ -403,6 +449,125 @@ mod tests {
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
             assert_eq!(response.vote_granted, false);
             assert_eq!(response.term, 2);
+        }
+
+        #[tokio::test]
+        async fn rejects_vote_when_candidate_log_is_shorter_same_term() {
+            let dispatcher = mock_dispatcher();
+
+            // Populate local log: 2 entries in term 1
+            {
+                let mut state = dispatcher.state.write().await;
+                if let RaftNodeState::Follower(node) = &mut *state {
+                    node.log_mut().push(common::proto::v1::LogEntry {
+                        index: 1,
+                        term: 1,
+                        data: vec![],
+                    });
+                    node.log_mut().push(common::proto::v1::LogEntry {
+                        index: 2,
+                        term: 1,
+                        data: vec![],
+                    });
+                }
+            }
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 1, // Shorter than local (2)
+                last_log_term: 1,
+            });
+
+            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+            assert_eq!(response.vote_granted, false);
+        }
+
+        #[tokio::test]
+        async fn rejects_vote_when_candidate_log_has_older_term() {
+            let dispatcher = mock_dispatcher();
+
+            // Populate local log: 1 entry in term 2
+            {
+                let mut state = dispatcher.state.write().await;
+                if let RaftNodeState::Follower(node) = &mut *state {
+                    node.log_mut().push(common::proto::v1::LogEntry {
+                        index: 1,
+                        term: 2,
+                        data: vec![],
+                    });
+                }
+            }
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 2,
+                candidate_id: "2".to_string(),
+                last_log_index: 10, // Longer, but...
+                last_log_term: 1,   // ...older term
+            });
+
+            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+            assert_eq!(response.vote_granted, false);
+        }
+
+        #[tokio::test]
+        async fn grants_vote_when_candidate_log_is_longer_same_term() {
+            let dispatcher = mock_dispatcher();
+
+            // Populate local log: 1 entry in term 1
+            {
+                let mut state = dispatcher.state.write().await;
+                if let RaftNodeState::Follower(node) = &mut *state {
+                    node.log_mut().push(common::proto::v1::LogEntry {
+                        index: 1,
+                        term: 1,
+                        data: vec![],
+                    });
+                }
+            }
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 2, // Longer than local (1)
+                last_log_term: 1,
+            });
+
+            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+            assert_eq!(response.vote_granted, true);
+        }
+
+        #[tokio::test]
+        async fn grants_vote_when_candidate_log_has_newer_term() {
+            let dispatcher = mock_dispatcher();
+
+            // Populate local log: 10 entries in term 1
+            {
+                let mut state = dispatcher.state.write().await;
+                if let RaftNodeState::Follower(node) = &mut *state {
+                    for i in 1..=10 {
+                        node.log_mut().push(common::proto::v1::LogEntry {
+                            index: i,
+                            term: 1,
+                            data: vec![],
+                        });
+                    }
+                }
+            }
+
+            let req = Request::new(RequestVoteRequest {
+                cluster_id: "test-cluster".to_string(),
+                term: 2,
+                candidate_id: "2".to_string(),
+                last_log_index: 1, // Shorter, but...
+                last_log_term: 2,  // ...newer term
+            });
+
+            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+            assert_eq!(response.vote_granted, true);
         }
     }
 
