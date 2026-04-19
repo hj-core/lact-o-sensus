@@ -318,7 +318,7 @@ impl<S: NodeState> RaftNode<S> {
     /// Records a vote for a candidate in the current term.
     pub fn vote_for(&mut self, candidate_id: NodeId) {
         self.voted_for = Some(candidate_id);
-        // TODO: Phase 5 - fsync to sled
+        // TODO: Phase 6 - fsync to sled
     }
 
     /// Decomposes the node into its transition-invariant components.
