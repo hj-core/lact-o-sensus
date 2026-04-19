@@ -1,13 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 use common::proto::v1::consensus_service_client::ConsensusServiceClient;
 use common::types::NodeId;
 use thiserror::Error;
 use tonic::transport::Channel;
-
-use crate::identity::NodeIdentity;
 
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -33,19 +29,12 @@ struct PeerConnection {
 /// In this phase, the peer list is static and established at startup.
 #[derive(Debug)]
 pub struct PeerManager {
-    identity: Arc<NodeIdentity>,
     /// Pre-populated cache of peer connections.
     peers: HashMap<NodeId, PeerConnection>,
-    /// The default timeout for consensus RPCs, pulled from config.
-    default_rpc_timeout: Duration,
 }
 
 impl PeerManager {
-    pub fn new(
-        identity: Arc<NodeIdentity>,
-        peer_map: &HashMap<NodeId, String>,
-        default_rpc_timeout: Duration,
-    ) -> Result<Self, PeerError> {
+    pub fn new(peer_map: &HashMap<NodeId, String>) -> Result<Self, PeerError> {
         let mut peers = HashMap::new();
 
         for (id, uri) in peer_map {
@@ -65,11 +54,7 @@ impl PeerManager {
             );
         }
 
-        Ok(Self {
-            identity,
-            peers,
-            default_rpc_timeout,
-        })
+        Ok(Self { peers })
     }
 
     /// Returns a client for a specific peer from the internal channel cache.
@@ -100,11 +85,6 @@ impl PeerManager {
             .ok_or(PeerError::NodeNotFound(node_id))
     }
 
-    /// Returns the configured default timeout for consensus RPCs.
-    pub fn default_rpc_timeout(&self) -> Duration {
-        self.default_rpc_timeout
-    }
-
     /// Returns a list of all peer IDs configured for this cluster.
     pub fn peer_ids(&self) -> Vec<NodeId> {
         self.peers.keys().copied().collect()
@@ -113,14 +93,7 @@ impl PeerManager {
 
 #[cfg(test)]
 mod tests {
-    use common::types::ClusterId;
-
     use super::*;
-
-    fn mock_identity() -> Arc<NodeIdentity> {
-        let id = NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(1));
-        Arc::new(id)
-    }
 
     mod peer_manager_get_client {
         use super::*;
@@ -130,8 +103,7 @@ mod tests {
             let mut peers = HashMap::new();
             peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
-            let manager =
-                PeerManager::new(mock_identity(), &peers, Duration::from_millis(40)).unwrap();
+            let manager = PeerManager::new(&peers).unwrap();
             let result = manager.get_client(NodeId::new(2));
 
             assert!(result.is_ok());
@@ -139,9 +111,7 @@ mod tests {
 
         #[test]
         fn returns_err_when_id_missing() {
-            let manager =
-                PeerManager::new(mock_identity(), &HashMap::new(), Duration::from_millis(40))
-                    .unwrap();
+            let manager = PeerManager::new(&HashMap::new()).unwrap();
             let result = manager.get_client(NodeId::new(99));
 
             assert!(matches!(result, Err(PeerError::NodeNotFound(_))));
@@ -156,8 +126,7 @@ mod tests {
             let mut peers = HashMap::new();
             peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
-            let manager =
-                PeerManager::new(mock_identity(), &peers, Duration::from_millis(40)).unwrap();
+            let manager = PeerManager::new(&peers).unwrap();
             let result = manager.get_address(NodeId::new(2));
 
             assert!(result.is_ok());

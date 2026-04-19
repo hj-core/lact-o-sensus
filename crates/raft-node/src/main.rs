@@ -82,15 +82,14 @@ async fn main() -> Result<()> {
     let initial_node = RaftNode::<Follower>::new(identity.clone());
     let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
 
-    // 7. Initialize Peer Manager (Outbound Registry)
-    let peer_manager =
-        match PeerManager::new(identity.clone(), &config.peers, config.raft.rpc_timeout()) {
-            Ok(pm) => Arc::new(pm),
-            Err(e) => {
-                error!("Fatal Error during Peer Manager initialization: {}", e);
-                return Err(e.into());
-            }
-        };
+    // 7. Initialize Networking (Outbound Peer Mesh)
+    let peer_manager = Arc::new(match PeerManager::new(&config.peers) {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Fatal Error during Peer Manager initialization: {}", e);
+            return Err(e.into());
+        }
+    });
 
     // 8. Initialize RPC Service Dispatchers
     let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());

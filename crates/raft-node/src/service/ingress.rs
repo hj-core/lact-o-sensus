@@ -382,7 +382,7 @@ mod tests {
     }
 
     fn mock_peer_manager(peers: &HashMap<NodeId, String>) -> Arc<PeerManager> {
-        Arc::new(PeerManager::new(mock_identity(), peers, Duration::from_millis(40)).unwrap())
+        Arc::new(PeerManager::new(peers).unwrap())
     }
 
     fn mock_dispatcher(state: RaftNodeState, peer_manager: Arc<PeerManager>) -> IngressDispatcher {
