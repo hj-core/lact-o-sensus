@@ -414,6 +414,75 @@ def test_ai_veto_egress() -> None:
         )
 
 
+def test_client_cli_round_trip() -> None:
+    """Verifies that the Smart Client can redirect from a Follower and commit via the Leader."""
+    leader_id = wait_for_leader()
+
+    # Give followers time to receive the first heartbeat and learn the leader's ID
+    print("Stabilizing cluster (2s)...")
+    time.sleep(2)
+
+    follower_port = next(
+        n["port"] for n in NODES if n["id"] != leader_id
+    )
+
+    print(
+        f"Action: Starting client-cli seeded with Follower (port {follower_port})..."
+    )
+
+    # Clean up any lingering state
+    state_file = ".client_state.json"
+    if os.path.exists(state_file):
+        os.remove(state_file)
+
+    cmd = [
+        "cargo",
+        "run",
+        "-q",  # Quiet cargo output to make parsing stdout easier
+        "-p",
+        "client-cli",
+        "--",
+        "--cluster-id",
+        "lacto-dev-01",
+        "--seed",
+        f"127.0.0.1:{follower_port}",
+    ]
+
+    p = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    try:
+        # Send a mutation command and then exit
+        if p.stdin is None:
+            raise RuntimeError("Failed to open stdin for client-cli")
+
+        p.stdin.write('add "oat milk" 2 cartons dairy\nexit\n')
+        p.stdin.flush()
+
+        stdout, _ = p.communicate(timeout=10)
+
+        if "SUCCESS: Committed at version" in stdout:
+            print(
+                "SUCCESS: Client successfully navigated cluster and committed mutation."
+            )
+        else:
+            print(f"FAILURE: Unexpected client output:\n{stdout}")
+            raise RuntimeError(
+                "Client failed to commit mutation via CLI."
+            )
+    except subprocess.TimeoutExpired as exc:
+        p.kill()
+        raise RuntimeError("Client CLI timed out.") from exc
+    finally:
+        if os.path.exists(state_file):
+            os.remove(state_file)
+
+
 # --- Runner Logic ---
 
 
@@ -426,13 +495,22 @@ def main() -> None:
             False,
             lambda c: test_leadership_stability(),
         ),
-        ("Chaos Failover", False, lambda c: test_leader_failover(c)),
+        (
+            "Chaos Failover",
+            False,
+            lambda c: test_leader_failover(c),  # pylint: disable=W0108
+        ),
         (
             "Identity Guard (ADR 004)",
             False,
             lambda c: test_identity_guard(),
         ),
         ("AI Veto Egress", True, lambda c: test_ai_veto_egress()),
+        (
+            "Smart Client Round-Trip",
+            True,
+            lambda c: test_client_cli_round_trip(),
+        ),
     ]
 
     passed = 0
