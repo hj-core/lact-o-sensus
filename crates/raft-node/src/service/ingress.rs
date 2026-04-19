@@ -147,10 +147,6 @@ impl ServiceState for IngressDispatcher {
     fn identity_arc(&self) -> &Arc<NodeIdentity> {
         &self.identity
     }
-
-    fn state(&self) -> &Arc<RwLock<RaftNodeState>> {
-        &self.state
-    }
 }
 
 #[tonic::async_trait]
@@ -372,7 +368,31 @@ mod tests {
     use super::*;
     use crate::node::Follower;
     use crate::node::RaftNode;
-    use crate::service::veto::MockVetoRelay;
+    use crate::service::veto::VetoError;
+    use crate::service::veto::VetoOutcome;
+    use crate::service::veto::VetoRelay;
+
+    #[derive(Debug)]
+    struct TestVetoRelay;
+
+    #[tonic::async_trait]
+    impl VetoRelay for TestVetoRelay {
+        async fn evaluate(
+            &self,
+            cluster_id: String,
+            _client_id: String,
+            _intent: &common::proto::v1::MutationIntent,
+            _current_inventory: &[common::proto::v1::GroceryItem],
+            _timeout: Duration,
+        ) -> Result<VetoOutcome, VetoError> {
+            Ok(VetoOutcome {
+                cluster_id,
+                is_approved: true,
+                category_assignment: "Primary Flora".to_string(),
+                moral_justification: "Test approval".to_string(),
+            })
+        }
+    }
 
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
@@ -390,7 +410,7 @@ mod tests {
             mock_identity(),
             Arc::new(RwLock::new(state)),
             peer_manager,
-            Arc::new(MockVetoRelay),
+            Arc::new(TestVetoRelay),
             Duration::from_secs(1),
         )
     }

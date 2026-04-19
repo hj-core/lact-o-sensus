@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
 use tonic::Status;
 use tracing::warn;
 
@@ -11,7 +10,6 @@ use crate::node::RaftNodeState;
 /// integrity.
 pub trait ServiceState {
     fn identity_arc(&self) -> &Arc<NodeIdentity>;
-    fn state(&self) -> &Arc<RwLock<RaftNodeState>>;
 
     /// Helper to get the underlying NodeIdentity reference.
     fn identity(&self) -> &NodeIdentity {

@@ -39,10 +39,6 @@ impl ServiceState for ConsensusDispatcher {
     fn identity_arc(&self) -> &Arc<NodeIdentity> {
         &self.identity
     }
-
-    fn state(&self) -> &Arc<RwLock<RaftNodeState>> {
-        &self.state
-    }
 }
 
 #[tonic::async_trait]
