@@ -209,10 +209,10 @@ impl ConsensusService for ConsensusDispatcher {
         // 3. Log Consistency Check (§5.3)
         // Note: We perform this only if the node is in a stable Follower state.
         // If we just transitioned from Candidate/Leader, we are now a Follower.
+        state_guard.reset_heartbeat();
+
         let (success, last_log_index) = match &mut *state_guard {
             RaftNodeState::Follower(node) => {
-                node.state_mut().reset_heartbeat();
-
                 let mut success = true;
 
                 // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
