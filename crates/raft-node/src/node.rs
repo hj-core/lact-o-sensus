@@ -56,6 +56,11 @@ impl Follower {
         &self.heartbeat_signal
     }
 
+    /// Updates the leader ID.
+    pub fn set_leader_id(&mut self, leader_id: Option<NodeId>) {
+        self.leader_id = leader_id;
+    }
+
     /// Resets the heartbeat timer and signals the election timer.
     pub fn reset_heartbeat(&mut self) {
         self.last_heartbeat = Instant::now();

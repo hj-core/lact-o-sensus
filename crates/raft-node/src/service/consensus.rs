@@ -16,8 +16,6 @@ use tracing::info;
 use tracing::info_span;
 
 use crate::identity::NodeIdentity;
-use crate::node::Follower;
-use crate::node::RaftNode;
 use crate::node::RaftNodeState;
 use crate::service::common::ServiceState;
 
@@ -158,7 +156,7 @@ impl ConsensusService for ConsensusDispatcher {
             );
             state_guard.transition(|old| old.into_follower(req.term, leader_id));
         } else if req.term == current_term {
-            match &*state_guard {
+            match &mut *state_guard {
                 RaftNodeState::Candidate(_) => {
                     // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
                     // it recognizes the leader as legitimate and returns to follower state.
@@ -181,7 +179,10 @@ impl ConsensusService for ConsensusDispatcher {
                     error!("{}", msg);
                     panic!("{}", msg);
                 }
-                _ => {} // Followers just accept heartbeats from their leader
+                RaftNodeState::Follower(node) => {
+                    node.state_mut().set_leader_id(leader_id);
+                }
+                _ => {}
             }
         }
 
@@ -274,6 +275,8 @@ mod tests {
     use common::types::ClusterId;
 
     use super::*;
+    use crate::node::Follower;
+    use crate::node::RaftNode;
 
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
