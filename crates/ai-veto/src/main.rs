@@ -10,6 +10,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::transport::Server;
 use tracing::Instrument;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
@@ -79,10 +80,11 @@ async fn main() -> anyhow::Result<()> {
 
         // Define the graceful shutdown signal
         let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to install CTRL+C handler");
-            info!("Shutdown signal received. Commencing graceful exit...");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                error!("Failed to install CTRL+C handler: {}", e);
+            } else {
+                info!("Shutdown signal received. Commencing graceful exit...");
+            }
         };
 
         // 3. Start gRPC Server
