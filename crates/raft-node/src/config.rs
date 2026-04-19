@@ -64,14 +64,6 @@ impl RaftConfig {
         Duration::from_millis(self.heartbeat_interval_ms)
     }
 
-    pub fn election_timeout_min(&self) -> Duration {
-        Duration::from_millis(self.election_timeout_min_ms)
-    }
-
-    pub fn election_timeout_max(&self) -> Duration {
-        Duration::from_millis(self.election_timeout_max_ms)
-    }
-
     pub fn rpc_timeout(&self) -> Duration {
         Duration::from_millis(self.rpc_timeout_ms)
     }

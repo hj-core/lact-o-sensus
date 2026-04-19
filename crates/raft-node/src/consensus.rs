@@ -247,7 +247,7 @@ pub fn spawn_heartbeat_task(
     state: Arc<RwLock<RaftNodeState>>,
     peer_manager: Arc<PeerManager>,
 ) {
-    let interval = Duration::from_millis(config.raft.heartbeat_interval_ms);
+    let interval = config.raft.heartbeat_interval();
     tokio::spawn(async move {
         loop {
             sleep(interval).await;
