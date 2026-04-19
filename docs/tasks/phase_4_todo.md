@@ -33,15 +33,15 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
   - [x] If approved: Append to log, replicate via `AppendEntries`, and return `COMMITTED` once a quorum acknowledges.
 - [x] Acceptance: Client receives a final status from the Leader.
 
-## Step 4: Implement the Client CLI REPL (`client-cli`)
+## Step 4: Implement the Client CLI REPL (`client-cli`) [x]
 
-- [ ] Implement a "Smart Client" with `client_id` (UUID) and `sequence_id`.
-- [ ] Build an interactive REPL loop with Leader Redirection handling.
-- [ ] Implement commands: `add <item> <qty> [unit] [category]`, `query`.
-- [ ] Acceptance: User can interact with the cluster from the CLI and automatically find the leader.
+- [x] Implement a "Smart Client" with `client_id` (UUID) and `sequence_id`.
+- [x] Build an interactive REPL loop with Leader Redirection handling.
+- [x] Implement commands: `add <item> <qty> [unit] [category]`, `query`.
+- [x] Acceptance: User can interact with the cluster from the CLI and automatically find the leader.
 
-## Step 5: Full Round-Trip Verification
+## Step 5: Full Round-Trip Verification [x]
 
-- [ ] Create `scripts/phase4_round_trip.py` integration test.
-- [ ] Verify: `client-cli` -> `follower` -> (hint) -> `leader` -> `ai-veto` -> `leader` -> `replication` -> `committed`.
-- [ ] Acceptance: 100% success rate on the round-trip integration test.
+- [x] Create `scripts/phase4_round_trip.py` integration test (integrated into `scripts/smoke_test.py`).
+- [x] Verify: `client-cli` -> `follower` -> (hint) -> `leader` -> `ai-veto` -> `leader` -> `replication` -> `committed`.
+- [x] Acceptance: 100% success rate on the round-trip integration test.
