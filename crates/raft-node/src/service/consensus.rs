@@ -50,16 +50,16 @@ impl ConsensusService for ConsensusDispatcher {
         let req = request.into_inner();
         self.verify_identity(&req.cluster_id)?;
 
-        let mut state_guard = self.state.write().await;
-        self.verify_node_integrity(&state_guard)?;
-
-        let span = info_span!("request_vote", term = req.term, candidate = %req.candidate_id);
-        let _enter = span.enter();
-
         let candidate_id = req
             .candidate_id
             .parse::<NodeId>()
             .map_err(|_| self.invalid_node_id_status(&req.candidate_id))?;
+
+        let span = info_span!("request_vote", term = req.term, candidate = %candidate_id);
+        let _enter = span.enter();
+
+        let mut state_guard = self.state.write().await;
+        self.verify_node_integrity(&state_guard)?;
 
         // 1. If term > currentTerm: set currentTerm = term, transition to follower
         //    (§5.1)
@@ -70,7 +70,7 @@ impl ConsensusService for ConsensusDispatcher {
         if req.term > current_term {
             info!(
                 "Received higher term ({}) from candidate {}. Transitioning to Follower.",
-                req.term, req.candidate_id
+                req.term, candidate_id
             );
             state_guard.transition(|old| old.into_follower(req.term, None));
         }
@@ -102,13 +102,13 @@ impl ConsensusService for ConsensusDispatcher {
                         node.vote_for(candidate_id);
                         info!(
                             "Granting vote to candidate {} for term {}",
-                            req.candidate_id, req.term
+                            candidate_id, req.term
                         );
                     } else {
                         debug!(
                             "Rejecting vote for candidate {}: candidate's log is not up-to-date \
                              (local: index {}, term {}; remote: index {}, term {})",
-                            req.candidate_id,
+                            candidate_id,
                             local_last_index,
                             local_last_term,
                             req.last_log_index,
@@ -141,11 +141,16 @@ impl ConsensusService for ConsensusDispatcher {
         let req = request.into_inner();
         self.verify_identity(&req.cluster_id)?;
 
+        let leader_id = req
+            .leader_id
+            .parse::<NodeId>()
+            .map_err(|_| self.invalid_node_id_status(&req.leader_id))?;
+
+        let span = info_span!("append_entries", term = req.term, leader = %leader_id);
+        let _enter = span.enter();
+
         let mut state_guard = self.state.write().await;
         self.verify_node_integrity(&state_guard)?;
-
-        let span = info_span!("append_entries", term = req.term, leader = %req.leader_id);
-        let _enter = span.enter();
 
         let current_term = state_guard
             .current_term()
@@ -155,7 +160,7 @@ impl ConsensusService for ConsensusDispatcher {
         if req.term < current_term {
             debug!(
                 "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
-                req.leader_id, req.term, current_term
+                leader_id, req.term, current_term
             );
             return Ok(Response::new(AppendEntriesResponse {
                 cluster_id: self.cluster_id_as_str().to_string(),
@@ -166,15 +171,13 @@ impl ConsensusService for ConsensusDispatcher {
         }
 
         // 2. Term-based state transitions
-        let leader_id = req.leader_id.parse::<NodeId>().ok();
-
         if req.term > current_term {
             // §5.1: If term > currentTerm, transition to follower
             info!(
                 "Received higher term ({}) from leader {}. Demoting to Follower.",
-                req.term, req.leader_id
+                req.term, leader_id
             );
-            state_guard.transition(|old| old.into_follower(req.term, leader_id));
+            state_guard.transition(|old| old.into_follower(req.term, Some(leader_id)));
         } else if req.term == current_term {
             match &mut *state_guard {
                 RaftNodeState::Candidate(_) => {
@@ -182,9 +185,9 @@ impl ConsensusService for ConsensusDispatcher {
                     // it recognizes the leader as legitimate and returns to follower state.
                     info!(
                         "Candidate recognizing leader {} for term {}. Returning to Follower.",
-                        req.leader_id, req.term
+                        leader_id, req.term
                     );
-                    state_guard.transition(|old| old.into_follower(req.term, leader_id));
+                    state_guard.transition(|old| old.into_follower(req.term, Some(leader_id)));
                 }
                 RaftNodeState::Leader(_) => {
                     // FATAL INVARIANT VIOLATION: Two leaders for the same term!
@@ -194,13 +197,13 @@ impl ConsensusService for ConsensusDispatcher {
                     let msg = format!(
                         "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
                          node to prevent state corruption.",
-                        req.leader_id, req.term
+                        leader_id, req.term
                     );
                     error!("{}", msg);
                     panic!("{}", msg);
                 }
                 RaftNodeState::Follower(node) => {
-                    node.state_mut().set_leader_id(leader_id);
+                    node.state_mut().set_leader_id(Some(leader_id));
                 }
                 _ => {}
             }
