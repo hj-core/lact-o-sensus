@@ -2,72 +2,89 @@
 
 ## Metadata
 
-* **Date:** 2026-04-09
-* **Status:** Proposed
-* **Scope:** Logical RPC Contracts and Service Definitions
-* **Primary Goal:** Define a consistent, typed interface for all inter-node communication.
+- **Date:** 2026-04-09
+- **Status:** Proposed
+- **Scope:** Logical RPC Contracts and Service Definitions
+- **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
+- **Last Updated:** 2026-04-20
 
 ## Context
 
-Lact-O-Sensus consists of three distinct interaction domains: internal consensus, external user ingress, and policy egress. To ensure cluster isolation and type safety, we must define a logical interface that all participants must adhere to. Per ADR 004, every message must include a `cluster_id` to prevent cross-cluster contamination.
+Lact-O-Sensus consists of three distinct interaction domains: internal consensus, external user ingress, and policy egress. Per ADR 007 and ADR 008, our interface must support AI-driven semantic resolution and internal SI stabilization while maintaining the strict cluster identity mandates of ADR 004.
 
 ## Decision
 
-We will define three logical services, each with a strict request/response contract.
+We will define three logical services with strict contracts. All messages must include the `cluster_id` to prevent cross-environment contamination.
 
 ### 1. The Consensus Service (Internal Mesh)
 
 Used for Raft peer-to-peer communication.
 
-* **`RequestVote`**:
-  * **Input**: `cluster_id`, `term`, `candidate_id`, `last_log_index`, `last_log_term`.
-  * **Output**: `cluster_id`, `term`, `vote_granted`.
-* **`AppendEntries`**:
-  * **Input**: `cluster_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
-  * **Output**: `cluster_id`, `term`, `success`, `last_log_index` (Optimization: allows leader to skip-back to the follower's actual log end during synchronization).
+- **`RequestVote`**:
+  - **Input:** `cluster_id`, `target_node_id`, `term`, `candidate_id`, `last_log_index`, `last_log_term`.
+  - **Output:** `cluster_id`, `node_id` (Responder), `term`, `vote_granted`.
+- **`AppendEntries`**:
+  - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
+  - **Output:** `cluster_id`, `node_id` (Responder), `term`, `success`, `last_log_index`.
+- **`LogEntry`**:
+  - **Structure:** `term`, `index`, `data` (Serialized `CommittedMutation`).
 
 ### 2. The Ingress Service (Client-to-Leader)
 
 Used for user mutations and queries.
 
-* **`ProposeMutation`**:
-  * **Input**: `cluster_id`, `client_id`, `sequence_id`, `MutationIntent` (contains `operation`, `item_key`, `quantity`, `unit?`, `category?`).
-  * **Output**: `cluster_id`, `status` (Committed/Rejected/Vetoed), `state_version`, `leader_hint` (for redirection), `error_message`.
-* **`QueryState`**:
-  * **Input**: `cluster_id`, `query_filter` (optional), `min_state_version` (optional).
-  * **Output**: `cluster_id`, `item_list[]` (of `GroceryItem`), `current_state_version`, `status` (Success/Rejected/Error), `leader_hint` (for redirection), `error_message`.
+- **`ProposeMutation`**:
+  - **Input:** `cluster_id`, `target_node_id`, `client_id`, `sequence_id`, `MutationIntent`.
+  - **Output:** `cluster_id`, `node_id` (Leader), `status` (Committed/Rejected/Vetoed), `state_version`, `leader_hint`, `error_message`.
+- **`QueryState`**:
+  - **Input:** `cluster_id`, `target_node_id`, `query_filter` (optional), `min_state_version` (optional).
+  - **Output:** `cluster_id`, `node_id` (Responder), `item_list[]` (of `GroceryItem`), `current_state_version`, `status`, `leader_hint`, `error_message`.
 
 ### 3. The Policy Service (Leader-to-AI)
 
-Used for automated evaluation and classification.
+Used for semantic resolution and physical verification.
 
-* **`EvaluateProposal`**:
-  * **Input**: `cluster_id`, `client_id`, `MutationIntent`, `current_inventory[]` (full list of `GroceryItem`), `request_context`.
-  * **Output**: `cluster_id`, `is_approved`, `category_assignment`, `moral_justification`.
+- **`EvaluateProposal`**:
+  - **Input:** `cluster_id`, `target_node_id`, `client_id`, `normalized_intent`, `current_inventory[]`, `request_context`.
+  - **Output:**
+    - `cluster_id`, `node_id` (The AI Node ID), `is_approved`, `moral_justification`.
+    - **Semantic Data:** `resolved_item_key`, `suggested_display_name`, `category_assignment`, `resolved_unit`.
+    - **Conversion Data:** `conversion_multiplier_to_base` (Decimal string).
+
+### 4. The Replicated Ledger Entry (`CommittedMutation`)
+
+The serialized binary format stored in the Raft log and database. This represents the "Final Truth."
+
+- **Mandate (Absolute State):** The Leader is exclusively responsible for performing all physical arithmetic (Base SI \* Multiplier). The log entry must record the **Absolute Result** (not the delta) to ensure state machine idempotency.
+- **Precision Policy:** All numeric quantities and multipliers MUST be transmitted and stored as **Stringified Fixed-Point Decimals** to avoid IEEE 754 non-determinism across different architectures.
+
+- **Identity:** `resolved_item_key` (Canonical Slug).
+- **Display:** `suggested_display_name` (UI Metadata).
+- **State:** `updated_base_quantity` (Absolute Result in SI as Decimal string), `base_unit` (Canonical SI Symbol), `display_unit` (User-preferred symbol), `updated_category` (Metadata).
+- **Session:** `client_id`, `sequence_id` (For Exactly-Once Semantics).
+- **Audit:** `raw_user_input` (Original Intent), `moral_justification` (AI Rationale), `event_time` (Timestamp).
 
 ## Rationale
 
-* **Intent vs. Record Separation**: By using `MutationIntent` for ingress, we strictly separate the user's desire (e.g., "Add 2 Milk") from the system's record (which includes `state_version` and `last_modifier_id`).
-* **Holistic Vetoing**: Providing the AI with the `current_inventory` allows for relational policy enforcement (e.g., "reject chocolate if sugar count is already high").
-* **Cluster Isolation**: Mandating the `cluster_id` in every request/response provides a lightweight but effective security boundary at the application layer.
-* **Protocol Completeness**: The Consensus Service provides the minimum necessary methods to implement the Raft protocol as defined in the original paper.
-* **Leader-Centricity**: The Ingress and Policy services are designed to be handled primarily by the Leader, reinforcing the topology defined in ADR 002.
-* **Logical Decoupling**: These definitions focus on "what" data is exchanged, remaining agnostic of the underlying serialization (e.g., Protobuf) or transport (e.g., gRPC).
+- **Identity Guarding:** Mandating `cluster_id` in every RPC ensures that nodes and clients never accidentally process traffic from a foreign cluster.
+- **Separation of Concerns:** The `MutationIntent` captures human ambiguity, while the `CommittedMutation` captures deterministic physical and taxonomic state.
+- **Semantic Oracle Integration:** The Policy Service is the only point where non-determinism (the AI) is allowed to influence the state before it is codified as a log entry.
 
 ## Consequences
 
 ### Pros
 
-* **Strong Typing**: Clear definitions prevent malformed data from reaching the core consensus logic.
-* **Auditability**: Every message carries the metadata (`cluster_id`, `client_id`, etc.) necessary for a full audit trail.
-* **Interoperability**: Different implementations of a node (e.g., a CLI client vs. a mobile client) can interact with the cluster as long as they follow this specification.
+- **Auditability:** Every ledger entry carries its complete causal history (raw input + AI reasoning).
+- **Interoperability:** Decoupled interfaces allow different client or AI implementations to be swapped as long as they follow the contract.
+- **Protocol Safety:** Full Raft RPC definitions prevent ambiguity during election or replication phases.
 
 ### Cons
 
-* **Message Overhead**: Including the `cluster_id` in every packet adds a small amount of redundant data to high-frequency heartbeats.
-* **Rigidity**: Changing the interface requires coordinated updates (and potentially schema migration) across all nodes.
+- **Rigidity:** Schema changes require coordinated updates across all node types.
+- **Overhead:** Large log entries (due to raw strings and justifications) increase disk I/O and storage requirements.
 
 ### Operational Impact
 
-* **Service Discovery**: Clients must be aware of the `cluster_id` they are attempting to interact with.
-* **Logging**: The `cluster_id` should be included in all structured logs for multi-tenant observability.
+- **Schema Evolution:** Since the ledger format (`CommittedMutation`) is persistent, any changes to the logical interface must support backward compatibility (e.g., Protobuf optional fields) to allow older logs to be replayed by newer binaries.
+- **Observability:** The inclusion of audit metadata (original intent and AI rationale) significantly simplifies debugging but requires monitoring for log-induced disk pressure.
+- **Protocol Drift:** Strict validation of `cluster_id` and `node_id` simplifies the isolation of environmental issues but requires rigorous configuration management during cluster deployment.
