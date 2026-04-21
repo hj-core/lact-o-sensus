@@ -5,6 +5,7 @@ use anyhow::Context;
 use anyhow::Result;
 use common::types::ClientId;
 use common::types::ClusterId;
+use common::types::SequenceId;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -19,7 +20,7 @@ pub const MAX_KNOWN_NODES: usize = 10;
 pub struct ClientState {
     cluster_id: ClusterId,
     client_id: ClientId,
-    sequence_id: u64,
+    sequence_id: SequenceId,
     /// Capped list of known node addresses, prioritized by recency of success.
     known_nodes: Vec<String>,
     #[serde(skip)]
@@ -92,7 +93,7 @@ impl ClientState {
             let state = Self {
                 cluster_id,
                 client_id: ClientId::generate(),
-                sequence_id: 0,
+                sequence_id: SequenceId::ZERO,
                 known_nodes: overriding_nodes,
                 path: path_buf,
             };
@@ -107,8 +108,8 @@ impl ClientState {
     ///
     /// This MUST be called before issuing a new mutation request to ensure
     /// Exactly-Once Semantics across client restarts.
-    pub fn next_sequence_id(&mut self) -> Result<u64> {
-        self.sequence_id += 1;
+    pub fn next_sequence_id(&mut self) -> Result<SequenceId> {
+        self.sequence_id = self.sequence_id + 1;
         self.save()
             .context("Failed to persist sequence_id increment")?;
         Ok(self.sequence_id)
@@ -147,7 +148,7 @@ impl ClientState {
         &self.client_id
     }
 
-    pub fn sequence_id(&self) -> u64 {
+    pub fn sequence_id(&self) -> SequenceId {
         self.sequence_id
     }
 
@@ -185,7 +186,7 @@ mod tests {
             let state = ClientState::load_or_init(&path, cluster_id.clone(), nodes.clone())?;
             assert_eq!(state.cluster_id(), &cluster_id);
             assert_eq!(state.known_nodes(), &nodes);
-            assert_eq!(state.sequence_id(), 0);
+            assert_eq!(state.sequence_id(), SequenceId::ZERO);
             assert!(path.exists());
 
             Ok(())
@@ -303,7 +304,7 @@ mod tests {
             let state = ClientState {
                 cluster_id: cluster_id.clone(),
                 client_id: ClientId::generate(),
-                sequence_id: 0,
+                sequence_id: SequenceId::ZERO,
                 known_nodes: large_nodes,
                 path: path.clone(),
             };

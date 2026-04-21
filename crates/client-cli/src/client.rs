@@ -11,6 +11,9 @@ use common::proto::v1::QueryStateRequest;
 use common::proto::v1::QueryStateResponse;
 use common::proto::v1::QueryStatus;
 use common::proto::v1::ingress_service_client::IngressServiceClient;
+use common::types::ClientId;
+use common::types::ClusterId;
+use common::types::LogIndex;
 use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::transport::Channel;
@@ -34,10 +37,10 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// ensures Exactly-Once Semantics (EOS) while minimizing synchronization
 /// overhead.
 pub struct LactoClient {
-    /// Cached identifier to avoid lock contention and redundant formatting.
-    cluster_id_str: Arc<str>,
-    /// Cached session identifier to ensure Exactly-Once Semantics.
-    client_id_str: Arc<str>,
+    /// Target cluster identity.
+    cluster_id: ClusterId,
+    /// Client session identity.
+    client_id: ClientId,
 
     /// Configurable timeouts for different RPC classes.
     mutation_timeout: Duration,
@@ -75,12 +78,12 @@ impl LactoClient {
             anyhow::bail!("Client timeouts must be non-zero");
         }
 
-        let cluster_id_str: Arc<str> = Arc::from(state.cluster_id().as_str());
-        let client_id_str: Arc<str> = Arc::from(state.client_id().as_str());
+        let cluster_id = state.cluster_id().clone();
+        let client_id = state.client_id().clone();
 
         Ok(Self {
-            cluster_id_str,
-            client_id_str,
+            cluster_id,
+            client_id,
             mutation_timeout,
             query_timeout,
             connect_timeout,
@@ -111,12 +114,8 @@ impl LactoClient {
             .next_sequence_id()
             .context("Failed to prepare session sequence for mutation")?;
 
-        let request_payload = ProposeMutationRequest {
-            cluster_id: self.cluster_id_str.to_string(),
-            client_id: self.client_id_str.to_string(),
-            sequence_id,
-            intent: Some(intent),
-        };
+        let request_payload =
+            ProposeMutationRequest::new(&self.cluster_id, &self.client_id, sequence_id, intent);
 
         self.dispatch_mutation(request_payload).await
     }
@@ -128,12 +127,12 @@ impl LactoClient {
     pub async fn query_state(
         &self,
         query_filter: Option<String>,
-        min_state_version: Option<u64>,
+        min_state_version: Option<LogIndex>,
     ) -> Result<QueryStateResponse> {
         let request_payload = QueryStateRequest {
-            cluster_id: self.cluster_id_str.to_string(),
+            cluster_id: self.cluster_id.as_str().to_string(),
             query_filter,
-            min_state_version,
+            min_state_version: min_state_version.map(|v| v.value()),
         };
 
         self.dispatch_query(request_payload).await
