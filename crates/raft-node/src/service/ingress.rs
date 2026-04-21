@@ -396,8 +396,11 @@ mod tests {
         ))
     }
 
-    fn mock_peer_manager(peers: &HashMap<NodeId, String>) -> Arc<PeerManager> {
-        Arc::new(PeerManager::new(peers).unwrap())
+    fn mock_peer_manager(
+        identity: Arc<NodeIdentity>,
+        peers: &HashMap<NodeId, String>,
+    ) -> Arc<PeerManager> {
+        Arc::new(PeerManager::new(identity, peers).unwrap())
     }
 
     fn mock_dispatcher(state: RaftNodeState, peer_manager: Arc<PeerManager>) -> IngressDispatcher {
@@ -416,8 +419,9 @@ mod tests {
 
         #[tokio::test]
         async fn returns_rejected_when_follower_leader_unknown() {
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
-            let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
+            let id = mock_identity();
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let dispatcher = mock_dispatcher(node, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -438,10 +442,10 @@ mod tests {
 
             let id = mock_identity();
             // Create follower who knows about leader Node 2
-            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id));
+            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
             let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
-            let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
+            let dispatcher = mock_dispatcher(follower, mock_peer_manager(id, &peers));
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -457,10 +461,10 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_candidate() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id);
+            let follower = RaftNode::<Follower>::new(id.clone());
             let candidate = RaftNodeState::Candidate(follower.into_candidate());
 
-            let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
+            let dispatcher = mock_dispatcher(candidate, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -478,8 +482,9 @@ mod tests {
 
         #[tokio::test]
         async fn returns_rejected_when_follower_leader_unknown() {
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
-            let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
+            let id = mock_identity();
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let dispatcher = mock_dispatcher(node, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
@@ -497,10 +502,10 @@ mod tests {
             peers.insert(NodeId::new(2), leader_addr.to_string());
 
             let id = mock_identity();
-            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id));
+            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
             let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
-            let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
+            let dispatcher = mock_dispatcher(follower, mock_peer_manager(id, &peers));
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
@@ -514,10 +519,10 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_candidate() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id);
+            let follower = RaftNode::<Follower>::new(id.clone());
             let candidate = RaftNodeState::Candidate(follower.into_candidate());
 
-            let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
+            let dispatcher = mock_dispatcher(candidate, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
@@ -530,10 +535,10 @@ mod tests {
         #[tokio::test]
         async fn returns_success_when_leader() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id);
+            let follower = RaftNode::<Follower>::new(id.clone());
             let leader = RaftNodeState::Leader(follower.into_candidate().into_leader(Vec::new()));
 
-            let dispatcher = mock_dispatcher(leader, mock_peer_manager(&HashMap::new()));
+            let dispatcher = mock_dispatcher(leader, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,

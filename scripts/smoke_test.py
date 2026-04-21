@@ -278,10 +278,11 @@ def check_connectivity(
         "crates/common/proto",
         "-proto",
         "lacto_sensus.proto",
+        "-H", f"x-cluster-id: {cluster_id}",
+        "-H", f"x-target-node-id: {target_node_id}",
         "-d",
         json.dumps(
             {
-                "cluster_id": cluster_id,
                 "term": 1,
                 "candidate_id": str(peer_id),
             }
@@ -295,7 +296,7 @@ def check_connectivity(
     if cluster_id == "lacto-dev-01":
         return result.returncode == 0
     else:
-        return "is not authorized for this node" in result.stderr
+        return "Cluster identity mismatch" in result.stderr or "Unauthenticated" in result.stderr
 
 
 # --- Test Cases ---
@@ -385,10 +386,11 @@ def test_ai_veto_egress() -> None:
         "crates/common/proto",
         "-proto",
         "lacto_sensus.proto",
+        "-H", f"x-cluster-id: lacto-dev-01",
+        "-H", f"x-target-node-id: {leader_id}",
         "-d",
         json.dumps(
             {
-                "cluster_id": "lacto-dev-01",
                 "client_id": "550e8400-e29b-41d4-a716-446655440000",
                 "sequence_id": 1,
                 "intent": {"item_key": "oat_milk", "quantity": "2"},

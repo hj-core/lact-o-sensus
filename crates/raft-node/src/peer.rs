@@ -1,9 +1,17 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use common::proto::v1::consensus_service_client::ConsensusServiceClient;
 use common::types::NodeId;
 use thiserror::Error;
+use tonic::Request;
+use tonic::Status;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+
+use crate::identity::NodeIdentity;
+use crate::service::common::HEADER_CLUSTER_ID;
+use crate::service::common::HEADER_TARGET_NODE_ID;
 
 #[derive(Debug, Error)]
 pub enum PeerError {
@@ -29,12 +37,17 @@ struct PeerConnection {
 /// In this phase, the peer list is static and established at startup.
 #[derive(Debug)]
 pub struct PeerManager {
+    /// Local node identity for outbound header injection.
+    identity: Arc<NodeIdentity>,
     /// Pre-populated cache of peer connections.
     peers: HashMap<NodeId, PeerConnection>,
 }
 
 impl PeerManager {
-    pub fn new(peer_map: &HashMap<NodeId, String>) -> Result<Self, PeerError> {
+    pub fn new(
+        identity: Arc<NodeIdentity>,
+        peer_map: &HashMap<NodeId, String>,
+    ) -> Result<Self, PeerError> {
         let mut peers = HashMap::new();
 
         for (id, uri) in peer_map {
@@ -54,7 +67,7 @@ impl PeerManager {
             );
         }
 
-        Ok(Self { peers })
+        Ok(Self { identity, peers })
     }
 
     /// Returns a client for a specific peer from the internal channel cache.
@@ -67,14 +80,45 @@ impl PeerManager {
     pub fn get_client(
         &self,
         node_id: NodeId,
-    ) -> Result<ConsensusServiceClient<Channel>, PeerError> {
+    ) -> Result<
+        ConsensusServiceClient<
+            InterceptedService<
+                Channel,
+                impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone,
+            >,
+        >,
+        PeerError,
+    > {
         let peer = self
             .peers
             .get(&node_id)
             .ok_or(PeerError::NodeNotFound(node_id))?;
 
+        let cluster_id = self.identity.cluster_id().clone();
+        let target_node_id = node_id;
+
+        // Interceptor to inject identity headers for cluster isolation.
+        let interceptor = move |mut req: Request<()>| {
+            req.metadata_mut().insert(
+                HEADER_CLUSTER_ID,
+                cluster_id.as_str().parse().map_err(|_| {
+                    Status::internal("Failed to parse cluster_id for outbound header")
+                })?,
+            );
+            req.metadata_mut().insert(
+                HEADER_TARGET_NODE_ID,
+                target_node_id.to_string().parse().map_err(|_| {
+                    Status::internal("Failed to parse target_node_id for outbound header")
+                })?,
+            );
+            Ok(req)
+        };
+
         // Cloning a Channel is cheap as it is an Arc-wrapped connection pool.
-        Ok(ConsensusServiceClient::new(peer.channel.clone()))
+        Ok(ConsensusServiceClient::with_interceptor(
+            peer.channel.clone(),
+            interceptor,
+        ))
     }
 
     /// Returns the network address (URL) for a specific peer.
@@ -93,40 +137,56 @@ impl PeerManager {
 
 #[cfg(test)]
 mod tests {
+    use common::types::ClusterId;
+
     use super::*;
 
-    mod peer_manager_get_client {
+    mod get_client {
         use super::*;
 
+        fn mock_identity() -> Arc<NodeIdentity> {
+            Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::new(1),
+            ))
+        }
+
         #[tokio::test]
-        async fn returns_client_when_id_exists() {
+        async fn returns_intercepted_client_when_node_exists() {
             let mut peers = HashMap::new();
             peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
-            let manager = PeerManager::new(&peers).unwrap();
+            let manager = PeerManager::new(mock_identity(), &peers).unwrap();
             let result = manager.get_client(NodeId::new(2));
 
             assert!(result.is_ok());
         }
 
         #[test]
-        fn returns_err_when_id_missing() {
-            let manager = PeerManager::new(&HashMap::new()).unwrap();
+        fn returns_error_when_node_id_is_missing() {
+            let manager = PeerManager::new(mock_identity(), &HashMap::new()).unwrap();
             let result = manager.get_client(NodeId::new(99));
 
             assert!(matches!(result, Err(PeerError::NodeNotFound(_))));
         }
     }
 
-    mod peer_manager_get_address {
+    mod get_address {
         use super::*;
 
+        fn mock_identity() -> Arc<NodeIdentity> {
+            Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::new(1),
+            ))
+        }
+
         #[tokio::test]
-        async fn returns_address_when_id_exists() {
+        async fn returns_network_address_when_node_exists() {
             let mut peers = HashMap::new();
             peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
 
-            let manager = PeerManager::new(&peers).unwrap();
+            let manager = PeerManager::new(mock_identity(), &peers).unwrap();
             let result = manager.get_address(NodeId::new(2));
 
             assert!(result.is_ok());

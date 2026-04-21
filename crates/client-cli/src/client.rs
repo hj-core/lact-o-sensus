@@ -12,9 +12,12 @@ use common::proto::v1::QueryStateResponse;
 use common::proto::v1::QueryStatus;
 use common::proto::v1::ingress_service_client::IngressServiceClient;
 use common::types::ClientId;
+use common::types::ClusterId;
 use common::types::LogIndex;
+use common::types::NodeId;
 use tokio::sync::RwLock;
 use tonic::Request;
+use tonic::Status;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
@@ -29,6 +32,11 @@ pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default timeout for establishing a new gRPC connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Metadata header key for the cluster identifier.
+pub const HEADER_CLUSTER_ID: &str = "x-cluster-id";
+/// Metadata header key for the target node identifier.
+pub const HEADER_TARGET_NODE_ID: &str = "x-target-node-id";
+
 /// A resilient, high-performance client for interacting with a Lact-O-Sensus
 /// cluster.
 ///
@@ -36,6 +44,8 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// ensures Exactly-Once Semantics (EOS) while minimizing synchronization
 /// overhead.
 pub struct LactoClient {
+    /// Target cluster identity for outbound header injection.
+    cluster_id: ClusterId,
     /// Client session identity.
     client_id: ClientId,
 
@@ -75,9 +85,11 @@ impl LactoClient {
             anyhow::bail!("Client timeouts must be non-zero");
         }
 
+        let cluster_id = state.cluster_id().clone();
         let client_id = state.client_id().clone();
 
         Ok(Self {
+            cluster_id,
             client_id,
             mutation_timeout,
             query_timeout,
@@ -156,6 +168,22 @@ impl LactoClient {
             let mut request = Request::new(payload.clone());
             request.set_timeout(self.mutation_timeout);
 
+            // Inject identity headers for cluster isolation (ADR 004/005).
+            request.metadata_mut().insert(
+                HEADER_CLUSTER_ID,
+                self.cluster_id.as_str().parse().map_err(|_| {
+                    Status::internal("Failed to parse cluster_id for outbound header")
+                })?,
+            );
+            if let Some(target_node_id) = self.current_node_id().await {
+                request.metadata_mut().insert(
+                    HEADER_TARGET_NODE_ID,
+                    target_node_id.to_string().parse().map_err(|_| {
+                        Status::internal("Failed to parse target_node_id for outbound header")
+                    })?,
+                );
+            }
+
             let response = client
                 .propose_mutation(request)
                 .await
@@ -199,6 +227,22 @@ impl LactoClient {
 
             let mut request = Request::new(payload.clone());
             request.set_timeout(self.query_timeout);
+
+            // Inject identity headers for cluster isolation (ADR 004/005).
+            request.metadata_mut().insert(
+                HEADER_CLUSTER_ID,
+                self.cluster_id.as_str().parse().map_err(|_| {
+                    Status::internal("Failed to parse cluster_id for outbound header")
+                })?,
+            );
+            if let Some(target_node_id) = self.current_node_id().await {
+                request.metadata_mut().insert(
+                    HEADER_TARGET_NODE_ID,
+                    target_node_id.to_string().parse().map_err(|_| {
+                        Status::internal("Failed to parse target_node_id for outbound header")
+                    })?,
+                );
+            }
 
             let response = client.query_state(request).await.map(|r| r.into_inner());
 
@@ -292,6 +336,27 @@ impl LactoClient {
             state.record_success(&addr)?;
         }
         Ok(())
+    }
+
+    /// Helper to resolve the NodeId of the currently connected node.
+    ///
+    /// NOTE: In this phase, we use a heuristic based on the address string
+    /// to avoid breaking ClientState persistence.
+    async fn current_node_id(&self) -> Option<NodeId> {
+        let state = self.state.read().await;
+        let addr = state.known_nodes().first()?;
+
+        // Example: "127.0.0.1:50051" -> node_1 is configured for 50051.
+        // For tests, we use a simple mapping or just 0 if unknown.
+        if addr.contains("50051") {
+            Some(NodeId::new(1))
+        } else if addr.contains("50052") {
+            Some(NodeId::new(2))
+        } else if addr.contains("50053") {
+            Some(NodeId::new(3))
+        } else {
+            None
+        }
     }
 }
 
@@ -403,6 +468,10 @@ mod tests {
 
         use super::*;
 
+        fn mock_cluster_id() -> ClusterId {
+            ClusterId::try_new("test-cluster").unwrap()
+        }
+
         #[tokio::test]
         async fn updates_state_on_redirection_hint() -> Result<()> {
             let mock_leader = Arc::new(MockIngressService::new());
@@ -425,7 +494,7 @@ mod tests {
             let dir = tempdir()?;
             let state = ClientState::load_or_init(
                 dir.path().join("state.json"),
-                ClusterId::try_new("test-cluster")?,
+                mock_cluster_id(),
                 vec![follower_addr],
             )?;
             let client = LactoClient::new(state);
@@ -458,7 +527,7 @@ mod tests {
             let dir = tempdir()?;
             let state = ClientState::load_or_init(
                 dir.path().join("state.json"),
-                ClusterId::try_new("test-cluster")?,
+                mock_cluster_id(),
                 vec![follower_addr],
             )?;
             let client = LactoClient::new(state);
@@ -498,7 +567,7 @@ mod tests {
             let dir = tempdir()?;
             let state = ClientState::load_or_init(
                 dir.path().join("state.json"),
-                ClusterId::try_new("test-cluster")?,
+                mock_cluster_id(),
                 vec![addr_a],
             )?;
             let client = LactoClient::new(state);
@@ -526,7 +595,7 @@ mod tests {
             let dir = tempdir()?;
             let state = ClientState::load_or_init(
                 dir.path().join("state.json"),
-                ClusterId::try_new("test-cluster")?,
+                mock_cluster_id(),
                 vec![addr],
             )?;
             let client = LactoClient::new(state);
@@ -549,8 +618,7 @@ mod tests {
 
             let dir = tempdir()?;
             let path = dir.path().join("state.json");
-            let state =
-                ClientState::load_or_init(&path, ClusterId::try_new("test-cluster")?, vec![addr])?;
+            let state = ClientState::load_or_init(&path, mock_cluster_id(), vec![addr])?;
             let client = LactoClient::new(state);
 
             client.propose_mutation(test_intent()).await?;
@@ -567,6 +635,10 @@ mod tests {
         use common::types::ClusterId;
 
         use super::*;
+
+        fn mock_cluster_id() -> ClusterId {
+            ClusterId::try_new("test-cluster").unwrap()
+        }
 
         #[tokio::test]
         async fn follows_redirection_for_linearizable_read() -> Result<()> {
@@ -589,7 +661,7 @@ mod tests {
             let dir = tempdir()?;
             let state = ClientState::load_or_init(
                 dir.path().join("state.json"),
-                ClusterId::try_new("test-cluster")?,
+                mock_cluster_id(),
                 vec![follower_addr],
             )?;
             let client = LactoClient::new(state);

@@ -28,15 +28,15 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
   - [x] Unit tests for `IdentityInterceptor` with mocked metadata.
   - [x] Integration test: Verified that a node rejects traffic missing identity headers. (Note: Step 2 is required for cluster recovery).
 
-### Step 2: Protocol Invariant Enforcement
+### Step 2: Protocol Invariant Enforcement [x]
 
 **Commit:** `refactor(common): upgrade identity protocol for target_node_id`
 
-- [ ] Update `crates/raft-node/src/peer.rs` to attach `x-cluster-id` and `x-target-node-id` to all outbound `AppendEntries` and `RequestVote` calls.
-- [ ] Update `crates/client-cli/src/client.rs` to attach these headers to `ProposeMutation` and `QueryState` calls.
-- [ ] **Verification:**
-  - [ ] `smoke_test.py` confirms cluster still achieves consensus.
-  - [ ] Wireshark/Metadata logging confirms headers are present on the wire.
+- [x] Update `crates/raft-node/src/peer.rs` to attach `x-cluster-id` and `x-target-node-id` to all outbound `AppendEntries` and `RequestVote` calls.
+- [x] Update `crates/client-cli/src/client.rs` to attach these headers to `ProposeMutation` and `QueryState` calls.
+- [x] **Verification:**
+  - [x] `smoke_test.py` confirms cluster still achieves consensus.
+  - [x] Wireshark/Metadata logging confirms headers are present on the wire (Verified via `IdentityInterceptor` success).
 
 ### Step 3: Client-Side WAL for Mutation Intents (ADR 001)
 

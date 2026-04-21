@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
     let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)
-    let peer_manager = Arc::new(match PeerManager::new(&config.peers) {
+    let peer_manager = Arc::new(match PeerManager::new(identity.clone(), &config.peers) {
         Ok(m) => m,
         Err(e) => {
             error!("Fatal Error during Peer Manager initialization: {}", e);
