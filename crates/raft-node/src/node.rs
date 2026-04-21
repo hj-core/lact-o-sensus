@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use common::proto::v1::LogEntry;
 use common::types::ClusterId;
+use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::Term;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::debug;
@@ -99,11 +101,11 @@ impl Candidate {
 pub struct Leader {
     /// For each server, index of the next log entry to send to that server
     /// (initialized to leader last log index + 1).
-    next_index: HashMap<NodeId, u64>,
+    next_index: HashMap<NodeId, LogIndex>,
 
     /// For each server, index of highest log entry known to be replicated on
     /// server (initialized to 0, increases monotonically).
-    match_index: HashMap<NodeId, u64>,
+    match_index: HashMap<NodeId, LogIndex>,
 }
 
 impl Leader {
@@ -111,13 +113,13 @@ impl Leader {
     ///
     /// nextIndex is initialized to (lastLogIndex + 1), and matchIndex is
     /// initialized to 0 for all peers.
-    pub fn new(peer_ids: Vec<NodeId>, last_log_index: u64) -> Self {
+    pub fn new(peer_ids: Vec<NodeId>, last_log_index: LogIndex) -> Self {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
 
         for peer_id in peer_ids {
             next_index.insert(peer_id, last_log_index + 1);
-            match_index.insert(peer_id, 0);
+            match_index.insert(peer_id, LogIndex::new(0));
         }
 
         Self {
@@ -126,19 +128,19 @@ impl Leader {
         }
     }
 
-    pub fn next_index(&self) -> &HashMap<NodeId, u64> {
+    pub fn next_index(&self) -> &HashMap<NodeId, LogIndex> {
         &self.next_index
     }
 
-    pub fn next_index_mut(&mut self) -> &mut HashMap<NodeId, u64> {
+    pub fn next_index_mut(&mut self) -> &mut HashMap<NodeId, LogIndex> {
         &mut self.next_index
     }
 
-    pub fn match_index(&self) -> &HashMap<NodeId, u64> {
+    pub fn match_index(&self) -> &HashMap<NodeId, LogIndex> {
         &self.match_index
     }
 
-    pub fn match_index_mut(&mut self) -> &mut HashMap<NodeId, u64> {
+    pub fn match_index_mut(&mut self) -> &mut HashMap<NodeId, LogIndex> {
         &mut self.match_index
     }
 }
@@ -158,7 +160,7 @@ pub struct RaftNode<S: NodeState> {
 
     // --- Persistent State ---
     /// Persistent term across role transitions.
-    current_term: u64,
+    current_term: Term,
 
     /// CandidateId that received vote in current term (or None if none).
     voted_for: Option<NodeId>,
@@ -168,10 +170,10 @@ pub struct RaftNode<S: NodeState> {
 
     // --- Volatile State (Shared) ---
     /// Index of highest log entry known to be committed.
-    commit_index: u64,
+    commit_index: LogIndex,
 
     /// Index of highest log entry applied to state machine.
-    last_applied: u64,
+    last_applied: LogIndex,
 
     /// Signal triggered whenever commit_index increases.
     commit_signal: Arc<Notify>,
@@ -190,7 +192,7 @@ impl<S: NodeState> RaftNode<S> {
         &self.identity
     }
 
-    pub fn current_term(&self) -> u64 {
+    pub fn current_term(&self) -> Term {
         self.current_term
     }
 
@@ -206,7 +208,7 @@ impl<S: NodeState> RaftNode<S> {
         &mut self.log
     }
 
-    pub fn commit_index(&self) -> u64 {
+    pub fn commit_index(&self) -> LogIndex {
         self.commit_index
     }
 
@@ -222,7 +224,7 @@ impl<S: NodeState> RaftNode<S> {
     /// # Panics
     /// Panics if the new index exceeds the current log boundaries, which
     /// indicates a fundamental protocol violation.
-    pub fn set_commit_index(&mut self, index: u64) {
+    pub fn set_commit_index(&mut self, index: LogIndex) {
         if index < self.commit_index {
             debug!(
                 "Ignoring stale commit_index update: {} < current {}",
@@ -247,7 +249,7 @@ impl<S: NodeState> RaftNode<S> {
         }
     }
 
-    pub fn last_applied(&self) -> u64 {
+    pub fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
 
@@ -256,7 +258,7 @@ impl<S: NodeState> RaftNode<S> {
     /// # Panics
     /// Panics if the new index regresses or exceeds the commit index, as
     /// the state machine must strictly follow the committed log.
-    pub fn set_last_applied(&mut self, index: u64) {
+    pub fn set_last_applied(&mut self, index: LogIndex) {
         if index < self.last_applied {
             panic!(
                 "CRITICAL: State machine regression. Attempted to set last_applied to {} but \
@@ -285,30 +287,36 @@ impl<S: NodeState> RaftNode<S> {
     }
 
     /// Returns the index of the last entry in the log (0 if empty).
-    pub fn last_log_index(&self) -> u64 {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+    pub fn last_log_index(&self) -> LogIndex {
+        self.log
+            .last()
+            .map(|e| LogIndex::new(e.index))
+            .unwrap_or(LogIndex::ZERO)
     }
 
     /// Returns the term of the last entry in the log (0 if empty).
-    pub fn last_log_term(&self) -> u64 {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+    pub fn last_log_term(&self) -> Term {
+        self.log
+            .last()
+            .map(|e| Term::new(e.term))
+            .unwrap_or(Term::ZERO)
     }
 
     /// Returns the term of the log entry at the given index.
     /// Returns 0 if index is 0 or out of bounds.
-    pub fn get_term_at(&self, index: u64) -> u64 {
-        if index == 0 {
-            return 0;
+    pub fn get_term_at(&self, index: LogIndex) -> Term {
+        if index == LogIndex::ZERO {
+            return Term::ZERO;
         }
         // Assuming contiguous log entries starting at index 1.
         self.log
-            .get((index - 1) as usize)
-            .map(|e| e.term)
-            .unwrap_or(0)
+            .get((index.value() - 1) as usize)
+            .map(|e| Term::new(e.term))
+            .unwrap_or(Term::ZERO)
     }
 
     /// Internal helper to update term and reset vote.
-    fn set_term(&mut self, term: u64) {
+    fn set_term(&mut self, term: Term) {
         if term > self.current_term {
             self.current_term = term;
             self.voted_for = None;
@@ -326,11 +334,11 @@ impl<S: NodeState> RaftNode<S> {
         self,
     ) -> (
         Arc<NodeIdentity>,
-        u64,
+        Term,
         Option<NodeId>,
         Vec<LogEntry>,
-        u64,
-        u64,
+        LogIndex,
+        LogIndex,
         Arc<Notify>,
     ) {
         (
@@ -349,11 +357,11 @@ impl RaftNode<Follower> {
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
         Self {
             identity,
-            current_term: 0,
+            current_term: Term::ZERO,
             voted_for: None,
             log: Vec::new(),
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: LogIndex::ZERO,
+            last_applied: LogIndex::ZERO,
             commit_signal: Arc::new(Notify::new()),
             state: Follower::default(),
         }
@@ -434,7 +442,7 @@ impl RaftNodeState {
     }
 
     /// Returns the current term of the node, regardless of its state.
-    pub fn current_term(&self) -> Result<u64, RaftError> {
+    pub fn current_term(&self) -> Result<Term, RaftError> {
         match self {
             RaftNodeState::Follower(node) => Ok(node.current_term()),
             RaftNodeState::Candidate(node) => Ok(node.current_term()),
@@ -454,7 +462,7 @@ impl RaftNodeState {
     }
 
     /// Returns the current commit index of the node.
-    pub fn commit_index(&self) -> Result<u64, RaftError> {
+    pub fn commit_index(&self) -> Result<LogIndex, RaftError> {
         match self {
             RaftNodeState::Follower(node) => Ok(node.commit_index()),
             RaftNodeState::Candidate(node) => Ok(node.commit_index()),
@@ -475,16 +483,12 @@ impl RaftNodeState {
 
     /// Appends a new command to the leader's log.
     /// Returns the index of the newly appended entry.
-    pub fn propose(&mut self, command: Vec<u8>) -> Result<u64, RaftError> {
+    pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, RaftError> {
         match self {
             RaftNodeState::Leader(node) => {
                 let index = node.last_log_index() + 1;
                 let term = node.current_term();
-                let entry = LogEntry {
-                    index,
-                    term,
-                    data: command,
-                };
+                let entry = LogEntry::new(index, term, command);
                 node.log_mut().push(entry);
                 Ok(index)
             }
@@ -524,7 +528,7 @@ impl RaftNodeState {
 
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
-    pub fn into_follower(self, term: u64, leader_id: Option<NodeId>) -> RaftNodeState {
+    pub fn into_follower(self, term: Term, leader_id: Option<NodeId>) -> RaftNodeState {
         let (identity, current_term, voted_for, log, commit_index, last_applied, commit_signal) =
             match self {
                 RaftNodeState::Follower(n) => n.into_parts(),

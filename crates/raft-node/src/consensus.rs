@@ -4,6 +4,8 @@ use std::time::Duration;
 use anyhow::Result;
 use common::proto::v1::AppendEntriesRequest;
 use common::proto::v1::RequestVoteRequest;
+use common::types::LogIndex;
+use common::types::Term;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rand::RngExt;
@@ -125,16 +127,14 @@ async fn initiate_election(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather election parameters from the current state.
-    // Identity is immutable, so we can pre-allocate Arc<str> once outside the
-    // loop for zero-allocation sharing across RPC tasks.
     let (term, cluster_id, node_id, last_log_index, last_log_term) = {
         let guard = state.read().await;
-        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
-        let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
+        let cid = guard.cluster_id()?.clone();
+        let nid = guard.node_id()?;
 
         let (last_idx, last_term) = match &*guard {
             RaftNodeState::Candidate(n) => (n.last_log_index(), n.last_log_term()),
-            _ => (0, 0), // Should be Candidate
+            _ => (LogIndex::ZERO, Term::ZERO), // Should be Candidate
         };
 
         (guard.current_term()?, cid, nid, last_idx, last_term)
@@ -150,26 +150,26 @@ async fn initiate_election(
     let vote_requests = peer_ids.clone().into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
         let cluster_id = cluster_id.clone();
-        let node_id = node_id.clone();
+        let node_id = node_id;
         let rpc_timeout = config.raft.rpc_timeout();
 
         async move {
             match peer_manager.get_client(peer_id) {
                 Ok(mut client) => {
-                    let mut request = Request::new(RequestVoteRequest {
-                        cluster_id: cluster_id.to_string(),
+                    let mut request = Request::new(RequestVoteRequest::new(
+                        &cluster_id,
                         term,
-                        candidate_id: node_id.to_string(),
+                        node_id,
                         last_log_index,
                         last_log_term,
-                    });
+                    ));
                     request.set_timeout(rpc_timeout);
 
                     match client.request_vote(request).await {
                         Ok(resp) => {
                             let resp = resp.into_inner();
                             // ADR 004 / Security: Verify cluster identity in response
-                            if resp.cluster_id != *cluster_id {
+                            if resp.cluster_id != cluster_id.as_str() {
                                 return Err(unauthorized_response_status());
                             }
                             Ok((peer_id, resp))
@@ -192,13 +192,14 @@ async fn initiate_election(
     while let Some(res) = vote_stream.next().await {
         match res {
             Ok((peer_id, resp)) => {
-                if resp.term > term {
+                let resp_term = Term::new(resp.term);
+                if resp_term > term {
                     info!(
                         "Found higher term ({}) during election. Demoting to Follower.",
-                        resp.term
+                        resp_term
                     );
                     let mut guard = state.write().await;
-                    guard.transition(|old| old.into_follower(resp.term, None));
+                    guard.transition(|old| old.into_follower(resp_term, None));
                     return Ok(());
                 }
 
@@ -306,12 +307,10 @@ async fn replicate_to_peers(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather global replication parameters.
-    // Use Arc<str> for zero-allocation identity sharing across concurrent RPC
-    // tasks.
     let (term, cluster_id, node_id, commit_index) = {
         let guard = state.read().await;
-        let cid: Arc<str> = Arc::from(guard.cluster_id()?.as_str());
-        let nid: Arc<str> = Arc::from(guard.node_id()?.to_string().as_str());
+        let cid = guard.cluster_id()?.clone();
+        let nid = guard.node_id()?;
         (guard.current_term()?, cid, nid, guard.commit_index()?)
     };
 
@@ -323,7 +322,7 @@ async fn replicate_to_peers(
         let state = state.clone();
         let peer_manager = peer_manager.clone();
         let cluster_id = cluster_id.clone();
-        let node_id = node_id.clone();
+        let node_id = node_id;
 
         async move {
             // a. Prepare the request for this specific peer
@@ -331,7 +330,11 @@ async fn replicate_to_peers(
                 let guard = state.read().await;
                 match &*guard {
                     RaftNodeState::Leader(node) => {
-                        let next_idx = *node.state().next_index().get(&peer_id).unwrap_or(&1);
+                        let next_idx = *node
+                            .state()
+                            .next_index()
+                            .get(&peer_id)
+                            .unwrap_or(&LogIndex::new(1));
                         let last_log_idx = node.last_log_index();
 
                         let prev_log_index = next_idx - 1;
@@ -340,27 +343,27 @@ async fn replicate_to_peers(
                         // Collect entries starting from next_idx
                         let entries = if last_log_idx >= next_idx {
                             // Logs are 1-indexed, so index 1 is at Vec index 0.
-                            node.log()[(next_idx as usize - 1)..].to_vec()
+                            node.log()[(next_idx.value() as usize - 1)..].to_vec()
                         } else {
                             Vec::new()
                         };
 
-                        AppendEntriesRequest {
-                            cluster_id: cluster_id.to_string(),
+                        AppendEntriesRequest::new(
+                            &cluster_id,
                             term,
-                            leader_id: node_id.to_string(),
+                            node_id,
                             prev_log_index,
                             prev_log_term,
                             entries,
-                            leader_commit: commit_index,
-                        }
+                            commit_index,
+                        )
                     }
                     _ => return Ok(None), // No longer leader
                 }
             };
 
             // Capture metadata before the request is consumed by the tonic::Request
-            let sent_prev_idx = request.prev_log_index;
+            let sent_prev_idx = LogIndex::new(request.prev_log_index);
             let sent_entries_len = request.entries.len() as u64;
 
             // b. Execute the RPC
@@ -373,7 +376,7 @@ async fn replicate_to_peers(
                         Ok(resp) => {
                             let resp = resp.into_inner();
                             // ADR 004 / Security: Verify cluster identity
-                            if resp.cluster_id != *cluster_id {
+                            if resp.cluster_id != cluster_id.as_str() {
                                 return Err(unauthorized_response_status());
                             }
                             // Return peer_id and minimal metadata to avoid cloning log data
@@ -395,13 +398,14 @@ async fn replicate_to_peers(
             Ok(Some((peer_id, sent_prev_idx, sent_entries_len, resp))) => {
                 let mut guard = state.write().await;
 
+                let resp_term = Term::new(resp.term);
                 // §5.1: If term > currentTerm, demote immediately
-                if resp.term > term {
+                if resp_term > term {
                     info!(
                         "Found higher term ({}) from peer {}. Demoting to Follower.",
-                        resp.term, peer_id
+                        resp_term, peer_id
                     );
-                    guard.transition(|old| old.into_follower(resp.term, None));
+                    guard.transition(|old| old.into_follower(resp_term, None));
                     return Ok(());
                 }
 
@@ -412,7 +416,11 @@ async fn replicate_to_peers(
                         let new_next = new_match + 1;
 
                         // Monotonicity check: only update if we are moving forward
-                        let current_match = *node.state().match_index().get(&peer_id).unwrap_or(&0);
+                        let current_match = *node
+                            .state()
+                            .match_index()
+                            .get(&peer_id)
+                            .unwrap_or(&LogIndex::ZERO);
                         if new_match > current_match {
                             node.state_mut().next_index_mut().insert(peer_id, new_next);
                             node.state_mut()
@@ -425,13 +433,18 @@ async fn replicate_to_peers(
                     } else {
                         // If AppendEntries fails because of log inconsistency:
                         // decrement nextIndex and retry (§5.3)
-                        let current_next = *node.state().next_index().get(&peer_id).unwrap_or(&1);
+                        let current_next = *node
+                            .state()
+                            .next_index()
+                            .get(&peer_id)
+                            .unwrap_or(&LogIndex::new(1));
 
                         // Optimization: jump back based on peer's actual log state
-                        let new_next = if resp.last_log_index > 0 {
-                            std::cmp::min(current_next, resp.last_log_index + 1)
+                        let last_log_index = LogIndex::new(resp.last_log_index);
+                        let new_next = if last_log_index > LogIndex::ZERO {
+                            std::cmp::min(current_next, last_log_index + 1)
                         } else {
-                            current_next.saturating_sub(1).max(1)
+                            (current_next - 1).max(LogIndex::new(1))
                         };
 
                         node.state_mut().next_index_mut().insert(peer_id, new_next);
@@ -458,7 +471,7 @@ async fn replicate_to_peers(
 fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
-    let mut match_indices: Vec<u64> = node.state().match_index().values().cloned().collect();
+    let mut match_indices: Vec<LogIndex> = node.state().match_index().values().cloned().collect();
     match_indices.push(last_idx); // Include self
     match_indices.sort_unstable();
 

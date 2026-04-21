@@ -11,6 +11,8 @@ use common::proto::v1::QueryStateRequest;
 use common::proto::v1::QueryStateResponse;
 use common::proto::v1::QueryStatus;
 use common::proto::v1::ingress_service_server::IngressService;
+use common::types::ClientId;
+use common::types::SequenceId;
 use prost::Message;
 use tokio::sync::RwLock;
 use tonic::Request;
@@ -158,7 +160,13 @@ impl IngressService for IngressDispatcher {
         let req = request.into_inner();
         self.verify_identity(&req.cluster_id)?;
 
-        let span = info_span!("propose_mutation", client = %req.client_id, seq = req.sequence_id);
+        let sequence_id = SequenceId::new(req.sequence_id);
+        let client_id = req
+            .client_id
+            .parse::<ClientId>()
+            .map_err(|e| Status::invalid_argument(format!("Invalid client_id: {}", e)))?;
+
+        let span = info_span!("propose_mutation", client = %client_id, seq = %sequence_id);
         let _enter = span.enter();
 
         // --- Phase 1: Leadership & Normalization (Read Lock) ---
@@ -239,8 +247,8 @@ impl IngressService for IngressDispatcher {
         // Resolve the intent into a finalized ledger entry.
         // TODO: Phase 5 - Item Store Integration (Delta Calculation)
         let mutation = CommittedMutation::new(
-            req.client_id.clone(),
-            req.sequence_id,
+            &client_id,
+            sequence_id,
             intent.item_key.clone(),
             intent.quantity.clone(),
             veto.category_assignment,
@@ -309,7 +317,7 @@ impl IngressService for IngressDispatcher {
         Ok(Response::new(ProposeMutationResponse {
             cluster_id: self.cluster_id_as_str().to_string(),
             status: MutationStatus::Committed as i32,
-            state_version: proposal_index,
+            state_version: proposal_index.value(),
             leader_hint: String::new(),
             error_message: String::new(),
         }))
@@ -364,6 +372,7 @@ mod tests {
 
     use common::types::ClusterId;
     use common::types::NodeId;
+    use common::types::Term;
 
     use super::*;
     use crate::node::Follower;
@@ -442,7 +451,7 @@ mod tests {
             let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
                 cluster_id: "test-cluster".to_string(),
-                client_id: "user-1".to_string(),
+                client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 ..Default::default()
             });
@@ -462,11 +471,12 @@ mod tests {
             let id = mock_identity();
             // Create follower who knows about leader Node 2
             let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id));
-            let follower = initial_state.into_follower(0, Some(NodeId::new(2)));
+            let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
             let req = Request::new(ProposeMutationRequest {
                 cluster_id: "test-cluster".to_string(),
+                client_id: ClientId::generate().as_str().to_string(),
                 ..Default::default()
             });
 
@@ -485,6 +495,7 @@ mod tests {
             let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
                 cluster_id: "test-cluster".to_string(),
+                client_id: ClientId::generate().as_str().to_string(),
                 ..Default::default()
             });
 
@@ -520,7 +531,7 @@ mod tests {
 
             let id = mock_identity();
             let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id));
-            let follower = initial_state.into_follower(0, Some(NodeId::new(2)));
+            let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
             let req = Request::new(QueryStateRequest {

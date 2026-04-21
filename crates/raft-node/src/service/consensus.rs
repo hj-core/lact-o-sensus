@@ -5,7 +5,9 @@ use common::proto::v1::AppendEntriesResponse;
 use common::proto::v1::RequestVoteRequest;
 use common::proto::v1::RequestVoteResponse;
 use common::proto::v1::consensus_service_server::ConsensusService;
+use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::Term;
 use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Response;
@@ -55,7 +57,11 @@ impl ConsensusService for ConsensusDispatcher {
             .parse::<NodeId>()
             .map_err(|_| self.invalid_node_id_status(&req.candidate_id))?;
 
-        let span = info_span!("request_vote", term = req.term, candidate = %candidate_id);
+        let req_term = Term::new(req.term);
+        let req_last_log_index = LogIndex::new(req.last_log_index);
+        let req_last_log_term = Term::new(req.last_log_term);
+
+        let span = info_span!("request_vote", term = %req_term, candidate = %candidate_id);
         let _enter = span.enter();
 
         let mut state_guard = self.state.write().await;
@@ -67,12 +73,12 @@ impl ConsensusService for ConsensusDispatcher {
             .current_term()
             .map_err(|_| self.poisoned_status())?;
 
-        if req.term > current_term {
+        if req_term > current_term {
             info!(
                 "Received higher term ({}) from candidate {}. Transitioning to Follower.",
-                req.term, candidate_id
+                req_term, candidate_id
             );
-            state_guard.transition(|old| old.into_follower(req.term, None));
+            state_guard.transition(|old| old.into_follower(req_term, None));
         }
 
         // Re-acquire current state after potential transition
@@ -81,7 +87,7 @@ impl ConsensusService for ConsensusDispatcher {
             RaftNodeState::Follower(node) => {
                 // 2. If votedFor is null or candidateId, and candidate’s log is at
                 // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-                if req.term >= node.current_term()
+                if req_term >= node.current_term()
                     && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
                 {
                     let local_last_term = node.last_log_term();
@@ -91,10 +97,10 @@ impl ConsensusService for ConsensusDispatcher {
                     // If the logs have last entries with different terms, then the log with the
                     // later term is more up-to-date. If the logs end with the same term, then
                     // whichever log is longer is more up-to-date.
-                    let is_up_to_date = if req.last_log_term != local_last_term {
-                        req.last_log_term > local_last_term
+                    let is_up_to_date = if req_last_log_term != local_last_term {
+                        req_last_log_term > local_last_term
                     } else {
-                        req.last_log_index >= local_last_index
+                        req_last_log_index >= local_last_index
                     };
 
                     if is_up_to_date {
@@ -102,7 +108,7 @@ impl ConsensusService for ConsensusDispatcher {
                         node.vote_for(candidate_id);
                         info!(
                             "Granting vote to candidate {} for term {}",
-                            candidate_id, req.term
+                            candidate_id, req_term
                         );
                     } else {
                         debug!(
@@ -111,8 +117,8 @@ impl ConsensusService for ConsensusDispatcher {
                             candidate_id,
                             local_last_index,
                             local_last_term,
-                            req.last_log_index,
-                            req.last_log_term
+                            req_last_log_index,
+                            req_last_log_term
                         );
                     }
                 }
@@ -125,13 +131,13 @@ impl ConsensusService for ConsensusDispatcher {
             RaftNodeState::Poisoned => return Err(self.poisoned_status()),
         };
 
-        Ok(Response::new(RequestVoteResponse {
-            cluster_id: self.cluster_id_as_str().to_string(),
-            term: state_guard
+        Ok(Response::new(RequestVoteResponse::new(
+            self.identity().cluster_id(),
+            state_guard
                 .current_term()
                 .map_err(|_| self.poisoned_status())?,
             vote_granted,
-        }))
+        )))
     }
 
     async fn append_entries(
@@ -146,7 +152,12 @@ impl ConsensusService for ConsensusDispatcher {
             .parse::<NodeId>()
             .map_err(|_| self.invalid_node_id_status(&req.leader_id))?;
 
-        let span = info_span!("append_entries", term = req.term, leader = %leader_id);
+        let req_term = Term::new(req.term);
+        let req_prev_log_index = LogIndex::new(req.prev_log_index);
+        let req_prev_log_term = Term::new(req.prev_log_term);
+        let req_leader_commit = LogIndex::new(req.leader_commit);
+
+        let span = info_span!("append_entries", term = %req_term, leader = %leader_id);
         let _enter = span.enter();
 
         let mut state_guard = self.state.write().await;
@@ -157,37 +168,37 @@ impl ConsensusService for ConsensusDispatcher {
             .map_err(|_| self.poisoned_status())?;
 
         // 1. Reply false if term < currentTerm (§5.1)
-        if req.term < current_term {
+        if req_term < current_term {
             debug!(
                 "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
-                leader_id, req.term, current_term
+                leader_id, req_term, current_term
             );
-            return Ok(Response::new(AppendEntriesResponse {
-                cluster_id: self.cluster_id_as_str().to_string(),
-                term: current_term,
-                success: false,
-                last_log_index: 0,
-            }));
+            return Ok(Response::new(AppendEntriesResponse::new(
+                self.identity().cluster_id(),
+                current_term,
+                false,
+                LogIndex::ZERO,
+            )));
         }
 
         // 2. Term-based state transitions
-        if req.term > current_term {
+        if req_term > current_term {
             // §5.1: If term > currentTerm, transition to follower
             info!(
                 "Received higher term ({}) from leader {}. Demoting to Follower.",
-                req.term, leader_id
+                req_term, leader_id
             );
-            state_guard.transition(|old| old.into_follower(req.term, Some(leader_id)));
-        } else if req.term == current_term {
+            state_guard.transition(|old| old.into_follower(req_term, Some(leader_id)));
+        } else if req_term == current_term {
             match &mut *state_guard {
                 RaftNodeState::Candidate(_) => {
                     // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
                     // it recognizes the leader as legitimate and returns to follower state.
                     info!(
                         "Candidate recognizing leader {} for term {}. Returning to Follower.",
-                        leader_id, req.term
+                        leader_id, req_term
                     );
-                    state_guard.transition(|old| old.into_follower(req.term, Some(leader_id)));
+                    state_guard.transition(|old| old.into_follower(req_term, Some(leader_id)));
                 }
                 RaftNodeState::Leader(_) => {
                     // FATAL INVARIANT VIOLATION: Two leaders for the same term!
@@ -197,7 +208,7 @@ impl ConsensusService for ConsensusDispatcher {
                     let msg = format!(
                         "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
                          node to prevent state corruption.",
-                        leader_id, req.term
+                        leader_id, req_term
                     );
                     error!("{}", msg);
                     panic!("{}", msg);
@@ -220,13 +231,13 @@ impl ConsensusService for ConsensusDispatcher {
 
                 // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
                 //    matches prevLogTerm (§5.3)
-                if req.prev_log_index > 0 {
-                    let local_term = node.get_term_at(req.prev_log_index);
-                    if local_term != req.prev_log_term {
+                if req_prev_log_index > LogIndex::ZERO {
+                    let local_term = node.get_term_at(req_prev_log_index);
+                    if local_term != req_prev_log_term {
                         debug!(
                             "Rejecting AppendEntries: prevLogIndex {} has term mismatch (local \
                              {}, remote {})",
-                            req.prev_log_index, local_term, req.prev_log_term
+                            req_prev_log_index, local_term, req_prev_log_term
                         );
                         success = false;
                     }
@@ -236,11 +247,12 @@ impl ConsensusService for ConsensusDispatcher {
                     // 3. If an existing entry conflicts with a new one (same index but different
                     //    terms), delete the existing entry and all that follow it (§5.3)
                     for entry in &req.entries {
-                        let local_term = node.get_term_at(entry.index);
-                        if local_term != 0 && local_term != entry.term {
+                        let entry_index = LogIndex::new(entry.index);
+                        let local_term = node.get_term_at(entry_index);
+                        if local_term != Term::ZERO && local_term != Term::new(entry.term) {
                             info!(
                                 "Log conflict detected at index {}. Truncating log.",
-                                entry.index
+                                entry_index
                             );
                             let truncate_at = (entry.index - 1) as usize;
                             node.log_mut().truncate(truncate_at);
@@ -250,15 +262,16 @@ impl ConsensusService for ConsensusDispatcher {
 
                     // 4. Append any new entries not already in the log
                     for entry in req.entries {
+                        let entry_index = LogIndex::new(entry.index);
                         let last_idx = node.last_log_index();
-                        if entry.index > last_idx {
-                            if entry.index != last_idx + 1 {
+                        if entry_index > last_idx {
+                            if entry_index != last_idx + 1 {
                                 // This should be caught by the prevLogIndex check, but we are
                                 // defensive.
                                 error!(
                                     "CRITICAL: Non-contiguous log append attempted. index={}, \
                                      last={}",
-                                    entry.index, last_idx
+                                    entry_index, last_idx
                                 );
                                 success = false;
                                 break;
@@ -271,9 +284,9 @@ impl ConsensusService for ConsensusDispatcher {
                 if success {
                     // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index
                     //    of last new entry)
-                    if req.leader_commit > node.commit_index() {
+                    if req_leader_commit > node.commit_index() {
                         let last_new_idx = node.last_log_index();
-                        let new_commit = std::cmp::min(req.leader_commit, last_new_idx);
+                        let new_commit = std::cmp::min(req_leader_commit, last_new_idx);
                         node.set_commit_index(new_commit);
                         debug!("Updated commit_index to {}", new_commit);
                     }
@@ -281,15 +294,15 @@ impl ConsensusService for ConsensusDispatcher {
 
                 (success, node.last_log_index())
             }
-            _ => (false, 0), // Should have demoted above
+            _ => (false, LogIndex::ZERO), // Should have demoted above
         };
 
-        Ok(Response::new(AppendEntriesResponse {
-            cluster_id: self.cluster_id_as_str().to_string(),
-            term: state_guard.current_term().unwrap_or(req.term),
+        Ok(Response::new(AppendEntriesResponse::new(
+            self.identity().cluster_id(),
+            state_guard.current_term().unwrap_or(req_term),
             success,
             last_log_index,
-        }))
+        )))
     }
 }
 
@@ -411,7 +424,7 @@ mod tests {
             // Pre-initialize to term 1
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(1, None));
+                state.transition(|old| old.into_follower(Term::new(1), None));
             }
 
             let req = Request::new(RequestVoteRequest {
@@ -434,7 +447,7 @@ mod tests {
             // First, update node to term 2
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(2, None));
+                state.transition(|old| old.into_follower(Term::new(2), None));
             }
 
             let req = Request::new(RequestVoteRequest {
@@ -549,7 +562,7 @@ mod tests {
                 if let RaftNodeState::Follower(node) = &mut *state {
                     for i in 1..=10 {
                         node.log_mut().push(common::proto::v1::LogEntry {
-                            index: i,
+                            index: i as u64,
                             term: 1,
                             data: vec![],
                         });
@@ -601,7 +614,7 @@ mod tests {
             // Update node to term 2
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(2, None));
+                state.transition(|old| old.into_follower(Term::new(2), None));
             }
 
             let req = Request::new(AppendEntriesRequest {
@@ -645,7 +658,7 @@ mod tests {
 
             let state_guard = dispatcher.state.read().await;
             assert!(matches!(&*state_guard, RaftNodeState::Follower(_)));
-            assert_eq!(state_guard.current_term().unwrap(), 1);
+            assert_eq!(state_guard.current_term().unwrap(), Term::new(1));
         }
 
         #[tokio::test]
