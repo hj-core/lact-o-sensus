@@ -22,7 +22,6 @@ pub enum VetoError {
 /// Result of an AI Veto evaluation.
 #[derive(Debug, Clone)]
 pub struct VetoOutcome {
-    pub cluster_id: String,
     pub is_approved: bool,
     pub category_assignment: String,
     pub moral_justification: String,
@@ -38,7 +37,6 @@ pub trait VetoRelay: Debug + Send + Sync {
     /// heuristics.
     async fn evaluate(
         &self,
-        cluster_id: String,
         client_id: String,
         intent: &MutationIntent,
         current_inventory: &[GroceryItem],
@@ -64,7 +62,6 @@ impl GrpcVetoRelay {
 impl VetoRelay for GrpcVetoRelay {
     async fn evaluate(
         &self,
-        cluster_id: String,
         client_id: String,
         intent: &MutationIntent,
         current_inventory: &[GroceryItem],
@@ -73,7 +70,6 @@ impl VetoRelay for GrpcVetoRelay {
         let mut client = self.client.clone();
 
         let mut request = Request::new(EvaluateProposalRequest {
-            cluster_id,
             client_id,
             intent: Some(intent.clone()),
             current_inventory: current_inventory.to_vec(),
@@ -94,7 +90,6 @@ impl VetoRelay for GrpcVetoRelay {
             .into_inner();
 
         Ok(VetoOutcome {
-            cluster_id: response.cluster_id,
             is_approved: response.is_approved,
             category_assignment: response.category_assignment,
             moral_justification: response.moral_justification,

@@ -4,7 +4,6 @@ pub mod v1 {
     use ::prost_types::Timestamp;
 
     use crate::types::ClientId;
-    use crate::types::ClusterId;
     use crate::types::LogIndex;
     use crate::types::NodeId;
     use crate::types::SequenceId;
@@ -22,14 +21,12 @@ pub mod v1 {
 
     impl RequestVoteRequest {
         pub fn new(
-            cluster_id: &ClusterId,
             term: Term,
             candidate_id: NodeId,
             last_log_index: LogIndex,
             last_log_term: Term,
         ) -> Self {
             Self {
-                cluster_id: cluster_id.as_str().to_string(),
                 term: term.value(),
                 candidate_id: candidate_id.to_string(),
                 last_log_index: last_log_index.value(),
@@ -39,9 +36,8 @@ pub mod v1 {
     }
 
     impl RequestVoteResponse {
-        pub fn new(cluster_id: &ClusterId, term: Term, vote_granted: bool) -> Self {
+        pub fn new(term: Term, vote_granted: bool) -> Self {
             Self {
-                cluster_id: cluster_id.as_str().to_string(),
                 term: term.value(),
                 vote_granted,
             }
@@ -50,7 +46,6 @@ pub mod v1 {
 
     impl AppendEntriesRequest {
         pub fn new(
-            cluster_id: &ClusterId,
             term: Term,
             leader_id: NodeId,
             prev_log_index: LogIndex,
@@ -59,7 +54,6 @@ pub mod v1 {
             leader_commit: LogIndex,
         ) -> Self {
             Self {
-                cluster_id: cluster_id.as_str().to_string(),
                 term: term.value(),
                 leader_id: leader_id.to_string(),
                 prev_log_index: prev_log_index.value(),
@@ -71,14 +65,8 @@ pub mod v1 {
     }
 
     impl AppendEntriesResponse {
-        pub fn new(
-            cluster_id: &ClusterId,
-            term: Term,
-            success: bool,
-            last_log_index: LogIndex,
-        ) -> Self {
+        pub fn new(term: Term, success: bool, last_log_index: LogIndex) -> Self {
             Self {
-                cluster_id: cluster_id.as_str().to_string(),
                 term: term.value(),
                 success,
                 last_log_index: last_log_index.value(),
@@ -87,17 +75,45 @@ pub mod v1 {
     }
 
     impl ProposeMutationRequest {
-        pub fn new(
-            cluster_id: &ClusterId,
-            client_id: &ClientId,
-            sequence_id: SequenceId,
-            intent: MutationIntent,
-        ) -> Self {
+        pub fn new(client_id: &ClientId, sequence_id: SequenceId, intent: MutationIntent) -> Self {
             Self {
-                cluster_id: cluster_id.as_str().to_string(),
                 client_id: client_id.as_str().to_string(),
                 sequence_id: sequence_id.value(),
                 intent: Some(intent),
+            }
+        }
+    }
+
+    impl QueryStateResponse {
+        pub fn new(
+            items: Vec<GroceryItem>,
+            current_state_version: LogIndex,
+            status: QueryStatus,
+            leader_hint: String,
+            error_message: String,
+        ) -> Self {
+            Self {
+                items,
+                current_state_version: current_state_version.value(),
+                status: status as i32,
+                leader_hint,
+                error_message,
+            }
+        }
+    }
+
+    impl ProposeMutationResponse {
+        pub fn new(
+            status: MutationStatus,
+            state_version: LogIndex,
+            leader_hint: String,
+            error_message: String,
+        ) -> Self {
+            Self {
+                status: status as i32,
+                state_version: state_version.value(),
+                leader_hint,
+                error_message,
             }
         }
     }

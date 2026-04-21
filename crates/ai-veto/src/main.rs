@@ -48,7 +48,6 @@ impl PolicyService for MockPolicyService {
 
         // Deterministic Mock Approval
         Ok(Response::new(EvaluateProposalResponse {
-            cluster_id: req.cluster_id,
             is_approved: true,
             category_assignment: "Anomalous Inputs".to_string(), // Default mock category
             moral_justification: "Mock approval for Phase 4 infrastructure verification."

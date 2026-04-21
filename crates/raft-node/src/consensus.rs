@@ -127,9 +127,8 @@ async fn initiate_election(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather election parameters from the current state.
-    let (term, cluster_id, node_id, last_log_index, last_log_term) = {
+    let (term, node_id, last_log_index, last_log_term) = {
         let guard = state.read().await;
-        let cid = guard.cluster_id()?.clone();
         let nid = guard.node_id()?;
 
         let (last_idx, last_term) = match &*guard {
@@ -137,7 +136,7 @@ async fn initiate_election(
             _ => (LogIndex::ZERO, Term::ZERO), // Should be Candidate
         };
 
-        (guard.current_term()?, cid, nid, last_idx, last_term)
+        (guard.current_term()?, nid, last_idx, last_term)
     };
 
     info!(
@@ -149,7 +148,6 @@ async fn initiate_election(
     let peer_ids = peer_manager.peer_ids();
     let vote_requests = peer_ids.clone().into_iter().map(|peer_id| {
         let peer_manager = peer_manager.clone();
-        let cluster_id = cluster_id.clone();
         let node_id = node_id;
         let rpc_timeout = config.raft.rpc_timeout();
 
@@ -157,7 +155,6 @@ async fn initiate_election(
             match peer_manager.get_client(peer_id) {
                 Ok(mut client) => {
                     let mut request = Request::new(RequestVoteRequest::new(
-                        &cluster_id,
                         term,
                         node_id,
                         last_log_index,
@@ -168,10 +165,6 @@ async fn initiate_election(
                     match client.request_vote(request).await {
                         Ok(resp) => {
                             let resp = resp.into_inner();
-                            // ADR 004 / Security: Verify cluster identity in response
-                            if resp.cluster_id != cluster_id.as_str() {
-                                return Err(unauthorized_response_status());
-                            }
                             Ok((peer_id, resp))
                         }
                         Err(e) => Err(e),
@@ -254,12 +247,6 @@ async fn initiate_election(
     Ok(())
 }
 
-/// Returns a standard gRPC PermissionDenied status for responses from
-/// unauthorized clusters.
-fn unauthorized_response_status() -> Status {
-    Status::permission_denied("Received response from unauthorized cluster")
-}
-
 /// Spawns a background task that periodically sends heartbeats or replicates
 /// logs if the node is a Leader.
 pub fn spawn_heartbeat_task(
@@ -307,11 +294,10 @@ async fn replicate_to_peers(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather global replication parameters.
-    let (term, cluster_id, node_id, commit_index) = {
+    let (term, node_id, commit_index) = {
         let guard = state.read().await;
-        let cid = guard.cluster_id()?.clone();
         let nid = guard.node_id()?;
-        (guard.current_term()?, cid, nid, guard.commit_index()?)
+        (guard.current_term()?, nid, guard.commit_index()?)
     };
 
     let peer_ids = peer_manager.peer_ids();
@@ -321,7 +307,6 @@ async fn replicate_to_peers(
     let replication_requests = peer_ids.into_iter().map(|peer_id| {
         let state = state.clone();
         let peer_manager = peer_manager.clone();
-        let cluster_id = cluster_id.clone();
         let node_id = node_id;
 
         async move {
@@ -349,7 +334,6 @@ async fn replicate_to_peers(
                         };
 
                         AppendEntriesRequest::new(
-                            &cluster_id,
                             term,
                             node_id,
                             prev_log_index,
@@ -375,10 +359,6 @@ async fn replicate_to_peers(
                     match client.append_entries(req).await {
                         Ok(resp) => {
                             let resp = resp.into_inner();
-                            // ADR 004 / Security: Verify cluster identity
-                            if resp.cluster_id != cluster_id.as_str() {
-                                return Err(unauthorized_response_status());
-                            }
                             // Return peer_id and minimal metadata to avoid cloning log data
                             Ok(Some((peer_id, sent_prev_idx, sent_entries_len, resp)))
                         }

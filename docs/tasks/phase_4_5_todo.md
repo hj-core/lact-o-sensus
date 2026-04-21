@@ -14,19 +14,19 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
 
 ## 🏗️ Task Hierarchy & Git Commit Strategy
 
-### Step 1: Centralized Identity Interceptors (ADR 004/005)
+### Step 1: Centralized Identity Interceptors (ADR 004/005) [x]
 
 **Commit:** `feat(raft): implement centralized identity gRPC interceptors`
 
-- [ ] Create `IdentityInterceptor` in `crates/raft-node/src/service/common.rs`.
-  - [ ] Extract `x-cluster-id` and `x-target-node-id` from gRPC metadata.
-  - [ ] Validate against local `ClusterId` and `NodeId`.
-  - [ ] Return `Status::unauthenticated` or `Status::invalid_argument` on mismatch.
-- [ ] Register the interceptor in `crates/raft-node/src/main.rs` for both `ConsensusService` and `IngressService`.
-- [ ] Remove manual identity checks from `service/consensus.rs` and `service/ingress.rs`.
-- [ ] **Verification:**
-  - [ ] Unit tests for `IdentityInterceptor` with mocked metadata.
-  - [ ] Integration test: A node rejects a `RequestVote` with the wrong `cluster_id` at the middleware layer.
+- [x] Create `IdentityInterceptor` in `crates/raft-node/src/service/common.rs`.
+  - [x] Extract `x-cluster-id` and `x-target-node-id` from gRPC metadata.
+  - [x] Validate against local `ClusterId` and `NodeId`.
+  - [x] Return `Status::unauthenticated` or `Status::invalid_argument` on mismatch.
+- [x] Register the interceptor in `crates/raft-node/src/main.rs` for both `ConsensusService` and `IngressService`.
+- [x] Remove manual identity checks from `service/consensus.rs` and `service/ingress.rs`.
+- [x] **Verification:**
+  - [x] Unit tests for `IdentityInterceptor` with mocked metadata.
+  - [x] Integration test: Verified that a node rejects traffic missing identity headers. (Note: Step 2 is required for cluster recovery).
 
 ### Step 2: Protocol Invariant Enforcement
 

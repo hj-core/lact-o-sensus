@@ -101,7 +101,6 @@ impl IngressDispatcher {
     ) -> Response<ProposeMutationResponse> {
         let (leader_hint, error_message) = self.redirection_hint(node);
         Response::new(ProposeMutationResponse {
-            cluster_id: self.cluster_id_as_str().to_string(),
             status: MutationStatus::Rejected as i32,
             state_version: 0,
             leader_hint,
@@ -114,7 +113,6 @@ impl IngressDispatcher {
     fn query_follower_response(&self, node: &RaftNode<Follower>) -> Response<QueryStateResponse> {
         let (leader_hint, error_message) = self.redirection_hint(node);
         Response::new(QueryStateResponse {
-            cluster_id: self.cluster_id_as_str().to_string(),
             items: Vec::new(),
             current_state_version: 0,
             status: QueryStatus::Rejected as i32,
@@ -158,7 +156,6 @@ impl IngressService for IngressDispatcher {
         request: Request<ProposeMutationRequest>,
     ) -> Result<Response<ProposeMutationResponse>, Status> {
         let req = request.into_inner();
-        self.verify_identity(&req.cluster_id)?;
 
         let sequence_id = SequenceId::new(req.sequence_id);
         let client_id = req
@@ -187,7 +184,6 @@ impl IngressService for IngressDispatcher {
                 }
                 RaftNodeState::Candidate(_) => {
                     return Ok(Response::new(ProposeMutationResponse {
-                        cluster_id: self.cluster_id_as_str().to_string(),
                         status: MutationStatus::Rejected as i32,
                         state_version: 0,
                         leader_hint: String::new(),
@@ -204,7 +200,6 @@ impl IngressService for IngressDispatcher {
         let outcome = self
             .veto_relay
             .evaluate(
-                req.cluster_id.clone(),
                 req.client_id.clone(),
                 &intent,
                 &[], // Inventory store implemented in Phase 5
@@ -214,11 +209,9 @@ impl IngressService for IngressDispatcher {
 
         let veto = match outcome {
             Ok(v) => {
-                self.verify_identity(&v.cluster_id)?;
                 if !v.is_approved {
                     info!("Mutation VETOED by AI: {}", v.moral_justification);
                     return Ok(Response::new(ProposeMutationResponse {
-                        cluster_id: self.cluster_id_as_str().to_string(),
                         status: MutationStatus::Vetoed as i32,
                         state_version: 0,
                         leader_hint: String::new(),
@@ -230,7 +223,6 @@ impl IngressService for IngressDispatcher {
             Err(VetoError::Timeout(d)) => {
                 warn!("AI Veto evaluation timed out after {:?}", d);
                 return Ok(Response::new(ProposeMutationResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
                     status: MutationStatus::Rejected as i32,
                     state_version: 0,
                     leader_hint: String::new(),
@@ -315,7 +307,6 @@ impl IngressService for IngressDispatcher {
 
         info!("Mutation index {} committed successfully.", proposal_index);
         Ok(Response::new(ProposeMutationResponse {
-            cluster_id: self.cluster_id_as_str().to_string(),
             status: MutationStatus::Committed as i32,
             state_version: proposal_index.value(),
             leader_hint: String::new(),
@@ -327,8 +318,7 @@ impl IngressService for IngressDispatcher {
         &self,
         request: Request<QueryStateRequest>,
     ) -> Result<Response<QueryStateResponse>, Status> {
-        let req = request.into_inner();
-        self.verify_identity(&req.cluster_id)?;
+        let _req = request.into_inner();
 
         let state_guard = self.state.read().await;
         self.verify_node_integrity(&state_guard)?;
@@ -342,7 +332,6 @@ impl IngressService for IngressDispatcher {
                 Ok(self.query_follower_response(node))
             }
             RaftNodeState::Candidate(_) => Ok(Response::new(QueryStateResponse {
-                cluster_id: self.cluster_id_as_str().to_string(),
                 items: Vec::new(),
                 current_state_version: 0,
                 status: QueryStatus::Rejected as i32,
@@ -352,7 +341,6 @@ impl IngressService for IngressDispatcher {
             RaftNodeState::Leader(_) => {
                 // TODO: Phase 5 - Implement State Machine queries (Item Store)
                 Ok(Response::new(QueryStateResponse {
-                    cluster_id: self.cluster_id_as_str().to_string(),
                     items: Vec::new(),
                     current_state_version: 0,
                     status: QueryStatus::Success as i32,
@@ -388,14 +376,12 @@ mod tests {
     impl VetoRelay for TestVetoRelay {
         async fn evaluate(
             &self,
-            cluster_id: String,
             _client_id: String,
             _intent: &common::proto::v1::MutationIntent,
             _current_inventory: &[common::proto::v1::GroceryItem],
             _timeout: Duration,
         ) -> Result<VetoOutcome, VetoError> {
             Ok(VetoOutcome {
-                cluster_id,
                 is_approved: true,
                 category_assignment: "Primary Flora".to_string(),
                 moral_justification: "Test approval".to_string(),
@@ -415,31 +401,14 @@ mod tests {
     }
 
     fn mock_dispatcher(state: RaftNodeState, peer_manager: Arc<PeerManager>) -> IngressDispatcher {
+        let identity = state.identity_arc().unwrap().clone();
         IngressDispatcher::new(
-            mock_identity(),
+            identity,
             Arc::new(RwLock::new(state)),
             peer_manager,
             Arc::new(TestVetoRelay),
             Duration::from_secs(1),
         )
-    }
-
-    mod identity_guard {
-        use super::*;
-
-        #[tokio::test]
-        async fn returns_err_when_cluster_id_mismatches() {
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
-            let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
-            let req = Request::new(ProposeMutationRequest {
-                cluster_id: "wrong-cluster".to_string(),
-                ..Default::default()
-            });
-
-            let result = dispatcher.propose_mutation(req).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
-        }
     }
 
     mod propose_mutation {
@@ -450,10 +419,9 @@ mod tests {
             let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
             let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
-                cluster_id: "test-cluster".to_string(),
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
-                ..Default::default()
+                intent: None,
             });
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
@@ -475,9 +443,9 @@ mod tests {
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
             let req = Request::new(ProposeMutationRequest {
-                cluster_id: "test-cluster".to_string(),
                 client_id: ClientId::generate().as_str().to_string(),
-                ..Default::default()
+                sequence_id: 1,
+                intent: None,
             });
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
@@ -494,9 +462,9 @@ mod tests {
 
             let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
-                cluster_id: "test-cluster".to_string(),
                 client_id: ClientId::generate().as_str().to_string(),
-                ..Default::default()
+                sequence_id: 1,
+                intent: None,
             });
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
@@ -513,9 +481,8 @@ mod tests {
             let node = RaftNodeState::Follower(RaftNode::<Follower>::new(mock_identity()));
             let dispatcher = mock_dispatcher(node, mock_peer_manager(&HashMap::new()));
             let req = Request::new(QueryStateRequest {
-                cluster_id: "test-cluster".to_string(),
                 query_filter: None,
-                ..Default::default()
+                min_state_version: None,
             });
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
@@ -535,8 +502,8 @@ mod tests {
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(&peers));
             let req = Request::new(QueryStateRequest {
-                cluster_id: "test-cluster".to_string(),
-                ..Default::default()
+                query_filter: None,
+                min_state_version: None,
             });
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
@@ -552,8 +519,8 @@ mod tests {
 
             let dispatcher = mock_dispatcher(candidate, mock_peer_manager(&HashMap::new()));
             let req = Request::new(QueryStateRequest {
-                cluster_id: "test-cluster".to_string(),
-                ..Default::default()
+                query_filter: None,
+                min_state_version: None,
             });
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
@@ -568,8 +535,8 @@ mod tests {
 
             let dispatcher = mock_dispatcher(leader, mock_peer_manager(&HashMap::new()));
             let req = Request::new(QueryStateRequest {
-                cluster_id: "test-cluster".to_string(),
-                ..Default::default()
+                query_filter: None,
+                min_state_version: None,
             });
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();

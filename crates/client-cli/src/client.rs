@@ -12,7 +12,6 @@ use common::proto::v1::QueryStateResponse;
 use common::proto::v1::QueryStatus;
 use common::proto::v1::ingress_service_client::IngressServiceClient;
 use common::types::ClientId;
-use common::types::ClusterId;
 use common::types::LogIndex;
 use tokio::sync::RwLock;
 use tonic::Request;
@@ -37,8 +36,6 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// ensures Exactly-Once Semantics (EOS) while minimizing synchronization
 /// overhead.
 pub struct LactoClient {
-    /// Target cluster identity.
-    cluster_id: ClusterId,
     /// Client session identity.
     client_id: ClientId,
 
@@ -78,11 +75,9 @@ impl LactoClient {
             anyhow::bail!("Client timeouts must be non-zero");
         }
 
-        let cluster_id = state.cluster_id().clone();
         let client_id = state.client_id().clone();
 
         Ok(Self {
-            cluster_id,
             client_id,
             mutation_timeout,
             query_timeout,
@@ -114,8 +109,7 @@ impl LactoClient {
             .next_sequence_id()
             .context("Failed to prepare session sequence for mutation")?;
 
-        let request_payload =
-            ProposeMutationRequest::new(&self.cluster_id, &self.client_id, sequence_id, intent);
+        let request_payload = ProposeMutationRequest::new(&self.client_id, sequence_id, intent);
 
         self.dispatch_mutation(request_payload).await
     }
@@ -130,7 +124,6 @@ impl LactoClient {
         min_state_version: Option<LogIndex>,
     ) -> Result<QueryStateResponse> {
         let request_payload = QueryStateRequest {
-            cluster_id: self.cluster_id.as_str().to_string(),
             query_filter,
             min_state_version: min_state_version.map(|v| v.value()),
         };
@@ -419,14 +412,12 @@ mod tests {
 
             // Follower rejects and points to leader
             mock_follower.push_mutation_response(Ok(ProposeMutationResponse {
-                cluster_id: "test-cluster".to_string(),
                 status: MutationStatus::Rejected as i32,
                 leader_hint: leader_addr.clone(),
                 ..Default::default()
             }));
             // Leader succeeds
             mock_leader.push_mutation_response(Ok(ProposeMutationResponse {
-                cluster_id: "test-cluster".to_string(),
                 status: MutationStatus::Committed as i32,
                 ..Default::default()
             }));
@@ -455,13 +446,11 @@ mod tests {
             let follower_addr = spawn_mock(mock_follower.clone()).await;
 
             mock_follower.push_mutation_response(Ok(ProposeMutationResponse {
-                cluster_id: "test-cluster".to_string(),
                 status: MutationStatus::Rejected as i32,
                 leader_hint: leader_addr.clone(),
                 ..Default::default()
             }));
             mock_leader.push_mutation_response(Ok(ProposeMutationResponse {
-                cluster_id: "test-cluster".to_string(),
                 status: MutationStatus::Committed as i32,
                 ..Default::default()
             }));

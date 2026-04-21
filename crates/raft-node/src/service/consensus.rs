@@ -50,7 +50,6 @@ impl ConsensusService for ConsensusDispatcher {
         request: Request<RequestVoteRequest>,
     ) -> Result<Response<RequestVoteResponse>, Status> {
         let req = request.into_inner();
-        self.verify_identity(&req.cluster_id)?;
 
         let candidate_id = req
             .candidate_id
@@ -132,7 +131,6 @@ impl ConsensusService for ConsensusDispatcher {
         };
 
         Ok(Response::new(RequestVoteResponse::new(
-            self.identity().cluster_id(),
             state_guard
                 .current_term()
                 .map_err(|_| self.poisoned_status())?,
@@ -145,7 +143,6 @@ impl ConsensusService for ConsensusDispatcher {
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
         let req = request.into_inner();
-        self.verify_identity(&req.cluster_id)?;
 
         let leader_id = req
             .leader_id
@@ -174,7 +171,6 @@ impl ConsensusService for ConsensusDispatcher {
                 leader_id, req_term, current_term
             );
             return Ok(Response::new(AppendEntriesResponse::new(
-                self.identity().cluster_id(),
                 current_term,
                 false,
                 LogIndex::ZERO,
@@ -298,7 +294,6 @@ impl ConsensusService for ConsensusDispatcher {
         };
 
         Ok(Response::new(AppendEntriesResponse::new(
-            self.identity().cluster_id(),
             state_guard.current_term().unwrap_or(req_term),
             success,
             last_log_index,
@@ -327,27 +322,6 @@ mod tests {
         ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)))
     }
 
-    mod identity_guard {
-        use super::*;
-
-        #[tokio::test]
-        async fn returns_err_when_cluster_id_mismatches() {
-            let dispatcher = mock_dispatcher();
-
-            let req = Request::new(RequestVoteRequest {
-                cluster_id: "wrong-cluster".to_string(),
-                term: 1,
-                candidate_id: "2".to_string(),
-                last_log_index: 0,
-                last_log_term: 0,
-            });
-
-            let result = dispatcher.request_vote(req).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
-        }
-    }
-
     mod integrity_check {
         use super::*;
 
@@ -362,7 +336,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -381,10 +354,10 @@ mod tests {
             let wrong_id = Arc::new(NodeIdentity::new(id.cluster_id().clone(), NodeId::new(99)));
             let node = RaftNodeState::Follower(RaftNode::<Follower>::new(wrong_id));
 
+            // Use the original ID for the dispatcher but the wrong ID for the node
             let dispatcher = ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)));
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -406,7 +379,6 @@ mod tests {
             let dispatcher = mock_dispatcher();
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Follower starts at term 0, so 1 is higher
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -428,7 +400,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Same as current term
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -451,7 +422,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Older term
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -485,7 +455,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 1, // Shorter than local (2)
@@ -513,7 +482,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 2,
                 candidate_id: "2".to_string(),
                 last_log_index: 10, // Longer, but...
@@ -541,7 +509,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 2, // Longer than local (1)
@@ -571,7 +538,6 @@ mod tests {
             }
 
             let req = Request::new(RequestVoteRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 2,
                 candidate_id: "2".to_string(),
                 last_log_index: 1, // Shorter, but...
@@ -593,7 +559,6 @@ mod tests {
             let dispatcher = mock_dispatcher();
 
             let req = Request::new(AppendEntriesRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 0,
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -618,7 +583,6 @@ mod tests {
             }
 
             let req = Request::new(AppendEntriesRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Older
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -644,7 +608,6 @@ mod tests {
             );
 
             let req = Request::new(AppendEntriesRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Equal to candidate term
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -673,7 +636,6 @@ mod tests {
                 ConsensusDispatcher::new(id, Arc::new(RwLock::new(RaftNodeState::Leader(leader))));
 
             let req = Request::new(AppendEntriesRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 1, // Rival leader for same term
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -704,7 +666,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
 
             let req = Request::new(AppendEntriesRequest {
-                cluster_id: "test-cluster".to_string(),
                 term: 0,
                 leader_id: "2".to_string(),
                 prev_log_index: 0,

@@ -20,6 +20,7 @@ use node::Follower;
 use node::RaftNode;
 use node::RaftNodeState;
 use peer::PeerManager;
+use service::common::IdentityInterceptor;
 use service::consensus::ConsensusDispatcher;
 use service::ingress::IngressDispatcher;
 use service::veto::GrpcVetoRelay;
@@ -121,6 +122,8 @@ async fn main() -> Result<()> {
         id = %identity.node_id()
     );
 
+    let interceptor = IdentityInterceptor::new(identity.clone());
+
     async move {
         info!("Identity verified. Transport layer starting...");
 
@@ -138,8 +141,14 @@ async fn main() -> Result<()> {
 
         // 11. Start the gRPC Server
         Server::builder()
-            .add_service(ConsensusServiceServer::new(consensus_dispatcher))
-            .add_service(IngressServiceServer::new(ingress_dispatcher))
+            .add_service(ConsensusServiceServer::with_interceptor(
+                consensus_dispatcher,
+                interceptor.clone(),
+            ))
+            .add_service(IngressServiceServer::with_interceptor(
+                ingress_dispatcher,
+                interceptor,
+            ))
             .serve_with_shutdown(addr, shutdown)
             .await
             .map_err(anyhow::Error::from)?;

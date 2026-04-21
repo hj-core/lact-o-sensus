@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::proto::v1::LogEntry;
-use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
@@ -494,16 +493,6 @@ impl RaftNodeState {
             }
             RaftNodeState::Poisoned => Err(RaftError::Poisoned),
             _ => Err(RaftError::NotLeader),
-        }
-    }
-
-    /// Returns the cluster ID this node belongs to.
-    pub fn cluster_id(&self) -> Result<&ClusterId, RaftError> {
-        match self {
-            RaftNodeState::Follower(n) => Ok(n.identity().cluster_id()),
-            RaftNodeState::Candidate(n) => Ok(n.identity().cluster_id()),
-            RaftNodeState::Leader(n) => Ok(n.identity().cluster_id()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
         }
     }
 
