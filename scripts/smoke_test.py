@@ -389,7 +389,7 @@ def test_ai_veto_egress() -> None:
         json.dumps(
             {
                 "cluster_id": "lacto-dev-01",
-                "client_id": "smoke-tester",
+                "client_id": "550e8400-e29b-41d4-a716-446655440000",
                 "sequence_id": 1,
                 "intent": {"item_key": "oat_milk", "quantity": "2"},
             }
