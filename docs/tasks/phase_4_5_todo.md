@@ -38,20 +38,20 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
   - [x] `smoke_test.py` confirms cluster still achieves consensus.
   - [x] Wireshark/Metadata logging confirms headers are present on the wire (Verified via `IdentityInterceptor` success).
 
-### Step 3: Client-Side WAL for Mutation Intents (ADR 001)
+### Step 3: Client-Side WAL for Mutation Intents (ADR 001) [x]
 
 **Commit:** `feat(client): implement client-side WAL using sled for intent durability`
 
-- [ ] Integrate `sled` into `crates/client-cli`.
-- [ ] Define `IntentWal` manager to handle:
-  - [ ] `append(sequence_id, intent)`: Save to `sled` before RPC.
-  - [ ] `remove(sequence_id)`: Delete after `COMMITTED` response.
-  - [ ] `recover()`: Return all pending intents on startup.
-- [ ] Update `LactoClient::propose` to utilize the WAL.
-- [ ] Implement a recovery task in `main.rs` that re-proposes pending intents from the WAL.
-- [ ] **Verification:**
-  - [ ] Unit tests for `IntentWal` CRUD operations.
-  - [ ] Crash Test: Kill `client-cli` after it logs "Intent Persisted" but before response; verify re-proposal on restart.
+- [x] Integrate `sled` into `crates/client-cli`.
+- [x] Define `IntentWal` manager to handle:
+  - [x] `append(sequence_id, intent)`: Save to `sled` before RPC.
+  - [x] `remove(sequence_id)`: Delete after `COMMITTED` response.
+  - [x] `recover()`: Return all pending intents on startup.
+- [x] Update `LactoClient::propose` to utilize the WAL.
+- [x] Implement a recovery task in `main.rs` that re-proposes pending intents from the WAL.
+- [x] **Verification:**
+  - [x] Unit tests for `IntentWal` CRUD operations.
+  - [x] Crash Test: Kill `client-cli` after it logs "Intent Persisted" but before response; verify re-proposal on restart.
 
 ### Step 4: Resilient Client Loop (ADR 003)
 
