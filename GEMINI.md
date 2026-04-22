@@ -8,26 +8,38 @@
 
 ## 🏗️ Architecture & Context
 
-- **Nature:** Pedagogical Distributed Replicated State Machine (RSM).
+- **Nature:** Pedagogical Domain-Agnostic Replicated State Machine (RSM) with Decoupled Application Logic.
 - **Topology:** Leader-Centric Hub-and-Spoke (**ADR 002**). Full-Mesh Internal Consensus.
 - **Failure Model:** Crash-Recovery (**ADR 001**). Stable storage via `sled`.
 - **Identity:** Persistent Logical Identity Tuple (**ADR 004**).
 
 ## ⚖️ Technical Standards
 
+### 1. Structural Integrity & Isolation
+
 - **Safety Over Liveness (ADR 001):** Trigger the **Halt Mandate** (immediate panic) on any protocol or identity invariant violation.
-- **Exactly-Once (ADR 006):** Mandatory Client-Side WAL for pending intents. Logic must be deterministic and monotonic.
-- **Defense Onion (ADR 007):** Enforce the 5-Layer Defensive Pipeline (Client Structural -> Leader Syntactic -> AI Semantic -> Leader Validation -> Consensus Commit). Mutations must survive every checkpoint to become immutable facts.
-- **Semantic Finality:** Distinguish between transient failures and semantic rejections (`VETOED`). Receipt of a terminal response must immediately reconcile durable state (clear WAL).
+- **Domain Isolation (ADR 005/007):** Maintain a strict boundary between the generic consensus engine and the application state machine via trait abstractions. The Raft core must remain domain-agnostic.
 - **Identity Integrity (ADR 004):** Verify `(cluster_id, node_id)` against stable storage on startup. Halt on mismatch.
-- **Persistence (ADR 001):** Mandatory `fsync` to stable storage before acknowledging any commit.
+- **Cluster Isolation (ADR 004):** Strictly validate `cluster_id` and `target_node_id` via centralized gRPC interceptors to prevent environmental cross-contamination.
+
+### 2. Network & Protocol
+
+- **Logical Interface (ADR 005):** Employ the **Split Contract Pattern**. Separate generic consensus RPCs (`raft.proto`) from application-specific intents and mutations (`app.proto`).
 - **Network Authority (ADR 002):** The Leader is the exclusive processor for mutations/queries and the sole egress initiator.
-- **Cluster Isolation (ADR 004):** Strictly validate `cluster_id` and `target_node_id` via centralized gRPC interceptors.
+- **Timing Model (ADR 003):** Maintain 1:3-1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
+- **Exactly-Once (ADR 006):** Mandatory Client-Side WAL for pending intents. Logic must be deterministic and monotonic.
+
+### 3. Request Lifecycle & Consensus
+
+- **Defense Onion (ADR 007):** Enforce the 5-Layer Defensive Pipeline (Client Structural -> Leader Syntactic -> AI Semantic -> Leader Validation -> Consensus Commit).
+- **Semantic Finality:** Distinguish between transient failures and semantic rejections (`VETOED`). Receipt of a terminal response must immediately reconcile durable state (clear WAL).
+- **Persistence (ADR 001):** Mandatory `fsync` to stable storage before acknowledging any commit.
+
+### 4. Semantic & Physical Data Integrity
+
 - **Physical Invariants (ADR 008):** Enforce the "Dimensional Fence." Arithmetic only between compatible units. Banker's Rounding is mandatory.
 - **Idempotency (ADR 007):** Log the **Absolute Result in Internal SI Base Units**. Record last-used display unit for UX consistency.
 - **Semantic Integrity (ADR 007):** Enforce the **Registry Firewall**. Verify all AI metadata (Categories/Units) against system registries before proposal.
-- **Timing Model (ADR 003):** Maintain 1:3-1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
-- **Logical Interface (ADR 005):** Responses must include responder `node_id`. Use stringified fixed-point decimals for all quantities.
 
 ## 🛠️ Implementation & Workflow
 
