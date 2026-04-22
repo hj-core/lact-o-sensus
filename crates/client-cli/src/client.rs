@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use common::types::ClientId;
 use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::SequenceId;
 use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Status;
@@ -23,6 +25,7 @@ use tonic::transport::Endpoint;
 
 use crate::state::ClientState;
 use crate::state::MAX_KNOWN_NODES;
+use crate::wal::IntentWal;
 
 /// Default timeout for mutation requests, accounting for AI Veto egress (5s)
 /// and Raft consensus.
@@ -42,7 +45,7 @@ pub const HEADER_TARGET_NODE_ID: &str = "x-target-node-id";
 ///
 /// The `LactoClient` handles leader discovery, automatic redirection, and
 /// ensures Exactly-Once Semantics (EOS) while minimizing synchronization
-/// overhead.
+/// overhead and ensuring crash-durability via a WAL.
 pub struct LactoClient {
     /// Target cluster identity for outbound header injection.
     cluster_id: ClusterId,
@@ -56,27 +59,28 @@ pub struct LactoClient {
 
     /// Persistent state including sequence IDs and the node discovery list.
     state: Arc<RwLock<ClientState>>,
+    /// Durable Write-Ahead Log for mutation intents.
+    wal: Arc<IntentWal>,
     /// Active gRPC channel, lazily initialized and refreshed upon redirection.
     client: RwLock<Option<IngressServiceClient<Channel>>>,
 }
 
 impl LactoClient {
     /// Creates a new `LactoClient` with default timeouts.
-    pub fn new(state: ClientState) -> Self {
-        // Safe to unwrap here because defaults are known constants,
-        // but we'll use with_timeouts for consistency.
+    pub fn new(state: ClientState, wal_path: impl AsRef<Path>) -> Result<Self> {
         Self::with_timeouts(
             state,
+            wal_path,
             DEFAULT_MUTATION_TIMEOUT,
             DEFAULT_QUERY_TIMEOUT,
             DEFAULT_CONNECT_TIMEOUT,
         )
-        .expect("Default timeouts must be valid")
     }
 
     /// Creates a new `LactoClient` with explicit timeout configuration.
     pub fn with_timeouts(
         state: ClientState,
+        wal_path: impl AsRef<Path>,
         mutation_timeout: Duration,
         query_timeout: Duration,
         connect_timeout: Duration,
@@ -87,6 +91,7 @@ impl LactoClient {
 
         let cluster_id = state.cluster_id().clone();
         let client_id = state.client_id().clone();
+        let wal = IntentWal::open(wal_path)?;
 
         Ok(Self {
             cluster_id,
@@ -95,6 +100,7 @@ impl LactoClient {
             query_timeout,
             connect_timeout,
             state: Arc::new(RwLock::new(state)),
+            wal: Arc::new(wal),
             client: RwLock::new(None),
         })
     }
@@ -104,12 +110,20 @@ impl LactoClient {
         &self.state
     }
 
+    /// Returns a reference to the Write-Ahead Log.
+    pub fn wal(&self) -> &Arc<IntentWal> {
+        &self.wal
+    }
+
     // --- High-Level API ---
 
     /// Proposes a grocery mutation to the cluster.
     ///
-    /// Ensures Exactly-Once Semantics by incrementing and persisting the
-    /// sequence ID *before* the RPC is dispatched.
+    /// Ensures Exactly-Once Semantics by:
+    /// 1. Incrementing the sequence ID.
+    /// 2. Persisting the intent to the WAL.
+    /// 3. Dispatching the RPC.
+    /// 4. Removing from WAL only on terminal response (COMMITTED/VETOED).
     pub async fn propose_mutation(
         &self,
         intent: MutationIntent,
@@ -123,7 +137,42 @@ impl LactoClient {
 
         let request_payload = ProposeMutationRequest::new(&self.client_id, sequence_id, intent);
 
-        self.dispatch_mutation(request_payload).await
+        // ADR 001: Persist before network egress
+        self.wal.append(sequence_id, &request_payload)?;
+
+        self.execute_mutation(sequence_id, request_payload).await
+    }
+
+    /// Re-proposes a recovered mutation intent from the WAL.
+    ///
+    /// This is used during the startup recovery phase to reconcile pending
+    /// intents without generating new sequence IDs.
+    pub async fn repropose_mutation(
+        &self,
+        sequence_id: SequenceId,
+        payload: ProposeMutationRequest,
+    ) -> Result<ProposeMutationResponse> {
+        self.execute_mutation(sequence_id, payload).await
+    }
+
+    /// Orchestrates the mutation lifecycle from dispatch to WAL cleanup.
+    async fn execute_mutation(
+        &self,
+        sequence_id: SequenceId,
+        payload: ProposeMutationRequest,
+    ) -> Result<ProposeMutationResponse> {
+        let response = self.dispatch_mutation(payload).await?;
+
+        // ADR 001: Only remove from WAL if the state is terminal.
+        // REJECTED (redirection) is NOT terminal and will continue in the retry loop.
+        match MutationStatus::try_from(response.status) {
+            Ok(MutationStatus::Committed) | Ok(MutationStatus::Vetoed) => {
+                self.wal.remove(sequence_id)?;
+            }
+            _ => {}
+        }
+
+        Ok(response)
     }
 
     /// Queries the current grocery ledger state.
@@ -497,7 +546,7 @@ mod tests {
                 mock_cluster_id(),
                 vec![follower_addr],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             client.propose_mutation(test_intent()).await?;
 
@@ -530,7 +579,7 @@ mod tests {
                 mock_cluster_id(),
                 vec![follower_addr],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             let res = client.propose_mutation(test_intent()).await?;
 
@@ -570,7 +619,7 @@ mod tests {
                 mock_cluster_id(),
                 vec![addr_a],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             let res = client.propose_mutation(test_intent()).await?;
             assert_eq!(res.status, MutationStatus::Committed as i32);
@@ -598,7 +647,7 @@ mod tests {
                 mock_cluster_id(),
                 vec![addr],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             let result = client.propose_mutation(test_intent()).await;
             assert!(result.is_err());
@@ -619,7 +668,7 @@ mod tests {
             let dir = tempdir()?;
             let path = dir.path().join("state.json");
             let state = ClientState::load_or_init(&path, mock_cluster_id(), vec![addr])?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             client.propose_mutation(test_intent()).await?;
 
@@ -664,11 +713,148 @@ mod tests {
                 mock_cluster_id(),
                 vec![follower_addr],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             let res = client.query_state(None, None).await?;
             assert_eq!(res.status, QueryStatus::Success as i32);
             assert_eq!(res.current_state_version, 42);
+            Ok(())
+        }
+    }
+
+    mod wal_integration {
+        use common::types::ClusterId;
+
+        use super::*;
+
+        fn mock_cluster_id() -> ClusterId {
+            ClusterId::try_new("test-cluster").unwrap()
+        }
+
+        #[tokio::test]
+        async fn removes_intent_from_wal_on_committed() -> Result<()> {
+            let mock = Arc::new(MockIngressService::new());
+            let addr = spawn_mock(mock.clone()).await;
+
+            mock.push_mutation_response(Ok(ProposeMutationResponse {
+                status: MutationStatus::Committed as i32,
+                ..Default::default()
+            }));
+
+            let dir = tempdir()?;
+            let state = ClientState::load_or_init(
+                dir.path().join("state.json"),
+                mock_cluster_id(),
+                vec![addr],
+            )?;
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
+
+            client.propose_mutation(test_intent()).await?;
+
+            let recovered = client.wal().recover()?;
+            assert!(recovered.is_empty(), "WAL should be empty after COMMITTED");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn removes_intent_from_wal_on_vetoed() -> Result<()> {
+            let mock = Arc::new(MockIngressService::new());
+            let addr = spawn_mock(mock.clone()).await;
+
+            mock.push_mutation_response(Ok(ProposeMutationResponse {
+                status: MutationStatus::Vetoed as i32,
+                ..Default::default()
+            }));
+
+            let dir = tempdir()?;
+            let state = ClientState::load_or_init(
+                dir.path().join("state.json"),
+                mock_cluster_id(),
+                vec![addr],
+            )?;
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
+
+            client.propose_mutation(test_intent()).await?;
+
+            let recovered = client.wal().recover()?;
+            assert!(recovered.is_empty(), "WAL should be empty after VETOED");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn preserves_intent_in_wal_on_transport_failure() -> Result<()> {
+            let mock = Arc::new(MockIngressService::new());
+            let addr = spawn_mock(mock.clone()).await;
+
+            // Mock returns a transport-level error
+            mock.push_mutation_response(Err(Status::unavailable("Service down")));
+
+            let dir = tempdir()?;
+            let state = ClientState::load_or_init(
+                dir.path().join("state.json"),
+                mock_cluster_id(),
+                vec![addr],
+            )?;
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
+
+            let result = client.propose_mutation(test_intent()).await;
+            assert!(result.is_err());
+
+            let recovered = client.wal().recover()?;
+            assert_eq!(recovered.len(), 1, "WAL should preserve intent on failure");
+            assert_eq!(recovered[0].0.value(), 1);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_startup_recovery_simulation() -> Result<()> {
+            let mock = Arc::new(MockIngressService::new());
+            let addr = spawn_mock(mock.clone()).await;
+
+            // 1. Setup: Pre-populate WAL with a "crashed" intent
+            let dir = tempdir()?;
+            let wal_path = dir.path().join("wal");
+            let wal = IntentWal::open(&wal_path)?;
+            let seq = SequenceId::new(42);
+            let intent = MutationIntent {
+                item_key: "eggs".to_string(),
+                quantity: "12".to_string(),
+                unit: None,
+                category: None,
+                operation: OperationType::Add as i32,
+            };
+            let client_id = ClientId::generate();
+            let req = ProposeMutationRequest::new(&client_id, seq, intent);
+            wal.append(seq, &req)?;
+            drop(wal); // Release lock so LactoClient can open it
+
+            // 2. Mock server response for the recovery attempt
+            mock.push_mutation_response(Ok(ProposeMutationResponse {
+                status: MutationStatus::Committed as i32,
+                ..Default::default()
+            }));
+
+            // 3. Initialize client (simulating restart)
+            let state = ClientState::load_or_init(
+                dir.path().join("state.json"),
+                mock_cluster_id(),
+                vec![addr],
+            )?;
+            let client = LactoClient::new(state, wal_path)?;
+
+            // 4. Perform recovery (simulating main.rs logic)
+            let pending = client.wal().recover()?;
+            assert_eq!(pending.len(), 1);
+            for (s, r) in pending {
+                client.repropose_mutation(s, r).await?;
+            }
+
+            // 5. Verification
+            assert!(
+                client.wal().recover()?.is_empty(),
+                "WAL should be flushed after recovery"
+            );
+            assert_eq!(mock.call_count.load(Ordering::SeqCst), 1);
             Ok(())
         }
     }
