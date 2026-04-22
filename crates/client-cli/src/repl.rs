@@ -377,7 +377,7 @@ mod tests {
                 ClusterId::try_new("test")?,
                 vec!["127.0.0.1:1".to_string()],
             )?;
-            let client = LactoClient::new(state);
+            let client = LactoClient::new(state, dir.path().join("wal"))?;
 
             let (client_side, mut server_side) = duplex(64);
             server_side.write_all(b"exit\n").await?;
