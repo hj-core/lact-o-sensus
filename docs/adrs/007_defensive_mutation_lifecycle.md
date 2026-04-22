@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Mutation Request Lifecycle (Client, Leader, AI-Veto)
 - **Primary Goal:** Transform ambiguous human intent into immutable, deterministic consensus data via a multi-layered defensive pipeline.
-- **Last Updated:** 2026-04-20
+- **Last Updated:** 2026-04-22
 
 ## Context
 
@@ -57,18 +57,21 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
 
 ### Layer 5: The Consensus-Commit (Immutable Fact)
 
-- **Responsibility:** Distributed agreement and state transition.
+- **Responsibility:** Distributed agreement and state machine application.
 - **Logic:**
-  - **Raft Replication:** Appends entry to WAL and replicates to Followers.
+  - **Raft Replication:** Appends entry to WAL and replicates to Followers. The Raft engine is **domain-agnostic**, treating the payload as opaque `bytes`.
+  - **The State Machine Boundary:** Upon commit, the Raft engine calls the `apply` method on a generic `StateMachine` trait object.
+  - **Application Resolution:** The application-level State Machine implementation (`LactoStore`) deserializes the bytes into a `CommittedMutation` and updates the inventory.
   - **Internal State Stabilization:** Logs the **Absolute Result in the Internal Standardized Format** to ensure cluster-wide idempotency.
   - **State Convergence:** The `resolved_item_key` (Canonical Slug) is the **exclusive Primary Key** for the state machine's inventory.
-  - **Metadata Evolution (LWW):** Mutable metadata (e.g., `category`, `display_name`) is updated to match the latest committed log entry for that `item_key`. The "Highest Log Index" is the supreme authority for LWW metadata resolution.
+  - **Metadata Evolution (LWW):** Mutable metadata (e.g., `category`, `display_name`) is updated to match the latest committed log entry for that `item_key`.
   - **Cleanup:** Updates Session Table and releases the `MutationLock`.
 - **Outbound:** `MUTATION_STATUS_COMMITTED` (including `state_version`) to the client.
 
 ## Rationale
 
 - **Safety Over Liveness:** We prioritize a "Fail-Stop" model where malformed data is rejected before it can corrupt the grocery ledger.
+- **Architectural Purity:** Using a `StateMachine` trait enforces a "Clean Architecture" boundary. The Raft engine "pushes" committed facts to the application, ensuring that consensus logic never leaks into grocery validation.
 - **Idempotency:** Storing the absolute result in the log ensures that nodes always recover to an identical state without re-running non-deterministic logic.
 - **Linearizability:** Sequential processing via the `MutationLock` ensures the AI Oracle always has a perfectly up-to-date view of the inventory.
 
@@ -79,11 +82,13 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
 - **High Data Integrity:** Zero risk of "Unit Mismatch" or "Duplicate Aliases" in the list.
 - **Robust Recovery:** Simple log replay due to absolute-state entries in a standardized format.
 - **Professional Auditability:** Every entry carries the raw input, the conversion rationale, and the AI justification.
+- **Testability:** The `LactoStore` (the State Machine) can be tested by feeding it raw bytes independently of the Raft cluster.
 
 ### Cons
 
 - **Throughput Latency:** Sequential AI processing limits the system to one concurrent mutation per cluster.
-- **Complexity:** Requires sophisticated state machine logic to handle multi-layered validation and rollbacks.
+- **Complexity:** Requires sophisticated state machine logic to handle multi-layered validation and the decoupling of traits.
+- **Lock Contention:** The `MutationLock` limits throughput to the latency of a single AI call.
 
 ## Operational Impact
 

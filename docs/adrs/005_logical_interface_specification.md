@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Logical RPC Contracts and Service Definitions
 - **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
-- **Last Updated:** 2026-04-20
+- **Last Updated:** 2026-04-22
 
 ## Context
 
@@ -14,24 +14,29 @@ Lact-O-Sensus consists of three distinct interaction domains: internal consensus
 
 ## Decision
 
-We will define three logical services with strict contracts. All messages must include the `cluster_id` to prevent cross-environment contamination.
+We will define three logical services with strict contracts, decoupled into two distinct protobuf definitions to separate the generic consensus engine from the grocery application logic. All messages must include the `cluster_id` to prevent cross-environment contamination.
 
-### 1. The Consensus Service (Internal Mesh)
+### 1. The Generic Consensus Interface (`raft.proto`)
 
-Used for Raft peer-to-peer communication.
+Used exclusively for Raft peer-to-peer communication. This interface is domain-agnostic and replicates opaque byte payloads.
 
-- **`RequestVote`**:
-  - **Input:** `cluster_id`, `target_node_id`, `term`, `candidate_id`, `last_log_index`, `last_log_term`.
-  - **Output:** `cluster_id`, `node_id` (Responder), `term`, `vote_granted`.
-- **`AppendEntries`**:
-  - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
-  - **Output:** `cluster_id`, `node_id` (Responder), `term`, `success`, `last_log_index`.
+- **`ConsensusService` (Package: `raft.v1`)**:
+  - **`RequestVote`**:
+    - **Input:** `cluster_id`, `target_node_id`, `term`, `candidate_id`, `last_log_index`, `last_log_term`.
+    - **Output:** `cluster_id`, `node_id` (Responder), `term`, `vote_granted`.
+  - **`AppendEntries`**:
+    - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
+    - **Output:** `cluster_id`, `node_id` (Responder), `term`, `success`, `last_log_index`.
 - **`LogEntry`**:
-  - **Structure:** `term`, `index`, `data` (Serialized `CommittedMutation`).
+  - **Structure:** `term`, `index`, `data` (Opaque `bytes` containing a serialized application-level entry).
 
-### 2. The Ingress Service (Client-to-Leader)
+### 2. The Application Interface (`app.proto`)
 
-Used for user mutations and queries.
+Used for external client ingress, policy egress, and the internal state machine representation.
+
+#### A. The Ingress Service (Client-to-Leader)
+
+Used for user mutations and queries. (Package: `lacto_sensus.v1`)
 
 - **`ProposeMutation`**:
   - **Input:** `cluster_id`, `target_node_id`, `client_id`, `sequence_id`, `MutationIntent`.
@@ -40,9 +45,9 @@ Used for user mutations and queries.
   - **Input:** `cluster_id`, `target_node_id`, `query_filter` (optional), `min_state_version` (optional).
   - **Output:** `cluster_id`, `node_id` (Responder), `item_list[]` (of `GroceryItem`), `current_state_version`, `status`, `leader_hint`, `error_message`.
 
-### 3. The Policy Service (Leader-to-AI)
+#### B. The Policy Service (Leader-to-AI)
 
-Used for semantic resolution and physical verification.
+Used for semantic resolution and physical verification. (Package: `lacto_sensus.v1`)
 
 - **`EvaluateProposal`**:
   - **Input:** `cluster_id`, `target_node_id`, `client_id`, `normalized_intent`, `current_inventory[]`, `request_context`.
@@ -51,11 +56,11 @@ Used for semantic resolution and physical verification.
     - **Semantic Data:** `resolved_item_key`, `suggested_display_name`, `category_assignment`, `resolved_unit`.
     - **Conversion Data:** `conversion_multiplier_to_base` (Decimal string).
 
-### 4. The Replicated Ledger Entry (`CommittedMutation`)
+#### C. The Replicated Ledger Entry (`CommittedMutation`)
 
-The serialized binary format stored in the Raft log and database. This represents the "Final Truth."
+The serialized binary format stored as `bytes` within the Raft `LogEntry`. This represents the "Final Truth" of the grocery state.
 
-- **Mandate (Absolute State):** The Leader is exclusively responsible for performing all physical arithmetic (Base SI \* Multiplier). The log entry must record the **Absolute Result** (not the delta) to ensure state machine idempotency.
+- **Mandate (Absolute State):** The Leader is exclusively responsible for performing all physical arithmetic (Base SI * Multiplier). The log entry must record the **Absolute Result** (not the delta) to ensure state machine idempotency.
 - **Precision Policy:** All numeric quantities and multipliers MUST be transmitted and stored as **Stringified Fixed-Point Decimals** to avoid IEEE 754 non-determinism across different architectures.
 
 - **Identity:** `resolved_item_key` (Canonical Slug).
@@ -66,22 +71,23 @@ The serialized binary format stored in the Raft log and database. This represent
 
 ## Rationale
 
+- **Protocol Reusability:** By splitting `raft.proto` from `app.proto`, the consensus engine becomes a domain-agnostic "black box." This ensures the core Raft implementation can be reused for any distributed state machine project.
+- **Contractual Clarity:** Developers working on the Raft core only need to understand the simple consensus state machine, while application developers focus on the rich grocery schema.
 - **Identity Guarding:** Mandating `cluster_id` in every RPC ensures that nodes and clients never accidentally process traffic from a foreign cluster.
 - **Separation of Concerns:** The `MutationIntent` captures human ambiguity, while the `CommittedMutation` captures deterministic physical and taxonomic state.
-- **Semantic Oracle Integration:** The Policy Service is the only point where non-determinism (the AI) is allowed to influence the state before it is codified as a log entry.
 
 ## Consequences
 
 ### Pros
 
+- **Engine Portability:** The Raft implementation is now 100% domain-agnostic and reusable.
+- **Parallel Evolution:** The consensus protocol and the grocery schema can evolve independently.
 - **Auditability:** Every ledger entry carries its complete causal history (raw input + AI reasoning).
-- **Interoperability:** Decoupled interfaces allow different client or AI implementations to be swapped as long as they follow the contract.
-- **Protocol Safety:** Full Raft RPC definitions prevent ambiguity during election or replication phases.
 
 ### Cons
 
-- **Rigidity:** Schema changes require coordinated updates across all node types.
-- **Overhead:** Large log entries (due to raw strings and justifications) increase disk I/O and storage requirements.
+- **Serialization Overhead:** Mutations require "Double Serialization" (Application -> Bytes -> Raft LogEntry) and corresponding deserialization on followers.
+- **Rigidity:** Schema changes across the split boundary require coordinated updates across all node types.
 
 ### Operational Impact
 
