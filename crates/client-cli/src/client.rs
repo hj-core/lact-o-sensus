@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
-use common::proto::v1::MutationIntent;
-use common::proto::v1::MutationStatus;
-use common::proto::v1::ProposeMutationRequest;
-use common::proto::v1::ProposeMutationResponse;
-use common::proto::v1::QueryStateRequest;
-use common::proto::v1::QueryStateResponse;
-use common::proto::v1::QueryStatus;
-use common::proto::v1::ingress_service_client::IngressServiceClient;
+use common::proto::v1::app::MutationIntent;
+use common::proto::v1::app::MutationStatus;
+use common::proto::v1::app::ProposeMutationRequest;
+use common::proto::v1::app::ProposeMutationResponse;
+use common::proto::v1::app::QueryStateRequest;
+use common::proto::v1::app::QueryStateResponse;
+use common::proto::v1::app::QueryStatus;
+use common::proto::v1::app::ingress_service_client::IngressServiceClient;
 use common::types::ClientId;
 use common::types::ClusterId;
 use common::types::LogIndex;
@@ -502,10 +502,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
-    use common::proto::v1::MutationIntent;
-    use common::proto::v1::OperationType;
-    use common::proto::v1::ingress_service_server::IngressService;
-    use common::proto::v1::ingress_service_server::IngressServiceServer;
+    use common::proto::v1::app::MutationIntent;
+    use common::proto::v1::app::OperationType;
+    use common::proto::v1::app::ingress_service_server::IngressService;
+    use common::proto::v1::app::ingress_service_server::IngressServiceServer;
     use tempfile::tempdir;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;

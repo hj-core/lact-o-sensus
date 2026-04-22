@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use common::proto::v1::AppendEntriesRequest;
-use common::proto::v1::AppendEntriesResponse;
-use common::proto::v1::RequestVoteRequest;
-use common::proto::v1::RequestVoteResponse;
-use common::proto::v1::consensus_service_server::ConsensusService;
+use common::proto::v1::raft::AppendEntriesRequest;
+use common::proto::v1::raft::AppendEntriesResponse;
+use common::proto::v1::raft::RequestVoteRequest;
+use common::proto::v1::raft::RequestVoteResponse;
+use common::proto::v1::raft::consensus_service_server::ConsensusService;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
@@ -283,7 +283,7 @@ impl ConsensusService for ConsensusDispatcher {
                     if req_leader_commit > node.commit_index() {
                         let last_new_idx = node.last_log_index();
                         let new_commit = std::cmp::min(req_leader_commit, last_new_idx);
-                        node.set_commit_index(new_commit);
+                        node.set_commit_index(new_commit).await;
                         debug!("Updated commit_index to {}", new_commit);
                     }
                 }
@@ -306,8 +306,18 @@ mod tests {
     use common::types::ClusterId;
 
     use super::*;
+    use crate::fsm::StateMachine;
     use crate::node::Follower;
     use crate::node::RaftNode;
+
+    #[derive(Debug, Default)]
+    struct MockFsm;
+    #[tonic::async_trait]
+    impl StateMachine for MockFsm {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+    }
 
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
@@ -318,7 +328,8 @@ mod tests {
 
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
-        let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+        let fsm = Arc::new(MockFsm::default());
+        let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
         ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)))
     }
 
@@ -352,7 +363,8 @@ mod tests {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
             let wrong_id = Arc::new(NodeIdentity::new(id.cluster_id().clone(), NodeId::new(99)));
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(wrong_id));
+            let fsm = Arc::new(MockFsm::default());
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(wrong_id, fsm));
 
             // Use the original ID for the dispatcher but the wrong ID for the node
             let dispatcher = ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)));
@@ -441,12 +453,12 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let RaftNodeState::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::LogEntry {
+                    node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 1,
                         data: vec![],
                     });
-                    node.log_mut().push(common::proto::v1::LogEntry {
+                    node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 2,
                         term: 1,
                         data: vec![],
@@ -473,7 +485,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let RaftNodeState::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::LogEntry {
+                    node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 2,
                         data: vec![],
@@ -500,7 +512,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let RaftNodeState::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::LogEntry {
+                    node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 1,
                         data: vec![],
@@ -528,7 +540,7 @@ mod tests {
                 let mut state = dispatcher.state.write().await;
                 if let RaftNodeState::Follower(node) = &mut *state {
                     for i in 1..=10 {
-                        node.log_mut().push(common::proto::v1::LogEntry {
+                        node.log_mut().push(common::proto::v1::raft::LogEntry {
                             index: i as u64,
                             term: 1,
                             data: vec![],
@@ -599,8 +611,9 @@ mod tests {
         #[tokio::test]
         async fn demotes_candidate_on_equal_term() {
             let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
             // Start as Follower term 0, transition to Candidate term 1
-            let follower = RaftNode::<Follower>::new(id.clone());
+            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
             let candidate = follower.into_candidate();
             let dispatcher = ConsensusDispatcher::new(
                 id,
@@ -628,8 +641,9 @@ mod tests {
         #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
         async fn panics_on_rival_leader_same_term() {
             let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
             // Start as Leader term 1
-            let follower = RaftNode::<Follower>::new(id.clone());
+            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
             let candidate = follower.into_candidate();
             let leader = candidate.into_leader(Vec::new());
             let dispatcher =

@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
 use clap::Parser;
-use common::proto::v1::EvaluateProposalRequest;
-use common::proto::v1::EvaluateProposalResponse;
-use common::proto::v1::policy_service_server::PolicyService;
-use common::proto::v1::policy_service_server::PolicyServiceServer;
+use common::proto::v1::app::EvaluateProposalRequest;
+use common::proto::v1::app::EvaluateProposalResponse;
+use common::proto::v1::app::policy_service_server::PolicyService;
+use common::proto::v1::app::policy_service_server::PolicyServiceServer;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;

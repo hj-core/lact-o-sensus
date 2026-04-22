@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
-use common::proto::v1::ProposeMutationRequest;
+use common::proto::v1::app::ProposeMutationRequest;
 use common::types::SequenceId;
 use prost::Message;
 use sled::Db;
@@ -98,8 +98,8 @@ impl IntentWal {
 
 #[cfg(test)]
 mod tests {
-    use common::proto::v1::MutationIntent;
-    use common::proto::v1::OperationType;
+    use common::proto::v1::app::MutationIntent;
+    use common::proto::v1::app::OperationType;
     use common::types::ClientId;
     use tempfile::tempdir;
 

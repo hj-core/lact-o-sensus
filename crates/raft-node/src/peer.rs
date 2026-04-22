@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use common::proto::v1::consensus_service_client::ConsensusServiceClient;
+use common::proto::v1::raft::consensus_service_client::ConsensusServiceClient;
 use common::types::NodeId;
 use thiserror::Error;
 use tonic::Request;

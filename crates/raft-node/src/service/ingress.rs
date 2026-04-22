@@ -1,16 +1,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::proto::v1::CommittedMutation;
-use common::proto::v1::MutationIntent;
-use common::proto::v1::MutationStatus;
-use common::proto::v1::OperationType;
-use common::proto::v1::ProposeMutationRequest;
-use common::proto::v1::ProposeMutationResponse;
-use common::proto::v1::QueryStateRequest;
-use common::proto::v1::QueryStateResponse;
-use common::proto::v1::QueryStatus;
-use common::proto::v1::ingress_service_server::IngressService;
+use common::proto::v1::app::CommittedMutation;
+use common::proto::v1::app::MutationIntent;
+use common::proto::v1::app::MutationStatus;
+use common::proto::v1::app::OperationType;
+use common::proto::v1::app::ProposeMutationRequest;
+use common::proto::v1::app::ProposeMutationResponse;
+use common::proto::v1::app::QueryStateRequest;
+use common::proto::v1::app::QueryStateResponse;
+use common::proto::v1::app::QueryStatus;
+use common::proto::v1::app::ingress_service_server::IngressService;
 use common::types::ClientId;
 use common::types::SequenceId;
 use prost::Message;
@@ -359,15 +359,26 @@ mod tests {
     use std::time::Duration;
 
     use common::types::ClusterId;
+    use common::types::LogIndex;
     use common::types::NodeId;
     use common::types::Term;
 
     use super::*;
+    use crate::fsm::StateMachine;
     use crate::node::Follower;
     use crate::node::RaftNode;
     use crate::service::veto::VetoError;
     use crate::service::veto::VetoOutcome;
     use crate::service::veto::VetoRelay;
+
+    #[derive(Debug, Default)]
+    struct MockFsm;
+    #[tonic::async_trait]
+    impl StateMachine for MockFsm {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+    }
 
     #[derive(Debug)]
     struct TestVetoRelay;
@@ -377,8 +388,8 @@ mod tests {
         async fn evaluate(
             &self,
             _client_id: String,
-            _intent: &common::proto::v1::MutationIntent,
-            _current_inventory: &[common::proto::v1::GroceryItem],
+            _intent: &common::proto::v1::app::MutationIntent,
+            _current_inventory: &[common::proto::v1::app::GroceryItem],
             _timeout: Duration,
         ) -> Result<VetoOutcome, VetoError> {
             Ok(VetoOutcome {
@@ -420,7 +431,8 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_follower_leader_unknown() {
             let id = mock_identity();
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let fsm = Arc::new(MockFsm::default());
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
             let dispatcher = mock_dispatcher(node, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -441,8 +453,9 @@ mod tests {
             peers.insert(NodeId::new(2), leader_addr.to_string());
 
             let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
             // Create follower who knows about leader Node 2
-            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
             let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(id, &peers));
@@ -461,7 +474,8 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_candidate() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id.clone());
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
             let candidate = RaftNodeState::Candidate(follower.into_candidate());
 
             let dispatcher = mock_dispatcher(candidate, mock_peer_manager(id, &HashMap::new()));
@@ -483,7 +497,8 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_follower_leader_unknown() {
             let id = mock_identity();
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let fsm = Arc::new(MockFsm::default());
+            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
             let dispatcher = mock_dispatcher(node, mock_peer_manager(id, &HashMap::new()));
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
@@ -502,7 +517,8 @@ mod tests {
             peers.insert(NodeId::new(2), leader_addr.to_string());
 
             let id = mock_identity();
-            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone()));
+            let fsm = Arc::new(MockFsm::default());
+            let initial_state = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
             let follower = initial_state.into_follower(Term::ZERO, Some(NodeId::new(2)));
 
             let dispatcher = mock_dispatcher(follower, mock_peer_manager(id, &peers));
@@ -519,7 +535,8 @@ mod tests {
         #[tokio::test]
         async fn returns_rejected_when_candidate() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id.clone());
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
             let candidate = RaftNodeState::Candidate(follower.into_candidate());
 
             let dispatcher = mock_dispatcher(candidate, mock_peer_manager(id, &HashMap::new()));
@@ -535,7 +552,8 @@ mod tests {
         #[tokio::test]
         async fn returns_success_when_leader() {
             let id = mock_identity();
-            let follower = RaftNode::<Follower>::new(id.clone());
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
             let leader = RaftNodeState::Leader(follower.into_candidate().into_leader(Vec::new()));
 
             let dispatcher = mock_dispatcher(leader, mock_peer_manager(id, &HashMap::new()));

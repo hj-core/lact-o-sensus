@@ -3,14 +3,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use common::proto::v1::LogEntry;
+use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::debug;
+use tracing::error;
 
+use crate::fsm::StateMachine;
 use crate::identity::NodeIdentity;
 
 #[derive(Error, Debug)]
@@ -157,6 +159,9 @@ pub struct RaftNode<S: NodeState> {
     /// Verified identity of the node (ADR 004).
     identity: Arc<NodeIdentity>,
 
+    /// The application state machine (ADR 007).
+    fsm: Arc<dyn StateMachine>,
+
     // --- Persistent State ---
     /// Persistent term across role transitions.
     current_term: Term,
@@ -215,15 +220,16 @@ impl<S: NodeState> RaftNode<S> {
         &self.commit_signal
     }
 
-    /// Updates the commit index.
+    /// Updates the commit index and triggers the application of entries to the
+    /// FSM.
     ///
-    /// Adheres to the monotonicity requirement: stale updates (e.g., from
-    /// delayed heartbeats) are ignored.
+    /// Adheres to the monotonicity requirement: stale updates are ignored.
+    /// This method acts as a high-level orchestrator, delegating the physical
+    /// application to `apply_to_state_machine`.
     ///
     /// # Panics
-    /// Panics if the new index exceeds the current log boundaries, which
-    /// indicates a fundamental protocol violation.
-    pub fn set_commit_index(&mut self, index: LogIndex) {
+    /// Panics if the new index exceeds the current log boundaries.
+    pub async fn set_commit_index(&mut self, index: LogIndex) {
         if index < self.commit_index {
             debug!(
                 "Ignoring stale commit_index update: {} < current {}",
@@ -243,38 +249,40 @@ impl<S: NodeState> RaftNode<S> {
 
         if index > self.commit_index {
             self.commit_index = index;
-            // Notify anyone waiting for this node to reach a specific commit index.
+            self.apply_to_state_machine().await;
             self.commit_signal.notify_waiters();
+        }
+    }
+
+    /// Orchestrates the sequential application of committed log entries to the
+    /// State Machine.
+    ///
+    /// # Panics
+    /// Panics (Halt Mandate) if an entry is missing from the log or if the
+    /// State Machine returns a terminal error.
+    async fn apply_to_state_machine(&mut self) {
+        while self.last_applied < self.commit_index {
+            let apply_idx = self.last_applied + 1;
+            let entry = self
+                .log
+                .get((apply_idx.value() - 1) as usize)
+                .expect("Halt Mandate: Committed entry missing from log during apply");
+
+            if let Err(e) = self.fsm.apply(apply_idx, &entry.data).await {
+                error!(
+                    "CRITICAL: State machine failed to apply index {}: {}. Triggering Halt \
+                     Mandate.",
+                    apply_idx, e
+                );
+                panic!("Halt Mandate: FSM application failed.");
+            }
+
+            self.last_applied = apply_idx;
         }
     }
 
     pub fn last_applied(&self) -> LogIndex {
         self.last_applied
-    }
-
-    /// Updates the last applied index.
-    ///
-    /// # Panics
-    /// Panics if the new index regresses or exceeds the commit index, as
-    /// the state machine must strictly follow the committed log.
-    pub fn set_last_applied(&mut self, index: LogIndex) {
-        if index < self.last_applied {
-            panic!(
-                "CRITICAL: State machine regression. Attempted to set last_applied to {} but \
-                 current is {}",
-                index, self.last_applied
-            );
-        }
-
-        if index > self.commit_index {
-            panic!(
-                "CRITICAL: State machine violation. Attempted to apply index {} but commit_index \
-                 is only {}",
-                index, self.commit_index
-            );
-        }
-
-        self.last_applied = index;
     }
 
     pub fn state(&self) -> &S {
@@ -333,6 +341,7 @@ impl<S: NodeState> RaftNode<S> {
         self,
     ) -> (
         Arc<NodeIdentity>,
+        Arc<dyn StateMachine>,
         Term,
         Option<NodeId>,
         Vec<LogEntry>,
@@ -342,6 +351,7 @@ impl<S: NodeState> RaftNode<S> {
     ) {
         (
             self.identity,
+            self.fsm,
             self.current_term,
             self.voted_for,
             self.log,
@@ -353,9 +363,10 @@ impl<S: NodeState> RaftNode<S> {
 }
 
 impl RaftNode<Follower> {
-    pub fn new(identity: Arc<NodeIdentity>) -> Self {
+    pub fn new(identity: Arc<NodeIdentity>, fsm: Arc<dyn StateMachine>) -> Self {
         Self {
             identity,
+            fsm,
             current_term: Term::ZERO,
             voted_for: None,
             log: Vec::new(),
@@ -373,6 +384,7 @@ impl RaftNode<Follower> {
 
         RaftNode {
             identity: self.identity.clone(),
+            fsm: self.fsm,
             current_term: self.current_term + 1,
             voted_for: Some(self.identity.node_id()),
             log: self.log,
@@ -393,6 +405,7 @@ impl RaftNode<Candidate> {
 
         RaftNode {
             identity: self.identity.clone(),
+            fsm: self.fsm,
             current_term: self.current_term + 1,
             voted_for: Some(self.identity.node_id()),
             log: self.log,
@@ -408,6 +421,7 @@ impl RaftNode<Candidate> {
         let last_log_index = self.last_log_index();
         RaftNode {
             identity: self.identity,
+            fsm: self.fsm,
             current_term: self.current_term,
             voted_for: self.voted_for,
             log: self.log,
@@ -518,16 +532,25 @@ impl RaftNodeState {
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(self, term: Term, leader_id: Option<NodeId>) -> RaftNodeState {
-        let (identity, current_term, voted_for, log, commit_index, last_applied, commit_signal) =
-            match self {
-                RaftNodeState::Follower(n) => n.into_parts(),
-                RaftNodeState::Candidate(n) => n.into_parts(),
-                RaftNodeState::Leader(n) => n.into_parts(),
-                RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
-            };
+        let (
+            identity,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            commit_signal,
+        ) = match self {
+            RaftNodeState::Follower(n) => n.into_parts(),
+            RaftNodeState::Candidate(n) => n.into_parts(),
+            RaftNodeState::Leader(n) => n.into_parts(),
+            RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
+        };
 
         let mut new_node = RaftNode {
             identity,
+            fsm,
             current_term,
             voted_for,
             log,
@@ -545,6 +568,117 @@ impl RaftNodeState {
     pub fn reset_heartbeat(&mut self) {
         if let RaftNodeState::Follower(node) = self {
             node.state_mut().reset_heartbeat();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use common::types::ClusterId;
+    use tonic::Status;
+
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct MockFsm {
+        applied_indices: Mutex<Vec<LogIndex>>,
+        applied_data: Mutex<Vec<Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl StateMachine for MockFsm {
+        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status> {
+            self.applied_indices.lock().unwrap().push(index);
+            self.applied_data.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    fn mock_identity() -> Arc<NodeIdentity> {
+        Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            NodeId::new(1),
+        ))
+    }
+
+    mod set_commit_index {
+        use super::*;
+
+        #[tokio::test]
+        async fn correctly_applies_entries_sequentially() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm.clone());
+
+            // 1. Populate log with 3 entries using domain identity helper
+            for i in 1..=3 {
+                node.log_mut().push(LogEntry::new(
+                    LogIndex::new(i),
+                    Term::new(1),
+                    format!("entry_{}", i).into_bytes(),
+                ));
+            }
+
+            // 2. Advance commit_index to 2
+            node.set_commit_index(LogIndex::new(2)).await;
+
+            // 3. Verify FSM application
+            {
+                let indices = fsm.applied_indices.lock().unwrap();
+                let data = fsm.applied_data.lock().unwrap();
+                assert_eq!(indices.len(), 2);
+                assert_eq!(indices[0], LogIndex::new(1));
+                assert_eq!(indices[1], LogIndex::new(2));
+                assert_eq!(data[0], b"entry_1");
+                assert_eq!(data[1], b"entry_2");
+            }
+            assert_eq!(node.last_applied(), LogIndex::new(2));
+
+            // 4. Advance commit_index to 3
+            node.set_commit_index(LogIndex::new(3)).await;
+
+            // 5. Verify incremental FSM application
+            {
+                let indices = fsm.applied_indices.lock().unwrap();
+                assert_eq!(indices.len(), 3);
+                assert_eq!(indices[2], LogIndex::new(3));
+            }
+            assert_eq!(node.last_applied(), LogIndex::new(3));
+        }
+
+        #[tokio::test]
+        async fn ignores_stale_commit_index() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm.clone());
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            node.set_commit_index(LogIndex::new(1)).await;
+            assert_eq!(node.commit_index(), LogIndex::new(1));
+
+            // Try to set back to 0
+            node.set_commit_index(LogIndex::new(0)).await;
+            assert_eq!(node.commit_index(), LogIndex::new(1));
+
+            // FSM should only have 1 application
+            assert_eq!(fsm.applied_indices.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "CRITICAL: Protocol violation")]
+        async fn panics_on_invalid_log_boundary() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            // Log is empty, so last_log_index is 0.
+            // Attempting to commit 1 should panic.
+            node.set_commit_index(LogIndex::new(1)).await;
         }
     }
 }

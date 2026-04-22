@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use common::proto::v1::AppendEntriesRequest;
-use common::proto::v1::RequestVoteRequest;
+use common::proto::v1::raft::AppendEntriesRequest;
+use common::proto::v1::raft::RequestVoteRequest;
 use common::types::LogIndex;
 use common::types::Term;
 use futures::StreamExt;
@@ -451,7 +451,7 @@ async fn replicate_to_peers(
                         }
 
                         // Check for new commit point (§5.3, §5.4)
-                        update_leader_commit_index(node);
+                        update_leader_commit_index(node).await;
                     } else {
                         // If AppendEntries fails because of log inconsistency:
                         // decrement nextIndex and retry (§5.3)
@@ -490,7 +490,7 @@ async fn replicate_to_peers(
 
 /// Helper to update the Leader's commit index based on a quorum of peer
 /// match_indices.
-fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
+async fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
     let mut match_indices: Vec<LogIndex> = node.state().match_index().values().cloned().collect();
@@ -503,7 +503,7 @@ fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
 
     if quorum_idx > node.commit_index() && node.get_term_at(quorum_idx) == current_term {
         info!("Quorum reached for log index {}. Committing.", quorum_idx);
-        node.set_commit_index(quorum_idx);
+        node.set_commit_index(quorum_idx).await;
     }
 }
 
@@ -548,9 +548,19 @@ mod tests {
         use common::types::NodeId;
 
         use super::*;
+        use crate::fsm::StateMachine;
         use crate::identity::NodeIdentity;
         use crate::node::Follower;
         use crate::node::RaftNode;
+
+        #[derive(Debug, Default)]
+        struct MockFsm;
+        #[tonic::async_trait]
+        impl StateMachine for MockFsm {
+            async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+                Ok(())
+            }
+        }
 
         fn mock_config(min_ms: u64, max_ms: u64) -> Arc<Config> {
             let toml_str = format!(
@@ -584,8 +594,9 @@ mod tests {
         async fn setup() -> (Arc<Config>, Arc<RwLock<RaftNodeState>>, Arc<PeerManager>) {
             let config = mock_config(50, 100);
             let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
             let state = Arc::new(RwLock::new(RaftNodeState::Follower(
-                RaftNode::<Follower>::new(id.clone()),
+                RaftNode::<Follower>::new(id.clone(), fsm),
             )));
             let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
             (config, state, peer_manager)

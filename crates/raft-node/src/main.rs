@@ -1,17 +1,19 @@
 mod config;
 mod consensus;
+mod fsm;
 mod identity;
 mod node;
 mod peer;
 mod service;
+mod store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Parser;
-use common::proto::v1::consensus_service_server::ConsensusServiceServer;
-use common::proto::v1::ingress_service_server::IngressServiceServer;
+use common::proto::v1::app::ingress_service_server::IngressServiceServer;
+use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
 use config::Config;
 use consensus::spawn_election_timer;
 use consensus::spawn_heartbeat_task;
@@ -24,6 +26,7 @@ use service::common::IdentityInterceptor;
 use service::consensus::ConsensusDispatcher;
 use service::ingress::IngressDispatcher;
 use service::veto::GrpcVetoRelay;
+use store::LactoStore;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::Instrument;
@@ -80,7 +83,9 @@ async fn main() -> Result<()> {
     };
 
     // 6. Initialize the Shared Node State (Type-State Engine)
-    let initial_node = RaftNode::<Follower>::new(identity.clone());
+    // Now decoupled via StateMachine trait.
+    let fsm = Arc::new(LactoStore::new());
+    let initial_node = RaftNode::<Follower>::new(identity.clone(), fsm.clone());
     let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)

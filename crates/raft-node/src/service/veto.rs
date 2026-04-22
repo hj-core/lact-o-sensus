@@ -2,10 +2,10 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::proto::v1::EvaluateProposalRequest;
-use common::proto::v1::GroceryItem;
-use common::proto::v1::MutationIntent;
-use common::proto::v1::policy_service_client::PolicyServiceClient;
+use common::proto::v1::app::EvaluateProposalRequest;
+use common::proto::v1::app::GroceryItem;
+use common::proto::v1::app::MutationIntent;
+use common::proto::v1::app::policy_service_client::PolicyServiceClient;
 use thiserror::Error;
 use tonic::Request;
 use tonic::transport::Channel;
