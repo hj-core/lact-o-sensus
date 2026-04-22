@@ -92,19 +92,20 @@ impl RaftConfig {
             ));
         }
 
-        // The Stability Invariant: Heartbeat interval should be significantly
-        // shorter than the minimum election timeout.
-        if self.election_timeout_min_ms <= self.heartbeat_interval_ms {
+        // The Stability Invariant (ADR 003): Heartbeat interval should be
+        // significantly shorter than the minimum election timeout.
+        // Specifically, maintaining a 1:3-1:6 ratio.
+        if self.election_timeout_min_ms < self.heartbeat_interval_ms * 3 {
             return Err(ConfigError::TimingInvariant(
-                "election_timeout_min_ms must be greater than heartbeat_interval_ms".to_string(),
+                "ADR 003: election_timeout_min_ms must be at least 3x heartbeat_interval_ms"
+                    .to_string(),
             ));
         }
 
-        // Heuristic check: Minimum election timeout should ideally be at least
-        // 2x heartbeat interval for basic stability.
-        if self.election_timeout_min_ms < self.heartbeat_interval_ms * 2 {
+        if self.election_timeout_min_ms > self.heartbeat_interval_ms * 6 {
             warn!(
-                "Narrow heartbeat-to-election ratio ({}ms : {}ms). Stability may be compromised.",
+                "Wide heartbeat-to-election ratio ({}ms : {}ms). Liveness may be delayed beyond \
+                 ADR 003 recommendations.",
                 self.heartbeat_interval_ms, self.election_timeout_min_ms
             );
         }
@@ -249,11 +250,11 @@ impl Config {
 mod tests {
     use super::*;
 
-    mod config_validate {
+    mod validate {
         use super::*;
 
         #[test]
-        fn returns_ok_when_valid_config() {
+        fn accept_valid_configuration() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -267,7 +268,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_self_loop() {
+        fn reject_config_when_node_id_is_in_peers_list() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -282,7 +283,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_empty_cluster_id() {
+        fn reject_config_when_cluster_id_is_empty() {
             let toml_str = r#"
             cluster_id = ""
             node_id = 1
@@ -297,7 +298,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_rpc_timeout_exceeds_heartbeat() {
+        fn reject_config_when_rpc_timeout_exceeds_heartbeat_interval() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -318,7 +319,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_invalid_raft_timing() {
+        fn reject_config_when_election_timeout_is_below_3x_heartbeat() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -328,16 +329,19 @@ mod tests {
             2 = "http://127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 100
-            election_timeout_min_ms = 50
-            election_timeout_max_ms = 200
+            election_timeout_min_ms = 299 # Violation of ADR 003
+            election_timeout_max_ms = 400
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             let result = config.validate();
-            assert!(matches!(result, Err(ConfigError::TimingInvariant(_))));
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("ADR 003")
+            ));
         }
 
         #[test]
-        fn returns_ok_when_partial_raft_timing() {
+        fn accept_config_when_election_timeout_is_exactly_3x_heartbeat() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -347,15 +351,52 @@ mod tests {
             2 = "http://127.0.0.1:50052"
             [raft]
             heartbeat_interval_ms = 100
+            election_timeout_min_ms = 300
+            election_timeout_max_ms = 450
         "#;
             let config: Config = toml::from_str(toml_str).unwrap();
             assert!(config.validate().is_ok());
-            assert_eq!(config.raft.heartbeat_interval_ms, 100);
-            assert_eq!(config.raft.election_timeout_min_ms, 150); // Default
         }
 
         #[test]
-        fn returns_err_when_zero_veto_timeout() {
+        fn accept_config_with_warning_when_election_timeout_exceeds_6x_heartbeat() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            heartbeat_interval_ms = 100
+            election_timeout_min_ms = 700 # > 6x, should warn but pass
+            election_timeout_max_ms = 900
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_ok());
+        }
+
+        #[test]
+        fn use_default_protocol_settings_when_fields_are_unspecified() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            heartbeat_interval_ms = 45 # Override one; must be > rpc_timeout (40ms default)
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            assert!(config.validate().is_ok());
+            assert_eq!(config.raft.heartbeat_interval_ms, 45);
+            assert_eq!(config.raft.election_timeout_min_ms, 150); // Default (150 > 3*45)
+            assert_eq!(config.raft.rpc_timeout_ms, 40); // Default
+        }
+
+        #[test]
+        fn reject_config_when_veto_timeout_is_zero() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -375,7 +416,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_invalid_peer_uri() {
+        fn reject_config_when_peer_uri_is_malformed() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
@@ -390,7 +431,7 @@ mod tests {
         }
 
         #[test]
-        fn returns_err_when_invalid_veto_uri() {
+        fn reject_config_when_veto_uri_is_malformed() {
             let toml_str = r#"
             cluster_id = "test-cluster"
             node_id = 1
