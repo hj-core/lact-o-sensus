@@ -277,7 +277,7 @@ def check_connectivity(
         "-import-path",
         "crates/common/proto",
         "-proto",
-        "lacto_sensus.proto",
+        "raft.proto",
         "-H", f"x-cluster-id: {cluster_id}",
         "-H", f"x-target-node-id: {target_node_id}",
         "-d",
@@ -288,7 +288,7 @@ def check_connectivity(
             }
         ),
         f"127.0.0.1:{port}",
-        "lacto_sensus.v1.ConsensusService/RequestVote",
+        "raft.v1.ConsensusService/RequestVote",
     ]
     result = subprocess.run(
         cmd, capture_output=True, text=True, check=False
@@ -385,7 +385,7 @@ def test_ai_veto_egress() -> None:
         "-import-path",
         "crates/common/proto",
         "-proto",
-        "lacto_sensus.proto",
+        "app.proto",
         "-H", f"x-cluster-id: lacto-dev-01",
         "-H", f"x-target-node-id: {leader_id}",
         "-d",
