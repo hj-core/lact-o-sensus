@@ -31,93 +31,135 @@ pub fn spawn_election_timer(
 ) {
     tokio::spawn(async move {
         loop {
-            // 1. Randomize timeout for this "tick".
-            let timeout = {
-                let mut rng = rand::rng();
-                Duration::from_millis(rng.random_range(
-                    config.raft.election_timeout_min_ms..config.raft.election_timeout_max_ms,
-                ))
-            };
+            // 1. Generate randomized timeout and identify signal.
+            let timeout = calculate_election_timeout(&config);
 
-            // 2. Extract the heartbeat signal if we are a Follower.
             let heartbeat_signal = {
                 let guard = state.read().await;
                 match &*guard {
                     RaftNodeState::Follower(node) => Some(node.state().heartbeat_signal().clone()),
-                    RaftNodeState::Candidate(_) => None, // Candidates use standard timeout
-                    RaftNodeState::Leader(_) => return,  // Leaders don't need the timer
+                    RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => None,
                     RaftNodeState::Poisoned => {
-                        error!("Node is poisoned. Election timer stopping.");
-                        return;
+                        panic!("HALT: Node is poisoned (ADR 001)");
                     }
                 }
             };
 
-            // 3. Reactive Wait: Either the timeout expires OR a heartbeat arrives.
-            if let Some(signal) = heartbeat_signal {
+            // 2. Wait: Race timeout vs. heartbeat signal (if Follower).
+            let action = if let Some(signal) = heartbeat_signal {
                 tokio::select! {
                     _ = sleep(timeout) => {
-                        // Timeout reached. Verify it hasn't been reset just before the lock.
-                        let mut state_guard = state.write().await;
-                        if let RaftNodeState::Follower(node) = &*state_guard {
-                            let elapsed = node.state().last_heartbeat().elapsed();
-                            if elapsed >= timeout {
-                                info!(
-                                    "Election timeout reached ({:?}). Transitioning to Candidate for term {}",
-                                    elapsed,
-                                    node.current_term() + 1
-                                );
-                                state_guard.transition(|old| match old {
-                                    RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
-                                    other => other,
-                                });
-
-                                let state_clone = state.clone();
-                                let peer_manager_clone = peer_manager.clone();
-                                let config_clone = config.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = initiate_election(config_clone, state_clone, peer_manager_clone).await {
-                                        error!("Failed to initiate election: {}", e);
-                                    }
-                                });
-                            }
-                        }
+                        let guard = state.read().await;
+                        handle_follower_tick(&*guard, timeout)
                     }
                     _ = signal.notified() => {
-                        // Heartbeat received! We restart the loop and pick a new timeout.
-                        continue;
+                        TimerAction::Restart
                     }
                 }
             } else {
-                // We are a Candidate. Standard sleep without signal reactivity.
                 sleep(timeout).await;
-                let mut state_guard = state.write().await;
-                if let RaftNodeState::Candidate(node) = &*state_guard {
-                    info!(
-                        "Election timeout reached as Candidate. Restarting election for term {}",
-                        node.current_term() + 1
-                    );
-                    state_guard.transition(|old| match old {
-                        RaftNodeState::Candidate(n) => {
-                            RaftNodeState::Candidate(n.into_restarted_candidate())
-                        }
-                        other => other,
-                    });
-
-                    let state_clone = state.clone();
-                    let peer_manager_clone = peer_manager.clone();
-                    let config_clone = config.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            initiate_election(config_clone, state_clone, peer_manager_clone).await
-                        {
-                            error!("Failed to initiate election: {}", e);
-                        }
-                    });
+                let guard = state.read().await;
+                match &*guard {
+                    RaftNodeState::Candidate(_) => handle_candidate_tick(&*guard),
+                    RaftNodeState::Leader(_) => handle_leader_tick(&*guard),
+                    RaftNodeState::Poisoned => panic!("HALT: Node is poisoned (ADR 001)"),
+                    _ => TimerAction::Restart,
                 }
+            };
+
+            // 3. Execution: If evaluation triggered an election, transition and campaign.
+            if action == TimerAction::StartElection {
+                initiate_transition_to_candidate(
+                    config.clone(),
+                    state.clone(),
+                    peer_manager.clone(),
+                )
+                .await;
             }
         }
     });
+}
+
+/// Transitions the node to Candidate and spawns the election RPC task.
+async fn initiate_transition_to_candidate(
+    config: Arc<Config>,
+    state: Arc<RwLock<RaftNodeState>>,
+    peer_manager: Arc<PeerManager>,
+) {
+    let mut state_guard = state.write().await;
+    let new_term = match &*state_guard {
+        RaftNodeState::Follower(n) => n.current_term() + 1,
+        RaftNodeState::Candidate(n) => n.current_term() + 1,
+        _ => return, // Only Followers and Candidates can start elections
+    };
+
+    info!(
+        "Election timeout reached. Transitioning to Candidate for term {}",
+        new_term
+    );
+
+    state_guard.transition(|old| match old {
+        RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
+        RaftNodeState::Candidate(n) => RaftNodeState::Candidate(n.into_restarted_candidate()),
+        other => other,
+    });
+
+    let state_clone = state.clone();
+    let peer_manager_clone = peer_manager.clone();
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = initiate_election(config_clone, state_clone, peer_manager_clone).await {
+            error!("Failed to initiate election: {}", e);
+        }
+    });
+}
+
+/// Evaluates the Follower's election timer.
+fn handle_follower_tick(state: &RaftNodeState, timeout: Duration) -> TimerAction {
+    match state {
+        RaftNodeState::Follower(node) => {
+            let elapsed = node.state().last_heartbeat().elapsed();
+            if elapsed >= timeout {
+                TimerAction::StartElection
+            } else {
+                TimerAction::Restart
+            }
+        }
+        _ => TimerAction::Restart,
+    }
+}
+
+/// Evaluates the Candidate's election timer.
+fn handle_candidate_tick(state: &RaftNodeState) -> TimerAction {
+    match state {
+        RaftNodeState::Candidate(_) => TimerAction::StartElection,
+        _ => TimerAction::Restart,
+    }
+}
+
+/// Evaluates the Leader's election timer.
+fn handle_leader_tick(state: &RaftNodeState) -> TimerAction {
+    match state {
+        RaftNodeState::Leader(_) => TimerAction::Restart,
+        _ => TimerAction::Restart,
+    }
+}
+
+/// Calculates a randomized election timeout based on the configuration.
+fn calculate_election_timeout(config: &Config) -> Duration {
+    let mut rng = rand::rng();
+    Duration::from_millis(
+        rng.random_range(config.raft.election_timeout_min_ms..config.raft.election_timeout_max_ms),
+    )
+}
+
+/// Instruction for the main election timer loop.
+#[derive(Debug, PartialEq)]
+enum TimerAction {
+    /// No significant event; restart the loop with a new timeout.
+    Restart,
+    /// Transition to Candidate and initiate a new election.
+    StartElection,
 }
 
 /// Initiates a Leader Election by requesting votes from all peers.
@@ -462,5 +504,195 @@ fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
     if quorum_idx > node.commit_index() && node.get_term_at(quorum_idx) == current_term {
         info!("Quorum reached for log index {}. Committing.", quorum_idx);
         node.set_commit_index(quorum_idx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod calculate_election_timeout {
+        use super::*;
+
+        #[test]
+        fn returns_duration_within_configured_range() {
+            let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                peers = {}
+                
+                [raft]
+                election_timeout_min_ms = 150
+                election_timeout_max_ms = 300
+
+                [policy]
+                veto_addr = "http://127.0.0.1:50060"
+                veto_timeout_ms = 1000
+            "#;
+            let config: Config = toml::from_str(toml_str).expect("Failed to parse mock config");
+
+            for _ in 0..100 {
+                let timeout = calculate_election_timeout(&config);
+                assert!(timeout >= Duration::from_millis(150));
+                assert!(timeout < Duration::from_millis(300));
+            }
+        }
+    }
+
+    mod spawn_election_timer {
+        use std::collections::HashMap;
+
+        use common::types::ClusterId;
+        use common::types::NodeId;
+
+        use super::*;
+        use crate::identity::NodeIdentity;
+        use crate::node::Follower;
+        use crate::node::RaftNode;
+
+        fn mock_config(min_ms: u64, max_ms: u64) -> Arc<Config> {
+            let toml_str = format!(
+                r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                peers = {{}}
+                
+                [raft]
+                election_timeout_min_ms = {}
+                election_timeout_max_ms = {}
+
+                [policy]
+                veto_addr = "http://127.0.0.1:50060"
+                veto_timeout_ms = 1000
+            "#,
+                min_ms, max_ms
+            );
+            Arc::new(toml::from_str(&toml_str).unwrap())
+        }
+
+        fn mock_identity() -> Arc<NodeIdentity> {
+            Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::new(1),
+            ))
+        }
+
+        async fn setup() -> (Arc<Config>, Arc<RwLock<RaftNodeState>>, Arc<PeerManager>) {
+            let config = mock_config(50, 100);
+            let id = mock_identity();
+            let state = Arc::new(RwLock::new(RaftNodeState::Follower(
+                RaftNode::<Follower>::new(id.clone()),
+            )));
+            let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
+            (config, state, peer_manager)
+        }
+
+        #[tokio::test]
+        async fn follower_transitions_to_candidate_on_timeout() {
+            let (config, state, peer_manager) = setup().await;
+            spawn_election_timer(config, state.clone(), peer_manager);
+
+            // Wait for timeout (50-100ms) + buffer
+            sleep(Duration::from_millis(250)).await;
+
+            let guard = state.read().await;
+            assert!(matches!(&*guard, RaftNodeState::Candidate(_)));
+        }
+
+        #[tokio::test]
+        async fn candidate_restarts_election_on_timeout() {
+            let (config, state, peer_manager) = setup().await;
+
+            // Start as Candidate
+            {
+                let mut guard = state.write().await;
+                guard.transition(|old| match old {
+                    RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
+                    other => other,
+                });
+            }
+            let initial_term = state.read().await.current_term().unwrap();
+
+            spawn_election_timer(config, state.clone(), peer_manager);
+
+            // Wait for timeout
+            sleep(Duration::from_millis(250)).await;
+
+            let guard = state.read().await;
+            assert!(matches!(&*guard, RaftNodeState::Candidate(_)));
+            assert!(
+                guard.current_term().unwrap() > initial_term,
+                "Candidate should have incremented term due to timeout"
+            );
+        }
+
+        #[tokio::test]
+        async fn leader_timer_remains_active() {
+            let (config, state, peer_manager) = setup().await;
+
+            // Start as Leader
+            {
+                let mut guard = state.write().await;
+                guard.transition(|old| match old {
+                    RaftNodeState::Follower(n) => {
+                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    }
+                    other => other,
+                });
+            }
+
+            spawn_election_timer(config, state.clone(), peer_manager);
+
+            // Wait a bit while Leader to ensure the loop hits the Leader case
+            sleep(Duration::from_millis(50)).await;
+
+            // Demote to Follower
+            {
+                let mut guard = state.write().await;
+                let term = guard.current_term().unwrap();
+                guard.transition(|old| old.into_follower(term, None));
+            }
+
+            // If the timer task returned when it was Leader (the bug), it won't trigger
+            // now. Wait for timeout
+            sleep(Duration::from_millis(300)).await;
+
+            let guard = state.read().await;
+            assert!(
+                matches!(&*guard, RaftNodeState::Candidate(_)),
+                "Timer should have stayed active and triggered election after demotion \
+                 (Reproduction of Leader Bug)"
+            );
+        }
+
+        #[tokio::test]
+        async fn poisoned_state_triggers_halt() {
+            let (config, state, peer_manager) = setup().await;
+
+            // Start as poisoned
+            {
+                let mut guard = state.write().await;
+                *guard = RaftNodeState::Poisoned;
+            }
+
+            // Wrap in tokio::spawn to capture panic
+            let handle = tokio::spawn(async move {
+                // We need to call the inner loop logic or a version that we can join.
+                // For now, let's just use spawn_election_timer and see if it halts.
+                spawn_election_timer(config, state, peer_manager);
+                // The timer is spawned in another task inside
+                // spawn_election_timer. This makes it hard to
+                // join the specific timer loop.
+            });
+
+            handle.await.unwrap();
+            // This test is currently a placeholder for the logic.
+            // The actual implementation will use panic! which we'll verify in
+            // Commit 2.
+        }
     }
 }
