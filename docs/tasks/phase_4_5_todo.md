@@ -53,23 +53,23 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
   - [x] Unit tests for `IntentWal` CRUD operations.
   - [x] Crash Test: Kill `client-cli` after it logs "Intent Persisted" but before response; verify re-proposal on restart.
 
-### Step 4: Resilient Client Loop (ADR 003)
+### Step 4: Resilient Client Loop (ADR 003) [x]
 
 **Commit:** `feat(client): implement exponential backoff and jitter for mutation retries`
 
-- [ ] Implement `retry_with_backoff` utility in `client.rs`.
-  - [ ] Strategy: Exponential backoff (initial 100ms, max 5s) with 20% jitter.
-- [ ] Align `DEFAULT_MUTATION_TIMEOUT` with 30s mandate.
-- [ ] Handle `NotLeader` redirection within the retry loop.
-- [ ] **Verification:**
-  - [ ] Unit test for backoff math (monotonicity and jitter bounds).
-  - [ ] Integration test: Mock a congested cluster and verify client retries without "thundering herd" behavior.
+- [x] Implement `retry_with_backoff` utility in `client.rs` (via `calculate_backoff` instance method).
+  - [x] Strategy: Exponential backoff (initial 100ms, max 5s) with 20% jitter.
+- [x] Align `DEFAULT_MUTATION_TIMEOUT` with 30s mandate.
+- [x] Handle `NotLeader` redirection within the retry loop (via `reconcile_routing_failure`).
+- [x] **Verification:**
+  - [x] Unit test for backoff math (monotonicity and jitter bounds).
+  - [x] Integration test: Mock a congested cluster and verify client retries without "thundering herd" behavior.
 
 ---
 
 ## 📈 Verification Summary
 
-- [ ] **NewType Migration Check:** Verified that `Term`, `LogIndex`, `SequenceId`, `ClientId`, and `NodeId` are used throughout `raft-node` and `client-cli`. (Completed).
-- [ ] **Identity Integrity:** Cluster rejects misconfigured traffic via middleware.
-- [ ] **Durability:** Client recovers pending mutations after a crash.
-- [ ] **Stability:** Retries are disciplined and respect the 30s timeout window.
+- [x] **NewType Migration Check:** Verified that `Term`, `LogIndex`, `SequenceId`, `ClientId`, and `NodeId` are used throughout `raft-node` and `client-cli`. (Completed).
+- [x] **Identity Integrity:** Cluster rejects misconfigured traffic via middleware.
+- [x] **Durability:** Client recovers pending mutations after a crash.
+- [x] **Stability:** Retries are disciplined and respect the 30s timeout window.
