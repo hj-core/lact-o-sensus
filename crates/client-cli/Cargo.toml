@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+sled.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 rust_decimal.workspace = true
