@@ -34,15 +34,24 @@ pub trait ServiceState: Send + Sync {
             Ok(engine_identity) if Arc::ptr_eq(engine_identity, self.identity_arc()) => Ok(()),
             Ok(engine_identity) => {
                 // Internal invariant violation: Service and Engine identity must match.
-                error!(
+                // ADR 001/004: We prioritize Safety over Liveness. Identity divergence
+                // is a terminal failure. Triggering Halt Mandate.
+                let msg = format!(
                     "CRITICAL: Identity divergence detected! ServiceIdentity='{:?}' \
                      EngineIdentity='{:?}'",
                     self.identity(),
                     engine_identity
                 );
-                Err(Status::internal("Internal identity mismatch"))
+                error!("{}", msg);
+                panic!("{}", msg);
             }
-            Err(_) => Err(self.poisoned_status()),
+            Err(_) => {
+                // ADR 001: The node is in a poisoned state following a fatal failure.
+                // To ensure safety, we must halt immediately.
+                let msg = "CRITICAL: Node is in a poisoned state! Triggering Halt Mandate.";
+                error!("{}", msg);
+                panic!("{}", msg);
+            }
         }
     }
 

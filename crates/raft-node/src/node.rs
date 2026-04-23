@@ -11,6 +11,7 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 
 use crate::fsm::StateMachine;
 use crate::identity::NodeIdentity;
@@ -326,6 +327,28 @@ impl<S: NodeState> RaftNode<S> {
             .unwrap_or(Term::ZERO)
     }
 
+    /// Verifies if a candidate's log is at least as up-to-date as the local
+    /// log.
+    ///
+    /// Raft §5.4:
+    /// If the logs have last entries with different terms, then the log with
+    /// the later term is more up-to-date. If the logs end with the same
+    /// term, then whichever log is longer is more up-to-date.
+    pub fn is_log_up_to_date(
+        &self,
+        candidate_last_log_term: Term,
+        candidate_last_log_index: LogIndex,
+    ) -> bool {
+        let local_last_term = self.last_log_term();
+        let local_last_index = self.last_log_index();
+
+        if candidate_last_log_term != local_last_term {
+            candidate_last_log_term > local_last_term
+        } else {
+            candidate_last_log_index >= local_last_index
+        }
+    }
+
     /// Internal helper to update term and reset vote.
     fn set_term(&mut self, term: Term) {
         if term > self.current_term {
@@ -555,6 +578,61 @@ impl RaftNodeState {
             node.state_mut().reset_heartbeat();
         }
     }
+
+    /// Processes a RequestVote RPC.
+    ///
+    /// Autonomously manages term transitions and vote granting according to
+    /// Raft §5.1, §5.2, and §5.4.
+    pub fn handle_request_vote(
+        &mut self,
+        candidate_id: NodeId,
+        req_term: Term,
+        req_last_log_index: LogIndex,
+        req_last_log_term: Term,
+    ) -> Result<(Term, bool), RaftError> {
+        let current_term = self.current_term()?;
+
+        // 1. If term > currentTerm: set currentTerm = term, transition to follower
+        //    (§5.1)
+        if req_term > current_term {
+            info!(
+                "Received higher term ({}) from candidate {}. Transitioning to Follower.",
+                req_term, candidate_id
+            );
+            self.transition(|old| old.into_follower(req_term, None));
+            // TODO: Phase 6 - fsync term to sled
+        }
+
+        // Re-acquire current state after potential transition
+        let mut vote_granted = false;
+        let current_term = self.current_term()?;
+
+        match self {
+            RaftNodeState::Follower(node) => {
+                // 2. If votedFor is null or candidateId, and candidate’s log is at
+                // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+                if req_term >= node.current_term()
+                    && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
+                {
+                    if node.is_log_up_to_date(req_last_log_term, req_last_log_index) {
+                        vote_granted = true;
+                        node.vote_for(candidate_id);
+                        info!(
+                            "Granting vote to candidate {} for term {}",
+                            candidate_id, req_term
+                        );
+                    }
+                }
+            }
+            RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => {
+                // If term is equal, we already voted for ourselves or are
+                // leading.
+            }
+            RaftNodeState::Poisoned => return Err(RaftError::Poisoned),
+        }
+
+        Ok((current_term, vote_granted))
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +742,183 @@ mod tests {
             // Log is empty, so last_log_index is 0.
             // Attempting to commit 1 should panic.
             node.set_commit_index(LogIndex::new(1)).await;
+        }
+    }
+
+    mod is_log_up_to_date {
+        use super::*;
+
+        #[test]
+        fn returns_true_when_candidate_term_is_higher() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            // Local: (index 1, term 1)
+            // Candidate: (index 1, term 2)
+            assert!(node.is_log_up_to_date(Term::new(2), LogIndex::new(1)));
+        }
+
+        #[test]
+        fn returns_false_when_candidate_term_is_lower() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(2), vec![]));
+
+            // Local: (index 1, term 2)
+            // Candidate: (index 10, term 1)
+            assert!(!node.is_log_up_to_date(Term::new(1), LogIndex::new(10)));
+        }
+
+        #[test]
+        fn returns_true_when_same_term_and_candidate_log_is_longer() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            // Local: (index 1, term 1)
+            // Candidate: (index 2, term 1)
+            assert!(node.is_log_up_to_date(Term::new(1), LogIndex::new(2)));
+        }
+
+        #[test]
+        fn returns_true_when_same_term_and_candidate_log_is_equal_length() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            // Local: (index 1, term 1)
+            // Candidate: (index 1, term 1)
+            assert!(node.is_log_up_to_date(Term::new(1), LogIndex::new(1)));
+        }
+
+        #[test]
+        fn returns_false_when_same_term_and_candidate_log_is_shorter() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(2), Term::new(1), vec![]));
+
+            // Local: (index 2, term 1)
+            // Candidate: (index 1, term 1)
+            assert!(!node.is_log_up_to_date(Term::new(1), LogIndex::new(1)));
+        }
+    }
+
+    mod handle_request_vote {
+        use super::*;
+
+        #[test]
+        fn grants_vote_when_term_is_higher_and_not_voted() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(granted);
+            assert_eq!(term, Term::new(1));
+            assert_eq!(state.voted_for().unwrap(), Some(NodeId::new(2)));
+        }
+
+        #[test]
+        fn grants_vote_when_term_is_current_and_not_voted() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+            state.transition(|old| old.into_follower(Term::new(1), None));
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(granted);
+            assert_eq!(term, Term::new(1));
+        }
+
+        #[test]
+        fn rejects_vote_when_term_is_older() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+            state.transition(|old| old.into_follower(Term::new(2), None));
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(!granted);
+            assert_eq!(term, Term::new(2));
+        }
+
+        #[test]
+        fn rejects_vote_when_already_voted_for_different_candidate() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+            state
+                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(3), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(!granted);
+            assert_eq!(term, Term::new(1));
+            assert_eq!(state.voted_for().unwrap(), Some(NodeId::new(2)));
+        }
+
+        #[test]
+        fn rejects_vote_when_candidate_log_is_stale() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+            let mut state = RaftNodeState::Follower(node);
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(!granted);
+            assert_eq!(term, Term::new(1));
+        }
+
+        #[test]
+        fn demotes_to_follower_on_higher_term() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id, fsm);
+            let candidate = follower.into_candidate(); // Term 1
+            let mut state = RaftNodeState::Candidate(candidate);
+
+            let (term, granted) = state
+                .handle_request_vote(NodeId::new(2), Term::new(2), LogIndex::new(0), Term::new(0))
+                .unwrap();
+
+            assert!(granted);
+            assert_eq!(term, Term::new(2));
+            assert!(matches!(state, RaftNodeState::Follower(_)));
         }
     }
 }

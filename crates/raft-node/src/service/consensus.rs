@@ -66,74 +66,17 @@ impl ConsensusService for ConsensusDispatcher {
         let mut state_guard = self.state.write().await;
         self.verify_node_integrity(&state_guard)?;
 
-        // 1. If term > currentTerm: set currentTerm = term, transition to follower
-        //    (§5.1)
-        let current_term = state_guard
-            .current_term()
+        let (current_term, vote_granted) = state_guard
+            .handle_request_vote(
+                candidate_id,
+                req_term,
+                req_last_log_index,
+                req_last_log_term,
+            )
             .map_err(|_| self.poisoned_status())?;
 
-        if req_term > current_term {
-            info!(
-                "Received higher term ({}) from candidate {}. Transitioning to Follower.",
-                req_term, candidate_id
-            );
-            state_guard.transition(|old| old.into_follower(req_term, None));
-        }
-
-        // Re-acquire current state after potential transition
-        let mut vote_granted = false;
-        match &mut *state_guard {
-            RaftNodeState::Follower(node) => {
-                // 2. If votedFor is null or candidateId, and candidate’s log is at
-                // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-                if req_term >= node.current_term()
-                    && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
-                {
-                    let local_last_term = node.last_log_term();
-                    let local_last_index = node.last_log_index();
-
-                    // Raft §5.4:
-                    // If the logs have last entries with different terms, then the log with the
-                    // later term is more up-to-date. If the logs end with the same term, then
-                    // whichever log is longer is more up-to-date.
-                    let is_up_to_date = if req_last_log_term != local_last_term {
-                        req_last_log_term > local_last_term
-                    } else {
-                        req_last_log_index >= local_last_index
-                    };
-
-                    if is_up_to_date {
-                        vote_granted = true;
-                        node.vote_for(candidate_id);
-                        info!(
-                            "Granting vote to candidate {} for term {}",
-                            candidate_id, req_term
-                        );
-                    } else {
-                        debug!(
-                            "Rejecting vote for candidate {}: candidate's log is not up-to-date \
-                             (local: index {}, term {}; remote: index {}, term {})",
-                            candidate_id,
-                            local_last_index,
-                            local_last_term,
-                            req_last_log_index,
-                            req_last_log_term
-                        );
-                    }
-                }
-            }
-            RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => {
-                // If term is equal, we already voted for ourselves or are
-                // leading. If term was higher, we transitioned
-                // to Follower above.
-            }
-            RaftNodeState::Poisoned => return Err(self.poisoned_status()),
-        };
-
         Ok(Response::new(RequestVoteResponse::new(
-            state_guard
-                .current_term()
-                .map_err(|_| self.poisoned_status())?,
+            current_term,
             vote_granted,
         )))
     }
@@ -337,7 +280,8 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn returns_err_when_poisoned() {
+        #[should_panic(expected = "CRITICAL: Node is in a poisoned state")]
+        async fn panics_when_poisoned() {
             let dispatcher = mock_dispatcher();
 
             // Force the node into a poisoned state for testing
@@ -353,13 +297,12 @@ mod tests {
                 last_log_term: 0,
             });
 
-            let result = dispatcher.request_vote(req).await;
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+            let _ = dispatcher.request_vote(req).await;
         }
 
         #[tokio::test]
-        async fn returns_err_when_identity_mismatches() {
+        #[should_panic(expected = "CRITICAL: Identity divergence detected")]
+        async fn panics_on_identity_mismatch() {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
             let wrong_id = Arc::new(NodeIdentity::new(id.cluster_id().clone(), NodeId::new(99)));
@@ -376,10 +319,7 @@ mod tests {
                 last_log_term: 0,
             });
 
-            let result = dispatcher.request_vote(req).await;
-            assert!(result.is_err());
-            // Should return Internal due to identity divergence
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+            let _ = dispatcher.request_vote(req).await;
         }
     }
 
