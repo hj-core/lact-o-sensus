@@ -196,6 +196,10 @@ impl<S: NodeState> RaftNode<S> {
         &self.identity
     }
 
+    pub fn node_id(&self) -> NodeId {
+        self.identity.node_id()
+    }
+
     pub fn current_term(&self) -> Term {
         self.current_term
     }
@@ -443,55 +447,46 @@ pub enum RaftNodeState {
     Poisoned, // ADR 001: Safety barrier during transition failures
 }
 
+macro_rules! delegate_to_inner {
+    ($self:ident, $method:ident $(, $args:expr)*) => {
+        match $self {
+            RaftNodeState::Follower(n) => Ok(n.$method($($args),*)),
+            RaftNodeState::Candidate(n) => Ok(n.$method($($args),*)),
+            RaftNodeState::Leader(n) => Ok(n.$method($($args),*)),
+            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
+        }
+    };
+}
+
 impl RaftNodeState {
     /// Returns the logical identity of the node as a reference to its Arc.
     pub fn identity_arc(&self) -> Result<&Arc<NodeIdentity>, RaftError> {
-        match self {
-            RaftNodeState::Follower(n) => Ok(n.identity_arc()),
-            RaftNodeState::Candidate(n) => Ok(n.identity_arc()),
-            RaftNodeState::Leader(n) => Ok(n.identity_arc()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
+        delegate_to_inner!(self, identity_arc)
+    }
+
+    /// Returns this node's ID.
+    pub fn node_id(&self) -> Result<NodeId, RaftError> {
+        delegate_to_inner!(self, node_id)
     }
 
     /// Returns the current term of the node, regardless of its state.
     pub fn current_term(&self) -> Result<Term, RaftError> {
-        match self {
-            RaftNodeState::Follower(node) => Ok(node.current_term()),
-            RaftNodeState::Candidate(node) => Ok(node.current_term()),
-            RaftNodeState::Leader(node) => Ok(node.current_term()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
+        delegate_to_inner!(self, current_term)
     }
 
     /// Returns who the node voted for in the current term.
     pub fn voted_for(&self) -> Result<Option<NodeId>, RaftError> {
-        match self {
-            RaftNodeState::Follower(node) => Ok(node.voted_for()),
-            RaftNodeState::Candidate(node) => Ok(node.voted_for()),
-            RaftNodeState::Leader(node) => Ok(node.voted_for()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
+        delegate_to_inner!(self, voted_for)
     }
 
     /// Returns the current commit index of the node.
     pub fn commit_index(&self) -> Result<LogIndex, RaftError> {
-        match self {
-            RaftNodeState::Follower(node) => Ok(node.commit_index()),
-            RaftNodeState::Candidate(node) => Ok(node.commit_index()),
-            RaftNodeState::Leader(node) => Ok(node.commit_index()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
+        delegate_to_inner!(self, commit_index)
     }
 
     /// Returns the commit signal of the node.
     pub fn commit_signal(&self) -> Result<Arc<Notify>, RaftError> {
-        match self {
-            RaftNodeState::Follower(node) => Ok(node.commit_signal().clone()),
-            RaftNodeState::Candidate(node) => Ok(node.commit_signal().clone()),
-            RaftNodeState::Leader(node) => Ok(node.commit_signal().clone()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
+        delegate_to_inner!(self, commit_signal).map(|s| s.clone())
     }
 
     /// Appends a new command to the leader's log.
@@ -507,16 +502,6 @@ impl RaftNodeState {
             }
             RaftNodeState::Poisoned => Err(RaftError::Poisoned),
             _ => Err(RaftError::NotLeader),
-        }
-    }
-
-    /// Returns this node's ID.
-    pub fn node_id(&self) -> Result<NodeId, RaftError> {
-        match self {
-            RaftNodeState::Follower(n) => Ok(n.identity().node_id()),
-            RaftNodeState::Candidate(n) => Ok(n.identity().node_id()),
-            RaftNodeState::Leader(n) => Ok(n.identity().node_id()),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
         }
     }
 
