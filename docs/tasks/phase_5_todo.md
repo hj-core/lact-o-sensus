@@ -46,19 +46,19 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] Write a unit test in `node.rs` verifying that `apply` is called with the correct bytes when `commit_index` advances. (Verified via integration and existing tests adapted to new fsm).
   - [x] `cargo test` passes.
 
-### Step 4: The Universal Unit Registry (ADR 008) [ ]
+### Step 4: The Universal Unit Registry (ADR 008) [x]
 
 **Commit:** `feat(common): implement universal unit registry and SI stabilization`
 
 - **Description:** Implement the physical domain types and the internal SI stabilization model.
 - **Changes:**
-  - [ ] Create `crates/common/src/units.rs`.
-  - [ ] Implement dimensional models (Mass, Volume, Count, Anomalous) using self-validating NewTypes.
-  - [ ] Implement conversion logic using `rust_decimal::Decimal` and Banker's Rounding.
+  - [x] Create `crates/common/src/units.rs`.
+  - [x] Implement dimensional models (Mass, Volume, Count, Anomalous) using self-validating NewTypes.
+  - [x] Implement conversion logic using `rust_decimal::Decimal` and Banker's Rounding.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit tests in `units.rs` verify conversions (e.g., `lb` to `g`, `gal` to `ml`).
-  - [ ] Test verifying that Banker's rounding correctly prevents cumulative bias.
-  - [ ] Test verifying the "Dimensional Fence" (adding `g` to `L` returns an error).
+  - [x] Unit tests in `units.rs` verify conversions (e.g., `lb` to `g`, `gal` to `ml`).
+  - [x] Test verifying that Banker's rounding correctly prevents cumulative bias.
+  - [x] Test verifying the "Dimensional Fence" (adding `g` to `L` returns an error).
 
 ### Step 5: The 5-Layer Defensive Pipeline (ADR 007) [ ]
 
