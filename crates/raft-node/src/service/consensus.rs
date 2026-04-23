@@ -12,9 +12,6 @@ use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
-use tracing::debug;
-use tracing::error;
-use tracing::info;
 use tracing::info_span;
 
 use crate::identity::NodeIdentity;
@@ -103,141 +100,20 @@ impl ConsensusService for ConsensusDispatcher {
         let mut state_guard = self.state.write().await;
         self.verify_node_integrity(&state_guard)?;
 
-        let current_term = state_guard
-            .current_term()
+        let (current_term, success, last_log_index) = state_guard
+            .handle_append_entries(
+                leader_id,
+                req_term,
+                req_prev_log_index,
+                req_prev_log_term,
+                req.entries,
+                req_leader_commit,
+            )
+            .await
             .map_err(|_| self.poisoned_status())?;
 
-        // 1. Reply false if term < currentTerm (§5.1)
-        if req_term < current_term {
-            debug!(
-                "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
-                leader_id, req_term, current_term
-            );
-            return Ok(Response::new(AppendEntriesResponse::new(
-                current_term,
-                false,
-                LogIndex::ZERO,
-            )));
-        }
-
-        // 2. Term-based state transitions
-        if req_term > current_term {
-            // §5.1: If term > currentTerm, transition to follower
-            info!(
-                "Received higher term ({}) from leader {}. Demoting to Follower.",
-                req_term, leader_id
-            );
-            state_guard.transition(|old| old.into_follower(req_term, Some(leader_id)));
-        } else if req_term == current_term {
-            match &mut *state_guard {
-                RaftNodeState::Candidate(_) => {
-                    // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
-                    // it recognizes the leader as legitimate and returns to follower state.
-                    info!(
-                        "Candidate recognizing leader {} for term {}. Returning to Follower.",
-                        leader_id, req_term
-                    );
-                    state_guard.transition(|old| old.into_follower(req_term, Some(leader_id)));
-                }
-                RaftNodeState::Leader(_) => {
-                    // FATAL INVARIANT VIOLATION: Two leaders for the same term!
-                    // We prioritize Safety over Liveness. Detecting another leader for our own term
-                    // implies a failure in the consensus logic or persistence layer. We must halt
-                    // to prevent data corruption.
-                    let msg = format!(
-                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
-                         node to prevent state corruption.",
-                        leader_id, req_term
-                    );
-                    error!("{}", msg);
-                    panic!("{}", msg);
-                }
-                RaftNodeState::Follower(node) => {
-                    node.state_mut().set_leader_id(Some(leader_id));
-                }
-                _ => {}
-            }
-        }
-
-        // 3. Log Consistency Check (§5.3)
-        // Note: We perform this only if the node is in a stable Follower state.
-        // If we just transitioned from Candidate/Leader, we are now a Follower.
-        state_guard.reset_heartbeat();
-
-        let (success, last_log_index) = match &mut *state_guard {
-            RaftNodeState::Follower(node) => {
-                let mut success = true;
-
-                // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
-                //    matches prevLogTerm (§5.3)
-                if req_prev_log_index > LogIndex::ZERO {
-                    let local_term = node.get_term_at(req_prev_log_index);
-                    if local_term != req_prev_log_term {
-                        debug!(
-                            "Rejecting AppendEntries: prevLogIndex {} has term mismatch (local \
-                             {}, remote {})",
-                            req_prev_log_index, local_term, req_prev_log_term
-                        );
-                        success = false;
-                    }
-                }
-
-                if success {
-                    // 3. If an existing entry conflicts with a new one (same index but different
-                    //    terms), delete the existing entry and all that follow it (§5.3)
-                    for entry in &req.entries {
-                        let entry_index = LogIndex::new(entry.index);
-                        let local_term = node.get_term_at(entry_index);
-                        if local_term != Term::ZERO && local_term != Term::new(entry.term) {
-                            info!(
-                                "Log conflict detected at index {}. Truncating log.",
-                                entry_index
-                            );
-                            let truncate_at = (entry.index - 1) as usize;
-                            node.log_mut().truncate(truncate_at);
-                            break;
-                        }
-                    }
-
-                    // 4. Append any new entries not already in the log
-                    for entry in req.entries {
-                        let entry_index = LogIndex::new(entry.index);
-                        let last_idx = node.last_log_index();
-                        if entry_index > last_idx {
-                            if entry_index != last_idx + 1 {
-                                // This should be caught by the prevLogIndex check, but we are
-                                // defensive.
-                                error!(
-                                    "CRITICAL: Non-contiguous log append attempted. index={}, \
-                                     last={}",
-                                    entry_index, last_idx
-                                );
-                                success = false;
-                                break;
-                            }
-                            node.log_mut().push(entry);
-                        }
-                    }
-                }
-
-                if success {
-                    // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index
-                    //    of last new entry)
-                    if req_leader_commit > node.commit_index() {
-                        let last_new_idx = node.last_log_index();
-                        let new_commit = std::cmp::min(req_leader_commit, last_new_idx);
-                        node.set_commit_index(new_commit).await;
-                        debug!("Updated commit_index to {}", new_commit);
-                    }
-                }
-
-                (success, node.last_log_index())
-            }
-            _ => (false, LogIndex::ZERO), // Should have demoted above
-        };
-
         Ok(Response::new(AppendEntriesResponse::new(
-            state_guard.current_term().unwrap_or(req_term),
+            current_term,
             success,
             last_log_index,
         )))

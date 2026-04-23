@@ -404,6 +404,105 @@ impl RaftNode<Follower> {
         }
     }
 
+    /// Following Raft §5.3, reconciles the local log with entries from the
+    /// leader.
+    ///
+    /// This is a high-level orchestrator for Follower log updates.
+    /// Returns (success, last_log_index).
+    pub async fn reconcile_log(
+        &mut self,
+        prev_log_index: LogIndex,
+        prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        leader_commit: LogIndex,
+    ) -> (bool, LogIndex) {
+        // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
+        //    matches prevLogTerm (§5.3)
+        if !self.verify_log_consistency(prev_log_index, prev_log_term) {
+            return (false, self.last_log_index());
+        }
+
+        // 3 & 4. Handle conflicts, truncation, and appending.
+        if !self.append_entries_with_reconciliation(entries) {
+            return (false, self.last_log_index());
+        }
+
+        // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index
+        //    of last new entry)
+        self.advance_commit_index(leader_commit).await;
+
+        (true, self.last_log_index())
+    }
+
+    /// Raft §5.3 (Step 2): Verifies that the log contains an entry at
+    /// `prev_log_index` with `prev_log_term`.
+    fn verify_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
+        if prev_log_index == LogIndex::ZERO {
+            return true;
+        }
+
+        let local_term = self.get_term_at(prev_log_index);
+        if local_term != prev_log_term {
+            debug!(
+                "Rejecting AppendEntries: prevLogIndex {} has term mismatch (local {}, remote {})",
+                prev_log_index, local_term, prev_log_term
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Raft §5.3 (Steps 3 & 4): Resolves log conflicts and appends new entries.
+    fn append_entries_with_reconciliation(&mut self, entries: Vec<LogEntry>) -> bool {
+        // 3. If an existing entry conflicts with a new one (same index but different
+        //    terms), delete the existing entry and all that follow it (§5.3)
+        for entry in &entries {
+            let entry_index = LogIndex::new(entry.index);
+            let local_term = self.get_term_at(entry_index);
+            if local_term != Term::ZERO && local_term != Term::new(entry.term) {
+                info!(
+                    "Log conflict detected at index {}. Truncating log.",
+                    entry_index
+                );
+                let truncate_at = (entry.index - 1) as usize;
+                self.log_mut().truncate(truncate_at);
+                // TODO: Phase 6 - fsync truncation to sled
+                break;
+            }
+        }
+
+        // 4. Append any new entries not already in the log
+        for entry in entries {
+            let entry_index = LogIndex::new(entry.index);
+            let last_idx = self.last_log_index();
+            if entry_index > last_idx {
+                if entry_index != last_idx + 1 {
+                    // This should be caught by the prevLogIndex check, but we are defensive.
+                    error!(
+                        "CRITICAL: Non-contiguous log append attempted. index={}, last={}",
+                        entry_index, last_idx
+                    );
+                    return false;
+                }
+                self.log_mut().push(entry);
+                // TODO: Phase 6 - fsync append to sled
+            }
+        }
+
+        true
+    }
+
+    /// Raft §5.3 (Step 5): Advances the commit index.
+    async fn advance_commit_index(&mut self, leader_commit: LogIndex) {
+        if leader_commit > self.commit_index() {
+            let last_new_idx = self.last_log_index();
+            let new_commit = std::cmp::min(leader_commit, last_new_idx);
+            self.set_commit_index(new_commit).await;
+            debug!("Updated commit_index to {}", new_commit);
+        }
+    }
+
     /// Follower -> Candidate transition (Triggered by Election Timeout).
     pub fn into_candidate(self) -> RaftNode<Candidate> {
         let mut state = Candidate::new();
@@ -632,6 +731,91 @@ impl RaftNodeState {
         }
 
         Ok((current_term, vote_granted))
+    }
+
+    /// Processes an AppendEntries RPC.
+    ///
+    /// Acts as a high-level orchestrator, delegating log reconciliation to
+    /// specialized sub-functions. Autonomously manages term transitions and
+    /// rival leader detection according to Raft §5.1, §5.2, and §5.3.
+    pub async fn handle_append_entries(
+        &mut self,
+        leader_id: NodeId,
+        req_term: Term,
+        req_prev_log_index: LogIndex,
+        req_prev_log_term: Term,
+        entries: Vec<LogEntry>,
+        req_leader_commit: LogIndex,
+    ) -> Result<(Term, bool, LogIndex), RaftError> {
+        let current_term = self.current_term()?;
+
+        // --- Raft RPC Step 1: Term Check (§5.1) ---
+        if req_term < current_term {
+            debug!(
+                "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
+                leader_id, req_term, current_term
+            );
+            return Ok((current_term, false, LogIndex::ZERO));
+        }
+
+        // --- Internal: State Transitions & Heartbeat Verification ---
+        if req_term > current_term {
+            // §5.1: If term > currentTerm, transition to follower
+            info!(
+                "Received higher term ({}) from leader {}. Demoting to Follower.",
+                req_term, leader_id
+            );
+            self.transition(|old| old.into_follower(req_term, Some(leader_id)));
+            // TODO: Phase 6 - fsync term to sled
+        } else if req_term == current_term {
+            match self {
+                RaftNodeState::Candidate(_) => {
+                    // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
+                    // it recognizes the leader as legitimate and returns to follower state.
+                    info!(
+                        "Candidate recognizing leader {} for term {}. Returning to Follower.",
+                        leader_id, req_term
+                    );
+                    self.transition(|old| old.into_follower(req_term, Some(leader_id)));
+                }
+                RaftNodeState::Leader(_) => {
+                    // FATAL INVARIANT VIOLATION: Two leaders for the same term!
+                    // We prioritize Safety over Liveness. Detecting another leader for our own term
+                    // implies a failure in the consensus logic or persistence layer. We must halt
+                    // to prevent data corruption.
+                    let msg = format!(
+                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
+                         node to prevent state corruption.",
+                        leader_id, req_term
+                    );
+                    error!("{}", msg);
+                    panic!("{}", msg);
+                }
+                RaftNodeState::Follower(node) => {
+                    node.state_mut().set_leader_id(Some(leader_id));
+                }
+                _ => {}
+            }
+        }
+
+        // --- Raft RPC Steps 2-5: Log Reconciliation (§5.3) ---
+        self.reset_heartbeat();
+
+        let (success, last_log_index) = match self {
+            RaftNodeState::Follower(node) => {
+                node.reconcile_log(
+                    req_prev_log_index,
+                    req_prev_log_term,
+                    entries,
+                    req_leader_commit,
+                )
+                .await
+            }
+            _ => (false, LogIndex::ZERO), // Should have demoted above
+        };
+
+        let current_term = self.current_term()?;
+        Ok((current_term, success, last_log_index))
     }
 }
 
@@ -919,6 +1103,182 @@ mod tests {
             assert!(granted);
             assert_eq!(term, Term::new(2));
             assert!(matches!(state, RaftNodeState::Follower(_)));
+        }
+    }
+
+    mod handle_append_entries {
+        use super::*;
+
+        #[tokio::test]
+        async fn returns_success_when_term_is_current() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+
+            let (term, success, _) = state
+                .handle_append_entries(
+                    NodeId::new(2),
+                    Term::ZERO,
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                    vec![],
+                    LogIndex::ZERO,
+                )
+                .await
+                .unwrap();
+
+            assert!(success);
+            assert_eq!(term, Term::ZERO);
+        }
+
+        #[tokio::test]
+        async fn rejects_when_term_is_older() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
+            state.transition(|old| old.into_follower(Term::new(2), None));
+
+            let (term, success, _) = state
+                .handle_append_entries(
+                    NodeId::new(2),
+                    Term::new(1),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                    vec![],
+                    LogIndex::ZERO,
+                )
+                .await
+                .unwrap();
+
+            assert!(!success);
+            assert_eq!(term, Term::new(2));
+        }
+
+        #[tokio::test]
+        async fn demotes_candidate_on_equal_term() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id, fsm);
+            let candidate = follower.into_candidate(); // Term 1
+            let mut state = RaftNodeState::Candidate(candidate);
+
+            let (term, success, _) = state
+                .handle_append_entries(
+                    NodeId::new(2),
+                    Term::new(1),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                    vec![],
+                    LogIndex::ZERO,
+                )
+                .await
+                .unwrap();
+
+            assert!(success);
+            assert_eq!(term, Term::new(1));
+            assert!(matches!(state, RaftNodeState::Follower(_)));
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+        async fn panics_on_rival_leader_same_term() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let follower = RaftNode::<Follower>::new(id, fsm);
+            let candidate = follower.into_candidate();
+            let leader = candidate.into_leader(vec![NodeId::new(2)]); // Term 1
+            let mut state = RaftNodeState::Leader(leader);
+
+            let _ = state
+                .handle_append_entries(
+                    NodeId::new(2),
+                    Term::new(1),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                    vec![],
+                    LogIndex::ZERO,
+                )
+                .await;
+        }
+    }
+
+    mod reconcile_log {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_when_prev_log_index_term_mismatches() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            // Log has (index 1, term 1). Request expects (index 1, term 2)
+            let (success, _) = node
+                .reconcile_log(LogIndex::new(1), Term::new(2), vec![], LogIndex::ZERO)
+                .await;
+
+            assert!(!success);
+        }
+
+        #[tokio::test]
+        async fn truncates_and_appends_on_conflict() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(2), Term::new(1), vec![]));
+
+            // Conflict at index 2: local term 1, remote term 2
+            let entries = vec![LogEntry::new(LogIndex::new(2), Term::new(2), vec![])];
+            let (success, last_idx) = node
+                .reconcile_log(LogIndex::new(1), Term::new(1), entries, LogIndex::ZERO)
+                .await;
+
+            assert!(success);
+            assert_eq!(last_idx, LogIndex::new(2));
+            assert_eq!(node.log().len(), 2);
+            assert_eq!(node.get_term_at(LogIndex::new(2)), Term::new(2));
+        }
+
+        #[tokio::test]
+        async fn appends_new_entries_contiguously() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+
+            let entries = vec![
+                LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
+                LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
+            ];
+            let (success, last_idx) = node
+                .reconcile_log(LogIndex::ZERO, Term::ZERO, entries, LogIndex::ZERO)
+                .await;
+
+            assert!(success);
+            assert_eq!(last_idx, LogIndex::new(2));
+            assert_eq!(node.log().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn advances_commit_index() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(id, fsm);
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
+
+            node.reconcile_log(
+                LogIndex::ZERO,
+                Term::ZERO,
+                vec![],
+                LogIndex::new(1), // leaderCommit=1
+            )
+            .await;
+
+            assert_eq!(node.commit_index(), LogIndex::new(1));
         }
     }
 }
