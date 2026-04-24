@@ -25,6 +25,7 @@
 ### 2. Network & Protocol
 
 - **Logical Interface (ADR 005):** Employ the **Split Contract Pattern**. Separate generic consensus RPCs (`raft.proto`) from application-specific intents and mutations (`app.proto`).
+- **Network Boundary Integrity:** Prohibit manual construction of gRPC messages using raw primitives. Mandatory use of domain-aware factory methods (`new`) in `crates/common/src/proto.rs` that consume NewTypes to ensure type-safe boundary transitions.
 - **Network Authority (ADR 002):** The Leader is the exclusive processor for mutations/queries and the sole egress initiator.
 - **Timing Model (ADR 003):** Maintain 1:3-1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
 - **Exactly-Once (ADR 006):** Mandatory Client-Side WAL for pending intents. Logic must be deterministic and monotonic.
