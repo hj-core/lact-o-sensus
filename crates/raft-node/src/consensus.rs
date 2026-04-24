@@ -546,10 +546,10 @@ mod tests {
 
         use common::types::ClusterId;
         use common::types::NodeId;
+        use common::types::NodeIdentity;
 
         use super::*;
         use crate::fsm::StateMachine;
-        use crate::identity::NodeIdentity;
         use crate::node::Follower;
         use crate::node::RaftNode;
 

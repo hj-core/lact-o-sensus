@@ -4,6 +4,7 @@ members = [
     "crates/raft-node",
     "crates/client-cli",
     "crates/ai-veto",
+    "crates/gateway",
 ]
 resolver = "2"
 

@@ -14,18 +14,19 @@ use anyhow::Result;
 use clap::Parser;
 use common::proto::v1::app::ingress_service_server::IngressServiceServer;
 use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
+use common::rpc::IdentityInterceptor;
 use config::Config;
 use consensus::spawn_election_timer;
 use consensus::spawn_heartbeat_task;
+use gateway::ingress::IngressDispatcher;
+use gateway::veto::GrpcVetoRelay;
 use identity::initialize_node_identity;
 use node::Follower;
 use node::RaftNode;
 use node::RaftNodeState;
 use peer::PeerManager;
-use service::common::IdentityInterceptor;
 use service::consensus::ConsensusDispatcher;
-use service::ingress::IngressDispatcher;
-use service::veto::GrpcVetoRelay;
+use service::handle::LocalRaftHandle;
 use store::LactoStore;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
@@ -100,6 +101,12 @@ async fn main() -> Result<()> {
     // 8. Initialize RPC Service Dispatchers
     let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
 
+    // Initialize the Raft Handle for the Gateway (ADR 005/007)
+    let raft_handle = Arc::new(LocalRaftHandle::new(
+        shared_state.clone(),
+        peer_manager.clone(),
+    ));
+
     // Initialize the AI Veto Relay (Egress Bridge)
     let veto_channel = config
         .policy
@@ -108,13 +115,8 @@ async fn main() -> Result<()> {
         .connect_lazy();
     let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
 
-    let ingress_dispatcher = IngressDispatcher::new(
-        identity.clone(),
-        shared_state.clone(),
-        peer_manager.clone(),
-        veto_relay,
-        config.policy.veto_timeout(),
-    );
+    let ingress_dispatcher =
+        IngressDispatcher::new(raft_handle, veto_relay, config.policy.veto_timeout());
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());

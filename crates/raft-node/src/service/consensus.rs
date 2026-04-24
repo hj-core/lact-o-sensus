@@ -7,6 +7,7 @@ use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
 use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::NodeIdentity;
 use common::types::Term;
 use tokio::sync::RwLock;
 use tonic::Request;
@@ -14,7 +15,6 @@ use tonic::Response;
 use tonic::Status;
 use tracing::info_span;
 
-use crate::identity::NodeIdentity;
 use crate::node::RaftNodeState;
 use crate::service::common::ServiceState;
 

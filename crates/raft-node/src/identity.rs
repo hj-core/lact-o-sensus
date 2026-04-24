@@ -1,7 +1,4 @@
-use common::types::ClusterId;
-use common::types::NodeId;
-use serde::Deserialize;
-use serde::Serialize;
+use common::types::NodeIdentity;
 use sled::Db;
 use thiserror::Error;
 use tracing::error;
@@ -24,29 +21,6 @@ pub enum IdentityError {
 
     #[error("Safety Violation: Config ID ({config}) does not match Disk ID ({disk})")]
     Mismatch { disk: String, config: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NodeIdentity {
-    cluster_id: ClusterId,
-    node_id: NodeId,
-}
-
-impl NodeIdentity {
-    pub fn new(cluster_id: ClusterId, node_id: NodeId) -> Self {
-        Self {
-            cluster_id,
-            node_id,
-        }
-    }
-
-    pub fn cluster_id(&self) -> &ClusterId {
-        &self.cluster_id
-    }
-
-    pub fn node_id(&self) -> NodeId {
-        self.node_id
-    }
 }
 
 /// Orchestrates the initialization and verification of the node's persistent
@@ -100,6 +74,8 @@ mod tests {
     use std::collections::HashMap;
 
     use anyhow::Result;
+    use common::types::ClusterId;
+    use common::types::NodeId;
 
     use super::*;
 

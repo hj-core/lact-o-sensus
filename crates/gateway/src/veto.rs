@@ -10,7 +10,7 @@ use thiserror::Error;
 use tonic::Request;
 use tonic::transport::Channel;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum VetoError {
     #[error("AI evaluation timed out after {0:?}")]
     Timeout(Duration),

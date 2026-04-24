@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use common::proto::v1::raft::consensus_service_client::ConsensusServiceClient;
 use common::types::NodeId;
+use common::types::NodeIdentity;
 use thiserror::Error;
 use tonic::Request;
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::identity::NodeIdentity;
 use crate::service::common::HEADER_CLUSTER_ID;
 use crate::service::common::HEADER_TARGET_NODE_ID;
 

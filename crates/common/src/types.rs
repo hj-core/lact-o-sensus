@@ -228,6 +228,30 @@ impl TryFrom<&str> for ClusterId {
     }
 }
 
+/// Persistent logical identity of a node within a cluster.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeIdentity {
+    cluster_id: ClusterId,
+    node_id: NodeId,
+}
+
+impl NodeIdentity {
+    pub fn new(cluster_id: ClusterId, node_id: NodeId) -> Self {
+        Self {
+            cluster_id,
+            node_id,
+        }
+    }
+
+    pub fn cluster_id(&self) -> &ClusterId {
+        &self.cluster_id
+    }
+
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+}
+
 macro_rules! define_u64_newtype {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]

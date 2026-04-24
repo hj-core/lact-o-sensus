@@ -6,15 +6,23 @@ use std::time::Instant;
 use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::NodeIdentity;
 use common::types::Term;
 use thiserror::Error;
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 
 use crate::fsm::StateMachine;
-use crate::identity::NodeIdentity;
+
+/// Snapshot of the node's consensus progress, used for reactive observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusProgress {
+    pub term: Term,
+    pub commit_index: LogIndex,
+}
 
 #[derive(Error, Debug)]
 pub enum RaftError {
@@ -66,7 +74,9 @@ pub struct RaftNode<S: NodeState> {
     // --- Volatile State ---
     commit_index: LogIndex,
     last_applied: LogIndex,
-    commit_signal: Arc<Notify>,
+    /// Broadcasts consensus progress (term and commit_index) to external
+    /// observers.
+    progress_tx: watch::Sender<ConsensusProgress>,
     state: S,
 }
 
@@ -253,21 +263,13 @@ impl RaftNodeState {
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(self, term: Term, leader_id: Option<NodeId>) -> RaftNodeState {
-        let (
-            identity,
-            fsm,
-            current_term,
-            voted_for,
-            log,
-            commit_index,
-            last_applied,
-            commit_signal,
-        ) = match self {
-            RaftNodeState::Follower(n) => n.into_parts(),
-            RaftNodeState::Candidate(n) => n.into_parts(),
-            RaftNodeState::Leader(n) => n.into_parts(),
-            RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
-        };
+        let (identity, fsm, current_term, voted_for, log, commit_index, last_applied, progress_tx) =
+            match self {
+                RaftNodeState::Follower(n) => n.into_parts(),
+                RaftNodeState::Candidate(n) => n.into_parts(),
+                RaftNodeState::Leader(n) => n.into_parts(),
+                RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
+            };
 
         let mut new_node = RaftNode {
             identity,
@@ -277,7 +279,7 @@ impl RaftNodeState {
             log,
             commit_index,
             last_applied,
-            commit_signal,
+            progress_tx,
             state: Follower::new(leader_id),
         };
 
@@ -292,6 +294,13 @@ impl RaftNodeState {
     {
         let old_state = std::mem::replace(self, RaftNodeState::Poisoned);
         *self = f(old_state);
+
+        // Broadcast the change to all observers. This ensures that any task
+        // blocked on consensus progress (like await_commit) is woken up to
+        // detect role changes or term updates.
+        if let Ok(progress) = self.consensus_progress() {
+            let _ = self.progress_tx().unwrap().send_replace(progress);
+        }
     }
 
     /// Resets the election timer if the node is a Follower.
@@ -323,8 +332,15 @@ impl RaftNodeState {
         delegate_to_inner!(self, commit_index)
     }
 
-    pub fn commit_signal(&self) -> Result<Arc<Notify>, RaftError> {
-        delegate_to_inner!(self, commit_signal).map(|s| s.clone())
+    pub fn progress_tx(&self) -> Result<&watch::Sender<ConsensusProgress>, RaftError> {
+        delegate_to_inner!(self, progress_tx)
+    }
+
+    pub fn consensus_progress(&self) -> Result<ConsensusProgress, RaftError> {
+        Ok(ConsensusProgress {
+            term: self.current_term()?,
+            commit_index: self.commit_index()?,
+        })
     }
 }
 
@@ -356,7 +372,13 @@ impl<S: NodeState> RaftNode<S> {
         if index > self.commit_index {
             self.commit_index = index;
             self.apply_to_state_machine().await;
-            self.commit_signal.notify_waiters();
+
+            // Broadcast progress update
+            let progress = ConsensusProgress {
+                term: self.current_term,
+                commit_index: self.commit_index,
+            };
+            let _ = self.progress_tx.send_replace(progress);
         }
     }
 
@@ -460,8 +482,8 @@ impl<S: NodeState> RaftNode<S> {
         self.commit_index
     }
 
-    pub fn commit_signal(&self) -> &Arc<Notify> {
-        &self.commit_signal
+    pub fn progress_tx(&self) -> &watch::Sender<ConsensusProgress> {
+        &self.progress_tx
     }
 
     pub fn last_applied(&self) -> LogIndex {
@@ -500,7 +522,7 @@ impl<S: NodeState> RaftNode<S> {
         Vec<LogEntry>,
         LogIndex,
         LogIndex,
-        Arc<Notify>,
+        watch::Sender<ConsensusProgress>,
     ) {
         (
             self.identity,
@@ -510,7 +532,7 @@ impl<S: NodeState> RaftNode<S> {
             self.log,
             self.commit_index,
             self.last_applied,
-            self.commit_signal,
+            self.progress_tx,
         )
     }
 }
@@ -521,6 +543,11 @@ impl<S: NodeState> RaftNode<S> {
 
 impl RaftNode<Follower> {
     pub fn new(identity: Arc<NodeIdentity>, fsm: Arc<dyn StateMachine>) -> Self {
+        let (progress_tx, _) = watch::channel(ConsensusProgress {
+            term: Term::ZERO,
+            commit_index: LogIndex::ZERO,
+        });
+
         Self {
             identity,
             fsm,
@@ -529,7 +556,7 @@ impl RaftNode<Follower> {
             log: Vec::new(),
             commit_index: LogIndex::ZERO,
             last_applied: LogIndex::ZERO,
-            commit_signal: Arc::new(Notify::new()),
+            progress_tx,
             state: Follower::new(None),
         }
     }
@@ -640,7 +667,7 @@ impl RaftNode<Follower> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
-            commit_signal: self.commit_signal,
+            progress_tx: self.progress_tx,
             state,
         }
     }
@@ -659,7 +686,7 @@ impl RaftNode<Candidate> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
-            commit_signal: self.commit_signal,
+            progress_tx: self.progress_tx,
             state,
         }
     }
@@ -674,7 +701,7 @@ impl RaftNode<Candidate> {
             log: self.log,
             commit_index: self.commit_index,
             last_applied: self.last_applied,
-            commit_signal: self.commit_signal,
+            progress_tx: self.progress_tx,
             state: Leader::new(peer_ids, last_log_index),
         }
     }

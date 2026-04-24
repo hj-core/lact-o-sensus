@@ -60,21 +60,35 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] Test verifying that Banker's rounding correctly prevents cumulative bias.
   - [x] Test verifying the "Dimensional Fence" (adding `g` to `L` returns an error).
 
-### Step 5: The 5-Layer Defensive Pipeline (ADR 007) [ ]
+### Step 5: The Gateway Extraction (Architectural Decoupling) [x]
+
+**Commit:** `refactor(gateway): extract ingress and veto logic to dedicated crate`
+
+- **Description:** Move grocery-specific logic out of `raft-node` to enforce domain isolation.
+- **Changes:**
+  - [x] Create `crates/gateway` and migrate `ingress.rs` and `veto.rs` from `raft-node`.
+  - [x] Define generic `RaftHandle` trait in `crates/common/src/raft_api.rs`.
+  - [x] Implement `RaftHandle` in `raft-node` and update `gateway` to consume it.
+  - [x] Wire up the `gateway` services in `raft-node/src/main.rs`.
+- **Acceptance Tests (TDD):**
+  - [x] `cargo check` passes across the workspace.
+  - [x] `smoke_test.py` passes (verifying identical external behavior).
+
+### Step 6: The 5-Layer Defensive Pipeline (ADR 007) [ ]
 
 **Commit:** `feat(raft): implement MutationLock and 5-layer defensive pipeline`
 
-- **Description:** Implement the `MutationLock` and the syntactic/semantic validation layers in the leader.
+- **Description:** Implement the `MutationLock` and the syntactic/semantic validation layers in the new gateway component.
 - **Changes:**
-  - [ ] Embed `Arc<tokio::sync::Mutex<()>>` inside the `Leader` state in `ingress.rs`.
+  - [ ] Implement transient `MutationLock` in `IngressDispatcher` (Layer 2).
   - [ ] Implement Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
   - [ ] Implement Layer 4 (Registry Firewall & Physical Invariant Check).
   - [ ] Update serialization in Layer 5 to propose the validated `CommittedMutation` as `Vec<u8>`.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit tests in `ingress.rs` verifying that malformed input is rejected _before_ acquiring the `MutationLock`.
-  - [ ] Unit tests verifying that unauthorized AI metadata (bad category/unit) triggers a Veto.
+  - [ ] Unit tests in `gateway` verifying malformed input rejection.
+  - [ ] Unit tests verifying that unauthorized AI metadata triggers a Veto.
 
-### Step 6: The Semantic Oracle (Mock Integration) [ ]
+### Step 7: The Semantic Oracle (Mock Integration) [ ]
 
 **Commit:** `feat(ai-veto): update mock to compliant semantic resolution`
 
@@ -82,4 +96,4 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 - **Changes:**
   - [ ] Update `crates/ai-veto/src/main.rs` to return compliant semantic data.
 - **Acceptance Tests (TDD):**
-  - [ ] `smoke_test.py` passes full integration: Client -> Leader -> Mock AI -> Consensus -> `LactoStore`.
+  - [ ] `smoke_test.py` passes full integration: Client -> Gateway -> Mock AI -> Raft -> `LactoStore`.
