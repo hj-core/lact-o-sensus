@@ -74,26 +74,53 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] `cargo check` passes across the workspace.
   - [x] `smoke_test.py` passes (verifying identical external behavior).
 
-### Step 6: The 5-Layer Defensive Pipeline (ADR 007) [ ]
+### Step 6: Internal Onion Refactor (ADR 009) [ ]
 
-**Commit:** `feat(raft): implement MutationLock and 5-layer defensive pipeline`
+**Commit:** `refactor(raft): align node engine with tri-layered onion model`
 
-- **Description:** Implement the `MutationLock` and the syntactic/semantic validation layers in the new gateway component.
+- **Description:** Refactor the node engine to strictly separate Physical, Logical, and Execution layers and implement the Poison-then-Panic mandate.
+- **Changes:**
+  - [ ] Update `crates/raft-node/src/engine.rs` to implement the "Poison-then-Panic" sequence for all invariant violations.
+  - [ ] Refactor `crates/raft-node/src/state.rs` (Execution Shell) to ensure Lock-Signal Atomicity.
+  - [ ] Audit all `panic!` calls in `crates/raft-node/src/node.rs` to ensure they are trapped by the Logical layer.
+- **Acceptance Tests (TDD):**
+  - [ ] Unit test in `engine.rs` verifying that a node transitioned to `Poisoned` panics on any subsequent access.
+  - [ ] Integration test verifying that a task panic does not leave a "Zombie Node" accessible to other tasks.
+
+### Step 7: The Semantic Contract (Protobuf v2) [ ]
+
+**Commit:** `feat(common): update app.proto for resolved semantic data`
+
+- **Description:** Update the application contract to support the rich ledger entries required by ADR 005/007.
+- **Changes:**
+  - [ ] Update `app.proto` to include `CommittedMutation` with resolved slugs, SI units, and AI rationale.
+  - [ ] Update `crates/common/src/proto.rs` factory methods to support the new schema.
+- **Acceptance Tests (TDD):**
+  - [ ] `cargo check` passes.
+  - [ ] Unit tests for `CommittedMutation` serialization/deserialization.
+
+### Step 8: The 5-Layer Defensive Pipeline (ADR 007) [ ]
+
+**Commit:** `feat(gateway): implement MutationLock and 5-layer defensive pipeline`
+
+- **Description:** Implement the `MutationLock` and the syntactic/semantic validation layers in the gateway component.
 - **Changes:**
   - [ ] Implement transient `MutationLock` in `IngressDispatcher` (Layer 2).
   - [ ] Implement Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
   - [ ] Implement Layer 4 (Registry Firewall & Physical Invariant Check).
-  - [ ] Update serialization in Layer 5 to propose the validated `CommittedMutation` as `Vec<u8>`.
+  - [ ] Implement Layer 5 serialization (proposing validated `CommittedMutation` as `Vec<u8>`).
 - **Acceptance Tests (TDD):**
   - [ ] Unit tests in `gateway` verifying malformed input rejection.
   - [ ] Unit tests verifying that unauthorized AI metadata triggers a Veto.
 
-### Step 7: The Semantic Oracle (Mock Integration) [ ]
+### Step 9: The Semantic Oracle (Mock Integration & Robustness) [ ]
 
-**Commit:** `feat(ai-veto): update mock to compliant semantic resolution`
+**Commit:** `feat(ai-veto): implement robust mock resolution and internal retries`
 
-- **Description:** Update the mock AI node to satisfy the new Layer 4 strict validation.
+- **Description:** Update the mock AI node and implement leader-side retry logic for resolution failures.
 - **Changes:**
-  - [ ] Update `crates/ai-veto/src/main.rs` to return compliant semantic data.
+  - [ ] Update `crates/ai-veto/src/main.rs` to return compliant semantic and taxonomic data.
+  - [ ] Implement **Leader-Internal Retries** (Best-Effort) in the `VetoRelay` (Layer 3).
 - **Acceptance Tests (TDD):**
   - [ ] `smoke_test.py` passes full integration: Client -> Gateway -> Mock AI -> Raft -> `LactoStore`.
+  - [ ] Integration test verifying that a transient AI failure triggers exactly one retry before a Veto.

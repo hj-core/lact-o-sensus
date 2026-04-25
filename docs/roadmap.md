@@ -46,7 +46,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - Verify: Client -> Leader -> Mock AI -> Consensus -> Commit (Round Trip).
 - **Success Metric:** A client mutation is "Committed" after replication and a mock veto.
 
-## 🏰 Phase 4.5: Fortress Hardening (Identity & Type Safety)
+## 🏰 Phase 4.5: Fortress Hardening (Identity & Type Safety) [DONE]
 
 - **Goal:** Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandates.
 - **Key Actions:**
@@ -61,6 +61,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution.
 - **Key Actions:**
+  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (Physical, Logical, Execution) to strictly isolate protocol logic and enforce the **"Poison-then-Panic"** Halt Mandate (ADR 009).
   - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs, units, and display names (ADR 005).
   - **Unit Registry:** Implement the **Universal Unit Registry** (ADR 008) with the **Dual-Track Unit Model** (Base SI + Display Unit) and Banker's Rounding.
   - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence) in the `raft-node`.
@@ -74,7 +75,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 - **Key Actions:**
   - **Internal SI:** Implement the **SI Stabilization Model** (ADR 008) using `rust_decimal` and mandatory **Banker's Rounding**.
   - **Session Table:** Implement the Session Table with **Atomic Side-Effect Updates** (ADR 006) and a **Deterministic Monotonic Clock** derived from log timestamps.
-  - **The Halt Mandate:** Formalize immediate node panic on session table or state machine divergence during recovery or snapshot loading.
+  - **The Halt Mandate:** Formalize immediate node panic on session table or state machine divergence, utilizing the **Poison-then-Panic** sequence (ADR 009) to ensure safety during recovery or snapshot loading.
   - **Storage:** Integrate **`sled`** for persistent Raft logs and the State Machine with synchronous `fsync` (ADR 001).
   - **Chaos Testing:** Perform "Chaos Testing" to verify 100% recovery integrity and the **Halt Mandate** panic on state divergence.
 - **Success Metric:** Idempotent recovery from the log using absolute SI results with zero arithmetic bias.

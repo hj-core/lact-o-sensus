@@ -24,6 +24,7 @@ The goal is to transform a simple "Grocery List" into a **Replicated State Machi
 
 - **Role:** A participant in the distributed consensus group.
 - **Responsibility:** Manages the **Write-Ahead Log (WAL)**, the **State Machine**, and the **Defensive Onion**.
+- **Internal Architecture:** Utilizes a **Tri-Layered "Onion" Model** (ADR 009) to strictly isolate protocol logic (Physical), role orchestration (Logical), and concurrent signaling (Execution).
 - **Mandate:** Acts as the "Syntactic Fortress," ensuring that only validated, AI-resolved ledger facts are committed to the replicated log.
 
 ### 3. The AI Veto Node (The "Semantic Oracle")
@@ -87,6 +88,7 @@ To ensure deterministic classification, all items must be mapped to exactly one 
 By the end of this project, we will have achieved practical expertise in the following domains:
 
 - **Consensus Systems:** Building the **Raft Protocol** from the ground up, including leader election and replication.
+- **Architectural Patterns:** Implementing the **Internal Onion Model** to strictly decouple consensus logic from system-level concurrency and reactive signaling.
 - **Semantic State Machines:** Integrating non-deterministic AI Oracles into deterministic consensus logs via a multi-layered defensive pipeline.
 - **System Integrity:** Implementing **Internal SI Stabilization** and **Exactly-Once Semantics** to ensure data precision and linearizability.
 - **Persistence & Recovery:** Mastering the interaction between WAL updates and stable storage (`sled`).

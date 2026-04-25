@@ -17,7 +17,8 @@
 
 ### 1. Structural Integrity & Isolation
 
-- **Safety Over Liveness (ADR 001):** Trigger the **Halt Mandate** (immediate panic) on any protocol or identity invariant violation.
+- **Safety Over Liveness (ADR 001/009):** Trigger the **Halt Mandate** (immediate panic) on any protocol or identity invariant violation. To mitigate the lack of poisoning in `tokio::sync::RwLock`, violations MUST follow the **Poison-then-Panic** sequence: transition the logical state to `Poisoned` immediately before panicking.
+- **Internal Node Architecture (ADR 009):** Enforce the tri-layered **Onion Model**. Strictly isolate the **Physical Foundation** (deterministic logic), the **Logical Orchestrator** (protocol rules and poisoning), and the **Execution Shell** (concurrency and signaling).
 - **Domain Isolation (ADR 005/007):** Maintain a strict boundary between the generic consensus engine and the application state machine via trait abstractions. The Raft core must remain domain-agnostic.
 - **Identity Integrity (ADR 004):** Verify `(cluster_id, node_id)` against stable storage on startup. Halt on mismatch.
 - **Cluster Isolation (ADR 004):** Strictly validate `cluster_id` and `target_node_id` via centralized gRPC interceptors to prevent environmental cross-contamination.
@@ -32,7 +33,8 @@
 
 ### 3. Request Lifecycle & Consensus
 
-- **Defense Onion (ADR 007):** Enforce the 5-Layer Defensive Pipeline (Client Structural -> Leader Syntactic -> AI Semantic -> Leader Validation -> Consensus Commit).
+- **Defense Onion (ADR 007/009):** Enforce the 5-Layer Defensive Pipeline (External) and the 3-Layer Onion Model (Internal).
+- **Lock-Signal Atomicity (ADR 009):** All consensus progress broadcasts MUST occur after the mutation is complete but *before* the write lock is released to ensure reactive consistency.
 - **Semantic Finality:** Distinguish between transient failures and semantic rejections (`VETOED`). Receipt of a terminal response must immediately reconcile durable state (clear WAL).
 - **Persistence (ADR 001):** Mandatory `fsync` to stable storage before acknowledging any commit.
 
