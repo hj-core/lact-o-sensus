@@ -74,18 +74,18 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] `cargo check` passes across the workspace.
   - [x] `smoke_test.py` passes (verifying identical external behavior).
 
-### Step 6: Internal Onion Refactor (ADR 009) [ ]
+### Step 6: Internal Onion Refactor (ADR 009) [x]
 
 **Commit:** `refactor(raft): align node engine with tri-layered onion model`
 
 - **Description:** Refactor the node engine to strictly separate Physical, Logical, and Execution layers and implement the Poison-then-Panic mandate.
 - **Changes:**
-  - [ ] Update `crates/raft-node/src/engine.rs` to implement the "Poison-then-Panic" sequence for all invariant violations.
-  - [ ] Refactor `crates/raft-node/src/state.rs` (Execution Shell) to ensure Lock-Signal Atomicity.
-  - [ ] Audit all `panic!` calls in `crates/raft-node/src/node.rs` to ensure they are trapped by the Logical layer.
+  - [x] Update `crates/raft-node/src/engine.rs` to implement the "Poison-then-Panic" sequence for all invariant violations.
+  - [x] Refactor `crates/raft-node/src/state.rs` (Execution Shell) to ensure Lock-Signal Atomicity.
+  - [x] Audit all `panic!` calls in `crates/raft-node/src/node.rs` to ensure they are trapped by the Logical layer.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test in `engine.rs` verifying that a node transitioned to `Poisoned` panics on any subsequent access.
-  - [ ] Integration test verifying that a task panic does not leave a "Zombie Node" accessible to other tasks.
+  - [x] Unit test in `engine.rs` verifying that a node transitioned to `Poisoned` panics on any subsequent access.
+  - [x] Integration test verifying that a task panic does not leave a "Zombie Node" accessible to other tasks.
 
 ### Step 7: The Semantic Contract (Protobuf v2) [ ]
 

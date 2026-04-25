@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::proto::v1::raft::consensus_service_client::ConsensusServiceClient;
+use common::rpc::HEADER_CLUSTER_ID;
+use common::rpc::HEADER_TARGET_NODE_ID;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use thiserror::Error;
@@ -9,9 +11,6 @@ use tonic::Request;
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-
-use crate::service::common::HEADER_CLUSTER_ID;
-use crate::service::common::HEADER_TARGET_NODE_ID;
 
 #[derive(Debug, Error)]
 pub enum PeerError {

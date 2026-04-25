@@ -9,7 +9,6 @@ use common::types::Term;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rand::RngExt;
-use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tonic::Request;
 use tonic::Status;
@@ -18,15 +17,16 @@ use tracing::error;
 use tracing::info;
 
 use crate::config::Config;
-use crate::node::Leader;
+use crate::engine::Leader;
+use crate::engine::LogicalNode;
 use crate::node::RaftNode;
-use crate::node::RaftNodeState;
 use crate::peer::PeerManager;
+use crate::state::ConsensusShell;
 
 /// Spawns a background task that manages randomized election timeouts.
 pub fn spawn_election_timer(
     config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) {
     tokio::spawn(async move {
@@ -37,9 +37,9 @@ pub fn spawn_election_timer(
             let heartbeat_signal = {
                 let guard = state.read().await;
                 match &*guard {
-                    RaftNodeState::Follower(node) => Some(node.state().heartbeat_signal().clone()),
-                    RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => None,
-                    RaftNodeState::Poisoned => {
+                    LogicalNode::Follower(node) => Some(node.state().heartbeat_signal().clone()),
+                    LogicalNode::Candidate(_) | LogicalNode::Leader(_) => None,
+                    LogicalNode::Poisoned => {
                         panic!("HALT: Node is poisoned (ADR 001)");
                     }
                 }
@@ -60,9 +60,9 @@ pub fn spawn_election_timer(
                 sleep(timeout).await;
                 let guard = state.read().await;
                 match &*guard {
-                    RaftNodeState::Candidate(_) => handle_candidate_tick(&*guard),
-                    RaftNodeState::Leader(_) => handle_leader_tick(&*guard),
-                    RaftNodeState::Poisoned => panic!("HALT: Node is poisoned (ADR 001)"),
+                    LogicalNode::Candidate(_) => handle_candidate_tick(&*guard),
+                    LogicalNode::Leader(_) => handle_leader_tick(&*guard),
+                    LogicalNode::Poisoned => panic!("HALT: Node is poisoned (ADR 001)"),
                     _ => TimerAction::Restart,
                 }
             };
@@ -83,14 +83,16 @@ pub fn spawn_election_timer(
 /// Transitions the node to Candidate and spawns the election RPC task.
 async fn initiate_transition_to_candidate(
     config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) {
-    let mut state_guard = state.write().await;
-    let new_term = match &*state_guard {
-        RaftNodeState::Follower(n) => n.current_term() + 1,
-        RaftNodeState::Candidate(n) => n.current_term() + 1,
-        _ => return, // Only Followers and Candidates can start elections
+    let new_term = {
+        let guard = state.read().await;
+        match &*guard {
+            LogicalNode::Follower(n) => n.current_term() + 1,
+            LogicalNode::Candidate(n) => n.current_term() + 1,
+            _ => return, // Only Followers and Candidates can start elections
+        }
     };
 
     info!(
@@ -98,11 +100,14 @@ async fn initiate_transition_to_candidate(
         new_term
     );
 
-    state_guard.transition(|old| match old {
-        RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
-        RaftNodeState::Candidate(n) => RaftNodeState::Candidate(n.into_restarted_candidate()),
-        other => other,
-    });
+    {
+        let mut guard = state.write().await;
+        guard.transition(|old| match old {
+            LogicalNode::Follower(n) => LogicalNode::Candidate(n.into_candidate()),
+            LogicalNode::Candidate(n) => LogicalNode::Candidate(n.into_restarted_candidate()),
+            other => other,
+        });
+    }
 
     let state_clone = state.clone();
     let peer_manager_clone = peer_manager.clone();
@@ -115,9 +120,9 @@ async fn initiate_transition_to_candidate(
 }
 
 /// Evaluates the Follower's election timer.
-fn handle_follower_tick(state: &RaftNodeState, timeout: Duration) -> TimerAction {
+fn handle_follower_tick(state: &LogicalNode, timeout: Duration) -> TimerAction {
     match state {
-        RaftNodeState::Follower(node) => {
+        LogicalNode::Follower(node) => {
             let elapsed = node.state().last_heartbeat().elapsed();
             if elapsed >= timeout {
                 TimerAction::StartElection
@@ -130,17 +135,17 @@ fn handle_follower_tick(state: &RaftNodeState, timeout: Duration) -> TimerAction
 }
 
 /// Evaluates the Candidate's election timer.
-fn handle_candidate_tick(state: &RaftNodeState) -> TimerAction {
+fn handle_candidate_tick(state: &LogicalNode) -> TimerAction {
     match state {
-        RaftNodeState::Candidate(_) => TimerAction::StartElection,
+        LogicalNode::Candidate(_) => TimerAction::StartElection,
         _ => TimerAction::Restart,
     }
 }
 
 /// Evaluates the Leader's election timer.
-fn handle_leader_tick(state: &RaftNodeState) -> TimerAction {
+fn handle_leader_tick(state: &LogicalNode) -> TimerAction {
     match state {
-        RaftNodeState::Leader(_) => TimerAction::Restart,
+        LogicalNode::Leader(_) => TimerAction::Restart,
         _ => TimerAction::Restart,
     }
 }
@@ -165,20 +170,20 @@ enum TimerAction {
 /// Initiates a Leader Election by requesting votes from all peers.
 async fn initiate_election(
     config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather election parameters from the current state.
     let (term, node_id, last_log_index, last_log_term) = {
         let guard = state.read().await;
-        let nid = guard.node_id()?;
+        let nid = guard.node_id();
 
         let (last_idx, last_term) = match &*guard {
-            RaftNodeState::Candidate(n) => (n.last_log_index(), n.last_log_term()),
+            LogicalNode::Candidate(n) => (n.last_log_index(), n.last_log_term()),
             _ => (LogIndex::ZERO, Term::ZERO), // Should be Candidate
         };
 
-        (guard.current_term()?, nid, last_idx, last_term)
+        (guard.current_term(), nid, last_idx, last_term)
     };
 
     info!(
@@ -233,30 +238,33 @@ async fn initiate_election(
                         "Found higher term ({}) during election. Demoting to Follower.",
                         resp_term
                     );
-                    let mut guard = state.write().await;
-                    guard.transition(|old| old.into_follower(resp_term, None));
+                    {
+                        let mut guard = state.write().await;
+                        guard.transition(|old| old.into_follower(resp_term, None));
+                    }
                     return Ok(());
                 }
 
                 if resp.vote_granted {
-                    let mut guard = state.write().await;
                     let mut is_leader = false;
+                    {
+                        let mut guard = state.write().await;
+                        guard.transition(|old| match old {
+                            LogicalNode::Candidate(mut n) if n.current_term() == term => {
+                                n.state_mut().add_vote(peer_id);
+                                // Synchronize local tally from the formal state machine
+                                votes_granted = n.state().vote_count();
 
-                    guard.transition(|old| match old {
-                        RaftNodeState::Candidate(mut n) if n.current_term() == term => {
-                            n.state_mut().add_vote(peer_id);
-                            // Synchronize local tally from the formal state machine
-                            votes_granted = n.state().vote_count();
-
-                            if votes_granted >= quorum {
-                                is_leader = true;
-                                RaftNodeState::Leader(n.into_leader(peer_ids.clone()))
-                            } else {
-                                RaftNodeState::Candidate(n)
+                                if votes_granted >= quorum {
+                                    is_leader = true;
+                                    LogicalNode::Leader(n.into_leader(peer_ids.clone()))
+                                } else {
+                                    LogicalNode::Candidate(n)
+                                }
                             }
-                        }
-                        other => other,
-                    });
+                            other => other,
+                        });
+                    }
 
                     if is_leader {
                         info!(
@@ -276,7 +284,7 @@ async fn initiate_election(
     // Loop finished without reaching quorum or being demoted.
     let still_candidate = {
         let guard = state.read().await;
-        matches!(&*guard, RaftNodeState::Candidate(n) if n.current_term() == term)
+        matches!(&*guard, LogicalNode::Candidate(n) if n.current_term() == term)
     };
 
     if still_candidate {
@@ -293,7 +301,7 @@ async fn initiate_election(
 /// logs if the node is a Leader.
 pub fn spawn_heartbeat_task(
     config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) {
     let interval = config.raft.heartbeat_interval();
@@ -303,7 +311,7 @@ pub fn spawn_heartbeat_task(
 
             let node_state = state.read().await;
             match &*node_state {
-                RaftNodeState::Leader(_) => {
+                LogicalNode::Leader(_) => {
                     let state_clone = state.clone();
                     let peer_manager_clone = peer_manager.clone();
                     let config_clone = config.clone();
@@ -315,7 +323,7 @@ pub fn spawn_heartbeat_task(
                         }
                     });
                 }
-                RaftNodeState::Poisoned => {
+                LogicalNode::Poisoned => {
                     error!("Node is poisoned. Heartbeat task stopping.");
                     return;
                 }
@@ -332,14 +340,14 @@ pub fn spawn_heartbeat_task(
 /// behind.
 async fn replicate_to_peers(
     config: Arc<Config>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather global replication parameters.
     let (term, node_id, commit_index) = {
         let guard = state.read().await;
-        let nid = guard.node_id()?;
-        (guard.current_term()?, nid, guard.commit_index()?)
+        let nid = guard.node_id();
+        (guard.current_term(), nid, guard.commit_index())
     };
 
     let peer_ids = peer_manager.peer_ids();
@@ -356,7 +364,7 @@ async fn replicate_to_peers(
             let request = {
                 let guard = state.read().await;
                 match &*guard {
-                    RaftNodeState::Leader(node) => {
+                    LogicalNode::Leader(node) => {
                         let next_idx = *node
                             .state()
                             .next_index()
@@ -418,8 +426,6 @@ async fn replicate_to_peers(
     while let Some(res) = response_stream.next().await {
         match res {
             Ok(Some((peer_id, sent_prev_idx, sent_entries_len, resp))) => {
-                let mut guard = state.write().await;
-
                 let resp_term = Term::new(resp.term);
                 // §5.1: If term > currentTerm, demote immediately
                 if resp_term > term {
@@ -427,54 +433,60 @@ async fn replicate_to_peers(
                         "Found higher term ({}) from peer {}. Demoting to Follower.",
                         resp_term, peer_id
                     );
-                    guard.transition(|old| old.into_follower(resp_term, None));
+                    {
+                        let mut guard = state.write().await;
+                        guard.transition(|old| old.into_follower(resp_term, None));
+                    }
                     return Ok(());
                 }
 
-                if let RaftNodeState::Leader(node) = &mut *guard {
-                    if resp.success {
-                        // Update nextIndex and matchIndex for follower (§5.3)
-                        let new_match = sent_prev_idx + sent_entries_len;
-                        let new_next = new_match + 1;
+                {
+                    let mut guard = state.write().await;
+                    if let LogicalNode::Leader(node) = &mut *guard {
+                        if resp.success {
+                            // Update nextIndex and matchIndex for follower (§5.3)
+                            let new_match = sent_prev_idx + sent_entries_len;
+                            let new_next = new_match + 1;
 
-                        // Monotonicity check: only update if we are moving forward
-                        let current_match = *node
-                            .state()
-                            .match_index()
-                            .get(&peer_id)
-                            .unwrap_or(&LogIndex::ZERO);
-                        if new_match > current_match {
-                            node.state_mut().next_index_mut().insert(peer_id, new_next);
-                            node.state_mut()
-                                .match_index_mut()
-                                .insert(peer_id, new_match);
-                        }
+                            // Monotonicity check: only update if we are moving forward
+                            let current_match = *node
+                                .state()
+                                .match_index()
+                                .get(&peer_id)
+                                .unwrap_or(&LogIndex::ZERO);
+                            if new_match > current_match {
+                                node.state_mut().next_index_mut().insert(peer_id, new_next);
+                                node.state_mut()
+                                    .match_index_mut()
+                                    .insert(peer_id, new_match);
+                            }
 
-                        // Check for new commit point (§5.3, §5.4)
-                        update_leader_commit_index(node).await;
-                    } else {
-                        // If AppendEntries fails because of log inconsistency:
-                        // decrement nextIndex and retry (§5.3)
-                        let current_next = *node
-                            .state()
-                            .next_index()
-                            .get(&peer_id)
-                            .unwrap_or(&LogIndex::new(1));
-
-                        // Optimization: jump back based on peer's actual log state
-                        let last_log_index = LogIndex::new(resp.last_log_index);
-                        let new_next = if last_log_index > LogIndex::ZERO {
-                            std::cmp::min(current_next, last_log_index + 1)
+                            // Check for new commit point (§5.3, §5.4)
+                            update_leader_commit_index(node).await;
                         } else {
-                            (current_next - 1).max(LogIndex::new(1))
-                        };
+                            // If AppendEntries fails because of log inconsistency:
+                            // decrement nextIndex and retry (§5.3)
+                            let current_next = *node
+                                .state()
+                                .next_index()
+                                .get(&peer_id)
+                                .unwrap_or(&LogIndex::new(1));
 
-                        node.state_mut().next_index_mut().insert(peer_id, new_next);
-                        debug!(
-                            "Peer {} rejected AppendEntries (log mismatch). Retrying with \
-                             next_index={}",
-                            peer_id, new_next
-                        );
+                            // Optimization: jump back based on peer's actual log state
+                            let last_log_index = LogIndex::new(resp.last_log_index);
+                            let new_next = if last_log_index > LogIndex::ZERO {
+                                std::cmp::min(current_next, last_log_index + 1)
+                            } else {
+                                (current_next - 1).max(LogIndex::new(1))
+                            };
+
+                            node.state_mut().next_index_mut().insert(peer_id, new_next);
+                            debug!(
+                                "Peer {} rejected AppendEntries (log mismatch). Retrying with \
+                                 next_index={}",
+                                peer_id, new_next
+                            );
+                        }
                     }
                 }
             }
@@ -549,8 +561,9 @@ mod tests {
         use common::types::NodeIdentity;
 
         use super::*;
+        use crate::engine::Follower;
+        use crate::engine::LogicalNode;
         use crate::fsm::StateMachine;
-        use crate::node::Follower;
         use crate::node::RaftNode;
 
         #[derive(Debug, Default)]
@@ -591,13 +604,12 @@ mod tests {
             ))
         }
 
-        async fn setup() -> (Arc<Config>, Arc<RwLock<RaftNodeState>>, Arc<PeerManager>) {
+        async fn setup() -> (Arc<Config>, Arc<ConsensusShell>, Arc<PeerManager>) {
             let config = mock_config(50, 100);
             let id = mock_identity();
             let fsm = Arc::new(MockFsm::default());
-            let state = Arc::new(RwLock::new(RaftNodeState::Follower(
-                RaftNode::<Follower>::new(id.clone(), fsm),
-            )));
+            let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm));
+            let state = Arc::new(ConsensusShell::new(node));
             let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
             (config, state, peer_manager)
         }
@@ -611,7 +623,7 @@ mod tests {
             sleep(Duration::from_millis(250)).await;
 
             let guard = state.read().await;
-            assert!(matches!(&*guard, RaftNodeState::Candidate(_)));
+            assert!(matches!(&*guard, LogicalNode::Candidate(_)));
         }
 
         #[tokio::test]
@@ -622,11 +634,11 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => RaftNodeState::Candidate(n.into_candidate()),
+                    LogicalNode::Follower(n) => LogicalNode::Candidate(n.into_candidate()),
                     other => other,
                 });
             }
-            let initial_term = state.read().await.current_term().unwrap();
+            let initial_term = state.read().await.current_term();
 
             spawn_election_timer(config, state.clone(), peer_manager);
 
@@ -634,9 +646,9 @@ mod tests {
             sleep(Duration::from_millis(250)).await;
 
             let guard = state.read().await;
-            assert!(matches!(&*guard, RaftNodeState::Candidate(_)));
+            assert!(matches!(&*guard, LogicalNode::Candidate(_)));
             assert!(
-                guard.current_term().unwrap() > initial_term,
+                guard.current_term() > initial_term,
                 "Candidate should have incremented term due to timeout"
             );
         }
@@ -649,8 +661,8 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => {
-                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    LogicalNode::Follower(n) => {
+                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
                     }
                     other => other,
                 });
@@ -664,7 +676,7 @@ mod tests {
             // Demote to Follower
             {
                 let mut guard = state.write().await;
-                let term = guard.current_term().unwrap();
+                let term = guard.current_term();
                 guard.transition(|old| old.into_follower(term, None));
             }
 
@@ -674,36 +686,10 @@ mod tests {
 
             let guard = state.read().await;
             assert!(
-                matches!(&*guard, RaftNodeState::Candidate(_)),
+                matches!(&*guard, LogicalNode::Candidate(_)),
                 "Timer should have stayed active and triggered election after demotion \
                  (Reproduction of Leader Bug)"
             );
-        }
-
-        #[tokio::test]
-        async fn poisoned_state_triggers_halt() {
-            let (config, state, peer_manager) = setup().await;
-
-            // Start as poisoned
-            {
-                let mut guard = state.write().await;
-                *guard = RaftNodeState::Poisoned;
-            }
-
-            // Wrap in tokio::spawn to capture panic
-            let handle = tokio::spawn(async move {
-                // We need to call the inner loop logic or a version that we can join.
-                // For now, let's just use spawn_election_timer and see if it halts.
-                spawn_election_timer(config, state, peer_manager);
-                // The timer is spawned in another task inside
-                // spawn_election_timer. This makes it hard to
-                // join the specific timer loop.
-            });
-
-            handle.await.unwrap();
-            // This test is currently a placeholder for the logic.
-            // The actual implementation will use panic! which we'll verify in
-            // Commit 2.
         }
     }
 }

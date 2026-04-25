@@ -1,10 +1,12 @@
 mod config;
 mod consensus;
+pub mod engine;
 mod fsm;
 mod identity;
 mod node;
 mod peer;
 mod service;
+pub mod state;
 mod store;
 
 use std::path::PathBuf;
@@ -18,17 +20,17 @@ use common::rpc::IdentityInterceptor;
 use config::Config;
 use consensus::spawn_election_timer;
 use consensus::spawn_heartbeat_task;
+use engine::Follower;
+use engine::LogicalNode;
 use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use identity::initialize_node_identity;
-use node::Follower;
 use node::RaftNode;
-use node::RaftNodeState;
 use peer::PeerManager;
 use service::consensus::ConsensusDispatcher;
 use service::handle::LocalRaftHandle;
+use state::ConsensusShell;
 use store::LactoStore;
-use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tracing::Instrument;
 use tracing::error;
@@ -83,11 +85,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 6. Initialize the Shared Node State (Type-State Engine)
-    // Now decoupled via StateMachine trait.
+    // 6. Initialize the Shared Node State (Atomic Shell)
+    // The functional core (RaftNode) is now silent.
     let fsm = Arc::new(LactoStore::new());
-    let initial_node = RaftNode::<Follower>::new(identity.clone(), fsm.clone());
-    let shared_state = Arc::new(RwLock::new(RaftNodeState::Follower(initial_node)));
+    let initial_node = RaftNode::<Follower>::new(identity.node_id(), fsm.clone());
+    let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)
     let peer_manager = Arc::new(match PeerManager::new(identity.clone(), &config.peers) {

@@ -9,14 +9,14 @@ use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
-use tokio::sync::RwLock;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::error;
 use tracing::info_span;
 
-use crate::node::RaftNodeState;
-use crate::service::common::ServiceState;
+use crate::engine::LogicalNode;
+use crate::state::ConsensusShell;
 
 /// Implementation of the internal Raft consensus RPCs.
 ///
@@ -25,18 +25,34 @@ use crate::service::common::ServiceState;
 #[derive(Debug)]
 pub struct ConsensusDispatcher {
     identity: Arc<NodeIdentity>,
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
 }
 
 impl ConsensusDispatcher {
-    pub fn new(identity: Arc<NodeIdentity>, state: Arc<RwLock<RaftNodeState>>) -> Self {
+    pub fn new(identity: Arc<NodeIdentity>, state: Arc<ConsensusShell>) -> Self {
         Self { identity, state }
     }
-}
 
-impl ServiceState for ConsensusDispatcher {
-    fn identity_arc(&self) -> &Arc<NodeIdentity> {
-        &self.identity
+    /// Verifies that the node engine is healthy and matches the service
+    /// node ID.
+    fn verify_node_integrity(&self, node: &LogicalNode) -> Result<(), Status> {
+        let engine_node_id = node.node_id();
+        if engine_node_id == self.identity.node_id() {
+            Ok(())
+        } else {
+            let msg = format!(
+                "CRITICAL: Node ID divergence detected! ServiceNodeID='{}' EngineNodeID='{}'",
+                self.identity.node_id(),
+                engine_node_id
+            );
+            error!("{}", msg);
+            panic!("{}", msg);
+        }
+    }
+
+    /// Returns a standard gRPC InvalidArgument status for invalid Node IDs.
+    fn invalid_node_id_status(&self, input: &str) -> Status {
+        Status::invalid_argument(format!("Invalid NodeId format: '{}'", input))
     }
 }
 
@@ -60,21 +76,21 @@ impl ConsensusService for ConsensusDispatcher {
         let span = info_span!("request_vote", term = %req_term, candidate = %candidate_id);
         let _enter = span.enter();
 
-        let mut state_guard = self.state.write().await;
-        self.verify_node_integrity(&state_guard)?;
+        let result = {
+            let mut guard = self.state.write().await;
+            self.verify_node_integrity(&guard)?;
 
-        let (current_term, vote_granted) = state_guard
-            .handle_request_vote(
+            guard.handle_request_vote(
                 candidate_id,
                 req_term,
                 req_last_log_index,
                 req_last_log_term,
             )
-            .map_err(|_| self.poisoned_status())?;
+        };
 
         Ok(Response::new(RequestVoteResponse::new(
-            current_term,
-            vote_granted,
+            result.term,
+            result.vote_granted,
         )))
     }
 
@@ -97,25 +113,26 @@ impl ConsensusService for ConsensusDispatcher {
         let span = info_span!("append_entries", term = %req_term, leader = %leader_id);
         let _enter = span.enter();
 
-        let mut state_guard = self.state.write().await;
-        self.verify_node_integrity(&state_guard)?;
+        let result = {
+            let mut guard = self.state.write().await;
+            self.verify_node_integrity(&guard)?;
 
-        let (current_term, success, last_log_index) = state_guard
-            .handle_append_entries(
-                leader_id,
-                req_term,
-                req_prev_log_index,
-                req_prev_log_term,
-                req.entries,
-                req_leader_commit,
-            )
-            .await
-            .map_err(|_| self.poisoned_status())?;
+            guard
+                .handle_append_entries(
+                    leader_id,
+                    req_term,
+                    req_prev_log_index,
+                    req_prev_log_term,
+                    req.entries,
+                    req_leader_commit,
+                )
+                .await
+        };
 
         Ok(Response::new(AppendEntriesResponse::new(
-            current_term,
-            success,
-            last_log_index,
+            result.term,
+            result.success,
+            result.conflict_index,
         )))
     }
 }
@@ -125,8 +142,9 @@ mod tests {
     use common::types::ClusterId;
 
     use super::*;
+    use crate::engine::Follower;
+    use crate::engine::LogicalNode;
     use crate::fsm::StateMachine;
-    use crate::node::Follower;
     use crate::node::RaftNode;
 
     #[derive(Debug, Default)]
@@ -148,22 +166,23 @@ mod tests {
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm::default());
-        let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
-        ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)))
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm));
+        let state = Arc::new(ConsensusShell::new(node));
+        ConsensusDispatcher::new(id, state)
     }
 
     mod integrity_check {
         use super::*;
 
         #[tokio::test]
-        #[should_panic(expected = "CRITICAL: Node is in a poisoned state")]
+        #[should_panic(expected = "Halt Mandate: Node is poisoned")]
         async fn panics_when_poisoned() {
             let dispatcher = mock_dispatcher();
 
             // Force the node into a poisoned state for testing
             {
-                let mut state_guard = dispatcher.state.write().await;
-                *state_guard = RaftNodeState::Poisoned;
+                let mut guard = dispatcher.state.write().await;
+                *guard = LogicalNode::Poisoned;
             }
 
             let req = Request::new(RequestVoteRequest {
@@ -177,16 +196,16 @@ mod tests {
         }
 
         #[tokio::test]
-        #[should_panic(expected = "CRITICAL: Identity divergence detected")]
+        #[should_panic(expected = "CRITICAL: Node ID divergence detected")]
         async fn panics_on_identity_mismatch() {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
-            let wrong_id = Arc::new(NodeIdentity::new(id.cluster_id().clone(), NodeId::new(99)));
             let fsm = Arc::new(MockFsm::default());
-            let node = RaftNodeState::Follower(RaftNode::<Follower>::new(wrong_id, fsm));
+            let node = LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm));
+            let state = Arc::new(ConsensusShell::new(node));
 
             // Use the original ID for the dispatcher but the wrong ID for the node
-            let dispatcher = ConsensusDispatcher::new(id, Arc::new(RwLock::new(node)));
+            let dispatcher = ConsensusDispatcher::new(id, state);
 
             let req = Request::new(RequestVoteRequest {
                 term: 1,
@@ -268,7 +287,7 @@ mod tests {
             // Populate local log: 2 entries in term 1
             {
                 let mut state = dispatcher.state.write().await;
-                if let RaftNodeState::Follower(node) = &mut *state {
+                if let LogicalNode::Follower(node) = &mut *state {
                     node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 1,
@@ -300,7 +319,7 @@ mod tests {
             // Populate local log: 1 entry in term 2
             {
                 let mut state = dispatcher.state.write().await;
-                if let RaftNodeState::Follower(node) = &mut *state {
+                if let LogicalNode::Follower(node) = &mut *state {
                     node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 2,
@@ -327,7 +346,7 @@ mod tests {
             // Populate local log: 1 entry in term 1
             {
                 let mut state = dispatcher.state.write().await;
-                if let RaftNodeState::Follower(node) = &mut *state {
+                if let LogicalNode::Follower(node) = &mut *state {
                     node.log_mut().push(common::proto::v1::raft::LogEntry {
                         index: 1,
                         term: 1,
@@ -354,7 +373,7 @@ mod tests {
             // Populate local log: 10 entries in term 1
             {
                 let mut state = dispatcher.state.write().await;
-                if let RaftNodeState::Follower(node) = &mut *state {
+                if let LogicalNode::Follower(node) = &mut *state {
                     for i in 1..=10 {
                         node.log_mut().push(common::proto::v1::raft::LogEntry {
                             index: i as u64,
@@ -429,12 +448,10 @@ mod tests {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm::default());
             // Start as Follower term 0, transition to Candidate term 1
-            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
+            let follower = RaftNode::<Follower>::new(id.node_id(), fsm);
             let candidate = follower.into_candidate();
-            let dispatcher = ConsensusDispatcher::new(
-                id,
-                Arc::new(RwLock::new(RaftNodeState::Candidate(candidate))),
-            );
+            let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
+            let dispatcher = ConsensusDispatcher::new(id, state);
 
             let req = Request::new(AppendEntriesRequest {
                 term: 1, // Equal to candidate term
@@ -449,8 +466,8 @@ mod tests {
             assert_eq!(response.success, true);
 
             let state_guard = dispatcher.state.read().await;
-            assert!(matches!(&*state_guard, RaftNodeState::Follower(_)));
-            assert_eq!(state_guard.current_term().unwrap(), Term::new(1));
+            assert!(matches!(&*state_guard, LogicalNode::Follower(_)));
+            assert_eq!(state_guard.current_term(), Term::new(1));
         }
 
         #[tokio::test]
@@ -459,11 +476,11 @@ mod tests {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm::default());
             // Start as Leader term 1
-            let follower = RaftNode::<Follower>::new(id.clone(), fsm);
+            let follower = RaftNode::<Follower>::new(id.node_id(), fsm);
             let candidate = follower.into_candidate();
             let leader = candidate.into_leader(Vec::new());
-            let dispatcher =
-                ConsensusDispatcher::new(id, Arc::new(RwLock::new(RaftNodeState::Leader(leader))));
+            let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));
+            let dispatcher = ConsensusDispatcher::new(id, state);
 
             let req = Request::new(AppendEntriesRequest {
                 term: 1, // Rival leader for same term
@@ -485,7 +502,7 @@ mod tests {
             // 1. Get initial heartbeat time
             let initial_heartbeat = {
                 let guard = dispatcher.state.read().await;
-                if let RaftNodeState::Follower(node) = &*guard {
+                if let LogicalNode::Follower(node) = &*guard {
                     node.state().last_heartbeat()
                 } else {
                     panic!("Should be follower");
@@ -509,7 +526,7 @@ mod tests {
             // 2. Verify heartbeat time was updated
             let updated_heartbeat = {
                 let guard = dispatcher.state.read().await;
-                if let RaftNodeState::Follower(node) = &*guard {
+                if let LogicalNode::Follower(node) = &*guard {
                     node.state().last_heartbeat()
                 } else {
                     panic!("Should be follower");

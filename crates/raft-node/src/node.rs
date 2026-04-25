@@ -6,34 +6,64 @@ use std::time::Instant;
 use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
-use common::types::NodeIdentity;
 use common::types::Term;
-use thiserror::Error;
 use tokio::sync::Notify;
-use tokio::sync::watch;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 
 use crate::fsm::StateMachine;
 
+// =============================================================================
+// 1. Public Snapshots & Types
+// =============================================================================
+
 /// Snapshot of the node's consensus progress, used for reactive observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsensusProgress {
     pub term: Term,
     pub commit_index: LogIndex,
+    /// Volatile counter representing the logical epoch of the node's consistent
+    /// state.
+    ///
+    /// INCREMENT POLICY: This counter MUST be incremented exactly once upon the
+    /// successful completion of any:
+    /// 1. Physical Mutation: Advancing the Term, appending to the Log, or
+    ///    updating the Commit Index.
+    /// 2. Logical Transition: Changing the node's Role (e.g., Candidate ->
+    ///    Leader), even if Term/Index are unchanged.
+    ///
+    /// This ensures that observers on the reactive channel are notified of
+    /// every significant consensus event and never miss a state change.
+    pub signal_counter: u64,
 }
 
-#[derive(Error, Debug)]
-pub enum RaftError {
-    #[error("Node is in an unrecoverable state due to a failed transition")]
-    Poisoned,
-
-    #[error("Node is not the leader and cannot propose mutations")]
-    NotLeader,
+/// The result of a physical log reconciliation operation (§5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationResult {
+    pub success: bool,
+    pub last_index: LogIndex,
 }
 
-// --- Type-State Markers (Role-Specific Volatile State) ---
+impl ReconciliationResult {
+    pub fn success(last_index: LogIndex) -> Self {
+        Self {
+            success: true,
+            last_index,
+        }
+    }
+
+    pub fn mismatch(last_index: LogIndex) -> Self {
+        Self {
+            success: false,
+            last_index,
+        }
+    }
+}
+
+// =============================================================================
+// 2. Role Markers (Type-State Engine)
+// =============================================================================
 
 #[derive(Debug)]
 pub struct Follower {
@@ -58,12 +88,21 @@ impl NodeState for Follower {}
 impl NodeState for Candidate {}
 impl NodeState for Leader {}
 
-// --- Consensus Data Structures ---
+// =============================================================================
+// 3. Shared Shared Container (RaftNode)
+// =============================================================================
 
 /// Container for Raft state that is shared across all roles or must persist.
+///
+/// Represents the "Physical Node" layer, managing log storage, term
+/// persistence, and the commitment boundary.
+///
+/// SILENT STATE MACHINE: This struct is a pure data mutator. It does NOT own
+/// signaling channels or perform I/O. Signaling is the responsibility of the
+/// high-level orchestrator shell.
 #[derive(Debug)]
 pub struct RaftNode<S: NodeState> {
-    identity: Arc<NodeIdentity>,
+    node_id: NodeId,
     fsm: Arc<dyn StateMachine>,
 
     // --- Persistent State ---
@@ -74,352 +113,58 @@ pub struct RaftNode<S: NodeState> {
     // --- Volatile State ---
     commit_index: LogIndex,
     last_applied: LogIndex,
-    /// Broadcasts consensus progress (term and commit_index) to external
+    /// Volatile counter representing the logical epoch of the node's consistent
+    /// state.
+    ///
+    /// Following the INCREMENT POLICY, this counter is updated on every
+    /// physical mutation or logical role transition to trigger reactive
     /// observers.
-    progress_tx: watch::Sender<ConsensusProgress>,
+    signal_counter: u64,
     state: S,
 }
 
-/// The Dispatcher Enum (Logical State Machine).
-///
-/// This is the primary entry point for all consensus operations, managing
-/// the transitions between Raft roles (ADR 002).
-#[derive(Debug)]
-pub enum RaftNodeState {
-    Follower(RaftNode<Follower>),
-    Candidate(RaftNode<Candidate>),
-    Leader(RaftNode<Leader>),
-    Poisoned, // ADR 001: Safety barrier during transition failures
-}
-
-macro_rules! delegate_to_inner {
-    ($self:ident, $method:ident $(, $args:expr)*) => {
-        match $self {
-            RaftNodeState::Follower(n) => Ok(n.$method($($args),*)),
-            RaftNodeState::Candidate(n) => Ok(n.$method($($args),*)),
-            RaftNodeState::Leader(n) => Ok(n.$method($($args),*)),
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-        }
-    };
-}
-
-// =============================================================================
-// Implementation: RaftNodeState (High-Level Orchestrator)
-// =============================================================================
-
-impl RaftNodeState {
-    /// Processes an AppendEntries RPC.
-    ///
-    /// Acts as a high-level orchestrator, delegating log reconciliation to
-    /// specialized sub-functions. Autonomously manages term transitions and
-    /// rival leader detection according to Raft §5.1, §5.2, and §5.3.
-    pub async fn handle_append_entries(
-        &mut self,
-        leader_id: NodeId,
-        req_term: Term,
-        req_prev_log_index: LogIndex,
-        req_prev_log_term: Term,
-        entries: Vec<LogEntry>,
-        req_leader_commit: LogIndex,
-    ) -> Result<(Term, bool, LogIndex), RaftError> {
-        let current_term = self.current_term()?;
-
-        // --- Raft RPC Step 1: Term Check (§5.1) ---
-        if req_term < current_term {
-            debug!(
-                "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
-                leader_id, req_term, current_term
-            );
-            return Ok((current_term, false, LogIndex::ZERO));
-        }
-
-        // --- Internal: State Transitions & Heartbeat Verification ---
-        if req_term > current_term {
-            // §5.1: If term > currentTerm, transition to follower
-            info!(
-                "Received higher term ({}) from leader {}. Demoting to Follower.",
-                req_term, leader_id
-            );
-            self.transition(|old| old.into_follower(req_term, Some(leader_id)));
-            // TODO: Phase 6 - fsync term to sled
-        } else if req_term == current_term {
-            match self {
-                RaftNodeState::Candidate(_) => {
-                    // §5.2: If Candidate receives AppendEntries from a leader of the SAME term,
-                    // it recognizes the leader as legitimate and returns to follower state.
-                    info!(
-                        "Candidate recognizing leader {} for term {}. Returning to Follower.",
-                        leader_id, req_term
-                    );
-                    self.transition(|old| old.into_follower(req_term, Some(leader_id)));
-                }
-                RaftNodeState::Leader(_) => {
-                    // FATAL INVARIANT VIOLATION: Two leaders for the same term!
-                    let msg = format!(
-                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
-                         node to prevent state corruption.",
-                        leader_id, req_term
-                    );
-                    error!("{}", msg);
-                    panic!("{}", msg);
-                }
-                RaftNodeState::Follower(node) => {
-                    node.state_mut().set_leader_id(Some(leader_id));
-                }
-                _ => {}
-            }
-        }
-
-        // --- Raft RPC Steps 2-5: Log Reconciliation (§5.3) ---
-        self.reset_heartbeat();
-
-        let (success, last_log_index) = match self {
-            RaftNodeState::Follower(node) => {
-                node.reconcile_log(
-                    req_prev_log_index,
-                    req_prev_log_term,
-                    entries,
-                    req_leader_commit,
-                )
-                .await
-            }
-            _ => (false, LogIndex::ZERO), // Should have demoted above
-        };
-
-        let current_term = self.current_term()?;
-        Ok((current_term, success, last_log_index))
-    }
-
-    /// Processes a RequestVote RPC.
-    ///
-    /// Autonomously manages term transitions and vote granting according to
-    /// Raft §5.1, §5.2, and §5.4.
-    pub fn handle_request_vote(
-        &mut self,
-        candidate_id: NodeId,
-        req_term: Term,
-        req_last_log_index: LogIndex,
-        req_last_log_term: Term,
-    ) -> Result<(Term, bool), RaftError> {
-        let current_term = self.current_term()?;
-
-        // 1. If term > currentTerm: set currentTerm = term, transition to follower
-        //    (§5.1)
-        if req_term > current_term {
-            info!(
-                "Received higher term ({}) from candidate {}. Transitioning to Follower.",
-                req_term, candidate_id
-            );
-            self.transition(|old| old.into_follower(req_term, None));
-            // TODO: Phase 6 - fsync term to sled
-        }
-
-        // Re-acquire current state after potential transition
-        let mut vote_granted = false;
-        let current_term = self.current_term()?;
-
-        match self {
-            RaftNodeState::Follower(node) => {
-                // 2. If votedFor is null or candidateId, and candidate’s log is at
-                // least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-                if req_term >= node.current_term()
-                    && (node.voted_for().is_none() || node.voted_for() == Some(candidate_id))
-                {
-                    if node.is_log_up_to_date(req_last_log_term, req_last_log_index) {
-                        vote_granted = true;
-                        node.vote_for(candidate_id);
-                        info!(
-                            "Granting vote to candidate {} for term {}",
-                            candidate_id, req_term
-                        );
-                    }
-                }
-            }
-            RaftNodeState::Candidate(_) | RaftNodeState::Leader(_) => {
-                // If term is equal, we already voted for ourselves or are
-                // leading.
-            }
-            RaftNodeState::Poisoned => return Err(RaftError::Poisoned),
-        }
-
-        Ok((current_term, vote_granted))
-    }
-
-    /// Appends a new command to the leader's log.
-    pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, RaftError> {
-        match self {
-            RaftNodeState::Leader(node) => {
-                let index = node.last_log_index() + 1;
-                let term = node.current_term();
-                let entry = LogEntry::new(index, term, command);
-                node.log_mut().push(entry);
-                Ok(index)
-            }
-            RaftNodeState::Poisoned => Err(RaftError::Poisoned),
-            _ => Err(RaftError::NotLeader),
-        }
-    }
-
-    /// Consumes the current state and returns a Follower state for the given
-    /// term. This is a universal transition mandated by Raft §5.1.
-    pub fn into_follower(self, term: Term, leader_id: Option<NodeId>) -> RaftNodeState {
-        let (identity, fsm, current_term, voted_for, log, commit_index, last_applied, progress_tx) =
-            match self {
-                RaftNodeState::Follower(n) => n.into_parts(),
-                RaftNodeState::Candidate(n) => n.into_parts(),
-                RaftNodeState::Leader(n) => n.into_parts(),
-                RaftNodeState::Poisoned => return RaftNodeState::Poisoned,
-            };
-
-        let mut new_node = RaftNode {
-            identity,
-            fsm,
-            current_term,
-            voted_for,
-            log,
-            commit_index,
-            last_applied,
-            progress_tx,
-            state: Follower::new(leader_id),
-        };
-
-        new_node.set_term(term);
-        RaftNodeState::Follower(new_node)
-    }
-
-    /// Safely transitions the node state using an ownership-consuming closure.
-    pub fn transition<F>(&mut self, f: F)
-    where
-        F: FnOnce(RaftNodeState) -> RaftNodeState,
-    {
-        let old_state = std::mem::replace(self, RaftNodeState::Poisoned);
-        *self = f(old_state);
-
-        // Broadcast the change to all observers. This ensures that any task
-        // blocked on consensus progress (like await_commit) is woken up to
-        // detect role changes or term updates.
-        if let Ok(progress) = self.consensus_progress() {
-            let _ = self.progress_tx().unwrap().send_replace(progress);
-        }
-    }
-
-    /// Resets the election timer if the node is a Follower.
-    pub fn reset_heartbeat(&mut self) {
-        if let RaftNodeState::Follower(node) = self {
-            node.state_mut().reset_heartbeat();
-        }
-    }
-
-    // --- Delegated Accessors ---
-
-    pub fn identity_arc(&self) -> Result<&Arc<NodeIdentity>, RaftError> {
-        delegate_to_inner!(self, identity_arc)
-    }
-
-    pub fn node_id(&self) -> Result<NodeId, RaftError> {
-        delegate_to_inner!(self, node_id)
-    }
-
-    pub fn current_term(&self) -> Result<Term, RaftError> {
-        delegate_to_inner!(self, current_term)
-    }
-
-    pub fn voted_for(&self) -> Result<Option<NodeId>, RaftError> {
-        delegate_to_inner!(self, voted_for)
-    }
-
-    pub fn commit_index(&self) -> Result<LogIndex, RaftError> {
-        delegate_to_inner!(self, commit_index)
-    }
-
-    pub fn progress_tx(&self) -> Result<&watch::Sender<ConsensusProgress>, RaftError> {
-        delegate_to_inner!(self, progress_tx)
-    }
-
-    pub fn consensus_progress(&self) -> Result<ConsensusProgress, RaftError> {
-        Ok(ConsensusProgress {
-            term: self.current_term()?,
-            commit_index: self.commit_index()?,
-        })
-    }
-}
-
-// =============================================================================
-// Implementation: RaftNode<S> (Core Engine Logic)
-// =============================================================================
+// --- Implementation: Shared Accessors ---
 
 impl<S: NodeState> RaftNode<S> {
-    /// Updates the commit index and triggers the application of entries to the
-    /// FSM.
-    pub async fn set_commit_index(&mut self, index: LogIndex) {
-        if index < self.commit_index {
-            debug!(
-                "Ignoring stale commit_index update: {} < current {}",
-                index, self.commit_index
-            );
-            return;
-        }
-
-        let last_idx = self.last_log_index();
-        if index > last_idx {
-            panic!(
-                "CRITICAL: Protocol violation. Attempted to commit index {} but last_log_index is \
-                 {}",
-                index, last_idx
-            );
-        }
-
-        if index > self.commit_index {
-            self.commit_index = index;
-            self.apply_to_state_machine().await;
-
-            // Broadcast progress update
-            let progress = ConsensusProgress {
-                term: self.current_term,
-                commit_index: self.commit_index,
-            };
-            let _ = self.progress_tx.send_replace(progress);
-        }
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
     }
 
-    /// Orchestrates the sequential application of committed log entries to the
-    /// State Machine.
-    async fn apply_to_state_machine(&mut self) {
-        while self.last_applied < self.commit_index {
-            let apply_idx = self.last_applied + 1;
-            let entry = self
-                .log
-                .get((apply_idx.value() - 1) as usize)
-                .expect("Halt Mandate: Committed entry missing from log during apply");
-
-            if let Err(e) = self.fsm.apply(apply_idx, &entry.data).await {
-                error!(
-                    "CRITICAL: State machine failed to apply index {}: {}. Triggering Halt \
-                     Mandate.",
-                    apply_idx, e
-                );
-                panic!("Halt Mandate: FSM application failed.");
-            }
-
-            self.last_applied = apply_idx;
-        }
+    pub fn current_term(&self) -> Term {
+        self.current_term
     }
 
-    /// Verifies if a candidate's log is at least as up-to-date as the local
-    /// log.
-    pub fn is_log_up_to_date(
-        &self,
-        candidate_last_log_term: Term,
-        candidate_last_log_index: LogIndex,
-    ) -> bool {
-        let local_last_term = self.last_log_term();
-        let local_last_index = self.last_log_index();
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
+    }
 
-        if candidate_last_log_term != local_last_term {
-            candidate_last_log_term > local_last_term
-        } else {
-            candidate_last_log_index >= local_last_index
-        }
+    pub fn commit_index(&self) -> LogIndex {
+        self.commit_index
+    }
+
+    pub fn last_applied(&self) -> LogIndex {
+        self.last_applied
+    }
+
+    pub fn signal_counter(&self) -> u64 {
+        self.signal_counter
+    }
+
+    pub fn state(&self) -> &S {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+
+    pub(crate) fn log(&self) -> &[LogEntry] {
+        &self.log
+    }
+
+    #[cfg(test)]
+    pub(crate) fn log_mut(&mut self) -> &mut Vec<LogEntry> {
+        &mut self.log
     }
 
     // --- Log Queries ---
@@ -447,150 +192,262 @@ impl<S: NodeState> RaftNode<S> {
             .map(|e| Term::new(e.term))
             .unwrap_or(Term::ZERO)
     }
+}
 
-    // --- Accessors ---
+// --- Implementation: Shared Physical Mutations ---
 
-    pub fn identity(&self) -> &NodeIdentity {
-        &self.identity
+impl<S: NodeState> RaftNode<S> {
+    /// Consumes the current node and returns it in a Follower role.
+    /// This is the primary mechanism for demotion and term updates.
+    ///
+    /// NOTE: This is a pure factory transformation.
+    pub fn into_follower(self, term: Term, leader_id: Option<NodeId>) -> RaftNode<Follower> {
+        let (
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+        ) = self.into_parts();
+
+        let mut node = RaftNode {
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+            state: Follower::new(leader_id),
+        };
+
+        // Transition to next term if higher (§5.1)
+        // INCREMENT POLICY: We increment for the term update AND the role change.
+        node.set_term(term);
+        node.increment_signal();
+        node
     }
 
-    pub fn identity_arc(&self) -> &Arc<NodeIdentity> {
-        &self.identity
+    /// Updates the commit index and triggers the application of entries to the
+    /// FSM.
+    pub async fn set_commit_index(&mut self, index: LogIndex) {
+        if index < self.commit_index {
+            debug!(
+                "Ignoring stale commit_index update: {} < current {}",
+                index, self.commit_index
+            );
+            return;
+        }
+
+        let last_idx = self.last_log_index();
+        if index > last_idx {
+            panic!(
+                "CRITICAL: Protocol violation. Attempted to commit index {} but last_log_index is \
+                 {}",
+                index, last_idx
+            );
+        }
+
+        if index > self.commit_index {
+            self.commit_index = index;
+            self.apply_to_state_machine().await;
+            self.increment_signal();
+        }
     }
 
-    pub fn node_id(&self) -> NodeId {
-        self.identity.node_id()
+    /// Orchestrates the sequential application of committed log entries to the
+    /// State Machine.
+    async fn apply_to_state_machine(&mut self) {
+        while self.last_applied < self.commit_index {
+            let apply_idx = self.last_applied + 1;
+            let entry = self
+                .log
+                .get((apply_idx.value() - 1) as usize)
+                .expect("Halt Mandate: Committed entry missing from log during apply");
+
+            if let Err(e) = self.fsm.apply(apply_idx, &entry.data).await {
+                error!(
+                    "CRITICAL: State machine failed to apply index {}: {}. Triggering Halt \
+                     Mandate.",
+                    apply_idx, e
+                );
+                // TODO: Classify errors. Transient errors (IO, Timeout) should trigger
+                // exponential backoff retry. Deterministic errors (Logic, Invariant
+                // Violation) MUST panic to prevent cluster-wide state divergence.
+                panic!("Halt Mandate: FSM application failed.");
+            }
+
+            self.last_applied = apply_idx;
+        }
     }
 
-    pub fn current_term(&self) -> Term {
-        self.current_term
-    }
-
-    pub fn voted_for(&self) -> Option<NodeId> {
-        self.voted_for
-    }
-
-    pub fn log(&self) -> &Vec<LogEntry> {
-        &self.log
-    }
-
-    pub fn log_mut(&mut self) -> &mut Vec<LogEntry> {
-        &mut self.log
-    }
-
-    pub fn commit_index(&self) -> LogIndex {
-        self.commit_index
-    }
-
-    pub fn progress_tx(&self) -> &watch::Sender<ConsensusProgress> {
-        &self.progress_tx
-    }
-
-    pub fn last_applied(&self) -> LogIndex {
-        self.last_applied
-    }
-
-    pub fn state(&self) -> &S {
-        &self.state
-    }
-
-    pub fn state_mut(&mut self) -> &mut S {
-        &mut self.state
-    }
-
-    // --- Core Mutations & Internal Helpers ---
-
-    fn set_term(&mut self, term: Term) {
+    /// Updates the current term and resets voting state if the term increased.
+    pub(crate) fn set_term(&mut self, term: Term) {
+        if term < self.current_term {
+            panic!(
+                "CRITICAL: Term regression detected! current={} new={}",
+                self.current_term, term
+            );
+        }
         if term > self.current_term {
             self.current_term = term;
             self.voted_for = None;
+            self.increment_signal();
         }
     }
 
     pub fn vote_for(&mut self, candidate_id: NodeId) {
         self.voted_for = Some(candidate_id);
-        // TODO: Phase 6 - fsync to sled
+    }
+
+    pub(crate) fn increment_signal(&mut self) {
+        self.signal_counter += 1;
     }
 
     fn into_parts(
         self,
     ) -> (
-        Arc<NodeIdentity>,
+        NodeId,
         Arc<dyn StateMachine>,
         Term,
         Option<NodeId>,
         Vec<LogEntry>,
         LogIndex,
         LogIndex,
-        watch::Sender<ConsensusProgress>,
+        u64,
     ) {
         (
-            self.identity,
+            self.node_id,
             self.fsm,
             self.current_term,
             self.voted_for,
             self.log,
             self.commit_index,
             self.last_applied,
-            self.progress_tx,
+            self.signal_counter,
         )
     }
 }
 
 // =============================================================================
-// Implementation: Specialized Role Impls (Follower, Candidate)
+// 4. Role: Follower Behavior
 // =============================================================================
 
 impl RaftNode<Follower> {
-    pub fn new(identity: Arc<NodeIdentity>, fsm: Arc<dyn StateMachine>) -> Self {
-        let (progress_tx, _) = watch::channel(ConsensusProgress {
-            term: Term::ZERO,
-            commit_index: LogIndex::ZERO,
-        });
-
+    pub fn new(node_id: NodeId, fsm: Arc<dyn StateMachine>) -> Self {
         Self {
-            identity,
+            node_id,
             fsm,
             current_term: Term::ZERO,
             voted_for: None,
             log: Vec::new(),
             commit_index: LogIndex::ZERO,
             last_applied: LogIndex::ZERO,
-            progress_tx,
+            signal_counter: 0,
             state: Follower::new(None),
         }
     }
 
     /// Following Raft §5.3, reconciles the local log with entries from the
-    /// leader (Steps 2–5). Step 1 (Term Check) must be performed by the caller.
+    /// leader.
     pub async fn reconcile_log(
         &mut self,
         prev_log_index: LogIndex,
         prev_log_term: Term,
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
-    ) -> (bool, LogIndex) {
-        // Raft RPC Step 2: Consistency Check (§5.3)
+    ) -> ReconciliationResult {
+        let old_last_idx = self.last_log_index();
+        let old_last_term = self.last_log_term();
+
         if !self.verify_log_consistency(prev_log_index, prev_log_term) {
-            return (false, self.last_log_index());
+            return ReconciliationResult::mismatch(self.last_log_index());
         }
 
-        // Raft RPC Steps 3 & 4: Conflict Reconciliation & Append (§5.3)
         if !self.append_entries_with_reconciliation(entries) {
-            return (false, self.last_log_index());
+            return ReconciliationResult::mismatch(self.last_log_index());
         }
 
-        // Raft RPC Step 5: Advance Commit Index (§5.3)
-        self.advance_commit_index(leader_commit).await;
+        if self.last_log_index() != old_last_idx || self.last_log_term() != old_last_term {
+            self.increment_signal();
+        }
 
-        (true, self.last_log_index())
+        self.advance_commit_index(leader_commit).await;
+        ReconciliationResult::success(self.last_log_index())
     }
 
-    /// Raft §5.3 (Step 2): Verifies that the log contains an entry at
-    /// `prev_log_index` with `prev_log_term`.
+    /// Follower -> Candidate transition (Triggered by Election Timeout).
+    pub fn into_candidate(self) -> RaftNode<Candidate> {
+        let (
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+        ) = self.into_parts();
+
+        let mut node = RaftNode {
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+            state: Candidate::new(),
+        };
+
+        // INCREMENT POLICY: We increment for the term update AND the role change.
+        node.set_term(current_term + 1);
+        node.vote_for(node_id);
+        node.state_mut().add_vote(node_id);
+        node.increment_signal();
+        node
+    }
+
+    /// Evaluates if a vote can be granted to a candidate for the given term.
+    pub fn attempt_grant_vote(
+        &mut self,
+        candidate_id: NodeId,
+        req_term: Term,
+        req_last_log_index: LogIndex,
+        req_last_log_term: Term,
+    ) -> bool {
+        // §5.2, §5.4: Only grant vote if votedFor is null or candidateId,
+        // and candidate’s log is at least as up-to-date as receiver’s log.
+        if req_term == self.current_term
+            && (self.voted_for.is_none() || self.voted_for == Some(candidate_id))
+        {
+            if self.is_log_up_to_date(req_last_log_term, req_last_log_index) {
+                self.vote_for(candidate_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    // --- Follower Helpers ---
+
     fn verify_log_consistency(&self, prev_log_index: LogIndex, prev_log_term: Term) -> bool {
         if prev_log_index == LogIndex::ZERO {
             return true;
+        }
+
+        if prev_log_index > self.last_log_index() {
+            debug!(
+                "Rejecting AppendEntries: prevLogIndex {} is beyond local log length {}",
+                prev_log_index,
+                self.last_log_index()
+            );
+            return false;
         }
 
         let local_term = self.get_term_at(prev_log_index);
@@ -605,10 +462,7 @@ impl RaftNode<Follower> {
         true
     }
 
-    /// Raft §5.3 (Steps 3 & 4): Resolves log conflicts and appends new entries.
     fn append_entries_with_reconciliation(&mut self, entries: Vec<LogEntry>) -> bool {
-        // 3. If an existing entry conflicts with a new one... delete it and all that
-        //    follow (§5.3)
         for entry in &entries {
             let entry_index = LogIndex::new(entry.index);
             let local_term = self.get_term_at(entry_index);
@@ -618,35 +472,32 @@ impl RaftNode<Follower> {
                     entry_index
                 );
                 let truncate_at = (entry.index - 1) as usize;
-                self.log_mut().truncate(truncate_at);
-                // TODO: Phase 6 - fsync truncation to sled
+                self.log.truncate(truncate_at);
                 break;
             }
         }
 
-        // 4. Append any new entries not already in the log
         for entry in entries {
             let entry_index = LogIndex::new(entry.index);
             let last_idx = self.last_log_index();
             if entry_index > last_idx {
                 if entry_index != last_idx + 1 {
                     error!(
-                        "CRITICAL: Non-contiguous log append attempted. index={}, last={}",
+                        "CRITICAL: Non-contiguous log append attempted by Leader. index={}, \
+                         last={}",
                         entry_index, last_idx
                     );
                     return false;
                 }
-                self.log_mut().push(entry);
-                // TODO: Phase 6 - fsync append to sled
+                self.log.push(entry);
             }
         }
 
         true
     }
 
-    /// Raft §5.3 (Step 5): Advances the commit index.
     async fn advance_commit_index(&mut self, leader_commit: LogIndex) {
-        if leader_commit > self.commit_index() {
+        if leader_commit > self.commit_index {
             let last_new_idx = self.last_log_index();
             let new_commit = std::cmp::min(leader_commit, last_new_idx);
             self.set_commit_index(new_commit).await;
@@ -654,61 +505,105 @@ impl RaftNode<Follower> {
         }
     }
 
-    /// Follower -> Candidate transition (Triggered by Election Timeout).
-    pub fn into_candidate(self) -> RaftNode<Candidate> {
-        let mut state = Candidate::new();
-        state.add_vote(self.identity.node_id());
+    fn is_log_up_to_date(
+        &self,
+        candidate_last_log_term: Term,
+        candidate_last_log_index: LogIndex,
+    ) -> bool {
+        let local_last_term = self.last_log_term();
+        let local_last_index = self.last_log_index();
 
-        RaftNode {
-            identity: self.identity.clone(),
-            fsm: self.fsm,
-            current_term: self.current_term + 1,
-            voted_for: Some(self.identity.node_id()),
-            log: self.log,
-            commit_index: self.commit_index,
-            last_applied: self.last_applied,
-            progress_tx: self.progress_tx,
-            state,
-        }
-    }
-}
-
-impl RaftNode<Candidate> {
-    pub fn into_restarted_candidate(self) -> RaftNode<Candidate> {
-        let mut state = Candidate::new();
-        state.add_vote(self.identity.node_id());
-
-        RaftNode {
-            identity: self.identity.clone(),
-            fsm: self.fsm,
-            current_term: self.current_term + 1,
-            voted_for: Some(self.identity.node_id()),
-            log: self.log,
-            commit_index: self.commit_index,
-            last_applied: self.last_applied,
-            progress_tx: self.progress_tx,
-            state,
-        }
-    }
-
-    pub fn into_leader(self, peer_ids: Vec<NodeId>) -> RaftNode<Leader> {
-        let last_log_index = self.last_log_index();
-        RaftNode {
-            identity: self.identity,
-            fsm: self.fsm,
-            current_term: self.current_term,
-            voted_for: self.voted_for,
-            log: self.log,
-            commit_index: self.commit_index,
-            last_applied: self.last_applied,
-            progress_tx: self.progress_tx,
-            state: Leader::new(peer_ids, last_log_index),
+        if candidate_last_log_term != local_last_term {
+            candidate_last_log_term > local_last_term
+        } else {
+            candidate_last_log_index >= local_last_index
         }
     }
 }
 
 // =============================================================================
-// Implementation: Role Marker Boilerplate
+// 5. Role: Candidate Behavior
+// =============================================================================
+
+impl RaftNode<Candidate> {
+    pub fn into_restarted_candidate(self) -> RaftNode<Candidate> {
+        let (
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+        ) = self.into_parts();
+
+        let mut node = RaftNode {
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+            state: Candidate::new(),
+        };
+
+        // INCREMENT POLICY: We increment for the term update AND the role change.
+        node.set_term(current_term + 1);
+        node.vote_for(node_id);
+        node.state_mut().add_vote(node_id);
+        node.increment_signal();
+        node
+    }
+
+    pub fn into_leader(self, peer_ids: Vec<NodeId>) -> RaftNode<Leader> {
+        let last_log_index = self.last_log_index();
+        let (
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+        ) = self.into_parts();
+
+        let mut node = RaftNode {
+            node_id,
+            fsm,
+            current_term,
+            voted_for,
+            log,
+            commit_index,
+            last_applied,
+            signal_counter,
+            state: Leader::new(peer_ids, last_log_index),
+        };
+        node.increment_signal();
+        node
+    }
+}
+
+// =============================================================================
+// 6. Role: Leader Behavior
+// =============================================================================
+
+impl RaftNode<Leader> {
+    pub fn propose(&mut self, command: Vec<u8>) -> LogIndex {
+        let index = self.last_log_index() + 1;
+        let term = self.current_term;
+        let entry = LogEntry::new(index, term, command);
+        self.log.push(entry);
+        self.increment_signal();
+        index
+    }
+}
+
+// =============================================================================
+// 7. Role Marker Boilerplate
 // =============================================================================
 
 impl Follower {
@@ -789,12 +684,15 @@ impl Leader {
     }
 }
 
+// =============================================================================
+// 8. Behavioral Specification (Tests)
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use common::types::ClusterId;
     use tonic::Status;
 
     use super::*;
@@ -814,122 +712,368 @@ mod tests {
         }
     }
 
-    fn mock_identity() -> Arc<NodeIdentity> {
-        Arc::new(NodeIdentity::new(
-            ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(1),
-        ))
-    }
-
-    mod set_commit_index {
+    mod shared_primitives {
         use super::*;
-        #[tokio::test]
-        async fn correctly_applies_entries_sequentially() {
-            let id = mock_identity();
+
+        #[test]
+        #[should_panic(expected = "CRITICAL: Term regression detected")]
+        fn set_term_panics_on_regression() {
             let fsm = Arc::new(MockFsm::default());
-            let mut node = RaftNode::<Follower>::new(id, fsm.clone());
-            for i in 1..=3 {
-                node.log_mut().push(LogEntry::new(
-                    LogIndex::new(i),
-                    Term::new(1),
-                    format!("entry_{}", i).into_bytes(),
-                ));
-            }
-            node.set_commit_index(LogIndex::new(2)).await;
-            {
-                let indices = fsm.applied_indices.lock().unwrap();
-                assert_eq!(indices.len(), 2);
-            }
-            assert_eq!(node.last_applied(), LogIndex::new(2));
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            node.set_term(Term::new(10));
+            node.set_term(Term::new(5));
         }
 
         #[tokio::test]
-        async fn ignores_stale_commit_index() {
-            let id = mock_identity();
+        async fn set_commit_index_applies_to_fsm() {
             let fsm = Arc::new(MockFsm::default());
-            let mut node = RaftNode::<Follower>::new(id, fsm.clone());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm.clone());
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![1]));
+
+            node.set_commit_index(LogIndex::new(1)).await;
+
+            assert_eq!(node.commit_index(), LogIndex::new(1));
+            assert_eq!(fsm.applied_indices.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn set_commit_index_ignores_stale_index() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
             node.log_mut()
                 .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
             node.set_commit_index(LogIndex::new(1)).await;
-            node.set_commit_index(LogIndex::new(0)).await;
+
+            let signal_before = node.signal_counter();
+            node.set_commit_index(LogIndex::ZERO).await;
+
             assert_eq!(node.commit_index(), LogIndex::new(1));
+            assert_eq!(node.signal_counter(), signal_before);
+        }
+
+        #[tokio::test]
+        async fn set_commit_index_applies_multiple_entries_sequentially() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm.clone());
+            for i in 1..=3 {
+                node.log_mut()
+                    .push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![i as u8]));
+            }
+
+            // Jump from index 0 to 3
+            node.set_commit_index(LogIndex::new(3)).await;
+
+            let applied = fsm.applied_indices.lock().unwrap();
+            assert_eq!(
+                applied.as_slice(),
+                &[LogIndex::new(1), LogIndex::new(2), LogIndex::new(3)]
+            );
+            assert_eq!(node.last_applied(), LogIndex::new(3));
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "Committed entry missing from log")]
+        async fn apply_to_state_machine_panics_on_physical_log_corruption() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            // Manually advance commit index beyond log length WITHOUT the set_commit_index
+            // guard
+            node.commit_index = LogIndex::new(5);
+            node.apply_to_state_machine().await;
         }
 
         #[tokio::test]
         #[should_panic(expected = "CRITICAL: Protocol violation")]
-        async fn panics_on_invalid_log_boundary() {
-            let id = mock_identity();
+        async fn set_commit_index_panics_on_boundary_violation() {
             let fsm = Arc::new(MockFsm::default());
-            let mut node = RaftNode::<Follower>::new(id, fsm);
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            // Log is empty (max index 0), trying to commit 1
             node.set_commit_index(LogIndex::new(1)).await;
         }
     }
 
-    mod is_log_up_to_date {
+    mod follower_ops {
         use super::*;
-        #[test]
-        fn returns_true_when_candidate_term_is_higher() {
-            let id = mock_identity();
-            let fsm = Arc::new(MockFsm::default());
-            let mut node = RaftNode::<Follower>::new(id, fsm);
-            node.log_mut()
-                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
-            assert!(node.is_log_up_to_date(Term::new(2), LogIndex::new(1)));
-        }
-    }
 
-    mod handle_request_vote {
-        use super::*;
-        #[test]
-        fn grants_vote_when_term_is_higher_and_not_voted() {
-            let id = mock_identity();
+        fn setup_node() -> RaftNode<Follower> {
             let fsm = Arc::new(MockFsm::default());
-            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
-            let (term, granted) = state
-                .handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::new(0), Term::new(0))
-                .unwrap();
-            assert!(granted);
-            assert_eq!(term, Term::new(1));
+            RaftNode::<Follower>::new(NodeId::new(1), fsm)
         }
-    }
 
-    mod handle_append_entries {
-        use super::*;
         #[tokio::test]
-        async fn returns_success_when_term_is_current() {
-            let id = mock_identity();
-            let fsm = Arc::new(MockFsm::default());
-            let mut state = RaftNodeState::Follower(RaftNode::<Follower>::new(id, fsm));
-            let (_, success, _) = state
-                .handle_append_entries(
-                    NodeId::new(2),
-                    Term::ZERO,
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                    vec![],
+        async fn reconcile_log_rejects_inconsistent_prev_index() {
+            let mut node = setup_node();
+            // Node has empty log. Leader claims prev is 1.
+            let result = node
+                .reconcile_log(LogIndex::new(1), Term::new(1), vec![], LogIndex::ZERO)
+                .await;
+            assert!(!result.success);
+        }
+
+        #[tokio::test]
+        async fn reconcile_log_detects_conflicts_and_truncates() {
+            let mut node = setup_node();
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![1]));
+            node.log_mut()
+                .push(LogEntry::new(LogIndex::new(2), Term::new(1), vec![2]));
+
+            // Leader sends entry for index 2 with Term 2.
+            let new_entry = LogEntry::new(LogIndex::new(2), Term::new(2), vec![3]);
+            let result = node
+                .reconcile_log(
+                    LogIndex::new(1),
+                    Term::new(1),
+                    vec![new_entry],
                     LogIndex::ZERO,
                 )
-                .await
-                .unwrap();
-            assert!(success);
+                .await;
+
+            assert!(result.success);
+            assert_eq!(result.last_index, LogIndex::new(2));
+            assert_eq!(node.get_term_at(LogIndex::new(2)), Term::new(2));
+            assert_eq!(node.log().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn reconcile_log_truncates_conflicting_suffix() {
+            let mut node = setup_node();
+            // Log: [ (1, T1), (2, T1), (3, T1) ]
+            for i in 1..=3 {
+                node.log_mut()
+                    .push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
+            }
+
+            // Leader sends conflict at index 2, but NO entry for index 3.
+            // Result should be: [ (1, T1), (2, T2) ]
+            let new_entry = LogEntry::new(LogIndex::new(2), Term::new(2), vec![]);
+            let result = node
+                .reconcile_log(
+                    LogIndex::new(1),
+                    Term::new(1),
+                    vec![new_entry],
+                    LogIndex::ZERO,
+                )
+                .await;
+
+            assert!(result.success);
+            assert_eq!(result.last_index, LogIndex::new(2));
+            assert_eq!(node.log().len(), 2);
+            assert_eq!(node.get_term_at(LogIndex::new(2)), Term::new(2));
+        }
+
+        #[tokio::test]
+        async fn reconcile_log_is_idempotent_for_duplicate_entries() {
+            let mut node = setup_node();
+            let entry = LogEntry::new(LogIndex::new(1), Term::new(1), vec![1]);
+            node.log_mut().push(entry.clone());
+
+            let signal_before = node.signal_counter();
+            let result = node
+                .reconcile_log(LogIndex::ZERO, Term::ZERO, vec![entry], LogIndex::ZERO)
+                .await;
+
+            assert!(result.success);
+            assert_eq!(node.log().len(), 1);
+            // No physical change -> No signal increment
+            assert_eq!(node.signal_counter(), signal_before);
+        }
+
+        #[tokio::test]
+        async fn reconcile_log_rejects_non_contiguous_append() {
+            let mut node = setup_node();
+            // Log empty (index 0). Leader sends entries for 2 and 3.
+            let entry2 = LogEntry::new(LogIndex::new(2), Term::new(1), vec![]);
+            let entry3 = LogEntry::new(LogIndex::new(3), Term::new(1), vec![]);
+
+            let result = node
+                .reconcile_log(
+                    LogIndex::new(1),
+                    Term::new(1),
+                    vec![entry2, entry3],
+                    LogIndex::ZERO,
+                )
+                .await;
+
+            assert!(!result.success);
+            assert_eq!(node.last_log_index(), LogIndex::ZERO);
+        }
+
+        #[test]
+        fn grant_vote_respects_voting_state() {
+            let mut node = setup_node();
+            node.set_term(Term::new(1));
+            node.vote_for(NodeId::new(3)); // Already voted for someone else
+
+            let granted =
+                node.attempt_grant_vote(NodeId::new(2), Term::new(1), LogIndex::ZERO, Term::ZERO);
+            assert!(!granted);
+
+            // Can still grant to the SAME candidate
+            let granted =
+                node.attempt_grant_vote(NodeId::new(3), Term::new(1), LogIndex::ZERO, Term::ZERO);
+            assert!(granted);
         }
     }
 
-    mod reconcile_log {
+    mod up_to_date_rule {
         use super::*;
-        #[tokio::test]
-        async fn truncates_and_appends_on_conflict() {
-            let id = mock_identity();
+
+        fn setup_node_with_log(last_idx: u64, last_term: u64) -> RaftNode<Follower> {
             let fsm = Arc::new(MockFsm::default());
-            let mut node = RaftNode::<Follower>::new(id, fsm);
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            for i in 1..last_idx {
+                node.log_mut()
+                    .push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
+            }
+            if last_idx > 0 {
+                node.log_mut().push(LogEntry::new(
+                    LogIndex::new(last_idx),
+                    Term::new(last_term),
+                    vec![],
+                ));
+            }
+            node
+        }
+
+        #[test]
+        fn rejects_stale_last_term() {
+            let node = setup_node_with_log(5, 2);
+            // Candidate has Term 1, Node has Term 2
+            assert!(!node.is_log_up_to_date(Term::new(1), LogIndex::new(10)));
+        }
+
+        #[test]
+        fn accepts_higher_last_term() {
+            let node = setup_node_with_log(5, 2);
+            // Candidate has Term 3, Node has Term 2
+            assert!(node.is_log_up_to_date(Term::new(3), LogIndex::new(1)));
+        }
+
+        #[test]
+        fn handles_equal_terms_with_index_check() {
+            let node = setup_node_with_log(5, 2);
+            // Same Term (2), but Candidate index 4 < Node index 5
+            assert!(!node.is_log_up_to_date(Term::new(2), LogIndex::new(4)));
+            // Same Term (2), Candidate index 5 == Node index 5
+            assert!(node.is_log_up_to_date(Term::new(2), LogIndex::new(5)));
+            // Same Term (2), Candidate index 6 > Node index 5
+            assert!(node.is_log_up_to_date(Term::new(2), LogIndex::new(6)));
+        }
+    }
+
+    mod heartbeat_invariants {
+        use futures::FutureExt;
+
+        use super::*;
+
+        #[test]
+        fn reset_heartbeat_updates_timer_and_notifies() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            let initial_time = node.state().last_heartbeat();
+            let notify = node.state().heartbeat_signal().clone();
+
+            // Small sleep to ensure Instant changes
+            std::thread::sleep(std::time::Duration::from_millis(1));
+
+            node.state_mut().reset_heartbeat();
+
+            assert!(node.state().last_heartbeat() > initial_time);
+            // In a real test we'd check notification, but it's internal to Notify.
+            // We can check it doesn't block.
+            assert!(notify.notified().now_or_never().is_some());
+        }
+    }
+
+    mod transitions {
+        use super::*;
+
+        #[test]
+        fn candidate_transition_preserves_invariants() {
+            let fsm = Arc::new(MockFsm::default());
+            let node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+
+            let candidate = node.into_candidate();
+
+            assert_eq!(candidate.current_term(), Term::new(1));
+            assert_eq!(candidate.voted_for(), Some(NodeId::new(1)));
+            assert_eq!(candidate.state().vote_count(), 1);
+        }
+
+        #[test]
+        fn leader_transition_initializes_indices_correctly() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
             node.log_mut()
                 .push(LogEntry::new(LogIndex::new(1), Term::new(1), vec![]));
-            let entries = vec![LogEntry::new(LogIndex::new(2), Term::new(2), vec![])];
-            let (success, _) = node
-                .reconcile_log(LogIndex::new(1), Term::new(1), entries, LogIndex::ZERO)
-                .await;
-            assert!(success);
-            assert_eq!(node.get_term_at(LogIndex::new(2)), Term::new(2));
+
+            let peer_id = NodeId::new(2);
+            let leader = node.into_candidate().into_leader(vec![peer_id]);
+
+            // Raft §5.3: initialize nextIndex to leader last log index + 1
+            let next_idx = leader.state().next_index().get(&peer_id).unwrap();
+            assert_eq!(next_idx.value(), 2);
+
+            // Raft §5.3: initialize matchIndex to 0
+            let match_idx = leader.state().match_index().get(&peer_id).unwrap();
+            assert_eq!(match_idx.value(), 0);
+        }
+
+        #[test]
+        fn demotion_resets_voting_state_on_new_term() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            node.set_term(Term::new(1));
+            node.vote_for(NodeId::new(1));
+
+            let demoted = node.into_follower(Term::new(2), None);
+
+            assert_eq!(demoted.current_term(), Term::new(2));
+            assert_eq!(demoted.voted_for(), None);
+        }
+
+        #[test]
+        fn demotion_preserves_vote_on_same_term() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm);
+            node.set_term(Term::new(1));
+            node.vote_for(NodeId::new(3));
+
+            let demoted = node.into_follower(Term::new(1), None);
+            assert_eq!(demoted.voted_for(), Some(NodeId::new(3)));
+        }
+
+        #[test]
+        fn into_restarted_candidate_increments_term_and_signal() {
+            let fsm = Arc::new(MockFsm::default());
+            let node = RaftNode::<Follower>::new(NodeId::new(1), fsm).into_candidate(); // Term 1
+
+            let signal_before = node.signal_counter();
+            let restarted = node.into_restarted_candidate(); // Term 2
+
+            assert_eq!(restarted.current_term(), Term::new(2));
+            assert_eq!(restarted.voted_for(), Some(NodeId::new(1)));
+            assert!(restarted.signal_counter() > signal_before);
+        }
+    }
+
+    mod leader_ops {
+        use super::*;
+
+        #[test]
+        fn propose_increases_epoch() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut node = RaftNode::<Follower>::new(NodeId::new(1), fsm)
+                .into_candidate()
+                .into_leader(vec![]);
+
+            let initial_signal = node.signal_counter();
+            node.propose(vec![1]);
+
+            assert!(node.signal_counter() > initial_signal);
+            assert_eq!(node.last_log_index(), LogIndex::new(1));
         }
     }
 }

@@ -4,61 +4,59 @@ use async_trait::async_trait;
 use common::raft_api::ConsensusStatus;
 use common::raft_api::RaftHandle;
 use common::types::LogIndex;
-use tokio::sync::RwLock;
+use common::types::NodeId;
 use tonic::Status;
 
-use crate::node::RaftError;
-use crate::node::RaftNodeState;
+use crate::engine::ConsensusError;
+use crate::engine::LogicalNode;
 use crate::peer::PeerManager;
+use crate::state::ConsensusShell;
 
 #[derive(Debug)]
 pub struct LocalRaftHandle {
-    state: Arc<RwLock<RaftNodeState>>,
+    state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 }
 
 impl LocalRaftHandle {
-    pub fn new(state: Arc<RwLock<RaftNodeState>>, peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(state: Arc<ConsensusShell>, peer_manager: Arc<PeerManager>) -> Self {
         Self {
             state,
             peer_manager,
         }
     }
 
-    fn redirection_hint_inner(&self, node_state: &RaftNodeState) -> (String, String) {
+    /// Determines the leader address and status message based on the current
+    /// role.
+    fn calculate_redirection(&self, node_state: &LogicalNode) -> (String, String) {
         match node_state {
-            RaftNodeState::Follower(node) => {
-                let leader_id = node.state().leader_id();
-                match leader_id {
-                    Some(id) => match self.peer_manager.get_address(id) {
-                        Ok(addr) => (
-                            addr,
-                            format!(
-                                "Node is a Follower. Please retry with the Leader at NodeID {}.",
-                                id
-                            ),
-                        ),
-                        Err(_) => (
-                            String::new(),
-                            format!(
-                                "Node is a Follower of NodeID {}, but its network address is \
-                                 missing.",
-                                id
-                            ),
-                        ),
-                    },
-                    None => (
-                        String::new(),
-                        "Node is a Follower, but the current leader is unknown.".to_string(),
-                    ),
-                }
-            }
-            RaftNodeState::Candidate(_) => (
+            LogicalNode::Follower(node) => self.follower_redirection(node.state().leader_id()),
+            LogicalNode::Candidate(_) => (
                 String::new(),
                 "Election in progress. No leader established.".to_string(),
             ),
-            RaftNodeState::Leader(_) => (String::new(), String::new()),
-            RaftNodeState::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
+            LogicalNode::Leader(_) => (String::new(), String::new()),
+            LogicalNode::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
+        }
+    }
+
+    /// Helper to resolve the leader's network address for a follower.
+    fn follower_redirection(&self, leader_id: Option<NodeId>) -> (String, String) {
+        match leader_id {
+            Some(id) => match self.peer_manager.get_address(id) {
+                Ok(addr) => (
+                    addr,
+                    format!("Node is a Follower. Retry with Leader at NodeID {}.", id),
+                ),
+                Err(_) => (
+                    String::new(),
+                    format!("Follower of {}, but address is missing.", id),
+                ),
+            },
+            None => (
+                String::new(),
+                "Node is a Follower; leader is unknown.".to_string(),
+            ),
         }
     }
 }
@@ -69,26 +67,19 @@ impl RaftHandle for LocalRaftHandle {
         let mut guard = self.state.write().await;
         match guard.propose(data) {
             Ok(idx) => Ok(idx),
-            Err(RaftError::NotLeader) => Err(Status::failed_precondition("Not the leader")),
-            Err(RaftError::Poisoned) => Err(Status::internal("Node poisoned")),
+            Err(ConsensusError::NotLeader) => Err(Status::failed_precondition("Not the leader")),
         }
     }
 
     async fn await_commit(&self, index: LogIndex) -> Result<(), Status> {
-        let mut progress_rx = {
-            let guard = self.state.read().await;
-            guard
-                .progress_tx()
-                .map_err(|_| Status::internal("Node poisoned"))?
-                .subscribe()
-        };
+        let mut progress_rx = self.state.subscribe();
 
         loop {
             // Check condition first (prevents missing updates before subscription)
             {
                 let guard = self.state.read().await;
                 match &*guard {
-                    RaftNodeState::Leader(node) => {
+                    LogicalNode::Leader(node) => {
                         if node.commit_index() >= index {
                             return Ok(());
                         }
@@ -110,8 +101,8 @@ impl RaftHandle for LocalRaftHandle {
 
     async fn consensus_status(&self) -> ConsensusStatus {
         let guard = self.state.read().await;
-        let is_leader = matches!(&*guard, RaftNodeState::Leader(_));
-        let (leader_hint, rejection_reason) = self.redirection_hint_inner(&*guard);
+        let is_leader = matches!(&*guard, LogicalNode::Leader(_));
+        let (leader_hint, rejection_reason) = self.calculate_redirection(&*guard);
 
         ConsensusStatus {
             is_leader,
@@ -129,8 +120,9 @@ mod tests {
     use common::types::Term;
 
     use super::*;
+    use crate::engine::Follower;
+    use crate::engine::LogicalNode;
     use crate::fsm::StateMachine;
-    use crate::node::Follower;
     use crate::node::RaftNode;
 
     #[derive(Debug, Default)]
@@ -149,11 +141,11 @@ mod tests {
         ))
     }
 
-    fn setup() -> (LocalRaftHandle, Arc<RwLock<RaftNodeState>>) {
+    fn setup() -> (LocalRaftHandle, Arc<ConsensusShell>) {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
-        let node = RaftNodeState::Follower(RaftNode::<Follower>::new(id.clone(), fsm));
-        let state = Arc::new(RwLock::new(node));
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm));
+        let state = Arc::new(ConsensusShell::new(node));
         let peer_manager =
             Arc::new(PeerManager::new(id, &std::collections::HashMap::new()).unwrap());
         (LocalRaftHandle::new(state.clone(), peer_manager), state)
@@ -178,8 +170,8 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => {
-                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    LogicalNode::Follower(n) => {
+                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
                     }
                     _ => panic!("Expected follower"),
                 });
@@ -210,8 +202,8 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => {
-                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    LogicalNode::Follower(n) => {
+                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
                     }
                     _ => panic!("Expected follower"),
                 });
@@ -234,8 +226,8 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => {
-                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    LogicalNode::Follower(n) => {
+                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
                     }
                     _ => panic!("Expected follower"),
                 });
@@ -248,7 +240,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
-                if let RaftNodeState::Leader(node) = &mut *guard {
+                if let LogicalNode::Leader(node) = &mut *guard {
                     node.set_commit_index(index).await;
                 }
             });
@@ -263,8 +255,8 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 guard.transition(|old| match old {
-                    RaftNodeState::Follower(n) => {
-                        RaftNodeState::Leader(n.into_candidate().into_leader(vec![]))
+                    LogicalNode::Follower(n) => {
+                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
                     }
                     _ => panic!("Expected follower"),
                 });
