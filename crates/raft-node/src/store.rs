@@ -46,25 +46,31 @@ impl StateMachine for LactoStore {
         let mut inventory = self.inventory.write().await;
 
         if mutation.is_delete {
-            info!("FSM[{}]: Deleting item '{}'", index, mutation.item_key);
-            inventory.remove(&mutation.item_key);
+            info!(
+                "FSM[{}]: Deleting item '{}'",
+                index, mutation.resolved_item_key
+            );
+            inventory.remove(&mutation.resolved_item_key);
         } else {
             info!(
                 "FSM[{}]: Upserting item '{}' (qty: {}, unit: {})",
-                index, mutation.item_key, mutation.updated_quantity, mutation.updated_unit
+                index,
+                mutation.resolved_item_key,
+                mutation.updated_base_quantity,
+                mutation.base_unit
             );
 
             let item = GroceryItem {
-                item_key: mutation.item_key.clone(),
-                quantity: mutation.updated_quantity,
-                unit: mutation.updated_unit,
+                item_key: mutation.resolved_item_key.clone(),
+                quantity: mutation.updated_base_quantity,
+                unit: mutation.base_unit,
                 category: mutation.updated_category,
                 last_modifier_id: mutation.client_id,
                 last_activity: mutation.event_time,
                 state_version: index.value(),
             };
 
-            inventory.insert(mutation.item_key, item);
+            inventory.insert(mutation.resolved_item_key, item);
         }
 
         Ok(())

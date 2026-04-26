@@ -35,19 +35,27 @@ message MutationIntent {
 // --- Internal Ledger Entry (Replicated via Raft) ---
 
 message CommittedMutation {
-    // 1. Session Layer (ADR 006)
-    string client_id = 1;
-    uint64 sequence_id = 2;
+    // 1. Identity Layer (ADR 005)
+    string resolved_item_key = 1;
+    string suggested_display_name = 2;
 
-    // 2. State Layer (Flattened Upsert)
-    string item_key = 3;
-    string updated_quantity = 4;
-    string updated_category = 5;
-    string updated_unit = 6;
-    bool is_delete = 7;
+    // 2. State Layer (Absolute Result in SI Units)
+    string updated_base_quantity = 3;
+    string base_unit = 4;
+    string display_unit = 5;
+    string updated_category = 6;
 
-    // 3. Metadata Layer
-    google.protobuf.Timestamp event_time = 8;
+    // 3. Session Layer (ADR 006)
+    string client_id = 7;
+    uint64 sequence_id = 8;
+
+    // 4. Audit Layer
+    string raw_user_input = 9;
+    string moral_justification = 10;
+    google.protobuf.Timestamp event_time = 11;
+
+    // 5. Control Layer
+    bool is_delete = 12;
 }
 
 // --- Ingress Service (Client-to-Leader) ---
@@ -114,4 +122,12 @@ message EvaluateProposalResponse {
     bool is_approved = 1;
     string category_assignment = 2;
     string moral_justification = 3;
+
+    // Semantic metadata resolved by the Oracle
+    string resolved_item_key = 4;
+    string suggested_display_name = 5;
+    string resolved_unit = 6;
+
+    // Stabilization data (Decimal string)
+    string conversion_multiplier_to_base = 7;
 }

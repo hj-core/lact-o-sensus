@@ -37,21 +37,22 @@ impl PolicyService for MockPolicyService {
         request: Request<EvaluateProposalRequest>,
     ) -> Result<Response<EvaluateProposalResponse>, Status> {
         let req = request.into_inner();
+        let intent = req.intent.clone().unwrap_or_default();
         info!(
             "Evaluating proposal from client={} for item='{}'",
-            req.client_id,
-            req.intent
-                .as_ref()
-                .map(|i| i.item_key.as_str())
-                .unwrap_or("unknown")
+            req.client_id, intent.item_key
         );
 
         // Deterministic Mock Approval
         Ok(Response::new(EvaluateProposalResponse {
             is_approved: true,
             category_assignment: "Anomalous Inputs".to_string(), // Default mock category
-            moral_justification: "Mock approval for Phase 4 infrastructure verification."
+            moral_justification: "Mock approval for Phase 5 semantic resolution verification."
                 .to_string(),
+            resolved_item_key: intent.item_key,
+            suggested_display_name: "Mock Item".to_string(),
+            resolved_unit: "g".to_string(),
+            conversion_multiplier_to_base: "1.0".to_string(),
         }))
     }
 }

@@ -234,10 +234,14 @@ impl IngressDispatcher {
         let mutation = CommittedMutation::new(
             client_id,
             sequence_id,
-            intent.item_key.clone(),
-            intent.quantity.clone(),
-            veto.category_assignment,
-            intent.unit.unwrap_or_default(),
+            intent.item_key.clone(),       // resolved_item_key (stub)
+            "PENDING_PHASE_8".to_string(), // suggested_display_name
+            intent.quantity.clone(),       // updated_base_quantity (stub)
+            intent.unit.clone().unwrap_or_default(), // base_unit (stub)
+            intent.unit.clone().unwrap_or_default(), // display_unit (stub)
+            intent.category.clone().unwrap_or_default(), // updated_category (stub)
+            format!("intent: {:?}", intent), // raw_user_input
+            "Automatic approval (Step 7 stub)".to_string(), // moral_justification
             intent.operation == OperationType::Delete as i32,
             std::time::SystemTime::now(),
         );
@@ -390,8 +394,8 @@ mod tests {
             let proposals = raft.proposals.lock().unwrap();
             assert_eq!(proposals.len(), 1);
             let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
-            assert_eq!(mutation.item_key, "bananas");
-            assert_eq!(mutation.updated_quantity, "5");
+            assert_eq!(mutation.resolved_item_key, "bananas");
+            assert_eq!(mutation.updated_base_quantity, "5");
         }
 
         #[tokio::test]
