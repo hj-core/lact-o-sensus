@@ -57,17 +57,17 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **Identity Protocol Upgrade:** Update Protobuf and gRPC interceptors to enforce the `target_node_id` invariant, preventing logical misrouting and identity collisions (ADR 004/005).
 - **Success Metric:** Cluster rejects misconfigured identity traffic via centralized middleware and client provides high-availability guarantees through durable WALs and stabilized retry backoff.
 
-## 🧠 Phase 5: The Semantic Oracle (Resolution & Defense)
+## 🧠 Phase 5: The AI Moral Advocate (Semantic Oracle)
 
-- **Goal:** Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution.
+- **Goal:** Implement the 5-Layer Defensive Onion (ADR 007) and transition from mock logic to a relational AI evaluation engine.
 - **Key Actions:**
-  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (Physical, Logical, Execution) to strictly isolate protocol logic and enforce the **"Poison-then-Panic"** Halt Mandate (ADR 009).
-  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs, units, and display names (ADR 005).
-  - **Unit Registry:** Implement the **Universal Unit Registry** (ADR 008) with the **Dual-Track Unit Model** (Base SI + Display Unit) and Banker's Rounding.
-  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence) in the `raft-node`.
-  - **MutationLock:** Implement **Leader-Local MutationLock** to serialize AI evaluations across the 5s egress window (ADR 007).
+  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (ADR 009).
+  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005).
+  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence).
+  - **Real AI Integration:** Integrate OpenAI API or local Llama via `ollama-rs` into `crates/ai-veto`.
+  - **Moral Heuristics:** Develop the "Moral Advocate" persona (e.g., rejecting sweets based on existing inventory context).
   - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures.
-- **Success Metric:** Messy user input (e.g., "OJ") is correctly resolved to canonical ledger facts (e.g., `orange_juice`).
+- **Success Metric:** Messy user input is correctly resolved and vetoed by the LLM based on context-aware moral judgement.
 
 ## 🛡️ Phase 6: Precision & Persistence (SI & Session EOS)
 

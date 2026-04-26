@@ -1,8 +1,8 @@
-# Phase 5 Task List: The Semantic Oracle (Resolution & Defense)
+# Phase 5 Task List: The AI Moral Advocate (Semantic Oracle)
 
 ## 🎯 Goal
 
-Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while completely decoupling the generic Raft consensus engine from the Lact-O-Sensus grocery application logic.
+Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while completely decoupling the generic Raft consensus engine from the Lact-O-Sensus grocery application logic, culminating in a real relational AI evaluation engine.
 
 ---
 
@@ -87,17 +87,17 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] Unit test in `engine.rs` verifying that a node transitioned to `Poisoned` panics on any subsequent access.
   - [x] Integration test verifying that a task panic does not leave a "Zombie Node" accessible to other tasks.
 
-### Step 7: The Semantic Contract (Protobuf v2) [ ]
+### Step 7: The Semantic Contract (Protobuf v2) [x]
 
 **Commit:** `feat(common): update app.proto for resolved semantic data`
 
 - **Description:** Update the application contract to support the rich ledger entries required by ADR 005/007.
 - **Changes:**
-  - [ ] Update `app.proto` to include `CommittedMutation` with resolved slugs, SI units, and AI rationale.
-  - [ ] Update `crates/common/src/proto.rs` factory methods to support the new schema.
+  - [x] Update `app.proto` to include `CommittedMutation` with resolved slugs, SI units, and AI rationale.
+  - [x] Update `crates/common/src/proto.rs` factory methods to support the new schema.
 - **Acceptance Tests (TDD):**
-  - [ ] `cargo check` passes.
-  - [ ] Unit tests for `CommittedMutation` serialization/deserialization.
+  - [x] `cargo check` passes.
+  - [x] Unit tests for `CommittedMutation` serialization/deserialization.
 
 ### Step 8: The 5-Layer Defensive Pipeline (ADR 007) [ ]
 
@@ -113,14 +113,26 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [ ] Unit tests in `gateway` verifying malformed input rejection.
   - [ ] Unit tests verifying that unauthorized AI metadata triggers a Veto.
 
-### Step 9: The Semantic Oracle (Mock Integration & Robustness) [ ]
+### Step 9: The Semantic Oracle (Robustness & Retry) [ ]
 
-**Commit:** `feat(ai-veto): implement robust mock resolution and internal retries`
+**Commit:** `feat(raft): implement leader-side retry logic for AI resolution`
 
-- **Description:** Update the mock AI node and implement leader-side retry logic for resolution failures.
+- **Description:** Implement leader-side retry logic for resolution failures and harden the defensive wall.
 - **Changes:**
-  - [ ] Update `crates/ai-veto/src/main.rs` to return compliant semantic and taxonomic data.
   - [ ] Implement **Leader-Internal Retries** (Best-Effort) in the `VetoRelay` (Layer 3).
 - **Acceptance Tests (TDD):**
-  - [ ] `smoke_test.py` passes full integration: Client -> Gateway -> Mock AI -> Raft -> `LactoStore`.
   - [ ] Integration test verifying that a transient AI failure triggers exactly one retry before a Veto.
+
+### Step 10: The Moral Advocate (Real AI Integration) [ ]
+
+**Commit:** `feat(ai-veto): integrate LLM engine and moral heuristics`
+
+- **Description:** Replace the mock resolution logic with a real relational evaluation engine using a Large Language Model (LLM).
+- **Changes:**
+  - [ ] Integrate OpenAI API or local Llama via `ollama-rs`.
+  - [ ] Implement the prompt engineering required for the **Moral Advocate** persona.
+  - [ ] Implement context-aware evaluation (passing `current_inventory` to the LLM for relational judgement).
+  - [ ] Verify: The LLM correctly resolves "OJ" to `orange_juice` and rejects items based on health/moral heuristics.
+- **Acceptance Tests (TDD):**
+  - [ ] Integration tests in `crates/ai-veto` verifying specific resolution scenarios.
+  - [ ] `smoke_test.py` passes using a live (or local) AI engine.
