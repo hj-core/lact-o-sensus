@@ -25,6 +25,12 @@ pub struct VetoOutcome {
     pub is_approved: bool,
     pub category_assignment: String,
     pub moral_justification: String,
+    // --- Semantic metadata resolved by the Oracle ---
+    pub resolved_item_key: String,
+    pub suggested_display_name: String,
+    pub resolved_unit: String,
+    /// Stabilization data (Decimal string)
+    pub conversion_multiplier_to_base: String,
 }
 
 /// Internal bridge for communicating with the AI Veto Node.
@@ -93,6 +99,10 @@ impl VetoRelay for GrpcVetoRelay {
             is_approved: response.is_approved,
             category_assignment: response.category_assignment,
             moral_justification: response.moral_justification,
+            resolved_item_key: response.resolved_item_key,
+            suggested_display_name: response.suggested_display_name,
+            resolved_unit: response.resolved_unit,
+            conversion_multiplier_to_base: response.conversion_multiplier_to_base,
         })
     }
 }

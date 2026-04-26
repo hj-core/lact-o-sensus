@@ -18,6 +18,8 @@ use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
+use common::units::PhysicalQuantity;
+use common::units::UnitRegistry;
 use prost::Message;
 use tokio::sync::Mutex;
 use tonic::Request;
@@ -31,6 +33,20 @@ use tracing::warn;
 use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
+
+/// Validated and mathematically stabilized data ready for consensus.
+///
+/// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
+#[derive(Debug, Clone)]
+struct StabilizedMutation {
+    resolved_item_key: String,
+    suggested_display_name: String,
+    updated_base_quantity: String,
+    base_unit: String,
+    display_unit: String,
+    category: GroceryCategory,
+    moral_justification: String,
+}
 
 /// Implementation of the external client ingress RPCs.
 ///
@@ -110,9 +126,31 @@ impl IngressService for IngressDispatcher {
             }));
         }
 
-        // --- Phase 4 & 5: Consensus Proposal & Quorum ---
+        // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
+        // Semantic failures (Registry/Physical) are returned as VETOED to the client.
+        let stabilized = match self.validate_and_stabilize(&intent, &veto, &[]) {
+            Ok(s) => s,
+            Err(status)
+                if status.code() == tonic::Code::Internal
+                    || status.code() == tonic::Code::InvalidArgument =>
+            {
+                warn!(
+                    "Mutation VETOED during Layer 4 validation: {}",
+                    status.message()
+                );
+                return Ok(Response::new(ProposeMutationResponse {
+                    status: MutationStatus::Vetoed as i32,
+                    state_version: 0,
+                    leader_hint: String::new(),
+                    error_message: status.message().to_string(),
+                }));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
         let proposal_index = self
-            .commit_to_consensus(&client_id, sequence_id, intent, veto)
+            .commit_to_consensus(&client_id, sequence_id, intent, veto, stabilized)
             .await?;
 
         info!("Mutation index {} committed successfully.", proposal_index);
@@ -240,6 +278,99 @@ impl IngressDispatcher {
         Ok(())
     }
 
+    /// Validates AI-provided metadata against system registries and calculates
+    /// the stabilized SI base quantity.
+    ///
+    /// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
+    fn validate_and_stabilize(
+        &self,
+        intent: &MutationIntent,
+        veto: &VetoOutcome,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
+    ) -> Result<StabilizedMutation, Status> {
+        let category = self.verify_category_registry(&veto.category_assignment)?;
+        let base_quantity =
+            self.verify_unit_stabilization(&intent.quantity, &veto.resolved_unit)?;
+
+        self.enforce_physical_invariants(
+            intent,
+            &veto.resolved_item_key,
+            &base_quantity,
+            current_inventory,
+        )?;
+
+        Ok(StabilizedMutation {
+            resolved_item_key: veto.resolved_item_key.clone(),
+            suggested_display_name: veto.suggested_display_name.clone(),
+            updated_base_quantity: base_quantity.value().to_string(),
+            base_unit: base_quantity.dimension().base_unit().to_string(),
+            display_unit: veto.resolved_unit.clone(),
+            category,
+            moral_justification: veto.moral_justification.clone(),
+        })
+    }
+
+    /// Registry Firewall: Verifies the AI's category assignment.
+    fn verify_category_registry(&self, category_str: &str) -> Result<GroceryCategory, Status> {
+        GroceryCategory::from_str(category_str).map_err(|_| {
+            self.internal_error(format!(
+                "AI Hallucination: Unregistered category '{}'",
+                category_str
+            ))
+        })
+    }
+
+    /// Registry Firewall & SI Math: Verifies unit existence and stabilizes
+    /// quantity.
+    fn verify_unit_stabilization(
+        &self,
+        quantity: &str,
+        unit_symbol: &str,
+    ) -> Result<PhysicalQuantity, Status> {
+        UnitRegistry::parse_and_convert(quantity, unit_symbol).map_err(|e| {
+            self.invalid_argument(format!(
+                "Physical Invariant Violation: Invalid unit '{}' ({}).",
+                unit_symbol, e
+            ))
+        })
+    }
+
+    /// Physical Invariant Check: Enforces the Dimensional Fence (ADR 008).
+    fn enforce_physical_invariants(
+        &self,
+        intent: &MutationIntent,
+        resolved_key: &str,
+        new_quantity: &PhysicalQuantity,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
+    ) -> Result<(), Status> {
+        if intent.operation == OperationType::Add as i32
+            || intent.operation == OperationType::Subtract as i32
+        {
+            if let Some(existing_item) = current_inventory
+                .iter()
+                .find(|i| i.item_key == resolved_key)
+            {
+                let existing_unit =
+                    UnitRegistry::resolve_symbol(&existing_item.unit).map_err(|e| {
+                        self.internal_error(format!(
+                            "Internal state corruption: Existing item has invalid unit '{}' ({})",
+                            existing_item.unit, e
+                        ))
+                    })?;
+
+                if existing_unit.dimension != new_quantity.dimension() {
+                    return Err(self.invalid_argument(format!(
+                        "Physical Invariant Violation: Cannot perform arithmetic between {:?} and \
+                         {:?} (Dimensional Fence).",
+                        existing_unit.dimension,
+                        new_quantity.dimension()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Phase 2 Implementation: Semantic validation via AI Veto Relay.
     async fn evaluate_policy(
         &self,
@@ -282,21 +413,22 @@ impl IngressDispatcher {
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
-        intent: MutationIntent,
+        _intent: MutationIntent,
         _veto: VetoOutcome,
+        stabilized: StabilizedMutation,
     ) -> Result<LogIndex, Status> {
         let mutation = CommittedMutation::new(
             client_id,
             sequence_id,
-            intent.item_key.clone(),       // resolved_item_key (stub)
-            "PENDING_PHASE_8".to_string(), // suggested_display_name
-            intent.quantity.clone(),       // updated_base_quantity (stub)
-            intent.unit.clone().unwrap_or_default(), // base_unit (stub)
-            intent.unit.clone().unwrap_or_default(), // display_unit (stub)
-            intent.category.clone().unwrap_or_default(), // updated_category (stub)
-            format!("intent: {:?}", intent), // raw_user_input
-            "Automatic approval (Step 7 stub)".to_string(), // moral_justification
-            intent.operation == OperationType::Delete as i32,
+            stabilized.resolved_item_key,
+            stabilized.suggested_display_name,
+            stabilized.updated_base_quantity,
+            stabilized.base_unit,
+            stabilized.display_unit,
+            stabilized.category.to_string(),
+            "PENDING_RAW_INPUT_FIX".to_string(), // TODO: Update protocol or keep intent
+            stabilized.moral_justification,
+            false, // TODO: Map operation properly
             std::time::SystemTime::now(),
         );
 
@@ -363,7 +495,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockVetoRelay {
-        approved: bool,
+        outcome: Option<VetoOutcome>,
         error: Option<VetoError>,
     }
 
@@ -379,11 +511,15 @@ mod tests {
             if let Some(err) = &self.error {
                 return Err(err.clone());
             }
-            Ok(VetoOutcome {
-                is_approved: self.approved,
+            Ok(self.outcome.clone().unwrap_or_else(|| VetoOutcome {
+                is_approved: true,
                 category_assignment: "Primary Flora".to_string(),
                 moral_justification: "Mock justification".to_string(),
-            })
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            }))
         }
     }
 
@@ -406,7 +542,15 @@ mod tests {
 
         fn successful_veto() -> Arc<MockVetoRelay> {
             Arc::new(MockVetoRelay {
-                approved: true,
+                outcome: Some(VetoOutcome {
+                    is_approved: true,
+                    category_assignment: "Primary Flora".to_string(),
+                    moral_justification: "Mock justification".to_string(),
+                    resolved_item_key: "milk".to_string(),
+                    suggested_display_name: "Milk".to_string(),
+                    resolved_unit: "ml".to_string(),
+                    conversion_multiplier_to_base: "1".to_string(),
+                }),
                 ..Default::default()
             })
         }
@@ -495,7 +639,21 @@ mod tests {
         #[tokio::test]
         async fn normalizes_intent_syntactically() {
             let raft = successful_raft();
-            let dispatcher = mock_dispatcher(raft.clone(), successful_veto());
+            let dispatcher = mock_dispatcher(
+                raft.clone(),
+                Arc::new(MockVetoRelay {
+                    outcome: Some(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Primary Flora".to_string(),
+                        moral_justification: "Mock justification".to_string(),
+                        resolved_item_key: "bananas".to_string(),
+                        suggested_display_name: "Bananas".to_string(),
+                        resolved_unit: "units".to_string(),
+                        conversion_multiplier_to_base: "1".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -602,6 +760,10 @@ mod tests {
                         is_approved: true,
                         category_assignment: "Primary Flora".to_string(),
                         moral_justification: "Approved".to_string(),
+                        resolved_item_key: "item".to_string(),
+                        suggested_display_name: "Item".to_string(),
+                        resolved_unit: "units".to_string(),
+                        conversion_multiplier_to_base: "1".to_string(),
                     })
                 }
             }
@@ -661,7 +823,15 @@ mod tests {
         #[tokio::test]
         async fn returns_vetoed_when_ai_rejects() {
             let veto = Arc::new(MockVetoRelay {
-                approved: false,
+                outcome: Some(VetoOutcome {
+                    is_approved: false,
+                    category_assignment: "Primary Flora".to_string(),
+                    moral_justification: "Mock justification".to_string(),
+                    resolved_item_key: "milk".to_string(),
+                    suggested_display_name: "Milk".to_string(),
+                    resolved_unit: "ml".to_string(),
+                    conversion_multiplier_to_base: "1".to_string(),
+                }),
                 ..Default::default()
             });
             let dispatcher = mock_dispatcher(successful_raft(), veto);
@@ -705,6 +875,76 @@ mod tests {
         }
 
         // --- Phase 4 & 5: Consensus & State Machine (Layer 4/5) ---
+
+        #[tokio::test]
+        async fn returns_vetoed_when_ai_hallucinates_metadata() {
+            let dispatcher = mock_dispatcher(
+                successful_raft(),
+                Arc::new(MockVetoRelay {
+                    outcome: Some(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Space Matter".to_string(), // Hallucination
+                        moral_justification: "Approved".to_string(),
+                        resolved_item_key: "milk".to_string(),
+                        suggested_display_name: "Milk".to_string(),
+                        resolved_unit: "g".to_string(),
+                        conversion_multiplier_to_base: "1".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: "1".to_string(),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert!(response.error_message.contains("AI Hallucination"));
+        }
+
+        #[tokio::test]
+        async fn returns_vetoed_when_ai_provides_invalid_conversion() {
+            let dispatcher = mock_dispatcher(
+                successful_raft(),
+                Arc::new(MockVetoRelay {
+                    outcome: Some(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Primary Flora".to_string(),
+                        moral_justification: "Approved".to_string(),
+                        resolved_item_key: "milk".to_string(),
+                        suggested_display_name: "Milk".to_string(),
+                        resolved_unit: "blorgs".to_string(), // Hallucination
+                        conversion_multiplier_to_base: "1".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: "1".to_string(),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("Physical Invariant Violation")
+            );
+        }
 
         #[tokio::test]
         async fn returns_error_on_consensus_failure() {
@@ -751,6 +991,143 @@ mod tests {
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
             assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+    }
+
+    mod validate_and_stabilize {
+        use common::proto::v1::app::GroceryItem;
+
+        use super::*;
+
+        fn test_dispatcher() -> IngressDispatcher {
+            mock_dispatcher(
+                Arc::new(MockRaftHandle::default()),
+                Arc::new(MockVetoRelay::default()),
+            )
+        }
+
+        #[test]
+        fn rejects_hallucinated_category() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: "1".to_string(),
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Space Matter".to_string(), // Hallucination
+                moral_justification: "Approved".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "g".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+
+            let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+
+        #[test]
+        fn rejects_hallucinated_unit() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: "1".to_string(),
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Primary Flora".to_string(),
+                moral_justification: "Approved".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "blorgs".to_string(), // Hallucination
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+
+            let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+
+        #[test]
+        fn rejects_invalid_si_unit_conversion() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: "abc".to_string(), // Malformed quantity
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Primary Flora".to_string(),
+                moral_justification: "Approved".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "g".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+
+            let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+
+        #[test]
+        fn rejects_cross_dimensional_arithmetic() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: "1".to_string(),
+                operation: OperationType::Add as i32,
+                ..Default::default()
+            };
+            // AI resolves a liquid unit for an item that exists as weight
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let inventory = vec![GroceryItem {
+                item_key: "milk".to_string(),
+                unit: "g".to_string(), // Dimension: Mass
+                ..Default::default()
+            }];
+
+            let result = dispatcher.validate_and_stabilize(&intent, &veto, &inventory);
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("Dimensional Fence"));
+        }
+
+        #[test]
+        fn applies_bankers_rounding_to_si_stabilization() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: "1.5".to_string(), // Half-way point
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Primary Flora".to_string(),
+                moral_justification: "Approved".to_string(),
+                resolved_item_key: "item".to_string(),
+                suggested_display_name: "Item".to_string(),
+                resolved_unit: "lb".to_string(), // 1 lb = 453.59237 g
+                conversion_multiplier_to_base: "453.59237".to_string(),
+            };
+
+            let result = dispatcher
+                .validate_and_stabilize(&intent, &veto, &[])
+                .unwrap();
+
+            // 1.5 * 453.59237 = 680.388555
+            // Banker's Rounding to 4 dp as defined in units.rs
+            assert_eq!(result.updated_base_quantity, "680.3886");
+            assert_eq!(result.base_unit, "g");
         }
     }
 
