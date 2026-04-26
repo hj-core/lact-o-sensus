@@ -47,13 +47,15 @@
 ## 🛠️ Implementation & Workflow
 
 - **Design First:** Establish an implementation plan before modification. Plans must be arranged in manageable Git commits, each with designed and mandated acceptance tests.
-- **TDD Sequence:** Define tests to establish behavioral invariants immediately after signature definition.
+- **TDD Sequence (Atomic Protocol):** Strictly adhere to the three-step implementation sequence for any non-trivial function, utilizing BDD-style hierarchies (`mod tests { mod func_name { #[test] fn behavior_when_condition() } }`) to establish behavioral invariants:
+  1. **Syntax / Signature Alignment:** For new functions, define the signature with a placeholder (`todo!()` or mock). For existing functions, advance the signature/contract while retaining the legacy implementation as a temporary placeholder.
+  2. **Behavior (Invariants):** Define the behavioral invariants through tests that fail against the placeholder (either the explicit `todo!()` or the un-upgraded legacy logic).
+  3. **Implementation (Consolidation):** Implement or refactor the logic until all tests pass. Modification of tests during this phase is prohibited unless the signature itself must change.
 - **Information Hierarchy:** Major functions must act as high-level orchestrators, delegating implementation to specialized sub-functions. In the source file, the orchestrator appears first, followed by its sub-functions to ensure top-down readability.
-- **NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (`NodeId`, `ClusterId`, etc.).
-- **Test Rigor:** Use BDD-style hierarchies (`mod tests { mod func_name { #[test] fn behavior_when_condition() } }`).
-- **Time-Dilation Testability:** Prohibit hardcoded timing. Use dependency injection to allow test suites to set delays to zero for high-speed failure-path verification.
 - **Verification & VCS Discipline:** VCS discipline is a protocol invariant. Post-change, verify via `cargo +nightly fmt`, `cargo test`, and `smoke_test.py`. Upon satisfying the acceptance tests for a planned commit, it must be committed before starting the next sub-task.
 - **Commits:** Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) (e.g., `feat(raft): implement leader election`). Amending history for atomic commits is encouraged ONLY for commits not yet pushed to the remote origin.
+- **NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (`NodeId`, `ClusterId`, etc.).
+- **Time-Dilation Testability:** Prohibit hardcoded timing. Use dependency injection to allow test suites to set delays to zero for high-speed failure-path verification.
 - **Reactive Concurrency:** Prefer `tokio::select!` and `tokio::sync::Notify` over polling loops.
 
 ## ❌ Prohibitions
