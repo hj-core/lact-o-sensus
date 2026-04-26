@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use tonic::Status;
 
+use crate::types::ClientId;
 use crate::types::LogIndex;
+use crate::types::SequenceId;
 
 /// Snapshot of the current consensus state relative to this node.
 #[derive(Debug, Clone, Default)]
@@ -32,4 +34,15 @@ pub trait RaftHandle: Send + Sync + std::fmt::Debug {
     /// This is preferred over individual checks to ensure atomicity in
     /// response generation.
     async fn consensus_status(&self) -> ConsensusStatus;
+
+    /// Checks the session cache for deduplication (EOS).
+    ///
+    /// If the sequence ID has already been committed for this client,
+    /// returns the LogIndex of the original mutation to allow the Gateway
+    /// to return a cached success response without re-processing.
+    async fn check_session(
+        &self,
+        client_id: &ClientId,
+        sequence_id: SequenceId,
+    ) -> Result<Option<LogIndex>, Status>;
 }

@@ -287,9 +287,17 @@ impl LactoClient {
                         return Ok(res);
                     }
                 },
-                Err(_) => {
-                    self.reconcile_routing_failure(None, retry_count).await?;
-                    continue;
+                Err(status) => {
+                    // ADR 007: Terminal errors should not be retried.
+                    match status.code() {
+                        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+                            anyhow::bail!("Mutation rejected by Leader: {}", status.message());
+                        }
+                        _ => {
+                            self.reconcile_routing_failure(None, retry_count).await?;
+                            continue;
+                        }
+                    }
                 }
             }
         }

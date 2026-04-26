@@ -3,8 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use common::raft_api::ConsensusStatus;
 use common::raft_api::RaftHandle;
+use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::SequenceId;
 use tonic::Status;
 
 use crate::engine::ConsensusError;
@@ -109,6 +111,15 @@ impl RaftHandle for LocalRaftHandle {
             leader_hint,
             rejection_reason,
         }
+    }
+
+    async fn check_session(
+        &self,
+        _client_id: &ClientId,
+        _sequence_id: SequenceId,
+    ) -> Result<Option<LogIndex>, Status> {
+        // TODO: Phase 9/10 - Wire to LactoStore Session Table (sled)
+        Ok(None)
     }
 }
 

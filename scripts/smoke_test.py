@@ -278,8 +278,10 @@ def check_connectivity(
         "crates/common/proto",
         "-proto",
         "raft.proto",
-        "-H", f"x-cluster-id: {cluster_id}",
-        "-H", f"x-target-node-id: {target_node_id}",
+        "-H",
+        f"x-cluster-id: {cluster_id}",
+        "-H",
+        f"x-target-node-id: {target_node_id}",
         "-d",
         json.dumps(
             {
@@ -296,7 +298,10 @@ def check_connectivity(
     if cluster_id == "lacto-dev-01":
         return result.returncode == 0
     else:
-        return "Cluster identity mismatch" in result.stderr or "Unauthenticated" in result.stderr
+        return (
+            "Cluster identity mismatch" in result.stderr
+            or "Unauthenticated" in result.stderr
+        )
 
 
 # --- Test Cases ---
@@ -386,8 +391,10 @@ def test_ai_veto_egress() -> None:
         "crates/common/proto",
         "-proto",
         "app.proto",
-        "-H", f"x-cluster-id: lacto-dev-01",
-        "-H", f"x-target-node-id: {leader_id}",
+        "-H",
+        "x-cluster-id: lacto-dev-01",
+        "-H",
+        f"x-target-node-id: {leader_id}",
         "-d",
         json.dumps(
             {
@@ -434,8 +441,13 @@ def test_client_cli_round_trip() -> None:
 
     # Clean up any lingering state
     state_file = ".client_state.json"
+    wal_dir = ".client_wal"
     if os.path.exists(state_file):
         os.remove(state_file)
+    if os.path.exists(wal_dir):
+        import shutil
+
+        shutil.rmtree(wal_dir)
 
     cmd = [
         "cargo",
@@ -463,7 +475,9 @@ def test_client_cli_round_trip() -> None:
         if p.stdin is None:
             raise RuntimeError("Failed to open stdin for client-cli")
 
-        p.stdin.write('add "oat milk" 2 cartons dairy\nexit\n')
+        p.stdin.write(
+            'add "oat milk" 2 cartons AnimalSecretions\nexit\n'
+        )
         p.stdin.flush()
 
         stdout, _ = p.communicate(timeout=10)

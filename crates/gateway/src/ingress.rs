@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +14,12 @@ use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
 use common::raft_api::ConsensusStatus;
 use common::raft_api::RaftHandle;
+use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
 use prost::Message;
+use tokio::sync::Mutex;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -38,6 +41,10 @@ pub struct IngressDispatcher {
     raft_handle: Arc<dyn RaftHandle>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
+    /// Mutex serving as the Layer 2 MutationLock (ADR 007).
+    /// Ensures that AI evaluation and proposal happen sequentially on the
+    /// leader.
+    mutation_lock: Mutex<()>,
 }
 
 #[tonic::async_trait]
@@ -65,13 +72,34 @@ impl IngressService for IngressDispatcher {
             return Ok(self.rejection_response_with_status(status));
         }
 
-        // --- Phase 1: Syntactic Normalization ---
+        // --- Phase 1: Deduplication (Layer 2 - EOS) ---
+        if let Some(original_index) = self
+            .raft_handle
+            .check_session(&client_id, sequence_id)
+            .await?
+        {
+            info!(
+                "Duplicate request detected for client {} (seq {}). Returning cached index {}.",
+                client_id, sequence_id, original_index
+            );
+            return Ok(Response::new(ProposeMutationResponse {
+                status: MutationStatus::Committed as i32,
+                state_version: original_index.value(),
+                leader_hint: String::new(),
+                error_message: String::new(),
+            }));
+        }
+
+        // --- Phase 2: Concurrency Control (Layer 2) ---
+        let _lock = self.acquire_mutation_lock().await;
+
+        // --- Phase 3: Syntactic Normalization & Taxonomy Guard (Layer 2) ---
         let mut intent = req.intent.clone().ok_or_else(|| {
             self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
         })?;
         self.normalize_intent(&mut intent)?;
 
-        // --- Phase 2: Semantic AI Policy Egress ---
+        // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
         let veto = self.evaluate_policy(req.client_id, &intent).await?;
         if !veto.is_approved {
             return Ok(Response::new(ProposeMutationResponse {
@@ -82,7 +110,7 @@ impl IngressService for IngressDispatcher {
             }));
         }
 
-        // --- Phase 3 & 4: Consensus Proposal & Quorum ---
+        // --- Phase 4 & 5: Consensus Proposal & Quorum ---
         let proposal_index = self
             .commit_to_consensus(&client_id, sequence_id, intent, veto)
             .await?;
@@ -138,7 +166,16 @@ impl IngressDispatcher {
             raft_handle,
             veto_relay,
             veto_timeout,
+            mutation_lock: Mutex::new(()),
         }
+    }
+
+    /// Acquires the Layer 2 MutationLock.
+    ///
+    /// This ensures that AI evaluation and proposal happen sequentially,
+    /// providing the AI with a stable view of the inventory.
+    async fn acquire_mutation_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutation_lock.lock().await
     }
 
     /// Helper to construct a standard "Rejected/Redirection" response from a
@@ -167,12 +204,29 @@ impl IngressDispatcher {
 
     /// Normalizes and validates the user's intent before it is processed by
     /// the AI or added to the consensus log.
+    ///
+    /// Implements Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
     fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
         intent.item_key = intent.item_key.trim().to_lowercase();
         intent.quantity = intent.quantity.trim().to_string();
 
         if let Some(unit) = intent.unit.as_mut() {
             *unit = unit.trim().to_lowercase();
+        }
+
+        // --- Taxonomy Guard (ADR 007 Layer 2) ---
+        if let Some(category) = intent.category.as_mut() {
+            let trimmed = category.trim();
+            if !trimmed.is_empty() {
+                // Verify hint against the 12-Point Authorized Taxonomy
+                GroceryCategory::from_str(trimmed).map_err(|_| {
+                    self.invalid_argument(format!(
+                        "Invalid category hint: '{}'. Must be one of the 12 clinical categories.",
+                        trimmed
+                    ))
+                })?;
+                *category = trimmed.to_string();
+            }
         }
 
         if intent.item_key.is_empty() {
@@ -229,7 +283,7 @@ impl IngressDispatcher {
         client_id: &ClientId,
         sequence_id: SequenceId,
         intent: MutationIntent,
-        veto: VetoOutcome,
+        _veto: VetoOutcome,
     ) -> Result<LogIndex, Status> {
         let mutation = CommittedMutation::new(
             client_id,
@@ -297,6 +351,14 @@ mod tests {
                 rejection_reason: self.rejection_reason.clone(),
             }
         }
+
+        async fn check_session(
+            &self,
+            _client_id: &ClientId,
+            _sequence_id: SequenceId,
+        ) -> Result<Option<LogIndex>, Status> {
+            Ok(None)
+        }
     }
 
     #[derive(Debug, Default)]
@@ -349,7 +411,7 @@ mod tests {
             })
         }
 
-        // --- Phase 0: Leadership ---
+        // --- Phase 0: Leadership Authority ---
 
         #[tokio::test]
         async fn returns_rejected_when_not_leader() {
@@ -372,10 +434,66 @@ mod tests {
             assert!(response.error_message.contains("Follower"));
         }
 
-        // --- Phase 1: Syntactic ---
+        // --- Phase 1: Deduplication (EOS) ---
 
         #[tokio::test]
-        async fn normalizes_intent_before_proposal() {
+        async fn returns_cached_success_on_duplicate_sequence() {
+            #[derive(Debug)]
+            struct DuplicateRaft {
+                mock: Arc<MockRaftHandle>,
+                committed_index: LogIndex,
+            }
+            #[async_trait]
+            impl RaftHandle for DuplicateRaft {
+                async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, Status> {
+                    self.mock.propose(data).await
+                }
+
+                async fn await_commit(&self, index: LogIndex) -> Result<(), Status> {
+                    self.mock.await_commit(index).await
+                }
+
+                async fn consensus_status(&self) -> ConsensusStatus {
+                    self.mock.consensus_status().await
+                }
+
+                async fn check_session(
+                    &self,
+                    _client_id: &ClientId,
+                    _sequence_id: SequenceId,
+                ) -> Result<Option<LogIndex>, Status> {
+                    Ok(Some(self.committed_index))
+                }
+            }
+
+            let committed_index = LogIndex::new(42);
+            let raft_with_dup = Arc::new(DuplicateRaft {
+                mock: successful_raft(),
+                committed_index,
+            });
+
+            let dispatcher = mock_dispatcher(raft_with_dup, successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "bananas".to_string(),
+                    quantity: "5".to_string(),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+            assert_eq!(response.state_version, committed_index.value());
+        }
+
+        // --- Phase 2: Concurrency & Syntactic (Layer 2) ---
+
+        #[tokio::test]
+        async fn normalizes_intent_syntactically() {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(raft.clone(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
@@ -399,7 +517,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn rejects_empty_item_key() {
+        async fn rejects_when_item_key_is_empty() {
             let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -417,7 +535,128 @@ mod tests {
             assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
         }
 
-        // --- Phase 2: Semantic & Infrastructure ---
+        #[tokio::test]
+        async fn rejects_when_category_hint_is_invalid() {
+            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "bananas".to_string(),
+                    quantity: "5".to_string(),
+                    category: Some("Forbidden Snacks".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(status.message().contains("Invalid category hint"));
+        }
+
+        #[tokio::test]
+        async fn enforces_sequential_processing_via_lock() {
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::atomic::Ordering;
+
+            use tokio::time::Duration;
+            use tokio::time::sleep;
+
+            #[derive(Debug)]
+            struct SlowVetoRelay {
+                active_calls: Arc<AtomicUsize>,
+                max_concurrent: Arc<AtomicUsize>,
+            }
+
+            #[async_trait]
+            impl VetoRelay for SlowVetoRelay {
+                async fn evaluate(
+                    &self,
+                    _client_id: String,
+                    _intent: &MutationIntent,
+                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _timeout: Duration,
+                ) -> Result<VetoOutcome, VetoError> {
+                    let current = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
+
+                    let mut max = self.max_concurrent.load(Ordering::SeqCst);
+                    while current > max {
+                        match self.max_concurrent.compare_exchange_weak(
+                            max,
+                            current,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => max = actual,
+                        }
+                    }
+
+                    sleep(Duration::from_millis(100)).await;
+                    self.active_calls.fetch_sub(1, Ordering::SeqCst);
+
+                    Ok(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Primary Flora".to_string(),
+                        moral_justification: "Approved".to_string(),
+                    })
+                }
+            }
+
+            let raft = successful_raft();
+            let active_calls = Arc::new(AtomicUsize::new(0));
+            let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+            let veto = Arc::new(SlowVetoRelay {
+                active_calls: active_calls.clone(),
+                max_concurrent: max_concurrent.clone(),
+            });
+
+            let dispatcher = Arc::new(mock_dispatcher(raft, veto));
+
+            let d1 = dispatcher.clone();
+            let h1 = tokio::spawn(async move {
+                let req = Request::new(ProposeMutationRequest {
+                    client_id: ClientId::generate().as_str().to_string(),
+                    sequence_id: 1,
+                    intent: Some(MutationIntent {
+                        item_key: "item1".to_string(),
+                        quantity: "1".to_string(),
+                        operation: OperationType::Add as i32,
+                        ..Default::default()
+                    }),
+                });
+                d1.propose_mutation(req).await
+            });
+
+            let d2 = dispatcher.clone();
+            let h2 = tokio::spawn(async move {
+                let req = Request::new(ProposeMutationRequest {
+                    client_id: ClientId::generate().as_str().to_string(),
+                    sequence_id: 2,
+                    intent: Some(MutationIntent {
+                        item_key: "item2".to_string(),
+                        quantity: "2".to_string(),
+                        operation: OperationType::Add as i32,
+                        ..Default::default()
+                    }),
+                });
+                d2.propose_mutation(req).await
+            });
+
+            let _ = tokio::try_join!(h1, h2).unwrap();
+
+            assert_eq!(
+                max_concurrent.load(Ordering::SeqCst),
+                1,
+                "Mutations were processed concurrently!"
+            );
+        }
+
+        // --- Phase 3: Semantic AI Resolution (Layer 3) ---
 
         #[tokio::test]
         async fn returns_vetoed_when_ai_rejects() {
@@ -465,7 +704,7 @@ mod tests {
             assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
         }
 
-        // --- Phase 3: Consensus ---
+        // --- Phase 4 & 5: Consensus & State Machine (Layer 4/5) ---
 
         #[tokio::test]
         async fn returns_error_on_consensus_failure() {
@@ -486,6 +725,14 @@ mod tests {
                         is_leader: true,
                         ..Default::default()
                     }
+                }
+
+                async fn check_session(
+                    &self,
+                    _client_id: &ClientId,
+                    _sequence_id: SequenceId,
+                ) -> Result<Option<LogIndex>, Status> {
+                    Ok(None)
                 }
             }
 
