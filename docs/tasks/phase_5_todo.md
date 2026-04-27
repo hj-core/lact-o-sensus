@@ -99,19 +99,19 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] `cargo check` passes.
   - [x] Unit tests for `CommittedMutation` serialization/deserialization.
 
-### Step 8: The 5-Layer Defensive Pipeline (ADR 007) [ ]
+### Step 8: The 5-Layer Defensive Pipeline (ADR 007) [x]
 
 **Commit:** `feat(gateway): implement MutationLock and 5-layer defensive pipeline`
 
 - **Description:** Implement the `MutationLock` and the syntactic/semantic validation layers in the gateway component.
 - **Changes:**
-  - [ ] Implement transient `MutationLock` in `IngressDispatcher` (Layer 2).
-  - [ ] Implement Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
-  - [ ] Implement Layer 4 (Registry Firewall & Physical Invariant Check).
-  - [ ] Implement Layer 5 serialization (proposing validated `CommittedMutation` as `Vec<u8>`).
+  - [x] Implement transient `MutationLock` in `IngressDispatcher` (Layer 2).
+  - [x] Implement Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
+  - [x] Implement Layer 4 (Registry Firewall & Physical Invariant Check).
+  - [x] Implement Layer 5 serialization (proposing validated `CommittedMutation` as `Vec<u8>`).
 - **Acceptance Tests (TDD):**
-  - [ ] Unit tests in `gateway` verifying malformed input rejection.
-  - [ ] Unit tests verifying that unauthorized AI metadata triggers a Veto.
+  - [x] Unit tests in `gateway` verifying malformed input rejection.
+  - [x] Unit tests verifying that unauthorized AI metadata triggers a Veto.
 
 ### Step 9: The Semantic Oracle (Robustness & Retry) [ ]
 
