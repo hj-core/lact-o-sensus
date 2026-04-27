@@ -57,6 +57,8 @@ pub struct IngressDispatcher {
     raft_handle: Arc<dyn RaftHandle>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
+    /// Maximum number of leader-internal retries for AI resolution.
+    veto_max_retries: usize,
     /// Mutex serving as the Layer 2 MutationLock (ADR 007).
     /// Ensures that AI evaluation and proposal happen sequentially on the
     /// leader.
@@ -109,48 +111,84 @@ impl IngressService for IngressDispatcher {
         // --- Phase 2: Concurrency Control (Layer 2) ---
         let _lock = self.acquire_mutation_lock().await;
 
-        // --- Phase 3: Syntactic Normalization & Taxonomy Guard (Layer 2) ---
+        // --- Phase 3 & 4: Semantic Resolution & Validation Loop ---
         let mut intent = req.intent.clone().ok_or_else(|| {
             self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
         })?;
-
-        // Capture TRULY RAW input before normalization (ADR 005 Audit Layer)
         let raw_user_input = self.format_raw_input(&intent);
-
         self.normalize_intent(&mut intent)?;
 
-        // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
-        let veto = self.evaluate_policy(req.client_id, &intent).await?;
-        if !veto.is_approved {
-            return Ok(Response::new(ProposeMutationResponse {
-                status: MutationStatus::Vetoed as i32,
-                state_version: 0,
-                leader_hint: String::new(),
-                error_message: veto.moral_justification,
-            }));
-        }
+        let mut last_error_message = String::new();
+        let mut stabilized_mutation = None;
 
-        // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
-        // Semantic failures (Registry/Physical) are returned as VETOED to the client.
-        let stabilized = match self.validate_and_stabilize(&intent, &veto, &[]) {
-            Ok(s) => s,
-            Err(status)
-                if status.code() == tonic::Code::Internal
-                    || status.code() == tonic::Code::InvalidArgument =>
-            {
-                warn!(
-                    "Mutation VETOED during Layer 4 validation: {}",
-                    status.message()
+        for attempt in 0..=self.veto_max_retries {
+            if attempt > 0 {
+                info!(
+                    "Retrying AI resolution (attempt {}/{})...",
+                    attempt + 1,
+                    self.veto_max_retries + 1
                 );
+            }
+
+            // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
+            let veto = match self.evaluate_policy(req.client_id.clone(), &intent).await {
+                Ok(v) => v,
+                Err(e) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "Transient AI failure on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        e
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            if !veto.is_approved {
                 return Ok(Response::new(ProposeMutationResponse {
                     status: MutationStatus::Vetoed as i32,
                     state_version: 0,
                     leader_hint: String::new(),
-                    error_message: status.message().to_string(),
+                    error_message: veto.moral_justification,
                 }));
             }
-            Err(e) => return Err(e),
-        };
+
+            // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
+            match self.validate_and_stabilize(&intent, &veto, &[]) {
+                Ok(s) => {
+                    stabilized_mutation = Some(s);
+                    break;
+                }
+                Err(status) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "AI response failed Layer 4 validation on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        status.message()
+                    );
+                    last_error_message = status.message().to_string();
+                    continue;
+                }
+                Err(status) => {
+                    warn!(
+                        "AI resolution exhausted retries and failed Layer 4 validation: {}",
+                        status.message()
+                    );
+                    return Ok(Response::new(ProposeMutationResponse {
+                        status: MutationStatus::Vetoed as i32,
+                        state_version: 0,
+                        leader_hint: String::new(),
+                        error_message: status.message().to_string(),
+                    }));
+                }
+            }
+        }
+
+        let stabilized = stabilized_mutation.ok_or_else(|| {
+            self.internal_error(format!(
+                "Retry loop exhausted without result: {}",
+                last_error_message
+            ))
+        })?;
 
         // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
         let proposal_index = self
@@ -203,11 +241,13 @@ impl IngressDispatcher {
         raft_handle: Arc<dyn RaftHandle>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
+        veto_max_retries: usize,
     ) -> Self {
         Self {
             raft_handle,
             veto_relay,
             veto_timeout,
+            veto_max_retries,
             mutation_lock: Mutex::new(()),
         }
     }
@@ -566,15 +606,99 @@ mod tests {
             if let Some(err) = &self.error {
                 return Err(err.clone());
             }
-            Ok(self.outcome.clone().unwrap_or_else(|| VetoOutcome {
-                is_approved: true,
-                category_assignment: "Primary Flora".to_string(),
-                moral_justification: "Mock justification".to_string(),
-                resolved_item_key: "milk".to_string(),
-                suggested_display_name: "Milk".to_string(),
-                resolved_unit: "ml".to_string(),
-                conversion_multiplier_to_base: "1".to_string(),
+            Ok(self.outcome.clone().unwrap_or_else(valid_outcome))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FlakyVetoRelay {
+        outcome: Option<VetoOutcome>,
+        fail_count: Mutex<usize>,
+        max_fails: usize,
+    }
+
+    #[async_trait]
+    impl VetoRelay for FlakyVetoRelay {
+        async fn evaluate(
+            &self,
+            _client_id: String,
+            _intent: &MutationIntent,
+            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _timeout: Duration,
+        ) -> Result<VetoOutcome, VetoError> {
+            let mut count = self.fail_count.lock().unwrap();
+            if *count < self.max_fails {
+                *count += 1;
+                return Err(VetoError::Timeout(Duration::from_secs(0)));
+            }
+            Ok(self.outcome.clone().unwrap_or_else(|| {
+                let mut v = valid_outcome();
+                v.moral_justification = "Recovered".to_string();
+                v
             }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct HallucinatingVetoRelay {
+        success_outcome: VetoOutcome,
+        hallucination_outcome: VetoOutcome,
+        call_count: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl VetoRelay for HallucinatingVetoRelay {
+        async fn evaluate(
+            &self,
+            _client_id: String,
+            _intent: &MutationIntent,
+            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _timeout: Duration,
+        ) -> Result<VetoOutcome, VetoError> {
+            let mut count = self.call_count.lock().unwrap();
+            if *count == 0 {
+                *count += 1;
+                return Ok(self.hallucination_outcome.clone());
+            }
+            Ok(self.success_outcome.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct MixedFailureVetoRelay {
+        hallucination_outcome: VetoOutcome,
+        call_count: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl VetoRelay for MixedFailureVetoRelay {
+        async fn evaluate(
+            &self,
+            _client_id: String,
+            _intent: &MutationIntent,
+            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _timeout: Duration,
+        ) -> Result<VetoOutcome, VetoError> {
+            let mut count = self.call_count.lock().unwrap();
+            let current = *count;
+            *count += 1;
+
+            match current {
+                0 => Err(VetoError::Timeout(Duration::from_secs(0))),
+                _ => Ok(self.hallucination_outcome.clone()),
+            }
+        }
+    }
+
+    fn valid_outcome() -> VetoOutcome {
+        VetoOutcome {
+            is_approved: true,
+            category_assignment: "Primary Flora".to_string(),
+            moral_justification: "Mock justification".to_string(),
+            resolved_item_key: "milk".to_string(),
+            suggested_display_name: "Milk".to_string(),
+            resolved_unit: "ml".to_string(),
+            conversion_multiplier_to_base: "1".to_string(),
         }
     }
 
@@ -582,7 +706,7 @@ mod tests {
         raft_handle: Arc<dyn RaftHandle>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
-        IngressDispatcher::new(raft_handle, veto_relay, Duration::from_secs(1))
+        IngressDispatcher::new(raft_handle, veto_relay, Duration::from_secs(1), 1)
     }
 
     mod propose_mutation {
@@ -597,15 +721,7 @@ mod tests {
 
         fn successful_veto() -> Arc<MockVetoRelay> {
             Arc::new(MockVetoRelay {
-                outcome: Some(VetoOutcome {
-                    is_approved: true,
-                    category_assignment: "Primary Flora".to_string(),
-                    moral_justification: "Mock justification".to_string(),
-                    resolved_item_key: "milk".to_string(),
-                    suggested_display_name: "Milk".to_string(),
-                    resolved_unit: "ml".to_string(),
-                    conversion_multiplier_to_base: "1".to_string(),
-                }),
+                outcome: Some(valid_outcome()),
                 ..Default::default()
             })
         }
@@ -833,8 +949,6 @@ mod tests {
             let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
             assert!(mutation.is_delete);
             assert_eq!(mutation.resolved_item_key, "milk-whole");
-            // Placeholder behavior check (will fail until Step 3
-            // implementation)
         }
 
         #[tokio::test]
@@ -919,15 +1033,7 @@ mod tests {
                     sleep(Duration::from_millis(100)).await;
                     self.active_calls.fetch_sub(1, Ordering::SeqCst);
 
-                    Ok(VetoOutcome {
-                        is_approved: true,
-                        category_assignment: "Primary Flora".to_string(),
-                        moral_justification: "Approved".to_string(),
-                        resolved_item_key: "item".to_string(),
-                        suggested_display_name: "Item".to_string(),
-                        resolved_unit: "units".to_string(),
-                        conversion_multiplier_to_base: "1".to_string(),
-                    })
+                    Ok(valid_outcome())
                 }
             }
 
@@ -1154,6 +1260,197 @@ mod tests {
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
             assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+
+        #[tokio::test]
+        async fn retries_on_transient_ai_failure_and_succeeds() {
+            let raft = successful_raft();
+            let veto = Arc::new(FlakyVetoRelay {
+                max_fails: 1,
+                ..Default::default()
+            });
+            // Configured for 1 retry (max 2 attempts)
+            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+        }
+
+        #[tokio::test]
+        async fn retries_on_ai_hallucination_and_succeeds() {
+            let raft = successful_raft();
+            let hallucination = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Space Matter".to_string(), // Hallucination
+                moral_justification: "Oops".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let success = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Corrected".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let veto = Arc::new(HallucinatingVetoRelay {
+                hallucination_outcome: hallucination,
+                success_outcome: success,
+                call_count: Mutex::new(0),
+            });
+            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+        }
+
+        #[tokio::test]
+        async fn vetoes_after_max_retries_exhausted_on_hallucination() {
+            let raft = successful_raft();
+            let hallucination = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Space Matter".to_string(),
+                moral_justification: "Still Hallucinating".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let veto = Arc::new(MockVetoRelay {
+                outcome: Some(hallucination),
+                ..Default::default()
+            });
+            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert!(response.error_message.contains("AI Hallucination"));
+        }
+
+        #[tokio::test]
+        async fn vetoes_after_max_retries_exhausted_on_mixed_failures() {
+            let raft = successful_raft();
+            let hallucination = VetoOutcome {
+                is_approved: true,
+                category_assignment: "Space Matter".to_string(), // Hallucination
+                moral_justification: "Oops".to_string(),
+                resolved_item_key: "milk".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let veto = Arc::new(MixedFailureVetoRelay {
+                hallucination_outcome: hallucination,
+                call_count: Mutex::new(0),
+            });
+            // Configured for 1 retry (2 attempts total)
+            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+
+            // Should be VETOED because:
+            // Attempt 1: Timeout (Consumed 1st attempt)
+            // Attempt 2: Hallucination (Consumed 1 retry quota)
+            // Quota exhausted -> definitive Veto
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert!(response.error_message.contains("AI Hallucination"));
+        }
+
+        #[tokio::test]
+        async fn does_not_retry_on_definitive_ai_veto() {
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::atomic::Ordering;
+
+            #[derive(Debug)]
+            struct CountingVetoRelay {
+                call_count: Arc<AtomicUsize>,
+            }
+            #[async_trait]
+            impl VetoRelay for CountingVetoRelay {
+                async fn evaluate(
+                    &self,
+                    _client_id: String,
+                    _intent: &MutationIntent,
+                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _timeout: Duration,
+                ) -> Result<VetoOutcome, VetoError> {
+                    self.call_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(VetoOutcome {
+                        is_approved: false,
+                        moral_justification: "Definitive NO".to_string(),
+                        ..valid_outcome()
+                    })
+                }
+            }
+
+            let raft = successful_raft();
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let veto = Arc::new(CountingVetoRelay {
+                call_count: call_count.clone(),
+            });
+            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 10);
+
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "unethical item".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let _ = dispatcher.propose_mutation(req).await.unwrap();
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
         }
     }
 

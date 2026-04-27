@@ -117,8 +117,12 @@ async fn main() -> Result<()> {
         .connect_lazy();
     let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
 
-    let ingress_dispatcher =
-        IngressDispatcher::new(raft_handle, veto_relay, config.policy.veto_timeout());
+    let ingress_dispatcher = IngressDispatcher::new(
+        raft_handle,
+        veto_relay,
+        config.policy.veto_timeout(),
+        config.policy.veto_max_retries,
+    );
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
     spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());

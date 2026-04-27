@@ -130,6 +130,10 @@ pub struct PolicyConfig {
 
     /// Timeout for AI Veto evaluations (in milliseconds).
     pub veto_timeout_ms: u64,
+
+    /// Maximum number of leader-internal retries for malformed AI responses
+    /// or transient infrastructure failures.
+    pub veto_max_retries: usize,
 }
 
 impl Default for PolicyConfig {
@@ -137,6 +141,7 @@ impl Default for PolicyConfig {
         Self {
             veto_addr: "http://127.0.0.1:50060".to_string(),
             veto_timeout_ms: 5000,
+            veto_max_retries: 1,
         }
     }
 }
