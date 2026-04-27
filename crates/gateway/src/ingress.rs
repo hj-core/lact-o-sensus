@@ -113,6 +113,10 @@ impl IngressService for IngressDispatcher {
         let mut intent = req.intent.clone().ok_or_else(|| {
             self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
         })?;
+
+        // Capture TRULY RAW input before normalization (ADR 005 Audit Layer)
+        let raw_user_input = self.format_raw_input(&intent);
+
         self.normalize_intent(&mut intent)?;
 
         // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
@@ -150,7 +154,7 @@ impl IngressService for IngressDispatcher {
 
         // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
         let proposal_index = self
-            .commit_to_consensus(&client_id, sequence_id, intent, veto, stabilized)
+            .commit_to_consensus(&client_id, sequence_id, intent, stabilized, raw_user_input)
             .await?;
 
         info!("Mutation index {} committed successfully.", proposal_index);
@@ -335,6 +339,28 @@ impl IngressDispatcher {
         })
     }
 
+    /// Captures the un-normalized human intent for the audit log.
+    fn format_raw_input(&self, intent: &MutationIntent) -> String {
+        let op = match OperationType::try_from(intent.operation) {
+            Ok(OperationType::Add) => "Add",
+            Ok(OperationType::Subtract) => "Sub",
+            Ok(OperationType::Set) => "Set",
+            Ok(OperationType::Delete) => "Delete",
+            _ => "Unknown",
+        };
+
+        format!(
+            "{} {} {} {}",
+            op,
+            intent.quantity,
+            intent.unit.as_deref().unwrap_or(""),
+            intent.item_key
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
     /// Physical Invariant Check: Enforces the Dimensional Fence (ADR 008).
     fn enforce_physical_invariants(
         &self,
@@ -413,10 +439,12 @@ impl IngressDispatcher {
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
-        _intent: MutationIntent,
-        _veto: VetoOutcome,
+        intent: MutationIntent,
         stabilized: StabilizedMutation,
+        raw_user_input: String,
     ) -> Result<LogIndex, Status> {
+        let is_delete = intent.operation == OperationType::Delete as i32;
+
         let mutation = CommittedMutation::new(
             client_id,
             sequence_id,
@@ -426,9 +454,9 @@ impl IngressDispatcher {
             stabilized.base_unit,
             stabilized.display_unit,
             stabilized.category.to_string(),
-            "PENDING_RAW_INPUT_FIX".to_string(), // TODO: Update protocol or keep intent
+            raw_user_input,
             stabilized.moral_justification,
-            false, // TODO: Map operation properly
+            is_delete,
             std::time::SystemTime::now(),
         );
 
@@ -672,6 +700,54 @@ mod tests {
             let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
             assert_eq!(mutation.resolved_item_key, "bananas");
             assert_eq!(mutation.updated_base_quantity, "5");
+        }
+
+        #[tokio::test]
+        async fn verifies_full_consensus_serialization() {
+            let raft = successful_raft();
+            let dispatcher = mock_dispatcher(
+                raft.clone(),
+                Arc::new(MockVetoRelay {
+                    outcome: Some(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Animal Secretions".to_string(),
+                        moral_justification: "Milk is ethical".to_string(),
+                        resolved_item_key: "milk-whole".to_string(),
+                        suggested_display_name: "Whole Milk".to_string(),
+                        resolved_unit: "gal".to_string(),
+                        conversion_multiplier_to_base: "3785.4118".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 42,
+                intent: Some(MutationIntent {
+                    item_key: "  MiLk  ".to_string(),
+                    quantity: " 1.5 ".to_string(),
+                    unit: Some(" gal ".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+
+            let proposals = raft.proposals.lock().unwrap();
+            assert_eq!(proposals.len(), 1);
+            let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
+
+            // Verification of SI Stabilization (1.5 * 3785.4118 = 5678.1177)
+            assert_eq!(mutation.resolved_item_key, "milk-whole");
+            assert_eq!(mutation.updated_base_quantity, "5678.1177");
+            assert_eq!(mutation.base_unit, "ml");
+            assert_eq!(mutation.display_unit, "gal");
+
+            // Verification of RAW Audit Log (Must preserve original messy input)
+            assert_eq!(mutation.raw_user_input, "Add 1.5 gal MiLk");
         }
 
         #[tokio::test]
