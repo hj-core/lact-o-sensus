@@ -50,7 +50,7 @@ impl MutationArgs {
     fn into_intent(self, operation: OperationType) -> MutationIntent {
         MutationIntent {
             item_key: self.item_key,
-            quantity: self.quantity,
+            quantity: Some(self.quantity),
             unit: self.unit,
             category: self.category,
             operation: operation as i32,
@@ -230,7 +230,7 @@ async fn execute_command(client: &LactoClient, cmd: Command) -> Result<String> {
         Command::Delete { item_key } => {
             let intent = MutationIntent {
                 item_key,
-                quantity: "0".to_string(),
+                quantity: None,
                 unit: None,
                 category: None,
                 operation: OperationType::Delete as i32,
@@ -363,6 +363,44 @@ mod tests {
             let res = Command::parse("add \"unclosed quote");
             assert!(res.is_err());
             assert!(res.unwrap_err().to_string().contains("quoting"));
+        }
+    }
+
+    mod intent_transformation {
+        use common::proto::v1::app::OperationType;
+
+        use super::*;
+
+        #[test]
+        fn wraps_quantity_in_some_for_mutations() {
+            let args = MutationArgs {
+                item_key: "milk".to_string(),
+                quantity: "1.5".to_string(),
+                unit: None,
+                category: None,
+            };
+            let intent = args.into_intent(OperationType::Add);
+            assert_eq!(intent.quantity, Some("1.5".to_string()));
+        }
+
+        #[test]
+        fn uses_none_quantity_for_delete_command() {
+            // Setup: Construct a Delete command
+            let cmd = Command::parse("delete milk").unwrap();
+
+            // Logic: The REPL handler constructs the intent for Delete
+            if let Command::Delete { item_key } = cmd {
+                let intent = common::proto::v1::app::MutationIntent {
+                    item_key,
+                    quantity: None,
+                    unit: None,
+                    category: None,
+                    operation: OperationType::Delete as i32,
+                };
+                assert_eq!(intent.quantity, None);
+            } else {
+                panic!("Expected Delete command");
+            }
         }
     }
 

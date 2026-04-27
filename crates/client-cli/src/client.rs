@@ -600,7 +600,7 @@ mod tests {
     fn test_intent() -> MutationIntent {
         MutationIntent {
             item_key: "milk".to_string(),
-            quantity: "2".to_string(),
+            quantity: Some("2".to_string()),
             unit: None,
             category: None,
             operation: OperationType::Add as i32,
@@ -1043,7 +1043,7 @@ mod tests {
             let seq = SequenceId::new(42);
             let intent = MutationIntent {
                 item_key: "eggs".to_string(),
-                quantity: "12".to_string(),
+                quantity: Some("12".to_string()),
                 unit: None,
                 category: None,
                 operation: OperationType::Add as i32,

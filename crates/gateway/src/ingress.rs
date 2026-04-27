@@ -250,7 +250,15 @@ impl IngressDispatcher {
     /// Implements Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
     fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
         intent.item_key = intent.item_key.trim().to_lowercase();
-        intent.quantity = intent.quantity.trim().to_string();
+
+        if let Some(q) = intent.quantity.as_mut() {
+            let trimmed = q.trim();
+            if trimmed.is_empty() {
+                intent.quantity = None;
+            } else {
+                *q = trimmed.to_string();
+            }
+        }
 
         if let Some(unit) = intent.unit.as_mut() {
             *unit = unit.trim().to_lowercase();
@@ -275,8 +283,9 @@ impl IngressDispatcher {
             return Err(self.invalid_argument("item_key cannot be empty"));
         }
 
-        if intent.quantity.is_empty() && intent.operation != OperationType::Delete as i32 {
-            return Err(self.invalid_argument("quantity cannot be empty"));
+        // Validate quantity requirement based on operation type
+        if intent.operation != OperationType::Delete as i32 && intent.quantity.is_none() {
+            return Err(self.invalid_argument("quantity is required for this operation"));
         }
 
         Ok(())
@@ -293,8 +302,26 @@ impl IngressDispatcher {
         current_inventory: &[common::proto::v1::app::GroceryItem],
     ) -> Result<StabilizedMutation, Status> {
         let category = self.verify_category_registry(&veto.category_assignment)?;
-        let base_quantity =
-            self.verify_unit_stabilization(&intent.quantity, &veto.resolved_unit)?;
+
+        // For DELETE operations, we bypass physical stabilization
+        if intent.operation == OperationType::Delete as i32 {
+            return Ok(StabilizedMutation {
+                resolved_item_key: veto.resolved_item_key.clone(),
+                suggested_display_name: veto.suggested_display_name.clone(),
+                updated_base_quantity: "0".to_string(),
+                base_unit: "units".to_string(), // Placeholder for non-physical delete
+                display_unit: veto.resolved_unit.clone(),
+                category,
+                moral_justification: veto.moral_justification.clone(),
+            });
+        }
+
+        let q_str = intent
+            .quantity
+            .as_deref()
+            .ok_or_else(|| self.invalid_argument("quantity is missing"))?;
+
+        let base_quantity = self.verify_unit_stabilization(q_str, &veto.resolved_unit)?;
 
         self.enforce_physical_invariants(
             intent,
@@ -352,7 +379,7 @@ impl IngressDispatcher {
         format!(
             "{} {} {} {}",
             op,
-            intent.quantity,
+            intent.quantity.as_deref().unwrap_or(""),
             intent.unit.as_deref().unwrap_or(""),
             intent.item_key
         )
@@ -650,7 +677,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "bananas".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -687,7 +714,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "  BANANAS  ".to_string(),
-                    quantity: " 5 ".to_string(),
+                    quantity: Some(" 5 ".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -725,7 +752,7 @@ mod tests {
                 sequence_id: 42,
                 intent: Some(MutationIntent {
                     item_key: "  MiLk  ".to_string(),
-                    quantity: " 1.5 ".to_string(),
+                    quantity: Some(" 1.5 ".to_string()),
                     unit: Some(" gal ".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
@@ -751,6 +778,66 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rejects_missing_quantity_for_add_operation() {
+            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "bananas".to_string(),
+                    quantity: None,
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+
+        #[tokio::test]
+        async fn successfully_handles_delete_operation() {
+            let raft = successful_raft();
+            let dispatcher = mock_dispatcher(
+                raft.clone(),
+                Arc::new(MockVetoRelay {
+                    outcome: Some(VetoOutcome {
+                        is_approved: true,
+                        category_assignment: "Animal Secretions".to_string(),
+                        moral_justification: "Item removed".to_string(),
+                        resolved_item_key: "milk-whole".to_string(),
+                        suggested_display_name: "Whole Milk".to_string(),
+                        resolved_unit: "ml".to_string(),
+                        conversion_multiplier_to_base: "1".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            );
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 42,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: None,
+                    operation: OperationType::Delete as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+
+            let proposals = raft.proposals.lock().unwrap();
+            let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
+            assert!(mutation.is_delete);
+            assert_eq!(mutation.resolved_item_key, "milk-whole");
+            // Placeholder behavior check (will fail until Step 3
+            // implementation)
+        }
+
+        #[tokio::test]
         async fn rejects_when_item_key_is_empty() {
             let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
@@ -758,7 +845,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "   ".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -777,7 +864,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "bananas".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     category: Some("Forbidden Snacks".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
@@ -862,7 +949,7 @@ mod tests {
                     sequence_id: 1,
                     intent: Some(MutationIntent {
                         item_key: "item1".to_string(),
-                        quantity: "1".to_string(),
+                        quantity: Some("1".to_string()),
                         operation: OperationType::Add as i32,
                         ..Default::default()
                     }),
@@ -877,7 +964,7 @@ mod tests {
                     sequence_id: 2,
                     intent: Some(MutationIntent {
                         item_key: "item2".to_string(),
-                        quantity: "2".to_string(),
+                        quantity: Some("2".to_string()),
                         operation: OperationType::Add as i32,
                         ..Default::default()
                     }),
@@ -916,7 +1003,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "bananas".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -939,7 +1026,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "bananas".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -974,7 +1061,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "milk".to_string(),
-                    quantity: "1".to_string(),
+                    quantity: Some("1".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -1007,7 +1094,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "milk".to_string(),
-                    quantity: "1".to_string(),
+                    quantity: Some("1".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -1058,7 +1145,7 @@ mod tests {
                 sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "bananas".to_string(),
-                    quantity: "5".to_string(),
+                    quantity: Some("5".to_string()),
                     operation: OperationType::Add as i32,
                     ..Default::default()
                 }),
@@ -1086,7 +1173,7 @@ mod tests {
         fn rejects_hallucinated_category() {
             let dispatcher = test_dispatcher();
             let intent = MutationIntent {
-                quantity: "1".to_string(),
+                quantity: Some("1".to_string()),
                 ..Default::default()
             };
             let veto = VetoOutcome {
@@ -1108,7 +1195,7 @@ mod tests {
         fn rejects_hallucinated_unit() {
             let dispatcher = test_dispatcher();
             let intent = MutationIntent {
-                quantity: "1".to_string(),
+                quantity: Some("1".to_string()),
                 ..Default::default()
             };
             let veto = VetoOutcome {
@@ -1130,7 +1217,7 @@ mod tests {
         fn rejects_invalid_si_unit_conversion() {
             let dispatcher = test_dispatcher();
             let intent = MutationIntent {
-                quantity: "abc".to_string(), // Malformed quantity
+                quantity: Some("abc".to_string()), // Malformed quantity
                 ..Default::default()
             };
             let veto = VetoOutcome {
@@ -1152,7 +1239,7 @@ mod tests {
         fn rejects_cross_dimensional_arithmetic() {
             let dispatcher = test_dispatcher();
             let intent = MutationIntent {
-                quantity: "1".to_string(),
+                quantity: Some("1".to_string()),
                 operation: OperationType::Add as i32,
                 ..Default::default()
             };
@@ -1183,7 +1270,7 @@ mod tests {
         fn applies_bankers_rounding_to_si_stabilization() {
             let dispatcher = test_dispatcher();
             let intent = MutationIntent {
-                quantity: "1.5".to_string(), // Half-way point
+                quantity: Some("1.5".to_string()), // Half-way point
                 ..Default::default()
             };
             let veto = VetoOutcome {

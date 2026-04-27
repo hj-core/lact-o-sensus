@@ -111,7 +111,7 @@ mod tests {
             SequenceId::new(seq),
             MutationIntent {
                 item_key: "milk".to_string(),
-                quantity: "1".to_string(),
+                quantity: Some("1".to_string()),
                 unit: None,
                 category: None,
                 operation: OperationType::Add as i32,

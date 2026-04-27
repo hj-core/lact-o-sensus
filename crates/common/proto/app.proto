@@ -26,7 +26,7 @@ enum OperationType {
 
 message MutationIntent {
     string item_key = 1;
-    string quantity = 2;
+    optional string quantity = 2;
     optional string unit = 3; // Optional: If omitted, the system retains the existing unit for the item
     optional string category = 4; // Optional override by client
     OperationType operation = 5;
