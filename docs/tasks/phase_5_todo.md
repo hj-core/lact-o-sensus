@@ -113,15 +113,16 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] Unit tests in `gateway` verifying malformed input rejection.
   - [x] Unit tests verifying that unauthorized AI metadata triggers a Veto.
 
-### Step 9: The Semantic Oracle (Robustness & Retry) [ ]
+### Step 9: The Semantic Oracle (Robustness & Retry) [x]
 
-**Commit:** `feat(raft): implement leader-side retry logic for AI resolution`
+**Commit:** `feat(gateway): implement leader-side retry logic for AI resolution`
 
 - **Description:** Implement leader-side retry logic for resolution failures and harden the defensive wall.
 - **Changes:**
-  - [ ] Implement **Leader-Internal Retries** (Best-Effort) in the `VetoRelay` (Layer 3).
+  - [x] Implement **Leader-Internal Retries** (Best-Effort) in the `IngressDispatcher` orchestrator.
 - **Acceptance Tests (TDD):**
-  - [ ] Integration test verifying that a transient AI failure triggers exactly one retry before a Veto.
+  - [x] Integration test verifying that a transient AI failure triggers exactly one retry (or the configured max) before a Veto.
+  - [x] Integration test verifying that the retry quota is shared across Phase 3 and Phase 4 failures.
 
 ### Step 10: The Moral Advocate (Real AI Integration) [ ]
 
