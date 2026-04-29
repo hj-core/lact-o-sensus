@@ -504,6 +504,10 @@ def test_client_cli_round_trip() -> None:
 
 def main() -> None:
     print("=== Lact-O-Sensus Consensus & Integration Suite ===")
+
+    # Allow filtering tests by name via command line
+    filter_arg = sys.argv[1] if len(sys.argv) > 1 else None
+
     tests = [
         ("Leader Election", False, lambda c: test_leader_election()),
         (
@@ -530,7 +534,12 @@ def main() -> None:
     ]
 
     passed = 0
+    total_run = 0
     for name, needs_veto, test_func in tests:
+        if filter_arg and filter_arg.lower() not in name.lower():
+            continue
+
+        total_run += 1
         print(f"\n[TEST] {name}")
         cluster = ClusterManager()
         try:
@@ -544,8 +553,8 @@ def main() -> None:
             cluster.cleanup()
             time.sleep(1)
 
-    print(f"\n=== Final Result: {passed}/{len(tests)} Tests Passed ===")
-    if passed < len(tests):
+    print(f"\n=== Final Result: {passed}/{total_run} Tests Passed ===")
+    if total_run > 0 and passed < total_run:
         sys.exit(1)
 
 
