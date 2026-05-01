@@ -124,16 +124,17 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
   - [x] Integration test verifying that a transient AI failure triggers exactly one retry (or the configured max) before a Veto.
   - [x] Integration test verifying that the retry quota is shared across Phase 3 and Phase 4 failures.
 
-### Step 10: The Moral Advocate (Real AI Integration) [ ]
+### Step 10: The Moral Advocate (Real AI Integration) [x]
 
 **Commit:** `feat(ai-veto): integrate LLM engine and moral heuristics`
 
 - **Description:** Replace the mock resolution logic with a real relational evaluation engine using a Large Language Model (LLM).
 - **Changes:**
-  - [ ] Integrate OpenAI API or local Llama via `ollama-rs`.
-  - [ ] Implement the prompt engineering required for the **Moral Advocate** persona.
-  - [ ] Implement context-aware evaluation (passing `current_inventory` to the LLM for relational judgement).
-  - [ ] Verify: The LLM correctly resolves "OJ" to `orange_juice` and rejects items based on health/moral heuristics.
+  - [x] Integrate local Llama via `ollama-rs` using Chat API for prompt caching.
+  - [x] Implement the prompt engineering required for the **Moral Advocate** persona.
+  - [x] Implement context-aware evaluation (passing `current_inventory` to the LLM for relational judgement).
+  - [x] Implement **Registry Firewall** (Task 3) to prevent AI metadata hallucinations.
+  - [x] Verify: The LLM correctly resolves "OJ" to `orange_juice` and rejects items based on health/moral heuristics.
 - **Acceptance Tests (TDD):**
-  - [ ] Integration tests in `crates/ai-veto` verifying specific resolution scenarios.
-  - [ ] `smoke_test.py` passes using a live (or local) AI engine.
+  - [x] Integration tests in `crates/ai-veto` verifying specific resolution scenarios and stateless isolation.
+  - [x] `smoke_test.py` passes using a live `qwen3.5:4b` engine.
