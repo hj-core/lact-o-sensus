@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         veto_relay,
         config.policy.veto_timeout(),
         config.policy.veto_max_retries,
+        config.policy.max_justification_len,
     );
 
     // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)

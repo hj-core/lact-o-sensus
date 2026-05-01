@@ -134,6 +134,9 @@ pub struct PolicyConfig {
     /// Maximum number of leader-internal retries for malformed AI responses
     /// or transient infrastructure failures.
     pub veto_max_retries: usize,
+
+    /// Maximum characters allowed in the AI's moral justification.
+    pub max_justification_len: usize,
 }
 
 impl Default for PolicyConfig {
@@ -142,6 +145,7 @@ impl Default for PolicyConfig {
             veto_addr: "http://127.0.0.1:50060".to_string(),
             veto_timeout_ms: 5000,
             veto_max_retries: 1,
+            max_justification_len: 512,
         }
     }
 }

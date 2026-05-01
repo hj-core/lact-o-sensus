@@ -59,195 +59,29 @@ pub struct IngressDispatcher {
     veto_timeout: Duration,
     /// Maximum number of leader-internal retries for AI resolution.
     veto_max_retries: usize,
+    /// Maximum characters allowed in the AI's moral justification.
+    max_justification_len: usize,
     /// Mutex serving as the Layer 2 MutationLock (ADR 007).
     /// Ensures that AI evaluation and proposal happen sequentially on the
     /// leader.
     mutation_lock: Mutex<()>,
 }
 
-#[tonic::async_trait]
-impl IngressService for IngressDispatcher {
-    /// High-level orchestrator for user mutations.
-    /// Implements the Defensive Onion pipeline (ADR 007).
-    async fn propose_mutation(
-        &self,
-        request: Request<ProposeMutationRequest>,
-    ) -> Result<Response<ProposeMutationResponse>, Status> {
-        let req = request.into_inner();
-
-        let sequence_id = SequenceId::new(req.sequence_id);
-        let client_id = req
-            .client_id
-            .parse::<ClientId>()
-            .map_err(|e| self.invalid_argument(format!("Invalid client_id: {}", e)))?;
-
-        let span = info_span!("propose_mutation", client = %client_id, seq = %sequence_id);
-        let _enter = span.enter();
-
-        // --- Phase 0: Leadership Authority & Consensus Status ---
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
-            return Ok(self.rejection_response_with_status(status));
-        }
-
-        // --- Phase 1: Deduplication (Layer 2 - EOS) ---
-        if let Some(original_index) = self
-            .raft_handle
-            .check_session(&client_id, sequence_id)
-            .await?
-        {
-            info!(
-                "Duplicate request detected for client {} (seq {}). Returning cached index {}.",
-                client_id, sequence_id, original_index
-            );
-            return Ok(Response::new(ProposeMutationResponse {
-                status: MutationStatus::Committed as i32,
-                state_version: original_index.value(),
-                leader_hint: String::new(),
-                error_message: String::new(),
-            }));
-        }
-
-        // --- Phase 2: Concurrency Control (Layer 2) ---
-        let _lock = self.acquire_mutation_lock().await;
-
-        // --- Phase 3 & 4: Semantic Resolution & Validation Loop ---
-        let mut intent = req.intent.clone().ok_or_else(|| {
-            self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
-        })?;
-        let raw_user_input = self.format_raw_input(&intent);
-        self.normalize_intent(&mut intent)?;
-
-        let mut last_error_message = String::new();
-        let mut stabilized_mutation = None;
-
-        for attempt in 0..=self.veto_max_retries {
-            if attempt > 0 {
-                info!(
-                    "Retrying AI resolution (attempt {}/{})...",
-                    attempt + 1,
-                    self.veto_max_retries + 1
-                );
-            }
-
-            // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
-            let veto = match self.evaluate_policy(req.client_id.clone(), &intent).await {
-                Ok(v) => v,
-                Err(e) if attempt < self.veto_max_retries => {
-                    warn!(
-                        "Transient AI failure on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        e
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            if !veto.is_approved {
-                return Ok(Response::new(ProposeMutationResponse {
-                    status: MutationStatus::Vetoed as i32,
-                    state_version: 0,
-                    leader_hint: String::new(),
-                    error_message: veto.moral_justification,
-                }));
-            }
-
-            // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
-            match self.validate_and_stabilize(&intent, &veto, &[]) {
-                Ok(s) => {
-                    stabilized_mutation = Some(s);
-                    break;
-                }
-                Err(status) if attempt < self.veto_max_retries => {
-                    warn!(
-                        "AI response failed Layer 4 validation on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        status.message()
-                    );
-                    last_error_message = status.message().to_string();
-                    continue;
-                }
-                Err(status) => {
-                    warn!(
-                        "AI resolution exhausted retries and failed Layer 4 validation: {}",
-                        status.message()
-                    );
-                    return Ok(Response::new(ProposeMutationResponse {
-                        status: MutationStatus::Vetoed as i32,
-                        state_version: 0,
-                        leader_hint: String::new(),
-                        error_message: status.message().to_string(),
-                    }));
-                }
-            }
-        }
-
-        let stabilized = stabilized_mutation.ok_or_else(|| {
-            self.internal_error(format!(
-                "Retry loop exhausted without result: {}",
-                last_error_message
-            ))
-        })?;
-
-        // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
-        let proposal_index = self
-            .commit_to_consensus(&client_id, sequence_id, intent, stabilized, raw_user_input)
-            .await?;
-
-        info!("Mutation index {} committed successfully.", proposal_index);
-        Ok(Response::new(ProposeMutationResponse {
-            status: MutationStatus::Committed as i32,
-            state_version: proposal_index.value(),
-            leader_hint: String::new(),
-            error_message: String::new(),
-        }))
-    }
-
-    /// High-level orchestrator for state queries.
-    async fn query_state(
-        &self,
-        request: Request<QueryStateRequest>,
-    ) -> Result<Response<QueryStateResponse>, Status> {
-        let _req = request.into_inner();
-
-        let span = info_span!("query_state");
-        let _enter = span.enter();
-
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
-            return Ok(Response::new(QueryStateResponse {
-                items: Vec::new(),
-                current_state_version: 0,
-                status: QueryStatus::Rejected as i32,
-                leader_hint: status.leader_hint,
-                error_message: status.rejection_reason,
-            }));
-        }
-
-        // TODO: Phase 5 - Implement State Machine queries (Item Store)
-        Ok(Response::new(QueryStateResponse {
-            items: Vec::new(),
-            current_state_version: 0,
-            status: QueryStatus::Success as i32,
-            leader_hint: String::new(),
-            error_message: String::new(),
-        }))
-    }
-}
-
 impl IngressDispatcher {
+    /// Creates a new IngressDispatcher with configured AI policy parameters.
     pub fn new(
         raft_handle: Arc<dyn RaftHandle>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
         veto_max_retries: usize,
+        max_justification_len: usize,
     ) -> Self {
         Self {
             raft_handle,
             veto_relay,
             veto_timeout,
             veto_max_retries,
+            max_justification_len,
             mutation_lock: Mutex::new(()),
         }
     }
@@ -478,6 +312,7 @@ impl IngressDispatcher {
                 intent,
                 &[], // Inventory store implemented in Phase 5
                 self.veto_timeout,
+                self.max_justification_len,
             )
             .await;
 
@@ -544,6 +379,177 @@ impl IngressDispatcher {
     }
 }
 
+#[tonic::async_trait]
+impl IngressService for IngressDispatcher {
+    /// High-level orchestrator for user mutations.
+    /// Implements the Defensive Onion pipeline (ADR 007).
+    async fn propose_mutation(
+        &self,
+        request: Request<ProposeMutationRequest>,
+    ) -> Result<Response<ProposeMutationResponse>, Status> {
+        let req = request.into_inner();
+
+        let sequence_id = SequenceId::new(req.sequence_id);
+        let client_id = req
+            .client_id
+            .parse::<ClientId>()
+            .map_err(|e| self.invalid_argument(format!("Invalid client_id: {}", e)))?;
+
+        let span = info_span!("propose_mutation", client = %client_id, seq = %sequence_id);
+        let _enter = span.enter();
+
+        // --- Phase 0: Leadership Authority & Consensus Status ---
+        let status = self.raft_handle.consensus_status().await;
+        if !status.is_leader {
+            return Ok(self.rejection_response_with_status(status));
+        }
+
+        // --- Phase 1: Deduplication (Layer 2 - EOS) ---
+        if let Some(original_index) = self
+            .raft_handle
+            .check_session(&client_id, sequence_id)
+            .await?
+        {
+            info!(
+                "Duplicate request detected for client {} (seq {}). Returning cached index {}.",
+                client_id, sequence_id, original_index
+            );
+            return Ok(Response::new(ProposeMutationResponse {
+                status: MutationStatus::Committed as i32,
+                state_version: original_index.value(),
+                leader_hint: String::new(),
+                error_message: String::new(),
+            }));
+        }
+
+        // --- Phase 2: Concurrency Control (Layer 2) ---
+        let _lock = self.acquire_mutation_lock().await;
+
+        // --- Phase 3 & 4: Semantic Resolution & Validation Loop ---
+        let mut intent = req.intent.clone().ok_or_else(|| {
+            self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
+        })?;
+        let raw_user_input = self.format_raw_input(&intent);
+        self.normalize_intent(&mut intent)?;
+
+        let mut last_error_message = String::new();
+        let mut stabilized_mutation = None;
+
+        for attempt in 0..=self.veto_max_retries {
+            if attempt > 0 {
+                info!(
+                    "Retrying AI resolution (attempt {}/{})...",
+                    attempt + 1,
+                    self.veto_max_retries + 1
+                );
+            }
+
+            // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
+            let veto = match self.evaluate_policy(req.client_id.clone(), &intent).await {
+                Ok(v) => v,
+                Err(e) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "Transient AI failure on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        e
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            if !veto.is_approved {
+                return Ok(Response::new(ProposeMutationResponse {
+                    status: MutationStatus::Vetoed as i32,
+                    state_version: 0,
+                    leader_hint: String::new(),
+                    error_message: veto.moral_justification,
+                }));
+            }
+
+            // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
+            match self.validate_and_stabilize(&intent, &veto, &[]) {
+                Ok(s) => {
+                    stabilized_mutation = Some(s);
+                    break;
+                }
+                Err(status) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "AI response failed Layer 4 validation on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        status.message()
+                    );
+                    last_error_message = status.message().to_string();
+                    continue;
+                }
+                Err(status) => {
+                    warn!(
+                        "AI resolution exhausted retries and failed Layer 4 validation: {}",
+                        status.message()
+                    );
+                    return Ok(Response::new(ProposeMutationResponse {
+                        status: MutationStatus::Vetoed as i32,
+                        state_version: 0,
+                        leader_hint: String::new(),
+                        error_message: status.message().to_string(),
+                    }));
+                }
+            }
+        }
+
+        let stabilized = stabilized_mutation.ok_or_else(|| {
+            self.internal_error(format!(
+                "Retry loop exhausted without result: {}",
+                last_error_message
+            ))
+        })?;
+
+        // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
+        let proposal_index = self
+            .commit_to_consensus(&client_id, sequence_id, intent, stabilized, raw_user_input)
+            .await?;
+
+        info!("Mutation index {} committed successfully.", proposal_index);
+        Ok(Response::new(ProposeMutationResponse {
+            status: MutationStatus::Committed as i32,
+            state_version: proposal_index.value(),
+            leader_hint: String::new(),
+            error_message: String::new(),
+        }))
+    }
+
+    /// High-level orchestrator for state queries.
+    async fn query_state(
+        &self,
+        request: Request<QueryStateRequest>,
+    ) -> Result<Response<QueryStateResponse>, Status> {
+        let _req = request.into_inner();
+
+        let span = info_span!("query_state");
+        let _enter = span.enter();
+
+        let status = self.raft_handle.consensus_status().await;
+        if !status.is_leader {
+            return Ok(Response::new(QueryStateResponse {
+                items: Vec::new(),
+                current_state_version: 0,
+                status: QueryStatus::Rejected as i32,
+                leader_hint: status.leader_hint,
+                error_message: status.rejection_reason,
+            }));
+        }
+
+        // TODO: Phase 5 - Implement State Machine queries (Item Store)
+        Ok(Response::new(QueryStateResponse {
+            items: Vec::new(),
+            current_state_version: 0,
+            status: QueryStatus::Success as i32,
+            leader_hint: String::new(),
+            error_message: String::new(),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -602,6 +608,7 @@ mod tests {
             _intent: &MutationIntent,
             _current_inventory: &[common::proto::v1::app::GroceryItem],
             _timeout: Duration,
+            _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
             if let Some(err) = &self.error {
                 return Err(err.clone());
@@ -625,6 +632,7 @@ mod tests {
             _intent: &MutationIntent,
             _current_inventory: &[common::proto::v1::app::GroceryItem],
             _timeout: Duration,
+            _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.fail_count.lock().unwrap();
             if *count < self.max_fails {
@@ -654,6 +662,7 @@ mod tests {
             _intent: &MutationIntent,
             _current_inventory: &[common::proto::v1::app::GroceryItem],
             _timeout: Duration,
+            _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.call_count.lock().unwrap();
             if *count == 0 {
@@ -678,6 +687,7 @@ mod tests {
             _intent: &MutationIntent,
             _current_inventory: &[common::proto::v1::app::GroceryItem],
             _timeout: Duration,
+            _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.call_count.lock().unwrap();
             let current = *count;
@@ -706,7 +716,7 @@ mod tests {
         raft_handle: Arc<dyn RaftHandle>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
-        IngressDispatcher::new(raft_handle, veto_relay, Duration::from_secs(1), 1)
+        IngressDispatcher::new(raft_handle, veto_relay, Duration::from_secs(1), 1, 512)
     }
 
     mod propose_mutation {
@@ -1014,6 +1024,7 @@ mod tests {
                     _intent: &MutationIntent,
                     _current_inventory: &[common::proto::v1::app::GroceryItem],
                     _timeout: Duration,
+                    _max_justification_len: usize,
                 ) -> Result<VetoOutcome, VetoError> {
                     let current = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1270,7 +1281,8 @@ mod tests {
                 ..Default::default()
             });
             // Configured for 1 retry (max 2 attempts)
-            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+            let dispatcher =
+                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1313,7 +1325,8 @@ mod tests {
                 success_outcome: success,
                 call_count: Mutex::new(0),
             });
-            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+            let dispatcher =
+                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1346,7 +1359,8 @@ mod tests {
                 outcome: Some(hallucination),
                 ..Default::default()
             });
-            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+            let dispatcher =
+                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1381,7 +1395,8 @@ mod tests {
                 call_count: Mutex::new(0),
             });
             // Configured for 1 retry (2 attempts total)
-            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1);
+            let dispatcher =
+                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1421,6 +1436,7 @@ mod tests {
                     _intent: &MutationIntent,
                     _current_inventory: &[common::proto::v1::app::GroceryItem],
                     _timeout: Duration,
+                    _max_justification_len: usize,
                 ) -> Result<VetoOutcome, VetoError> {
                     self.call_count.fetch_add(1, Ordering::SeqCst);
                     Ok(VetoOutcome {
@@ -1436,7 +1452,8 @@ mod tests {
             let veto = Arc::new(CountingVetoRelay {
                 call_count: call_count.clone(),
             });
-            let dispatcher = IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 10);
+            let dispatcher =
+                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 10, 512);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),

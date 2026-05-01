@@ -88,6 +88,8 @@ class ClusterManager:
                     "--",
                     "--port",
                     str(VETO_PORT),
+                    "--model",
+                    "qwen3.5:4b",
                 ],
                 stdout=self.veto_log,
                 stderr=subprocess.STDOUT,
@@ -400,7 +402,13 @@ def test_ai_veto_egress() -> None:
             {
                 "client_id": "550e8400-e29b-41d4-a716-446655440000",
                 "sequence_id": 1,
-                "intent": {"item_key": "oat_milk", "quantity": "2"},
+                "intent": {
+                    "item_key": "oat_milk",
+                    "quantity": "2",
+                    "unit": "l",
+                    "category": "LiquefiedHydration",
+                    "operation": 1,
+                },
             }
         ),
         f"127.0.0.1:{leader_port}",
@@ -423,80 +431,74 @@ def test_ai_veto_egress() -> None:
         )
 
 
-def test_client_cli_round_trip() -> None:
-    """Verifies that the Smart Client can redirect from a Follower and commit via the Leader."""
-    leader_id = wait_for_leader()
-
-    # Give followers time to receive the first heartbeat and learn the leader's ID
-    print("Stabilizing cluster (2s)...")
-    time.sleep(2)
-
-    follower_port = next(
-        n["port"] for n in NODES if n["id"] != leader_id
-    )
-
-    print(
-        f"Action: Starting client-cli seeded with Follower (port {follower_port})..."
-    )
-
-    # Clean up any lingering state
+def run_client_command(command: str, seed_port: int) -> str:
+    """Helper to run a single command through the client-cli."""
     state_file = ".client_state.json"
     wal_dir = ".client_wal"
     if os.path.exists(state_file):
         os.remove(state_file)
     if os.path.exists(wal_dir):
         import shutil
-
         shutil.rmtree(wal_dir)
 
     cmd = [
-        "cargo",
-        "run",
-        "-q",  # Quiet cargo output to make parsing stdout easier
-        "-p",
-        "client-cli",
-        "--",
-        "--cluster-id",
-        "lacto-dev-01",
-        "--seed",
-        f"127.0.0.1:{follower_port}",
+        "cargo", "run", "-q", "-p", "client-cli", "--",
+        "--cluster-id", "lacto-dev-01",
+        "--seed", f"127.0.0.1:{seed_port}",
     ]
 
     p = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True,
     )
 
     try:
-        # Send a mutation command and then exit
         if p.stdin is None:
             raise RuntimeError("Failed to open stdin for client-cli")
-
-        p.stdin.write(
-            'add "oat milk" 2 cartons AnimalSecretions\nexit\n'
-        )
+        p.stdin.write(f"{command}\nexit\n")
         p.stdin.flush()
-
-        stdout, _ = p.communicate(timeout=10)
-
-        if "SUCCESS: Committed at version" in stdout:
-            print(
-                "SUCCESS: Client successfully navigated cluster and committed mutation."
-            )
-        else:
-            print(f"FAILURE: Unexpected client output:\n{stdout}")
-            raise RuntimeError(
-                "Client failed to commit mutation via CLI."
-            )
+        stdout, _ = p.communicate(timeout=120)
+        return stdout
     except subprocess.TimeoutExpired as exc:
         p.kill()
         raise RuntimeError("Client CLI timed out.") from exc
     finally:
         if os.path.exists(state_file):
             os.remove(state_file)
+
+
+def test_smart_client_success() -> None:
+    """Verifies that valid input is successfully committed."""
+    leader_id = wait_for_leader()
+    print("Stabilizing cluster (2s)...")
+    time.sleep(2)
+    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
+    
+    print("Action: Sending VALID mutation (Oat Milk)...")
+    output = run_client_command('add "oat milk" 2 l LiquefiedHydration', follower_port)
+
+    if "SUCCESS: Committed at version" in output:
+        print("SUCCESS: Moral Advocate approved valid mutation.")
+    else:
+        print(f"FAILURE: AI rejected valid mutation:\n{output}")
+        raise RuntimeError("Valid mutation was unexpectedly rejected.")
+
+
+def test_smart_client_veto() -> None:
+    """Verifies that invalid input is correctly VETOED by the AI."""
+    leader_id = wait_for_leader()
+    print("Stabilizing cluster (2s)...")
+    time.sleep(2)
+    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
+    
+    print("Action: Sending INVALID mutation (Cigarettes)...")
+    output = run_client_command('add "cigarettes" 2 pack NutrientSparseCommodities', follower_port)
+
+    if "VETOED:" in output:
+        print("SUCCESS: Moral Advocate correctly blocked unethical mutation.")
+    else:
+        print(f"FAILURE: AI failed to veto unethical mutation:\n{output}")
+        raise RuntimeError("Unethical mutation was unexpectedly committed.")
 
 
 # --- Runner Logic ---
@@ -527,9 +529,14 @@ def main() -> None:
         ),
         ("AI Veto Egress", True, lambda c: test_ai_veto_egress()),
         (
-            "Smart Client Round-Trip",
+            "Smart Client (Success Path)",
             True,
-            lambda c: test_client_cli_round_trip(),
+            lambda c: test_smart_client_success(),
+        ),
+        (
+            "Smart Client (Veto Path)",
+            True,
+            lambda c: test_smart_client_veto(),
         ),
     ]
 

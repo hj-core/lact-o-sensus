@@ -6,3 +6,6 @@ data_dir = "data/node_3"
 [peers]
 1 = "http://127.0.0.1:50051"
 2 = "http://127.0.0.1:50052"
+
+[policy]
+veto_timeout_ms = 120000

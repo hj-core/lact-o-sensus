@@ -47,6 +47,7 @@ pub trait VetoRelay: Debug + Send + Sync {
         intent: &MutationIntent,
         current_inventory: &[GroceryItem],
         timeout: Duration,
+        max_justification_len: usize,
     ) -> Result<VetoOutcome, VetoError>;
 }
 
@@ -62,6 +63,21 @@ impl GrpcVetoRelay {
             client: PolicyServiceClient::new(channel),
         }
     }
+
+    /// Truncates the moral justification to a safe limit while preserving
+    /// valid character boundaries.
+    fn trim_justification(s: &str, max_len: usize) -> String {
+        if s.len() <= max_len {
+            s.to_string()
+        } else {
+            // Find the last valid character boundary within our limit
+            let mut end = max_len;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &s[..end])
+        }
+    }
 }
 
 #[async_trait]
@@ -72,6 +88,7 @@ impl VetoRelay for GrpcVetoRelay {
         intent: &MutationIntent,
         current_inventory: &[GroceryItem],
         timeout: Duration,
+        max_justification_len: usize,
     ) -> Result<VetoOutcome, VetoError> {
         let mut client = self.client.clone();
 
@@ -98,11 +115,47 @@ impl VetoRelay for GrpcVetoRelay {
         Ok(VetoOutcome {
             is_approved: response.is_approved,
             category_assignment: response.category_assignment,
-            moral_justification: response.moral_justification,
+            moral_justification: Self::trim_justification(
+                &response.moral_justification,
+                max_justification_len,
+            ),
             resolved_item_key: response.resolved_item_key,
             suggested_display_name: response.suggested_display_name,
             resolved_unit: response.resolved_unit,
             conversion_multiplier_to_base: response.conversion_multiplier_to_base,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod trim_justification {
+        use super::*;
+
+        #[test]
+        fn preserves_short_strings() {
+            let short = "Clinical approval granted.";
+            assert_eq!(GrpcVetoRelay::trim_justification(short, 100), short);
+        }
+
+        #[test]
+        fn truncates_long_strings_to_limit() {
+            let long = "a".repeat(100);
+            let trimmed = GrpcVetoRelay::trim_justification(&long, 10);
+            assert!(trimmed.len() <= 13); // 10 + 3 for ellipsis
+            assert!(trimmed.ends_with("..."));
+            assert_eq!(trimmed, "aaaaaaaaaa...");
+        }
+
+        #[test]
+        fn respects_unicode_boundaries() {
+            // "🦀" is 4 bytes.
+            let s = "🦀🦀🦀";
+            // 6 bytes would be in the middle of the second crab
+            let trimmed = GrpcVetoRelay::trim_justification(s, 6);
+            assert_eq!(trimmed, "🦀..."); // Truncated after first crab (4 bytes)
+        }
     }
 }
