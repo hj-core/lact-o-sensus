@@ -148,6 +148,10 @@ pub struct UnitRegistryEntry {
     pub symbol: &'static str,
     pub dimension: Dimension,
     pub multiplier: Decimal,
+    /// If true, the multiplier depends on the specific item context (e.g.,
+    /// 'pack'). If false, the multiplier is a universal physical constant
+    /// (e.g., 'kg').
+    pub is_contextual: bool,
 }
 
 pub struct UnitRegistry;
@@ -155,12 +159,22 @@ pub struct UnitRegistry;
 impl UnitRegistry {
     /// High-level Orchestrator: Parses a quantity and unit symbol into a
     /// validated, stabilized `PhysicalQuantity`.
-    ///
-    /// Following the Information Hierarchy, this orchestrator delegates to
-    /// specialized sub-functions for symbol resolution and conversion math.
     pub fn parse_and_convert(quantity: &str, unit: &str) -> Result<PhysicalQuantity, UnitError> {
         let entry = Self::resolve_symbol(unit)?;
         let base_val = Self::convert_to_base_val(quantity, entry.multiplier)?;
+        Ok(Self::construct_quantity(entry.dimension, base_val))
+    }
+
+    /// Specialized Orchestrator: Parses a quantity and unit symbol but uses an
+    /// EXTERNALLY provided multiplier (e.g. from AI Oracle resolution).
+    /// Still verifies the unit dimension via the registry.
+    pub fn parse_and_convert_with_multiplier(
+        quantity: &str,
+        unit: &str,
+        multiplier: Decimal,
+    ) -> Result<PhysicalQuantity, UnitError> {
+        let entry = Self::resolve_symbol(unit)?;
+        let base_val = Self::convert_to_base_val(quantity, multiplier)?;
         Ok(Self::construct_quantity(entry.dimension, base_val))
     }
 
@@ -174,21 +188,25 @@ impl UnitRegistry {
                 symbol: "g",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::ONE,
+                is_contextual: false,
             }),
             "kg" => Ok(UnitRegistryEntry {
                 symbol: "kg",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::from(1000),
+                is_contextual: false,
             }),
             "lb" | "lbs" => Ok(UnitRegistryEntry {
                 symbol: "lb",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::from_str("453.59237").unwrap(),
+                is_contextual: false,
             }),
             "oz" => Ok(UnitRegistryEntry {
                 symbol: "oz",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::from_str("28.34952").unwrap(),
+                is_contextual: false,
             }),
 
             // --- Volume ---
@@ -196,21 +214,25 @@ impl UnitRegistry {
                 symbol: "ml",
                 dimension: Dimension::Volume,
                 multiplier: Decimal::ONE,
+                is_contextual: false,
             }),
             "l" => Ok(UnitRegistryEntry {
                 symbol: "L",
                 dimension: Dimension::Volume,
                 multiplier: Decimal::from(1000),
+                is_contextual: false,
             }),
             "gal" => Ok(UnitRegistryEntry {
                 symbol: "gal",
                 dimension: Dimension::Volume,
                 multiplier: Decimal::from_str("3785.41178").unwrap(),
+                is_contextual: false,
             }),
             "fl_oz" => Ok(UnitRegistryEntry {
                 symbol: "fl_oz",
                 dimension: Dimension::Volume,
                 multiplier: Decimal::from_str("29.57353").unwrap(),
+                is_contextual: false,
             }),
 
             // --- Count ---
@@ -218,16 +240,19 @@ impl UnitRegistry {
                 symbol: "units",
                 dimension: Dimension::Count,
                 multiplier: Decimal::ONE,
+                is_contextual: false,
             }),
             "dozens" | "dozen" => Ok(UnitRegistryEntry {
                 symbol: "dozens",
                 dimension: Dimension::Count,
                 multiplier: Decimal::from(12),
+                is_contextual: false,
             }),
             "packs" | "pack" => Ok(UnitRegistryEntry {
                 symbol: "packs",
                 dimension: Dimension::Count,
                 multiplier: Decimal::ONE,
+                is_contextual: true,
             }),
 
             // --- Anomalous ---
@@ -235,6 +260,7 @@ impl UnitRegistry {
                 symbol: "misc",
                 dimension: Dimension::Anomalous,
                 multiplier: Decimal::ONE,
+                is_contextual: true,
             }),
 
             _ => Err(UnitError::InvalidSymbol(normalized)),
@@ -297,6 +323,43 @@ mod tests {
             let res = UnitRegistry::parse_and_convert("1.0", "gal").unwrap();
             assert_eq!(res.dimension(), Dimension::Volume);
             assert_eq!(res.value().to_string(), "3785.4118"); // 3785.41178 rounded to 4dp
+        }
+    }
+
+    mod parse_and_convert_with_multiplier {
+        use super::*;
+
+        #[test]
+        fn applies_custom_multiplier_and_resolves_dimension() {
+            // A "pack" of 6 units
+            let res =
+                UnitRegistry::parse_and_convert_with_multiplier("2", "pack", Decimal::from(6))
+                    .unwrap();
+
+            assert_eq!(res.dimension(), Dimension::Count);
+            // 2 packs * 6 multiplier = 12 units
+            assert_eq!(res.value().to_string(), "12");
+        }
+
+        #[test]
+        fn applies_bankers_rounding_to_stabilized_result() {
+            // Testing 1.23456 * 10 = 12.3456
+            let res = UnitRegistry::parse_and_convert_with_multiplier(
+                "1.23456",
+                "units",
+                Decimal::from(10),
+            )
+            .unwrap();
+
+            // Banker's Rounding to 4dp: 12.3456
+            assert_eq!(res.value().to_string(), "12.3456");
+        }
+
+        #[test]
+        fn fails_on_invalid_unit_symbol() {
+            let res =
+                UnitRegistry::parse_and_convert_with_multiplier("1", "unknown_unit", Decimal::ONE);
+            assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
         }
     }
 

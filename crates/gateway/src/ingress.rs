@@ -21,6 +21,7 @@ use common::types::SequenceId;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
 use prost::Message;
+use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tonic::Request;
 use tonic::Response;
@@ -130,6 +131,14 @@ impl IngressDispatcher {
             if trimmed.is_empty() {
                 intent.quantity = None;
             } else {
+                let val = Decimal::from_str(trimmed).map_err(|_| {
+                    self.invalid_argument(format!("Invalid quantity format: '{}'", trimmed))
+                })?;
+                if val.is_sign_negative() {
+                    return Err(self.invalid_argument(
+                        "quantity cannot be negative. Use SUBTRACT or DELETE for removals.",
+                    ));
+                }
                 *q = trimmed.to_string();
             }
         }
@@ -195,7 +204,11 @@ impl IngressDispatcher {
             .as_deref()
             .ok_or_else(|| self.invalid_argument("quantity is missing"))?;
 
-        let base_quantity = self.verify_unit_stabilization(q_str, &veto.resolved_unit)?;
+        let base_quantity = self.verify_unit_stabilization(
+            q_str,
+            &veto.resolved_unit,
+            &veto.conversion_multiplier_to_base,
+        )?;
 
         self.enforce_physical_invariants(
             intent,
@@ -231,13 +244,50 @@ impl IngressDispatcher {
         &self,
         quantity: &str,
         unit_symbol: &str,
+        ai_multiplier: &str,
     ) -> Result<PhysicalQuantity, Status> {
-        UnitRegistry::parse_and_convert(quantity, unit_symbol).map_err(|e| {
+        // 1. Resolve unit metadata from the clinical registry
+        let entry = UnitRegistry::resolve_symbol(unit_symbol).map_err(|e| {
             self.invalid_argument(format!(
                 "Physical Invariant Violation: Invalid unit '{}' ({}).",
                 unit_symbol, e
             ))
-        })
+        })?;
+
+        // 2. Parse the AI resolved multiplier
+        let ai_val = Decimal::from_str(ai_multiplier).map_err(|_| {
+            self.internal_error(format!(
+                "AI Hallucination: Malformed multiplier '{}' for contextual unit.",
+                ai_multiplier
+            ))
+        })?;
+
+        // 3. Safe Delegation: Determine Source of Authority
+        let base_quantity_res = if entry.is_contextual {
+            // Authority: AI (Contextual units like 'pack' or 'misc')
+            UnitRegistry::parse_and_convert_with_multiplier(quantity, unit_symbol, ai_val)
+        } else {
+            // Authority: REGISTRY (Universal constants like 'kg' or 'l')
+            // We ignore the AI's multiplier resolution to ensure physical laws are not
+            // redefined.
+            UnitRegistry::parse_and_convert(quantity, unit_symbol)
+        };
+
+        let base_quantity = base_quantity_res.map_err(|e| {
+            self.invalid_argument(format!(
+                "Physical Invariant Violation: Stabilization failed ({}).",
+                e
+            ))
+        })?;
+
+        // 4. Final Result Guard: Strictly Positive mass/volume/count
+        if base_quantity.value().is_sign_negative() || base_quantity.value().is_zero() {
+            return Err(self.invalid_argument(
+                "Physical Invariant Violation: Stabilized quantity must be strictly positive.",
+            ));
+        }
+
+        Ok(base_quantity)
     }
 
     /// Captures the un-normalized human intent for the audit log.
@@ -1003,6 +1053,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rejects_negative_quantity_for_mutation_intents() {
+            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "bananas".to_string(),
+                    quantity: Some("-5".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(status.message().contains("cannot be negative"));
+        }
+
+        #[tokio::test]
         async fn enforces_sequential_processing_via_lock() {
             use std::sync::atomic::AtomicUsize;
             use std::sync::atomic::Ordering;
@@ -1605,6 +1676,85 @@ mod tests {
             // Banker's Rounding to 4 dp as defined in units.rs
             assert_eq!(result.updated_base_quantity, "680.3886");
             assert_eq!(result.base_unit, "g");
+        }
+
+        #[test]
+        fn grants_contextual_override_when_unit_is_dynamic() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: Some("2".to_string()),
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_unit: "pack".to_string(), // Contextual unit
+                conversion_multiplier_to_base: "6".to_string(), // AI resolves 6 per pack
+                ..valid_outcome()
+            };
+
+            let result = dispatcher
+                .validate_and_stabilize(&intent, &veto, &[])
+                .unwrap();
+            // 2 packs * 6 multiplier = 12 base units
+            assert_eq!(result.updated_base_quantity, "12");
+        }
+
+        #[test]
+        fn ignores_physical_constant_redefinition_when_unit_is_static() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: Some("1".to_string()),
+                ..Default::default()
+            };
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_unit: "kg".to_string(), // Static unit
+                conversion_multiplier_to_base: "500".to_string(), /* AI attempts to redefine 1kg
+                                                  * = 500g */
+                ..valid_outcome()
+            };
+
+            let result = dispatcher
+                .validate_and_stabilize(&intent, &veto, &[])
+                .unwrap();
+
+            // Physical Law Check: Registry (1000) must override AI (500)
+            assert_eq!(result.updated_base_quantity, "1000");
+            assert_eq!(result.base_unit, "g");
+        }
+
+        #[test]
+        fn rejects_non_positive_quantity_during_stabilization() {
+            let dispatcher = test_dispatcher();
+            let intent = MutationIntent {
+                quantity: Some("1".to_string()),
+                ..Default::default()
+            };
+
+            // Test 1: Zero (using contextual unit to ensure AI multiplier is applied)
+            let veto_zero = VetoOutcome {
+                is_approved: true,
+                resolved_unit: "pack".to_string(),
+                conversion_multiplier_to_base: "0".to_string(),
+                ..valid_outcome()
+            };
+            let status_zero = dispatcher
+                .validate_and_stabilize(&intent, &veto_zero, &[])
+                .unwrap_err();
+            assert_eq!(status_zero.code(), tonic::Code::InvalidArgument);
+
+            // Test 2: Negative
+            let veto_neg = VetoOutcome {
+                is_approved: true,
+                resolved_unit: "pack".to_string(),
+                conversion_multiplier_to_base: "-1".to_string(),
+                ..valid_outcome()
+            };
+            let status_neg = dispatcher
+                .validate_and_stabilize(&intent, &veto_neg, &[])
+                .unwrap_err();
+            assert_eq!(status_neg.code(), tonic::Code::InvalidArgument);
+            assert!(status_neg.message().contains("strictly positive"));
         }
     }
 
