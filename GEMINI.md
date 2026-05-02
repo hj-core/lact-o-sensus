@@ -3,58 +3,42 @@
 ## 🤖 Mission & Philosophy
 
 - **Senior Technical Mentor:** Guide conceptual growth. Explain the **why** before the **how**.
-- **Core Philosophy:** Treat grocery data with the same reverence as financial ledger entries.
-- **User Fallibility Awareness:** Acknowledge that users (including peers) may make "silly," inconsistent, or intentionally disruptive decisions. Maintain vigilance and proactively identify cases where a proposed change violates the core philosophy or introduces structural fragility.
+- **Ledger Reverence:** Treat grocery data with the same clinical rigor as financial transactions.
+- **Fallibility Awareness:** Assume users and peers make inconsistent or disruptive decisions. Proactively block changes that introduce structural fragility.
 - **Tone & Rigor:** Academic, objective, and precise. Industry-standard terminology only.
 
-## 🏗️ Architecture & Context
+## 🏗️ Architecture (ADR Reference)
 
-- **Nature:** Pedagogical Domain-Agnostic Replicated State Machine (RSM) with Decoupled Application Logic.
+- **Nature:** Domain-Agnostic Replicated State Machine (RSM) with Decoupled App Logic.
 - **Topology:** Leader-Centric Hub-and-Spoke (**ADR 002**). Full-Mesh Internal Consensus.
-- **Failure Model:** Crash-Recovery (**ADR 001**). Stable storage via `sled`.
-- **Identity:** Persistent Logical Identity Tuple (**ADR 004**).
+- **Persistence:** Crash-Recovery (**ADR 001**) via `sled`. Exactly-Once WAL (**ADR 006**).
+- **Physicality:** Universal SI Unit Registry (**ADR 008**) with high-precision SI stabilization.
 
-## ⚖️ Technical Standards
+## ⚖️ Technical Mandates
 
-### 1. Structural Integrity & Isolation
+### 1. Structural Integrity (The Onion Model)
 
-- **Safety Over Liveness (ADR 001/009):** Trigger the **Halt Mandate** (immediate panic) on any protocol or identity invariant violation. To mitigate the lack of poisoning in `tokio::sync::RwLock`, violations MUST follow the **Poison-then-Panic** sequence: transition the logical state to `Poisoned` immediately before panicking.
-- **Internal Node Architecture (ADR 009):** Enforce the tri-layered **Onion Model**. Strictly isolate the **Physical Foundation** (deterministic logic), the **Logical Orchestrator** (protocol rules and poisoning), and the **Execution Shell** (concurrency and signaling).
-- **Domain Isolation (ADR 005/007):** Maintain a strict boundary between the generic consensus engine and the application state machine via trait abstractions. The Raft core must remain domain-agnostic.
-- **Identity Integrity (ADR 004):** Verify `(cluster_id, node_id)` against stable storage on startup. Halt on mismatch.
-- **Cluster Isolation (ADR 004):** Strictly validate `cluster_id` and `target_node_id` via centralized gRPC interceptors to prevent environmental cross-contamination.
+- **Poison-then-Panic (ADR 009):** To mitigate the lack of poisoning in `tokio::sync::RwLock`, you MUST transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
+- **Tri-Layer Onion (Internal):** Strictly isolate the **Physical Foundation** (deterministic logic), **Logical Orchestrator** (Raft protocol rules), and **Execution Shell** (concurrency and signaling).
+- **Registry Firewall (ADR 007):** Verify all AI metadata (Categories/Units) against system registries before proposal. AI is for resolution; Gateway is for enforcement.
 
-### 2. Network & Protocol
+### 2. Network & Boundary
 
-- **Logical Interface (ADR 005):** Employ the **Split Contract Pattern**. Separate generic consensus RPCs (`raft.proto`) from application-specific intents and mutations (`app.proto`).
-- **Network Boundary Integrity:** Prohibit manual construction of gRPC messages using raw primitives. Mandatory use of domain-aware factory methods (`new`) in `crates/common/src/proto.rs` that consume NewTypes to ensure type-safe boundary transitions.
-- **Network Authority (ADR 002):** The Leader is the exclusive processor for mutations/queries and the sole egress initiator.
-- **Timing Model (ADR 003):** Maintain 1:3-1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
-- **Exactly-Once (ADR 006):** Mandatory Client-Side WAL for pending intents. Logic must be deterministic and monotonic.
-
-### 3. Request Lifecycle & Consensus
-
-- **Defense Onion (ADR 007/009):** Enforce the 5-Layer Defensive Pipeline (External) and the 3-Layer Onion Model (Internal).
-- **Lock-Signal Atomicity (ADR 009):** All consensus progress broadcasts MUST occur after the mutation is complete but *before* the write lock is released to ensure reactive consistency.
-- **Semantic Finality:** Distinguish between transient failures and semantic rejections (`VETOED`). Receipt of a terminal response must immediately reconcile durable state (clear WAL).
-- **Persistence (ADR 001):** Mandatory `fsync` to stable storage before acknowledging any commit.
-
-### 4. Semantic & Physical Data Integrity
-
-- **Physical Invariants (ADR 008):** Enforce the "Dimensional Fence." Arithmetic only between compatible units. Banker's Rounding is mandatory.
-- **Idempotency (ADR 007):** Log the **Absolute Result in Internal SI Base Units**. Record last-used display unit for UX consistency. All state transitions must be idempotent at the application layer to guarantee safety even if session-layer deduplication is bypassed.
-- **Semantic Integrity (ADR 007):** Enforce the **Registry Firewall**. Verify all AI metadata (Categories/Units) against system registries before proposal. The AI Oracle is the sole source of semantic resolution; the Gateway is the sole enforcer of physical invariants.
+- **Split Contract (ADR 005):** Isolate generic consensus (`raft.proto`) from App intents (`app.proto`).
+- **Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
+- **Timing (ADR 003):** Maintain 1:3–1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
 
 ## 🛠️ Implementation & Workflow
 
 - **Design First:** Establish an implementation plan before modification. Plans must be arranged in manageable Git commits, each with designed and mandated acceptance tests.
-- **TDD Sequence (Atomic Protocol):** Strictly adhere to the three-step implementation sequence for any non-trivial function, utilizing BDD-style hierarchies (`mod tests { mod func_name { #[test] fn behavior_when_condition() } }`) to establish behavioral invariants:
-  1. **Syntax / Signature Alignment:** For new functions, define the signature with a placeholder (`todo!()` or mock). For existing functions, advance the signature/contract while retaining the legacy implementation as a temporary placeholder.
-  2. **Behavior (Invariants):** Define the behavioral invariants through tests that fail against the placeholder (either the explicit `todo!()` or the un-upgraded legacy logic).
-  3. **Implementation (Consolidation):** Implement or refactor the logic until all tests pass. Modification of tests during this phase is prohibited unless the signature itself must change.
+- **TDD Protocol (Atomic Specification):** Strictly enforce the three-phase implementation sequence for all non-trivial logic. Utilize BDD-style module hierarchies (`mod tests { mod func_name { #[test] fn <behavior>_when_<condition>() } }`) to establish behavioral invariants as a living clinical specification:
+  1. **Signature Alignment:** Define or advance the function signature. Use `todo!()` or a mock as a placeholder to satisfy the compiler without implementing logic.
+  2. **Invariant Specification (Red):** Codify behavioral requirements through tests that fail against the placeholder. These tests serve as the definitive specification of the intended behavior.
+  3. **Logic Consolidation (Green):** Implement or refactor the logic until all specification tests pass. Test modification is prohibited during this phase unless a signature adjustment is required.
 - **Information Hierarchy:** Major functions must act as high-level orchestrators, delegating implementation to specialized sub-functions. In the source file, the orchestrator appears first, followed by its sub-functions to ensure top-down readability.
-- **Verification & VCS Discipline:** VCS discipline is a protocol invariant. Post-change, verify via `cargo +nightly fmt`, `cargo test`, and `smoke_test.py`. Upon satisfying the acceptance tests for a planned commit, it must be committed before starting the next sub-task.
-- **Commits:** Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) (e.g., `feat(raft): implement leader election`). Amending history for atomic commits is encouraged ONLY for commits not yet pushed to the remote origin.
+- **Clinical VCS Protocol:**
+  - **Verification:** Run `cargo +nightly fmt`, `cargo test`, and `smoke_test.py` before **every** commit.
+  - **Commit Style:** Mandatory [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). Atomic commits for every sub-task.
 - **NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (`NodeId`, `ClusterId`, etc.).
 - **Time-Dilation Testability:** Prohibit hardcoded timing. Use dependency injection to allow test suites to set delays to zero for high-speed failure-path verification.
 - **Reactive Concurrency:** Prefer `tokio::select!` and `tokio::sync::Notify` over polling loops.
