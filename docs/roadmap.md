@@ -57,26 +57,27 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **Identity Protocol Upgrade:** Update Protobuf and gRPC interceptors to enforce the `target_node_id` invariant, preventing logical misrouting and identity collisions (ADR 004/005).
 - **Success Metric:** Cluster rejects misconfigured identity traffic via centralized middleware and client provides high-availability guarantees through durable WALs and stabilized retry backoff.
 
-## 🧠 Phase 5: The AI Moral Advocate (Semantic Oracle)
+## 🧠 Phase 5: The AI Moral Advocate (Semantic Oracle) [DONE]
 
 - **Goal:** Implement the 5-Layer Defensive Onion (ADR 007) and transition from mock logic to a relational AI evaluation engine.
 - **Key Actions:**
-  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (ADR 009).
-  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005).
-  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence).
-  - **Real AI Integration:** Integrate OpenAI API or local Llama via `ollama-rs` into `crates/ai-veto`.
-  - **Moral Heuristics:** Develop the "Moral Advocate" persona (e.g., rejecting sweets based on existing inventory context).
-  - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures.
+  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (ADR 009). [DONE]
+  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005). [DONE]
+  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence). [DONE]
+  - **Real AI Integration:** Integrate OpenAI API or local Llama via `ollama-rs` into `crates/ai-veto`. [DONE]
+  - **Moral Heuristics:** Develop the "Moral Advocate" persona (e.g., rejecting sweets based on existing inventory context). [DONE]
+  - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures. [DONE]
 - **Success Metric:** Messy user input is correctly resolved and vetoed by the LLM based on context-aware moral judgement.
 
-## 🛡️ Phase 6: Precision & Persistence (SI & Session EOS)
+## 🛡️ Phase 6: Persistence & Session Integrity (sled & EOS)
 
-- **Goal:** Implement SI Stabilization, Exactly-Once Semantics, and Persistent Storage.
+- **Goal:** Implement Exactly-Once Semantics and transition to persistent disk storage.
 - **Key Actions:**
-  - **Internal SI:** Implement the **SI Stabilization Model** (ADR 008) using `rust_decimal` and mandatory **Banker's Rounding**.
-  - **Session Table:** Implement the Session Table with **Atomic Side-Effect Updates** (ADR 006) and a **Deterministic Monotonic Clock** derived from log timestamps.
+  - **Consistent Query Path:** Implement the `InventorySource` trait and the `query_state` RPC. Support `query_filter` and satisfy the Linearizable Read mandate (ADR 007).
+  - **Internal SI (ADR 008):** [ACCELERATED - DONE] High-precision stabilization with `rust_decimal` and Banker's Rounding implemented in Phase 5.
+  - **Persistent Storage:** Integrate **`sled`** for persistent Raft logs and the State Machine inventory with synchronous `fsync` (ADR 001).
+  - **Session Table & EOS:** Implement the Session Table with **Atomic Side-Effect Updates** (ADR 006) and enforce `min_state_version` for "Read-Your-Writes" consistency.
   - **The Halt Mandate:** Formalize immediate node panic on session table or state machine divergence, utilizing the **Poison-then-Panic** sequence (ADR 009) to ensure safety during recovery or snapshot loading.
-  - **Storage:** Integrate **`sled`** for persistent Raft logs and the State Machine with synchronous `fsync` (ADR 001).
   - **Chaos Testing:** Perform "Chaos Testing" to verify 100% recovery integrity and the **Halt Mandate** panic on state divergence.
 - **Success Metric:** Idempotent recovery from the log using absolute SI results with zero arithmetic bias.
 
