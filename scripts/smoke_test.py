@@ -474,8 +474,8 @@ def test_smart_client_success() -> None:
     time.sleep(2)
     follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
     
-    print("Action: Sending VALID mutation (Oat Milk)...")
-    output = run_client_command('add "oat milk" 2 l LiquefiedHydration', follower_port)
+    print("Action: Sending VALID mutation (Water)...")
+    output = run_client_command('add "water" 5 l LiquefiedHydration', follower_port)
 
     if "SUCCESS: Committed at version" in output:
         print("SUCCESS: Moral Advocate approved valid mutation.")
