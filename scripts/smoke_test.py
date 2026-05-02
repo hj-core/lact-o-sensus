@@ -439,17 +439,28 @@ def run_client_command(command: str, seed_port: int) -> str:
         os.remove(state_file)
     if os.path.exists(wal_dir):
         import shutil
+
         shutil.rmtree(wal_dir)
 
     cmd = [
-        "cargo", "run", "-q", "-p", "client-cli", "--",
-        "--cluster-id", "lacto-dev-01",
-        "--seed", f"127.0.0.1:{seed_port}",
+        "cargo",
+        "run",
+        "-q",
+        "-p",
+        "client-cli",
+        "--",
+        "--cluster-id",
+        "lacto-dev-01",
+        "--seed",
+        f"127.0.0.1:{seed_port}",
     ]
 
     p = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True,
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
 
     try:
@@ -472,10 +483,14 @@ def test_smart_client_success() -> None:
     leader_id = wait_for_leader()
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
-    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
-    
+    follower_port = next(
+        n["port"] for n in NODES if n["id"] != leader_id
+    )
+
     print("Action: Sending VALID mutation (Water)...")
-    output = run_client_command('add "water" 5 l LiquefiedHydration', follower_port)
+    output = run_client_command(
+        'add "water" 5 l LiquefiedHydration', follower_port
+    )
 
     if "SUCCESS: Committed at version" in output:
         print("SUCCESS: Moral Advocate approved valid mutation.")
@@ -489,16 +504,92 @@ def test_smart_client_veto() -> None:
     leader_id = wait_for_leader()
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
-    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
-    
+    follower_port = next(
+        n["port"] for n in NODES if n["id"] != leader_id
+    )
+
     print("Action: Sending INVALID mutation (Cigarettes)...")
-    output = run_client_command('add "cigarettes" 2 pack NutrientSparseCommodities', follower_port)
+    output = run_client_command(
+        'add "cigarettes" 2 pack NutrientSparseCommodities',
+        follower_port,
+    )
 
     if "VETOED:" in output:
-        print("SUCCESS: Moral Advocate correctly blocked unethical mutation.")
+        print(
+            "SUCCESS: Moral Advocate correctly blocked unethical mutation."
+        )
     else:
-        print(f"FAILURE: AI failed to veto unethical mutation:\n{output}")
-        raise RuntimeError("Unethical mutation was unexpectedly committed.")
+        print(
+            f"FAILURE: AI failed to veto unethical mutation:\n{output}"
+        )
+        raise RuntimeError(
+            "Unethical mutation was unexpectedly committed."
+        )
+
+
+def test_linearizable_query_rejection() -> None:
+    """Verifies that a non-leader node rejects query_state directly."""
+    leader_id = wait_for_leader()
+    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
+    follower_port = next(
+        n["port"] for n in NODES if n["id"] == follower_id
+    )
+
+    print(
+        f"Action: Probing FOLLOWER (Node {follower_id}) for query_state..."
+    )
+    cmd = [
+        "grpcurl",
+        "-plaintext",
+        "-import-path",
+        "crates/common/proto",
+        "-proto",
+        "app.proto",
+        "-H",
+        "x-cluster-id: lacto-dev-01",
+        "-H",
+        f"x-target-node-id: {follower_id}",
+        "-d",
+        json.dumps({}),
+        f"127.0.0.1:{follower_port}",
+        "lacto_sensus.v1.IngressService/QueryState",
+    ]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False
+    )
+
+    try:
+        response = json.loads(result.stdout)
+        status = response.get("status")
+        leader_hint = response.get("leaderHint")
+
+        leader_port = next(
+            n["port"] for n in NODES if n["id"] == leader_id
+        )
+        expected_hint = f"http://127.0.0.1:{leader_port}"
+
+        if status == "QUERY_STATUS_REJECTED":
+            if leader_hint == expected_hint:
+                print(
+                    f"SUCCESS: Follower correctly rejected query_state with accurate hint: {leader_hint}"
+                )
+            else:
+                print(
+                    f"FAILURE: Follower provided incorrect leader hint. Expected {expected_hint}, got {leader_hint}"
+                )
+                raise RuntimeError(
+                    "Incorrect leader hint in query rejection."
+                )
+        else:
+            print(
+                f"FAILURE: Follower did not reject query_state: {result.stdout}"
+            )
+            raise RuntimeError(
+                "Follower failed to reject linearizable query."
+            )
+    except json.JSONDecodeError as exc:
+        print(f"FAILURE: Malformed JSON response: {result.stdout}")
+        raise RuntimeError("Malformed response from follower.") from exc
 
 
 # --- Runner Logic ---
@@ -526,6 +617,11 @@ def main() -> None:
             "Identity Guard (ADR 004)",
             False,
             lambda c: test_identity_guard(),
+        ),
+        (
+            "Linearizable Query Rejection",
+            False,
+            lambda c: test_linearizable_query_rejection(),
         ),
         ("AI Veto Egress", True, lambda c: test_ai_veto_egress()),
         (

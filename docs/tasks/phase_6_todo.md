@@ -8,20 +8,18 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 🏗️ Task Hierarchy & Git Commit Strategy
 
-### Step 1: The Linearizable Query Path (Instrumentation)
+### Step 1: The Linearizable Query Path (Instrumentation) [DONE]
 
 **Commit:** `feat(gateway): implement InventorySource and linearizable query path`
 
-- **Description:** Allow clients to read the inventory with strict consistency guarantees by enforcing a Quorum Read before returning data from the State Machine.
-- **Changes:**
-  - Define `InventorySource` trait in `crates/gateway/src/ingress.rs`.
-  - Update `RaftHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
-  - Implement `verify_leadership` in `crates/raft-node/src/service/handle.rs` (forcing a heartbeat or using the local epoch).
-  - Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventorySource`, and support basic `query_filter` matching on `item_key`.
-  - Update `raft-node/src/main.rs` to pass the `LactoStore` as the `InventorySource`.
+- [x] Define `InventorySource` trait in `crates/gateway/src/ingress.rs`.
+- [x] Update `RaftHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
+- [x] Implement `verify_leadership` in `crates/raft-node/src/service/handle.rs` (forcing a heartbeat or using the local epoch).
+- [x] Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventorySource`, and support basic `query_filter` matching on `item_key`.
+- [x] Update `raft-node/src/main.rs` to pass the `LactoStore` as the `InventorySource`.
 - **Acceptance Tests (TDD):**
-  - Unit test: `query_state` returns data filtered by `item_key`.
-  - Integration test: A deposed leader correctly rejects a `query_state` request due to failing the Quorum Read.
+  - [x] Unit test: `query_state` returns data filtered by `item_key`.
+  - [x] Integration test: A deposed leader correctly rejects a `query_state` request due to failing the Quorum Read.
 
 ### Step 2: Isolated Storage: Consensus Log
 
@@ -76,5 +74,5 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 📈 Completion Status
 
-- **Total Progress:** 0%
-- **Current Focus:** Step 1: The Linearizable Query Path
+- **Total Progress:** 20%
+- **Current Focus:** Step 2: Isolated Storage: Consensus Log

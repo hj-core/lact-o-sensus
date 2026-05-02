@@ -26,9 +26,11 @@ impl LactoStore {
     pub fn new() -> Self {
         Self::default()
     }
+}
 
-    /// Provides a read-only snapshot of the current inventory.
-    pub async fn get_inventory(&self) -> Vec<GroceryItem> {
+#[async_trait]
+impl gateway::ingress::InventorySource for LactoStore {
+    async fn get_inventory(&self) -> Vec<GroceryItem> {
         self.inventory.read().await.values().cloned().collect()
     }
 }

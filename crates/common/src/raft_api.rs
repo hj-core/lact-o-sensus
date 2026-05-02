@@ -45,4 +45,10 @@ pub trait RaftHandle: Send + Sync + std::fmt::Debug {
         client_id: &ClientId,
         sequence_id: SequenceId,
     ) -> Result<Option<LogIndex>, Status>;
+
+    /// Verifies that this node is still the current cluster leader.
+    ///
+    /// For strict linearizability, this should perform a quorum check
+    /// (e.g., a heartbeat round-trip) to ensure it hasn't been deposed.
+    async fn verify_leadership(&self) -> Result<(), Status>;
 }

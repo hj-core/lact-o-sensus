@@ -2,7 +2,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use common::proto::v1::app::CommittedMutation;
+use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::OperationType;
@@ -35,6 +37,13 @@ use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
 
+/// Trait for fetching the current state of the grocery inventory.
+#[async_trait]
+pub trait InventorySource: Send + Sync + std::fmt::Debug {
+    /// Returns the current list of items in the inventory.
+    async fn get_inventory(&self) -> Vec<GroceryItem>;
+}
+
 /// Validated and mathematically stabilized data ready for consensus.
 ///
 /// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
@@ -56,6 +65,7 @@ struct StabilizedMutation {
 #[derive(Debug)]
 pub struct IngressDispatcher {
     raft_handle: Arc<dyn RaftHandle>,
+    inventory_source: Arc<dyn InventorySource>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
     /// Maximum number of leader-internal retries for AI resolution.
@@ -72,6 +82,7 @@ impl IngressDispatcher {
     /// Creates a new IngressDispatcher with configured AI policy parameters.
     pub fn new(
         raft_handle: Arc<dyn RaftHandle>,
+        inventory_source: Arc<dyn InventorySource>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
         veto_max_retries: usize,
@@ -79,6 +90,7 @@ impl IngressDispatcher {
     ) -> Self {
         Self {
             raft_handle,
+            inventory_source,
             veto_relay,
             veto_timeout,
             veto_max_retries,
@@ -573,26 +585,42 @@ impl IngressService for IngressDispatcher {
         &self,
         request: Request<QueryStateRequest>,
     ) -> Result<Response<QueryStateResponse>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
 
         let span = info_span!("query_state");
         let _enter = span.enter();
 
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
+        // 1. Leadership Authority (Quorum Read Verification)
+        if let Err(status) = self.raft_handle.verify_leadership().await {
+            let consensus_status = self.raft_handle.consensus_status().await;
             return Ok(Response::new(QueryStateResponse {
                 items: Vec::new(),
                 current_state_version: 0,
                 status: QueryStatus::Rejected as i32,
-                leader_hint: status.leader_hint,
-                error_message: status.rejection_reason,
+                leader_hint: consensus_status.leader_hint,
+                error_message: status.message().to_string(),
             }));
         }
 
-        // TODO: Phase 5 - Implement State Machine queries (Item Store)
+        // 2. Fetch inventory from the authoritative state machine
+        let all_items = self.inventory_source.get_inventory().await;
+
+        // 3. Apply semantic filters
+        let filtered_items = if let Some(filter) = req.query_filter {
+            let filter = filter.to_lowercase();
+            all_items
+                .into_iter()
+                .filter(|item| item.item_key.to_lowercase().contains(&filter))
+                .collect()
+        } else {
+            all_items
+        };
+
+        // TODO: Step 4 - Wait for min_state_version (EOS Barrier)
+
         Ok(Response::new(QueryStateResponse {
-            items: Vec::new(),
-            current_state_version: 0,
+            items: filtered_items,
+            current_state_version: 0, // TODO: Return actual index from Store
             status: QueryStatus::Success as i32,
             leader_hint: String::new(),
             error_message: String::new(),
@@ -641,6 +669,14 @@ mod tests {
             _sequence_id: SequenceId,
         ) -> Result<Option<LogIndex>, Status> {
             Ok(None)
+        }
+
+        async fn verify_leadership(&self) -> Result<(), Status> {
+            if self.is_leader {
+                Ok(())
+            } else {
+                Err(Status::failed_precondition("Not leader"))
+            }
         }
     }
 
@@ -762,11 +798,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct MockInventorySource {
+        items: Vec<common::proto::v1::app::GroceryItem>,
+    }
+
+    #[async_trait]
+    impl InventorySource for MockInventorySource {
+        async fn get_inventory(&self) -> Vec<common::proto::v1::app::GroceryItem> {
+            self.items.clone()
+        }
+    }
+
     fn mock_dispatcher(
         raft_handle: Arc<dyn RaftHandle>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
-        IngressDispatcher::new(raft_handle, veto_relay, Duration::from_secs(1), 1, 512)
+        IngressDispatcher::new(
+            raft_handle,
+            Arc::new(MockInventorySource::default()),
+            veto_relay,
+            Duration::from_secs(1),
+            1,
+            512,
+        )
     }
 
     mod propose_mutation {
@@ -838,6 +893,10 @@ mod tests {
                     _sequence_id: SequenceId,
                 ) -> Result<Option<LogIndex>, Status> {
                     Ok(Some(self.committed_index))
+                }
+
+                async fn verify_leadership(&self) -> Result<(), Status> {
+                    self.mock.verify_leadership().await
                 }
             }
 
@@ -1325,6 +1384,10 @@ mod tests {
                 ) -> Result<Option<LogIndex>, Status> {
                     Ok(None)
                 }
+
+                async fn verify_leadership(&self) -> Result<(), Status> {
+                    Ok(())
+                }
             }
 
             let dispatcher = mock_dispatcher(Arc::new(FailingRaft), successful_veto());
@@ -1352,8 +1415,14 @@ mod tests {
                 ..Default::default()
             });
             // Configured for 1 retry (max 2 attempts)
-            let dispatcher =
-                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                Arc::new(MockInventorySource::default()),
+                veto,
+                Duration::from_secs(1),
+                1,
+                512,
+            );
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1396,8 +1465,14 @@ mod tests {
                 success_outcome: success,
                 call_count: Mutex::new(0),
             });
-            let dispatcher =
-                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                Arc::new(MockInventorySource::default()),
+                veto,
+                Duration::from_secs(1),
+                1,
+                512,
+            );
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1430,8 +1505,14 @@ mod tests {
                 outcome: Some(hallucination),
                 ..Default::default()
             });
-            let dispatcher =
-                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                Arc::new(MockInventorySource::default()),
+                veto,
+                Duration::from_secs(1),
+                1,
+                512,
+            );
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1466,8 +1547,14 @@ mod tests {
                 call_count: Mutex::new(0),
             });
             // Configured for 1 retry (2 attempts total)
-            let dispatcher =
-                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 1, 512);
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                Arc::new(MockInventorySource::default()),
+                veto,
+                Duration::from_secs(1),
+                1,
+                512,
+            );
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1523,8 +1610,14 @@ mod tests {
             let veto = Arc::new(CountingVetoRelay {
                 call_count: call_count.clone(),
             });
-            let dispatcher =
-                IngressDispatcher::new(raft.clone(), veto, Duration::from_secs(1), 10, 512);
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                Arc::new(MockInventorySource::default()),
+                veto,
+                Duration::from_secs(1),
+                10,
+                512,
+            );
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1778,6 +1871,95 @@ mod tests {
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Rejected as i32);
             assert_eq!(response.leader_hint, "http://leader:50051");
+        }
+
+        #[tokio::test]
+        async fn returns_all_items_when_no_filter_is_provided() {
+            let items = vec![
+                GroceryItem {
+                    item_key: "milk".to_string(),
+                    quantity: "1000".to_string(),
+                    unit: "ml".to_string(),
+                    ..Default::default()
+                },
+                GroceryItem {
+                    item_key: "eggs".to_string(),
+                    quantity: "12".to_string(),
+                    unit: "units".to_string(),
+                    ..Default::default()
+                },
+            ];
+
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                ..Default::default()
+            });
+            let inventory = Arc::new(MockInventorySource {
+                items: items.clone(),
+            });
+            let dispatcher = IngressDispatcher::new(
+                raft,
+                inventory,
+                Arc::new(MockVetoRelay::default()),
+                Duration::from_secs(1),
+                1,
+                512,
+            );
+
+            let req = Request::new(QueryStateRequest {
+                query_filter: None,
+                min_state_version: None,
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Success as i32);
+            assert_eq!(response.items.len(), 2);
+            assert_eq!(response.items[0].item_key, "milk");
+            assert_eq!(response.items[1].item_key, "eggs");
+        }
+
+        #[tokio::test]
+        async fn filters_items_by_substring_match() {
+            let items = vec![
+                GroceryItem {
+                    item_key: "milk-whole".to_string(),
+                    ..Default::default()
+                },
+                GroceryItem {
+                    item_key: "milk-skim".to_string(),
+                    ..Default::default()
+                },
+                GroceryItem {
+                    item_key: "eggs".to_string(),
+                    ..Default::default()
+                },
+            ];
+
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                ..Default::default()
+            });
+            let inventory = Arc::new(MockInventorySource {
+                items: items.clone(),
+            });
+            let dispatcher = IngressDispatcher::new(
+                raft,
+                inventory,
+                Arc::new(MockVetoRelay::default()),
+                Duration::from_secs(1),
+                1,
+                512,
+            );
+
+            let req = Request::new(QueryStateRequest {
+                query_filter: Some("milk".to_string()),
+                min_state_version: None,
+            });
+
+            let response = dispatcher.query_state(req).await.unwrap().into_inner();
+            assert_eq!(response.status, QueryStatus::Success as i32);
+            assert_eq!(response.items.len(), 2);
+            assert!(response.items.iter().all(|i| i.item_key.contains("milk")));
         }
     }
 }

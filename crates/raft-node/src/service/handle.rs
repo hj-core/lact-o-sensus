@@ -121,6 +121,20 @@ impl RaftHandle for LocalRaftHandle {
         // TODO: Phase 9/10 - Wire to LactoStore Session Table (sled)
         Ok(None)
     }
+
+    async fn verify_leadership(&self) -> Result<(), Status> {
+        let guard = self.state.read().await;
+        if matches!(&*guard, LogicalNode::Leader(_)) {
+            // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability
+            Ok(())
+        } else {
+            let (hint, reason) = self.calculate_redirection(&*guard);
+            Err(Status::failed_precondition(format!(
+                "Not the leader. Hint: {} ({})",
+                hint, reason
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
