@@ -7,6 +7,7 @@ mod node;
 mod peer;
 mod service;
 pub mod state;
+mod storage;
 mod store;
 
 use std::path::PathBuf;
@@ -30,6 +31,7 @@ use peer::PeerManager;
 use service::consensus::ConsensusDispatcher;
 use service::handle::LocalRaftHandle;
 use state::ConsensusShell;
+use storage::SledStorage;
 use store::LactoStore;
 use tonic::transport::Server;
 use tracing::Instrument;
@@ -72,12 +74,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 4. Initialize Persistence (sled)
-    info!("Opening database at: {}", config.data_dir.display());
-    let db = sled::open(&config.data_dir).map_err(anyhow::Error::from)?;
+    // 4. Initialize Isolated Persistence (sled) (ADR 001/009)
+    // Establishing split databases for strict component isolation.
+    let system_path = config.data_dir.join("system");
+    let log_path = config.data_dir.join("log");
+
+    info!("Opening system database at: {}", system_path.display());
+    let system_db = sled::open(&system_path).map_err(anyhow::Error::from)?;
+
+    info!("Opening log database at: {}", log_path.display());
+    let log_db = sled::open(&log_path).map_err(anyhow::Error::from)?;
 
     // 5. Verify or Initialize Identity (ADR 004)
-    let identity = match initialize_node_identity(&db, &config) {
+    let identity = match initialize_node_identity(&system_db, &config) {
         Ok(id) => Arc::new(id),
         Err(e) => {
             error!("Fatal Error during identity verification: {}", e);
@@ -86,9 +95,13 @@ async fn main() -> Result<()> {
     };
 
     // 6. Initialize the Shared Node State (Atomic Shell)
-    // The functional core (RaftNode) is now silent.
     let fsm = Arc::new(LactoStore::new());
-    let initial_node = RaftNode::<Follower>::new(identity.node_id(), fsm.clone());
+    let storage = Box::new(
+        SledStorage::new(log_db.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
+    );
+
+    let initial_node = RaftNode::<Follower>::new(identity.node_id(), fsm.clone(), storage);
     let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)
@@ -169,9 +182,10 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::from)?;
 
         // 12. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
-        info!("gRPC server stopped. Flushing database to disk...");
-        db.flush_async().await.map_err(anyhow::Error::from)?;
-        info!("Database synchronized successfully.");
+        info!("gRPC server stopped. Flushing databases to disk...");
+        system_db.flush_async().await.map_err(anyhow::Error::from)?;
+        log_db.flush_async().await.map_err(anyhow::Error::from)?;
+        info!("Databases synchronized successfully.");
 
         info!("Node lifecycle finished successfully. Goodbye.");
         Ok(())

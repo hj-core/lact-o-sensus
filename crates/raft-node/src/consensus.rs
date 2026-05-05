@@ -538,11 +538,7 @@ fn build_append_entries_request(
     let prev_log_index = next_idx - 1;
     let prev_log_term = node.get_term_at(prev_log_index);
 
-    let entries = if last_log_idx >= next_idx {
-        node.log()[(next_idx.value() as usize - 1)..].to_vec()
-    } else {
-        Vec::new()
-    };
+    let entries = node.read_entries(next_idx, last_log_idx);
 
     AppendEntriesRequest::new(
         term,
@@ -664,6 +660,7 @@ mod tests {
     use super::*;
     use crate::engine::Follower;
     use crate::fsm::StateMachine;
+    use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -707,7 +704,8 @@ mod tests {
         let config = mock_config(50, 100);
         let id = mock_identity();
         let fsm = Arc::new(MockFsm::default());
-        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm));
+        let storage = Box::new(MemoryStorage::new());
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
         (config, state, peer_manager)
@@ -985,13 +983,14 @@ mod tests {
                     LogicalNode::Follower(n) => {
                         let mut leader = n.into_candidate().into_leader(vec![peer_id_2, peer_id_3]);
                         // Add 5 entries in current term
-                        for i in 1..=5 {
-                            leader.log_mut().push(common::proto::v1::raft::LogEntry {
+                        let entries: Vec<_> = (1..=5)
+                            .map(|i| common::proto::v1::raft::LogEntry {
                                 index: i,
                                 term: 1,
                                 data: vec![],
-                            });
-                        }
+                            })
+                            .collect();
+                        leader.storage_mut().append_entries(entries).unwrap();
                         LogicalNode::Leader(leader)
                     }
                     _ => panic!("Setup failed"),

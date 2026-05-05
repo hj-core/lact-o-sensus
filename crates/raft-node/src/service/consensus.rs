@@ -146,6 +146,7 @@ mod tests {
     use crate::engine::LogicalNode;
     use crate::fsm::StateMachine;
     use crate::node::RaftNode;
+    use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -166,7 +167,8 @@ mod tests {
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm::default());
-        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm));
+        let storage = Box::new(MemoryStorage::new());
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         ConsensusDispatcher::new(id, state)
     }
@@ -201,7 +203,9 @@ mod tests {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
             let fsm = Arc::new(MockFsm::default());
-            let node = LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm));
+            let storage = Box::new(MemoryStorage::new());
+            let node =
+                LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm, storage));
             let state = Arc::new(ConsensusShell::new(node));
 
             // Use the original ID for the dispatcher but the wrong ID for the node
@@ -219,6 +223,8 @@ mod tests {
     }
 
     mod request_vote {
+        use common::proto::v1::LogEntry;
+
         use super::*;
 
         #[tokio::test]
@@ -288,16 +294,12 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::raft::LogEntry {
-                        index: 1,
-                        term: 1,
-                        data: vec![],
-                    });
-                    node.log_mut().push(common::proto::v1::raft::LogEntry {
-                        index: 2,
-                        term: 1,
-                        data: vec![],
-                    });
+                    node.storage_mut()
+                        .append_entries(vec![
+                            LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
+                            LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
+                        ])
+                        .unwrap();
                 }
             }
 
@@ -320,11 +322,9 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::raft::LogEntry {
-                        index: 1,
-                        term: 2,
-                        data: vec![],
-                    });
+                    node.storage_mut()
+                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(2), vec![])])
+                        .unwrap();
                 }
             }
 
@@ -347,11 +347,9 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.log_mut().push(common::proto::v1::raft::LogEntry {
-                        index: 1,
-                        term: 1,
-                        data: vec![],
-                    });
+                    node.storage_mut()
+                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
+                        .unwrap();
                 }
             }
 
@@ -374,13 +372,11 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
+                    let mut entries = Vec::new();
                     for i in 1..=10 {
-                        node.log_mut().push(common::proto::v1::raft::LogEntry {
-                            index: i as u64,
-                            term: 1,
-                            data: vec![],
-                        });
+                        entries.push(LogEntry::new(LogIndex::new(i as u64), Term::new(1), vec![]));
                     }
+                    node.storage_mut().append_entries(entries).unwrap();
                 }
             }
 
@@ -400,6 +396,7 @@ mod tests {
         use std::time::Duration;
 
         use super::*;
+        use crate::storage::MemoryStorage;
 
         #[tokio::test]
         async fn returns_success_when_term_is_current() {
@@ -447,8 +444,9 @@ mod tests {
         async fn demotes_candidate_on_equal_term() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm::default());
+            let storage = Box::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
-            let follower = RaftNode::<Follower>::new(id.node_id(), fsm);
+            let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
             let candidate = follower.into_candidate();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
@@ -475,8 +473,9 @@ mod tests {
         async fn panics_on_rival_leader_same_term() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm::default());
+            let storage = Box::new(MemoryStorage::new());
             // Start as Leader term 1
-            let follower = RaftNode::<Follower>::new(id.node_id(), fsm);
+            let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
             let candidate = follower.into_candidate();
             let leader = candidate.into_leader(Vec::new());
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));

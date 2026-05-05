@@ -1607,6 +1607,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sled",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",

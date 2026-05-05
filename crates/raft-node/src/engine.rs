@@ -308,6 +308,7 @@ mod tests {
 
     use super::*;
     use crate::fsm::StateMachine;
+    use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -320,7 +321,12 @@ mod tests {
 
     fn setup_node(node_id: u64) -> LogicalNode {
         let fsm = Arc::new(MockFsm);
-        LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(node_id), fsm))
+        let storage = Box::new(MemoryStorage::new());
+        LogicalNode::Follower(RaftNode::<Follower>::new(
+            NodeId::new(node_id),
+            fsm,
+            storage,
+        ))
     }
 
     mod handle_append_entries {
@@ -429,11 +435,9 @@ mod tests {
             let mut state = setup_node(1);
             state.transition(|old| match old {
                 LogicalNode::Follower(mut n) => {
-                    n.log_mut().push(LogEntry {
-                        index: 1,
-                        term: 1,
-                        data: vec![],
-                    });
+                    n.storage_mut()
+                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
+                        .unwrap();
                     LogicalNode::Candidate(n.into_candidate())
                 }
                 _ => panic!("Setup failed"),
