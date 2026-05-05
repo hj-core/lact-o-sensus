@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Logical RPC Contracts and Service Definitions
 - **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
-- **Last Updated:** 2026-04-22
+- **Last Updated:** 2026-05-05
 
 ## Context
 
@@ -68,6 +68,7 @@ The serialized binary format stored as `bytes` within the Raft `LogEntry`. This 
 - **State:** `updated_base_quantity` (Absolute Result in SI as Decimal string), `base_unit` (Canonical SI Symbol), `display_unit` (User-preferred symbol), `updated_category` (Metadata).
 - **Session:** `client_id`, `sequence_id` (For Exactly-Once Semantics).
 - **Audit:** `raw_user_input` (Original Intent), `moral_justification` (AI Rationale), `event_time` (Timestamp).
+- **Control:** `status` (Outcome: APPROVED/VETOED), `is_delete` (Boolean flag).
 
 ## Rationale
 

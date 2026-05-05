@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** State Machine Reliability and Linearizability
 - **Primary Goal:** Ensure every mutation is executed exactly once, regardless of network retries or leader elections.
-- **Last Updated:** 2026-04-20
+- **Last Updated:** 2026-05-05
 
 ## Context
 
@@ -32,12 +32,14 @@ Upon applying a command from the Raft log, the state machine must execute the fo
 - **Unknown `client_id`**: **Initialize**. Treat the first appearance of a `client_id` as a registration event; create a session record and proceed to **Process**.
 - **`seq_id < last_seen_seq`**: **Discard**. The request is an out-of-order or ancient retry.
 - **`seq_id == last_seen_seq`**: **Replay**. Return the `cached_response` without re-applying any mutation or re-querying the AI Node.
-- **`seq_id == last_seen_seq + 1`**: **Process**. Execute the mutation, update the grocery list, and overwrite the `cached_response` and `last_sequence_id` with the outcome.
-- **`seq_id > last_seen_seq + 1`**: **Reject**. A "gap" in sequences indicates a client-side failure or an ordering violation.
+- **`seq_id == last_seen_seq + 1`**: **Process**. This is a new, valid mutation. The state machine must record the outcome (whether `APPROVED` or `VETOED`) in the Session Table and update the `last_sequence_id`. The application-level inventory is only modified if the status is `APPROVED`. This ensures that even rejected mutations consume a sequence ID, maintaining a contiguous, gap-free ledger.
+- **`seq_id > last_seen_seq + 1`**: **Reject**. A "gap" in sequences indicates a client-side failure or an ordering violation. By logging vetoes as ledger events, we ensure that clients can always progress monotonically (`1, 2, 3...`) without needing to reuse IDs after a rejection.
 
-### 3. Atomic Side-Effect Updates
+### 3. The Unified Ledger Mandate
 
-The Session Table is not updated via separate Raft commands. Instead, it is updated as a **deterministic side-effect** whenever a mutation is applied to the State Machine. This ensures that the grocery list and the session table are always in perfect sync across all nodes.
+To ensure cluster-wide linearizability, **all AI evaluation outcomes (Approvals and Vetoes) must be proposed to the Raft Ledger.**
+
+Treating a Veto as a "Silent Gateway Event" is prohibited. If a leader vetoes a request and crashes before notifying the client, the new leader must be able to recover that same Veto from the log. This clinical approach ensures that the Session Table remains a perfectly synchronized mirror of the client's progress across all nodes.
 
 ### 4. Deterministic Session Expiration (Monotonic TTL)
 

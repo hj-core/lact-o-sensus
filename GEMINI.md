@@ -20,7 +20,7 @@
 
 - **3.1.1. Poison-then-Panic (ADR 009):** To mitigate the lack of poisoning in `tokio::sync::RwLock`, you MUST transition logical state to `Poisoned` immediately before any invariant-violation `panic!`. This protocol MUST also be triggered if a persisted identity (`ClusterId`/`NodeId`) mismatch is detected at startup (**ADR 004**).
 - **3.1.2. Tri-Layer Onion (Internal):** Strictly isolate the **Physical Foundation** (deterministic logic), **Logical Orchestrator** (Raft protocol rules), and **Execution Shell** (concurrency and signaling).
-- **3.1.3. Registry Firewall (ADR 007):** Verify all AI metadata (Categories/Units) against system registries before proposal. AI is for resolution; Gateway is for enforcement.
+- **3.1.3. Registry Firewall (ADR 007):** Verify all AI metadata (Categories/Units) against system registries. AI is for resolution; the Gateway acts as a **Clinical Notary**, proposing both Approvals and Vetoes to the ledger to maintain contiguous sequence integrity.
 - **3.1.4. Storage Integrity (ADR 001):** Utilize specialized trees (`hard_state`, `logs`, `conf_state`) within the `sled` database. Every physical mutation to the Raft core state (`currentTerm`, `votedFor`, and `log[]`) MUST be followed by an explicit `flush_async()` before responding to an RPC to prevent "Phantom Votes" or log loss after a crash.
 
 ### 3.2. Network & Boundary
@@ -43,7 +43,7 @@
 ### 3.5. Linearizability & Session Integrity (ADR 006)
 
 - **3.5.1. Replicated Session Table:** Exactly-Once deduplication MUST be implemented as a deterministic, replicated side-effect within the State Machine.
-- **3.5.2. Sequence Strictness:** The State Machine MUST strictly enforce the `seq == last_seen + 1` invariant for new mutations. Out-of-order or "gapped" sequences MUST be rejected to prevent state-machine divergence.
+- **3.5.2. Sequence Strictness:** The State Machine MUST strictly enforce the `seq == last_seen + 1` invariant for new mutations. Out-of-order or "gapped" sequences MUST be rejected. To satisfy this without client-side complexity, **every evaluation outcome (Success/Veto) MUST be logged as a first-class consensus event.**
 - **3.5.3. Session Halt Mandate:** Any detection of session table inconsistency (e.g., during snapshot loading or hash verification) MUST trigger an immediate `Poison-then-Panic`.
 
 ## 4. Implementation & Workflow

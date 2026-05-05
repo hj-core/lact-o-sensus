@@ -25,7 +25,7 @@ The goal is to transform a simple "Grocery List" into a **Replicated State Machi
 - **Role:** A participant in the distributed consensus group.
 - **Responsibility:** Manages the **Write-Ahead Log (WAL)**, the **State Machine**, and the **Defensive Onion**.
 - **Internal Architecture:** Utilizes a **Tri-Layered "Onion" Model** (ADR 009) to strictly isolate protocol logic (Physical), role orchestration (Logical), and concurrent signaling (Execution).
-- **Mandate:** Acts as the "Syntactic Fortress," ensuring that only validated, AI-resolved ledger facts are committed to the replicated log.
+- **Mandate:** Acts as the "Clinical Notary," ensuring that every AI evaluation outcome—whether approved or vetoed—is recorded as an immutable fact on the replicated ledger to maintain contiguous sequence integrity.
 
 ### 3. The AI Veto Node (The "Semantic Oracle")
 
@@ -41,7 +41,7 @@ The state machine maintains two distinct schemas within the replicated log. Ever
 
 ### 1. The Item Store (Grocery Inventory)
 
-This represents the current state of the grocery list, stored in a **Flat Identity Model** (ADR 007):
+This represents the current state of the grocery list, stored in a **Flat Identity Model** (ADR 007). Only `APPROVED` ledger entries update this store.
 
 - **item_key (`CanonicalSlug`):** A unique, AI-resolved canonical slug (e.g., "orange_juice").
 - **base_quantity (`BaseQuantity`):** A high-precision `rust_decimal::Decimal` normalized to the **SI Base Unit** (ADR 008).
@@ -68,8 +68,7 @@ This represents the metadata required to ensure linearizability and deduplicatio
 To ensure deterministic classification, all items must be mapped to exactly one of the following clinical categories. Items falling into the "Anomalous" category trigger an **Anomalous Identity Split** (ADR 008), resulting in distinct item identities per unit.
 
 1. **Primary Flora:** Unprocessed botanical matter (Fruits, Vegetables).
-   ...
-2. **Anomalous Inputs:** Items failing systematic classification (Miscellaneous).
+2. **Animal Secretions:** Liquid and solid animal-derived proteins (Dairy, Eggs).
 3. **Flesh & Marrow:** Carcass-based nutritional inputs (Meat, Seafood).
 4. **Shelf-Stable Carbohydrates:** Dry pantry staples (Grains, Pasta, Legumes).
 5. **Cultured Doughs:** Yeast-risen or unleavened grain products (Bakery).

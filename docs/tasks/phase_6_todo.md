@@ -32,6 +32,20 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: Log entries appended to `sled` can be successfully retrieved after a `db` restart.
   - [x] Integration test: Node restarts and correctly initializes `current_term` and `voted_for` from disk.
 
+### Step 2.5: The Unified Ledger (Veto Logging)
+
+**Commit:** `feat(contract): implement Unified Ledger by logging AI vetoes`
+
+- **Description:** Align the Gateway and Ledger by recording rejections as first-class Raft events.
+- **Changes:**
+  - Update `app.proto`: Add `MutationStatus` (APPROVED/VETOED) and `moral_justification` to `CommittedMutation`.
+  - Refactor `IngressDispatcher` (Gateway): Propose **every** evaluation outcome to Raft, regardless of the AI's decision.
+  - Update `LactoStore` (FSM): Apply every log entry to the Session Table, but update Inventory only for `APPROVED` status.
+  - **Documentation Audit**: Review and update `roadmap.md` and `ADR 006` / `ADR 007` to reflect the transition from "Firewall Veto" to "Ledger Veto."
+- **Acceptance Tests (TDD):**
+  - [ ] Unit test: `LactoStore` correctly updates session sequence for a vetoed mutation without changing inventory.
+  - [ ] Integration test: `smoke_test.py` verifies that a vetoed mutation appears in the Raft log of all nodes.
+
 ### Step 3: Isolated Storage: State Machine & Session Table
 
 **Commit:** `feat(raft): transition LactoStore to sled and implement Session Table`
@@ -73,4 +87,4 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 ## 📈 Completion Status
 
 - **Total Progress:** 40%
-- **Current Focus:** Step 3: Isolated Storage: State Machine & Session Table
+- **Current Focus:** Step 2.5: The Unified Ledger (Veto Logging)

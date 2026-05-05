@@ -73,13 +73,13 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Implement Exactly-Once Semantics and transition to persistent disk storage.
 - **Key Actions:**
-  - **Consistent Query Path:** Implement the `InventorySource` trait and the `query_state` RPC. Support `query_filter` and satisfy the Linearizable Read mandate (ADR 007).
-  - **Internal SI (ADR 008):** [ACCELERATED - DONE] High-precision stabilization with `rust_decimal` and Banker's Rounding implemented in Phase 5.
-  - **Persistent Storage:** Integrate **`sled`** for persistent Raft logs and the State Machine inventory with synchronous `fsync` (ADR 001).
-  - **Session Table & EOS:** Implement the Session Table with **Atomic Side-Effect Updates** (ADR 006) and enforce `min_state_version` for "Read-Your-Writes" consistency.
-  - **The Halt Mandate:** Formalize immediate node panic on session table or state machine divergence, utilizing the **Poison-then-Panic** sequence (ADR 009) to ensure safety during recovery or snapshot loading.
+  - **Consistent Query Path:** Implement the `InventorySource` trait and the `query_state` RPC. Support `query_filter` and satisfy the Linearizable Read mandate (ADR 007). [DONE]
+  - **Unified Ledger Alignment**: Refactor the request lifecycle to log all AI outcomes (Approvals and Vetoes) as first-class Raft events to ensure contiguous sequence IDs.
+  - **Persistent Storage:** Integrate **`sled`** for persistent Raft logs and the State Machine inventory with synchronous `fsync` (ADR 001). [IN PROGRESS]
+  - **Session Table & EOS:** Implement the Session Table with **Atomic Side-Effect Updates** (ADR 006) to track both successful and vetoed attempts for cluster-wide linearizability.
+  - **The Halt Mandate:** Formalize immediate node panic on session table or state machine divergence, utilizing the **Poison-then-Panic** sequence (ADR 009).
   - **Chaos Testing:** Perform "Chaos Testing" to verify 100% recovery integrity and the **Halt Mandate** panic on state divergence.
-- **Success Metric:** Idempotent recovery from the log using absolute SI results with zero arithmetic bias.
+- **Success Metric:** Idempotent recovery from the log with a perfectly contiguous, gap-free Session Table.
 
 ## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting)
 

@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Mutation Request Lifecycle (Client, Leader, AI-Veto)
 - **Primary Goal:** Transform ambiguous human intent into immutable, deterministic consensus data via a multi-layered defensive pipeline.
-- **Last Updated:** 2026-04-22
+- **Last Updated:** 2026-05-05
 
 ## Context
 
@@ -46,27 +46,29 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
   - **Leader-Internal Retry (Best-Effort):** If the AI response is malformed or fails the subsequent Registry Firewall (Layer 4), the Leader may perform **at most one** automatic retry with the AI Node. If the second attempt also fails, the request must proceed to a definitive **Veto**.
 - **Outbound:** `EvaluateProposalResponse` (Resolved Key, Unit, Category, Multiplier, Verdict).
 
-### Layer 4: The Leader-Postprocess (Validation Proxy)
+### Layer 4: The Leader-Postprocess (Resolution & Finalization)
 
-- **Responsibility:** Deterministic validation of AI-provided data.
+- **Responsibility:** Deterministic validation of AI-provided data and result finalization.
 - **Logic:**
-  - **Registry Firewall:** The Leader MUST verify AI-provided metadata against hardcoded system registries (ADR 008). Any proposal containing an unauthorized `category` or `unit` must be **Vetoed** to prevent AI hallucinations.
-  - **Physical Invariant Check:** Rejects conversions between incompatible dimensions as defined by the Physical Invariant Policy.
-  - **Deterministic Math:** Calculates the final absolute quantity in the **Internal Standardized Format** using fixed-point arithmetic.
-- **Outbound:** Finalized, validated ledger entry.
+  - **Registry Firewall:** The Leader MUST verify AI-provided metadata against hardcoded system registries (ADR 008). Any proposal containing an unauthorized `category` or `unit` must be marked as **Vetoed** to prevent AI hallucinations.
+  - **Physical Invariant Check:** Rejects conversions between incompatible dimensions (e.g., Mass to Volume); failures result in a **Veto**.
+  - **Deterministic Math:** For approved mutations, calculates the final absolute quantity in the **Internal Standardized Format** using fixed-point arithmetic.
+  - **Outcome Packaging:** The Leader constructs a `CommittedMutation` record containing the final status (`APPROVED` or `VETOED`) and the `moral_justification`.
+- **Outbound:** Finalized ledger entry (The Unified Record).
 
 ### Layer 5: The Consensus-Commit (Immutable Fact)
 
 - **Responsibility:** Distributed agreement and state machine application.
 - **Logic:**
-  - **Raft Replication:** Appends entry to WAL and replicates to Followers. The Raft engine is **domain-agnostic**, treating the payload as opaque `bytes`.
-  - **The State Machine Boundary:** Upon commit, the Raft engine calls the `apply` method on a generic `StateMachine` trait object.
-  - **Application Resolution:** The application-level State Machine implementation (`LactoStore`) deserializes the bytes into a `CommittedMutation` and updates the inventory.
-  - **Internal State Stabilization:** Logs the **Absolute Result in the Internal Standardized Format** to ensure cluster-wide idempotency.
-  - **State Convergence:** The `resolved_item_key` (Canonical Slug) is the **exclusive Primary Key** for the state machine's inventory.
-  - **Metadata Evolution (LWW):** Mutable metadata (e.g., `category`, `display_name`) is updated to match the latest committed log entry for that `item_key`.
-  - **Cleanup:** Updates Session Table and releases the `MutationLock`.
-- **Outbound:** `MUTATION_STATUS_COMMITTED` (including `state_version`) to the client.
+  - **Raft Replication:** Appends the outcome record (Success or Veto) to the WAL and replicates to Followers. The Raft engine remains **domain-agnostic**, treating the payload as opaque bytes.
+  - **The State Machine Boundary:** Upon commit, the Raft engine calls the `apply` method on the `StateMachine` trait.
+  - **Universal Session Update:** The `LactoStore` updates the persistent **Session Table** for every entry, recording the `sequence_id` and the outcome to ensure contiguous linearizability and support client-side deduplication.
+  - **Conditional State Update:** ONLY for entries with `APPROVED` status:
+    - **Internal State Stabilization**: Applies the absolute numeric result to the inventory tree.
+    - **State Convergence**: The `resolved_item_key` (Canonical Slug) acts as the **exclusive Primary Key**.
+    - **Metadata Evolution (LWW)**: Mutable metadata (e.g., `category`, `display_name`) is updated to match the latest committed entry.
+  - **Cleanup:** Releases the `MutationLock`.
+- **Outbound:** `MUTATION_STATUS_COMMITTED` or `MUTATION_STATUS_VETOED` (including `state_version`) to the client.
 
 ## Rationale
 
