@@ -21,18 +21,16 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `query_state` returns data filtered by `item_key`.
   - [x] Integration test: A deposed leader correctly rejects a `query_state` request due to failing the Quorum Read.
 
-### Step 2: Isolated Storage: Consensus Log
+### Step 2: Isolated Storage: Consensus Log [DONE]
 
 **Commit:** `feat(raft): implement isolated sled persistence for consensus log`
 
-- **Description:** Persist the Raft physical state (Term, Vote, Log) to a dedicated `sled` database.
-- **Changes:**
-  - Initialize a dedicated `sled::Db` instance (e.g., `data_dir/log`) in `raft-node/src/main.rs`.
-  - Update `RaftNode` (or a dedicated storage struct) to read/write `current_term`, `voted_for`, and the log entries to `sled`.
-  - Ensure synchronous `fsync` (`db.flush()`) on every append to satisfy crash-recovery mandates.
+- [x] Initialize a dedicated `sled::Db` instance (e.g., `data_dir/log`) in `raft-node/src/main.rs`.
+- [x] Update `RaftNode` (or a dedicated storage struct) to read/write `current_term`, `voted_for`, and the log entries to `sled`.
+- [x] Ensure synchronous `fsync` (`db.flush()`) on every append to satisfy crash-recovery mandates.
 - **Acceptance Tests (TDD):**
-  - Unit test: Log entries appended to `sled` can be successfully retrieved after a `db` restart.
-  - Integration test: Node restarts and correctly initializes `current_term` and `voted_for` from disk.
+  - [x] Unit test: Log entries appended to `sled` can be successfully retrieved after a `db` restart.
+  - [x] Integration test: Node restarts and correctly initializes `current_term` and `voted_for` from disk.
 
 ### Step 3: Isolated Storage: State Machine & Session Table
 
@@ -45,8 +43,8 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - Implement the **Session Table** (ADR 006) within this FSM database to track `client_id` -> `last_sequence_id` and the corresponding `LogIndex`.
   - Implement recovery logic: on startup, compare the FSM applied index against the Raft commit index and replay logs if the FSM fell behind.
 - **Acceptance Tests (TDD):**
-  - Unit test: `LactoStore::apply` writes item data and updates the session table atomically in `sled`.
-  - Unit test: Client deduplication successfully returns cached responses using the persisted Session Table.
+  - [ ] Unit test: `LactoStore::apply` writes item data and updates the session table atomically in `sled`.
+  - [ ] Unit test: Client deduplication successfully returns cached responses using the persisted Session Table.
 
 ### Step 4: Exactly-Once Semantics (EOS) Barrier
 
@@ -57,7 +55,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - Update `query_state` to accept and enforce `min_state_version`.
   - If the local FSM index is lower than `min_state_version`, asynchronously wait until the state machine catches up (via `tokio::sync::watch` on the Consensus Progress channel).
 - **Acceptance Tests (TDD):**
-  - Unit test: Query requests block and eventually resolve when the FSM index advances past `min_state_version`.
+  - [ ] Unit test: Query requests block and eventually resolve when the FSM index advances past `min_state_version`.
 
 ### Step 5: The Halt Mandate & Chaos Testing
 
@@ -68,11 +66,11 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - Implement the `Poison-then-Panic` sequence (ADR 009) if the FSM index ever exceeds the Raft commit index during recovery (which indicates corruption).
   - Expand `smoke_test.py` to aggressively kill nodes during mutation proposals.
 - **Acceptance Tests (TDD):**
-  - Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
+  - [ ] Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
 
 ---
 
 ## 📈 Completion Status
 
-- **Total Progress:** 20%
-- **Current Focus:** Step 2: Isolated Storage: Consensus Log
+- **Total Progress:** 40%
+- **Current Focus:** Step 3: Isolated Storage: State Machine & Session Table
