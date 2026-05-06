@@ -106,7 +106,7 @@ pub fn spawn_election_timer(
                 tokio::select! {
                     _ = sleep(timeout) => {
                         let guard = state.read().await;
-                        handle_follower_tick(&*guard, timeout)
+                        handle_follower_tick(&guard, timeout)
                     }
                     _ = signal.notified() => {
                         TimerAction::Restart
@@ -116,8 +116,8 @@ pub fn spawn_election_timer(
                 sleep(timeout).await;
                 let guard = state.read().await;
                 match &*guard {
-                    LogicalNode::Candidate(_) => handle_candidate_tick(&*guard),
-                    LogicalNode::Leader(_) => handle_leader_tick(&*guard),
+                    LogicalNode::Candidate(_) => handle_candidate_tick(&guard),
+                    LogicalNode::Leader(_) => handle_leader_tick(&guard),
                     LogicalNode::Poisoned => panic!("HALT: Node is poisoned (ADR 001)"),
                     _ => TimerAction::Restart,
                 }
@@ -703,7 +703,7 @@ mod tests {
     async fn setup() -> (Arc<Config>, Arc<ConsensusShell>, Arc<PeerManager>) {
         let config = mock_config(50, 100);
         let id = mock_identity();
-        let fsm = Arc::new(MockFsm::default());
+        let fsm = Arc::new(MockFsm);
         let storage = Box::new(MemoryStorage::new());
         let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));

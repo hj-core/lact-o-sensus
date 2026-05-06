@@ -166,7 +166,7 @@ mod tests {
 
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
-        let fsm = Arc::new(MockFsm::default());
+        let fsm = Arc::new(MockFsm);
         let storage = Box::new(MemoryStorage::new());
         let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
@@ -202,7 +202,7 @@ mod tests {
         async fn panics_on_identity_mismatch() {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
-            let fsm = Arc::new(MockFsm::default());
+            let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             let node =
                 LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm, storage));
@@ -239,7 +239,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, true);
+            assert!(response.vote_granted);
             assert_eq!(response.term, 1);
         }
 
@@ -260,7 +260,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, true);
+            assert!(response.vote_granted);
             assert_eq!(response.term, 1);
         }
 
@@ -282,7 +282,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, false);
+            assert!(!response.vote_granted);
             assert_eq!(response.term, 2);
         }
 
@@ -311,7 +311,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, false);
+            assert!(!response.vote_granted);
         }
 
         #[tokio::test]
@@ -336,7 +336,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, false);
+            assert!(!response.vote_granted);
         }
 
         #[tokio::test]
@@ -361,7 +361,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, true);
+            assert!(response.vote_granted);
         }
 
         #[tokio::test]
@@ -388,7 +388,7 @@ mod tests {
             });
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert_eq!(response.vote_granted, true);
+            assert!(response.vote_granted);
         }
     }
 
@@ -412,7 +412,7 @@ mod tests {
             });
 
             let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert_eq!(response.success, true);
+            assert!(response.success);
             assert_eq!(response.term, 0);
         }
 
@@ -436,14 +436,14 @@ mod tests {
             });
 
             let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert_eq!(response.success, false);
+            assert!(!response.success);
             assert_eq!(response.term, 2);
         }
 
         #[tokio::test]
         async fn demotes_candidate_on_equal_term() {
             let id = mock_identity();
-            let fsm = Arc::new(MockFsm::default());
+            let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
             let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
@@ -461,7 +461,7 @@ mod tests {
             });
 
             let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert_eq!(response.success, true);
+            assert!(response.success);
 
             let state_guard = dispatcher.state.read().await;
             assert!(matches!(&*state_guard, LogicalNode::Follower(_)));
@@ -472,7 +472,7 @@ mod tests {
         #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
         async fn panics_on_rival_leader_same_term() {
             let id = mock_identity();
-            let fsm = Arc::new(MockFsm::default());
+            let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);

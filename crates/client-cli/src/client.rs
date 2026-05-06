@@ -444,10 +444,10 @@ impl LactoClient {
         leader_hint: Option<String>,
         retry_count: usize,
     ) -> Result<()> {
-        if let Some(hint) = leader_hint {
-            if !hint.is_empty() {
-                return self.handle_redirection(&hint).await;
-            }
+        if let Some(hint) = leader_hint
+            && !hint.is_empty()
+        {
+            return self.handle_redirection(&hint).await;
         }
 
         // If no hint is available (Election in progress or transport error),

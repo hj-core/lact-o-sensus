@@ -180,11 +180,6 @@ impl<S: NodeState> RaftNode<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn storage(&self) -> &dyn LogStorage {
-        self.storage.as_ref()
-    }
-
-    #[cfg(test)]
     pub(crate) fn storage_mut(&mut self) -> &mut dyn LogStorage {
         self.storage.as_mut()
     }
@@ -402,11 +397,12 @@ impl RaftNode<Follower> {
         let current_term = self.storage.current_term();
         let voted_for = self.storage.voted_for();
 
-        if req_term == current_term && (voted_for.is_none() || voted_for == Some(candidate_id)) {
-            if self.is_log_up_to_date(req_last_log_term, req_last_log_index) {
-                self.vote_for(candidate_id);
-                return true;
-            }
+        if req_term == current_term
+            && (voted_for.is_none() || voted_for == Some(candidate_id))
+            && self.is_log_up_to_date(req_last_log_term, req_last_log_index)
+        {
+            self.vote_for(candidate_id);
+            return true;
         }
         false
     }

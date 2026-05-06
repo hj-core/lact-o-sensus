@@ -218,6 +218,7 @@ impl LogStorage for SledStorage {
 
 /// In-memory implementation of LogStorage for testing and initial bootstrap.
 #[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct MemoryStorage {
     current_term: Term,
     voted_for: Option<NodeId>,
@@ -238,6 +239,7 @@ impl Default for MemoryStorage {
 }
 
 impl MemoryStorage {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self::default()
     }

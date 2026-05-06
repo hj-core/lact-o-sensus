@@ -104,7 +104,7 @@ impl RaftHandle for LocalRaftHandle {
     async fn consensus_status(&self) -> ConsensusStatus {
         let guard = self.state.read().await;
         let is_leader = matches!(&*guard, LogicalNode::Leader(_));
-        let (leader_hint, rejection_reason) = self.calculate_redirection(&*guard);
+        let (leader_hint, rejection_reason) = self.calculate_redirection(&guard);
 
         ConsensusStatus {
             is_leader,
@@ -128,7 +128,7 @@ impl RaftHandle for LocalRaftHandle {
             // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability
             Ok(())
         } else {
-            let (hint, reason) = self.calculate_redirection(&*guard);
+            let (hint, reason) = self.calculate_redirection(&guard);
             Err(Status::failed_precondition(format!(
                 "Not the leader. Hint: {} ({})",
                 hint, reason

@@ -76,6 +76,7 @@ impl PeerManager {
     /// low-latency consensus RPCs and potentially high-latency operations
     /// (like snapshot transfers) by applying specific timeouts to the
     /// `tonic::Request` itself.
+    #[allow(clippy::type_complexity)]
     pub fn get_client(
         &self,
         node_id: NodeId,
