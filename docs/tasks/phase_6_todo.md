@@ -46,19 +46,31 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `LactoStore` correctly acknowledges a vetoed mutation without changing inventory.
   - [x] Integration test: `smoke_test.py` verifies that a vetoed mutation appears in the Raft log of all nodes.
 
-### Step 3: Isolated Storage: State Machine & Session Table
+### Step 3.1: Persistent FSM (Physical Inventory)
 
-**Commit:** `feat(raft): transition LactoStore to sled and implement Session Table`
+**Commit:** `feat(raft): transition LactoStore inventory to sled`
 
-- **Description:** Persist the Application State and EOS tracking data using a second, strictly isolated `sled` database.
+- **Description:** Transition the State Machine from a volatile `HashMap` to a persistent `sled` tree.
 - **Changes:**
-  - [ ] Initialize a second `sled::Db` instance (e.g., `data_dir/fsm`).
-  - [ ] Transition `LactoStore` inventory from `HashMap` to the `sled` tree.
-  - [ ] Implement the **Session Table** (ADR 006) within this FSM database to track `client_id` -> `last_sequence_id` and the corresponding `LogIndex`.
-  - [ ] Implement recovery logic: on startup, compare the FSM applied index against the Raft commit index and replay logs if the FSM fell behind.
+  - [ ] Initialize the `fsm` database handle in `raft-node/src/main.rs`.
+  - [ ] Refactor `LactoStore` to use `sled::Tree` for inventory storage.
+  - [ ] Update `InventorySource` to stream data from `sled`.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: `LactoStore::apply` writes item data and updates the session table atomically in `sled`.
-  - [ ] Unit test: Client deduplication successfully returns cached responses using the persisted Session Table.
+  - [ ] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
+  - [ ] Integration test: `smoke_test.py` verifies that inventory survives a node restart.
+
+### Step 3.2: Persistent Session Table & Recovery
+
+**Commit:** `feat(raft): implement persistent Session Table and FSM recovery`
+
+- **Description:** Implement exactly-once metadata and startup log-replay logic.
+- **Changes:**
+  - [ ] Implement the **Session Table** (ADR 006) within the FSM database (`client_id` -> `last_seq` mapping).
+  - [ ] Implement `RaftHandle::check_session` by querying the persistent Session Table.
+  - [ ] Implement **FSM Recovery**: On startup, compare the FSM's last applied index with the Raft log and replay missing entries.
+- **Acceptance Tests (TDD):**
+  - [ ] Unit test: `check_session` correctly identifies duplicate sequence IDs from disk.
+  - [ ] Integration test: `smoke_test.py` verifies that client deduplication works across node restarts.
 
 ### Step 4: Exactly-Once Semantics (EOS) Barrier
 
