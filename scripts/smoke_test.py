@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -478,8 +479,48 @@ def run_client_command(command: str, seed_port: int) -> str:
             os.remove(state_file)
 
 
+def extract_version(output: str) -> int:
+    """Extracts the state version from client-cli output."""
+    match = re.search(r"\(version (\d+)\)", output)
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def verify_convergence(index: int, status_str: str, timeout: float = 5.0) -> None:
+    """Verifies that ALL nodes applied the mutation at the given index."""
+    print(
+        f"Action: Verifying cluster convergence for index {index} ({status_str})..."
+    )
+    start = time.time()
+    missing: list[int] = []
+    while (time.time() - start) < timeout:
+        missing = []
+        for node in NODES:
+            found = False
+            # FSM log marker from store.rs
+            pattern = f"FSM[{index}]:"
+            marker = f"status {status_str}"
+
+            for line in get_complete_lines(node["log"], 0):
+                if pattern in line and marker in line:
+                    found = True
+                    break
+            if not found:
+                missing.append(node["id"])
+
+        if not missing:
+            print(f"SUCCESS: All nodes converged at index {index}.")
+            return
+        time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Convergence failure. Nodes {missing} did not apply index {index} within {timeout}s."
+    )
+
+
 def test_smart_client_success() -> None:
-    """Verifies that valid input is successfully committed."""
+    """Verifies that valid input is successfully committed and converged."""
     leader_id = wait_for_leader()
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
@@ -494,13 +535,16 @@ def test_smart_client_success() -> None:
 
     if "SUCCESS: Committed at version" in output:
         print("SUCCESS: Moral Advocate approved valid mutation.")
+        version = extract_version(output)
+        if version > 0:
+            verify_convergence(version, "Committed")
     else:
         print(f"FAILURE: AI rejected valid mutation:\n{output}")
         raise RuntimeError("Valid mutation was unexpectedly rejected.")
 
 
 def test_smart_client_veto() -> None:
-    """Verifies that invalid input is correctly VETOED by the AI."""
+    """Verifies that invalid input is correctly VETOED and converged."""
     leader_id = wait_for_leader()
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
@@ -518,6 +562,9 @@ def test_smart_client_veto() -> None:
         print(
             "SUCCESS: Moral Advocate correctly blocked unethical mutation."
         )
+        version = extract_version(output)
+        if version > 0:
+            verify_convergence(version, "Vetoed")
     else:
         print(
             f"FAILURE: AI failed to veto unethical mutation:\n{output}"

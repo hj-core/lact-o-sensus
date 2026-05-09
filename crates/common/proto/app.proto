@@ -56,6 +56,7 @@ message CommittedMutation {
 
     // 5. Control Layer
     bool is_delete = 12;
+    MutationStatus status = 13;
 }
 
 // --- Ingress Service (Client-to-Leader) ---

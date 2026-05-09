@@ -170,6 +170,7 @@ pub mod v1 {
                 raw_user_input: String,
                 moral_justification: String,
                 is_delete: bool,
+                status: MutationStatus,
                 now: std::time::SystemTime,
             ) -> Self {
                 Self {
@@ -184,6 +185,7 @@ pub mod v1 {
                     raw_user_input,
                     moral_justification,
                     is_delete,
+                    status: status as i32,
                     event_time: Some(Timestamp::from(now)),
                 }
             }
@@ -229,6 +231,7 @@ mod tests {
                     "add 2L milk".to_string(),
                     "Valid dairy item".to_string(),
                     false,
+                    MutationStatus::Committed,
                     now,
                 );
 

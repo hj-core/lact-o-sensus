@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
+use common::proto::v1::app::MutationStatus;
 use common::types::LogIndex;
+use gateway::ingress::InventorySource;
 use prost::Message;
 use tokio::sync::RwLock;
 use tonic::Status;
@@ -29,7 +31,7 @@ impl LactoStore {
 }
 
 #[async_trait]
-impl gateway::ingress::InventorySource for LactoStore {
+impl InventorySource for LactoStore {
     async fn get_inventory(&self) -> Vec<GroceryItem> {
         self.inventory.read().await.values().cloned().collect()
     }
@@ -44,6 +46,18 @@ impl StateMachine for LactoStore {
                 index, e
             ))
         })?;
+
+        // UNIFIED LEDGER: We only update inventory for successful mutations.
+        // Rejections and Vetoes only impact the Session Table (implemented in Step 3).
+        if mutation.status != MutationStatus::Committed as i32 {
+            info!(
+                "FSM[{}]: Recording completion of sequence {} with status {:?}",
+                index,
+                mutation.sequence_id,
+                MutationStatus::try_from(mutation.status).unwrap_or(MutationStatus::Unspecified)
+            );
+            return Ok(());
+        }
 
         let mut inventory = self.inventory.write().await;
 
@@ -76,5 +90,88 @@ impl StateMachine for LactoStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::proto::v1::app::MutationStatus;
+    use common::types::ClientId;
+    use common::types::SequenceId;
+
+    use super::*;
+
+    mod apply {
+        use super::*;
+
+        fn mock_mutation(status: MutationStatus) -> CommittedMutation {
+            CommittedMutation::new(
+                &ClientId::generate(),
+                SequenceId::new(1),
+                "milk".to_string(),
+                "Milk".to_string(),
+                "1000".to_string(),
+                "ml".to_string(),
+                "ml".to_string(),
+                "Dairy".to_string(),
+                "add milk".to_string(),
+                "Approved".to_string(),
+                false,
+                status,
+                std::time::SystemTime::now(),
+            )
+        }
+
+        #[tokio::test]
+        async fn updates_inventory_when_status_is_committed() {
+            let store = LactoStore::new();
+            let mutation = mock_mutation(MutationStatus::Committed);
+            let mut data = Vec::new();
+            mutation.encode(&mut data).unwrap();
+
+            store.apply(LogIndex::new(1), &data).await.unwrap();
+
+            let inventory = store.get_inventory().await;
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].item_key, "milk");
+            assert_eq!(inventory[0].quantity, "1000");
+        }
+
+        #[tokio::test]
+        async fn does_not_update_inventory_when_status_is_vetoed() {
+            let store = LactoStore::new();
+            let mutation = mock_mutation(MutationStatus::Vetoed);
+            let mut data = Vec::new();
+            mutation.encode(&mut data).unwrap();
+
+            // apply Vetoed mutation
+            store.apply(LogIndex::new(1), &data).await.unwrap();
+
+            // Verify inventory is still empty
+            let inventory = store.get_inventory().await;
+            assert!(inventory.is_empty());
+        }
+
+        #[tokio::test]
+        async fn deletes_item_when_is_delete_is_true() {
+            let store = LactoStore::new();
+
+            // 1. Add item
+            let add_mut = mock_mutation(MutationStatus::Committed);
+            let mut add_data = Vec::new();
+            add_mut.encode(&mut add_data).unwrap();
+            store.apply(LogIndex::new(1), &add_data).await.unwrap();
+
+            // 2. Delete item
+            let mut del_mut = mock_mutation(MutationStatus::Committed);
+            del_mut.is_delete = true;
+            let mut del_data = Vec::new();
+            del_mut.encode(&mut del_data).unwrap();
+            store.apply(LogIndex::new(2), &del_data).await.unwrap();
+
+            // 3. Verify
+            let inventory = store.get_inventory().await;
+            assert!(inventory.is_empty());
+        }
     }
 }
