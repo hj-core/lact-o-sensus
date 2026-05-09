@@ -322,12 +322,13 @@ impl<S: NodeState> RaftNode<S> {
 
 impl RaftNode<Follower> {
     pub fn new(node_id: NodeId, fsm: Arc<dyn StateMachine>, storage: Box<dyn LogStorage>) -> Self {
+        let initial_index = fsm.last_applied_index();
         Self {
             node_id,
             fsm,
             storage,
-            commit_index: LogIndex::ZERO,
-            last_applied: LogIndex::ZERO,
+            commit_index: initial_index,
+            last_applied: initial_index,
             signal_counter: 0,
             state: Follower::new(None),
         }
@@ -671,6 +672,10 @@ mod tests {
 
     #[async_trait]
     impl StateMachine for MockFsm {
+        fn last_applied_index(&self) -> LogIndex {
+            LogIndex::ZERO
+        }
+
         async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status> {
             self.applied_indices.lock().unwrap().push(index);
             self.applied_data.lock().unwrap().push(data.to_vec());

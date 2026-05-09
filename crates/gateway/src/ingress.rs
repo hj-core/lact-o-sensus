@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,9 +40,12 @@ use crate::veto::VetoRelay;
 
 /// Trait for fetching the current state of the grocery inventory.
 #[async_trait]
-pub trait InventorySource: Send + Sync + std::fmt::Debug {
+pub trait InventorySource: Send + Sync + Debug {
     /// Returns the current list of items in the inventory.
     async fn get_inventory(&self) -> Vec<GroceryItem>;
+
+    /// Returns the version (LogIndex) that this snapshot represents.
+    async fn current_version(&self) -> LogIndex;
 }
 
 /// Validated and mathematically stabilized data ready for consensus.
@@ -264,6 +268,7 @@ impl IngressService for IngressDispatcher {
 
         // 2. Fetch inventory from the authoritative state machine
         let all_items = self.inventory_source.get_inventory().await;
+        let state_version = self.inventory_source.current_version().await;
 
         // 3. Apply semantic filters
         let filtered_items = if let Some(filter) = req.query_filter {
@@ -280,7 +285,7 @@ impl IngressService for IngressDispatcher {
 
         Ok(Response::new(QueryStateResponse {
             items: filtered_items,
-            current_state_version: 0, // TODO: Return actual index from Store
+            current_state_version: state_version.value(),
             status: QueryStatus::Success as i32,
             leader_hint: String::new(),
             error_message: String::new(),
@@ -655,6 +660,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use common::proto::v1::app::GroceryItem;
 
     use super::*;
 
@@ -714,7 +720,7 @@ mod tests {
             &self,
             _client_id: String,
             _intent: &MutationIntent,
-            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
@@ -738,7 +744,7 @@ mod tests {
             &self,
             _client_id: String,
             _intent: &MutationIntent,
-            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
@@ -768,7 +774,7 @@ mod tests {
             &self,
             _client_id: String,
             _intent: &MutationIntent,
-            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
@@ -793,7 +799,7 @@ mod tests {
             &self,
             _client_id: String,
             _intent: &MutationIntent,
-            _current_inventory: &[common::proto::v1::app::GroceryItem],
+            _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
         ) -> Result<VetoOutcome, VetoError> {
@@ -822,13 +828,18 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockInventorySource {
-        items: Vec<common::proto::v1::app::GroceryItem>,
+        items: Vec<GroceryItem>,
+        version: LogIndex,
     }
 
     #[async_trait]
     impl InventorySource for MockInventorySource {
-        async fn get_inventory(&self) -> Vec<common::proto::v1::app::GroceryItem> {
+        async fn get_inventory(&self) -> Vec<GroceryItem> {
             self.items.clone()
+        }
+
+        async fn current_version(&self) -> LogIndex {
+            self.version
         }
     }
 
@@ -1960,6 +1971,7 @@ mod tests {
             });
             let inventory = Arc::new(MockInventorySource {
                 items: items.clone(),
+                ..Default::default()
             });
             let dispatcher = IngressDispatcher::new(
                 raft,
@@ -2005,6 +2017,7 @@ mod tests {
             });
             let inventory = Arc::new(MockInventorySource {
                 items: items.clone(),
+                ..Default::default()
             });
             let dispatcher = IngressDispatcher::new(
                 raft,

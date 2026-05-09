@@ -78,12 +78,16 @@ async fn main() -> Result<()> {
     // Establishing split databases for strict component isolation.
     let system_path = config.data_dir.join("system");
     let log_path = config.data_dir.join("log");
+    let fsm_path = config.data_dir.join("fsm");
 
     info!("Opening system database at: {}", system_path.display());
     let system_db = sled::open(&system_path).map_err(anyhow::Error::from)?;
 
     info!("Opening log database at: {}", log_path.display());
     let log_db = sled::open(&log_path).map_err(anyhow::Error::from)?;
+
+    info!("Opening FSM database at: {}", fsm_path.display());
+    let fsm_db = sled::open(&fsm_path).map_err(anyhow::Error::from)?;
 
     // 5. Verify or Initialize Identity (ADR 004)
     let identity = match initialize_node_identity(&system_db, &config) {
@@ -95,7 +99,9 @@ async fn main() -> Result<()> {
     };
 
     // 6. Initialize the Shared Node State (Atomic Shell)
-    let fsm = Arc::new(LactoStore::new());
+    let fsm_store = LactoStore::new(fsm_db.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to initialize LactoStore: {}", e))?;
+    let fsm = Arc::new(fsm_store);
     let storage = Box::new(
         SledStorage::new(log_db.clone())
             .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
@@ -185,6 +191,7 @@ async fn main() -> Result<()> {
         info!("gRPC server stopped. Flushing databases to disk...");
         system_db.flush_async().await.map_err(anyhow::Error::from)?;
         log_db.flush_async().await.map_err(anyhow::Error::from)?;
+        fsm_db.flush_async().await.map_err(anyhow::Error::from)?;
         info!("Databases synchronized successfully.");
 
         info!("Node lifecycle finished successfully. Goodbye.");

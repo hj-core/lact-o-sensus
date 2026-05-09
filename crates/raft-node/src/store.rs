@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
@@ -7,38 +5,97 @@ use common::proto::v1::app::MutationStatus;
 use common::types::LogIndex;
 use gateway::ingress::InventorySource;
 use prost::Message;
-use tokio::sync::RwLock;
+use sled::Transactional;
+use sled::transaction::TransactionResult;
 use tonic::Status;
 use tracing::info;
 
 use crate::fsm::StateMachine;
 
-/// In-memory implementation of the Lact-O-Sensus state machine.
+/// Persistent implementation of the Lact-O-Sensus state machine using `sled`.
 ///
 /// This store satisfies the StateMachine trait by deserializing
-/// CommittedMutation bytes and updating a localized inventory.
-#[derive(Debug, Default)]
+/// CommittedMutation bytes and updating a localized inventory persisted on
+/// disk.
+///
+/// TREE ARCHITECTURE:
+/// To ensure logical isolation within the FSM database:
+/// 1. "inventory": Exclusively for [resolved_item_key (String) => GroceryItem
+///    (Protobuf)]
+/// 2. "meta": Exclusively for [Key (String) => Metadata (Binary)], e.g.,
+///    last_applied_index.
+#[derive(Debug)]
 pub struct LactoStore {
-    /// The canonical inventory of groceries.
-    /// Key: resolved_item_key (Canonical Slug)
-    inventory: RwLock<HashMap<String, GroceryItem>>,
+    db: sled::Db,
+    inventory: sled::Tree,
+    meta: sled::Tree,
 }
 
 impl LactoStore {
-    pub fn new() -> Self {
-        Self::default()
+    const KEY_LAST_APPLIED: &'static [u8] = b"last_applied";
+    const TREE_INVENTORY: &'static str = "inventory";
+    const TREE_META: &'static str = "meta";
+
+    pub fn new(db: sled::Db) -> Result<Self, Status> {
+        let inventory = db
+            .open_tree(Self::TREE_INVENTORY)
+            .map_err(|e| Status::internal(format!("Failed to open inventory tree: {}", e)))?;
+        let meta = db
+            .open_tree(Self::TREE_META)
+            .map_err(|e| Status::internal(format!("Failed to open meta tree: {}", e)))?;
+
+        Ok(Self {
+            db,
+            inventory,
+            meta,
+        })
+    }
+
+    /// Factory to construct a GroceryItem from a committed mutation record.
+    fn item_from_mutation(index: LogIndex, mutation: CommittedMutation) -> GroceryItem {
+        GroceryItem {
+            item_key: mutation.resolved_item_key,
+            quantity: mutation.updated_base_quantity,
+            unit: mutation.base_unit,
+            category: mutation.updated_category,
+            last_modifier_id: mutation.client_id,
+            last_activity: mutation.event_time,
+            state_version: index.value(),
+        }
     }
 }
 
 #[async_trait]
 impl InventorySource for LactoStore {
     async fn get_inventory(&self) -> Vec<GroceryItem> {
-        self.inventory.read().await.values().cloned().collect()
+        self.inventory
+            .iter()
+            .filter_map(|res| {
+                res.ok()
+                    .and_then(|(_, v)| GroceryItem::decode(v.as_ref()).ok())
+            })
+            .collect()
+    }
+
+    async fn current_version(&self) -> LogIndex {
+        StateMachine::last_applied_index(self)
     }
 }
 
 #[async_trait]
 impl StateMachine for LactoStore {
+    fn last_applied_index(&self) -> LogIndex {
+        self.meta
+            .get(Self::KEY_LAST_APPLIED)
+            .ok()
+            .flatten()
+            .map(|k| {
+                let bytes: [u8; 8] = k.as_ref().try_into().unwrap_or([0; 8]);
+                LogIndex::new(u64::from_be_bytes(bytes))
+            })
+            .unwrap_or(LogIndex::ZERO)
+    }
+
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
             Status::internal(format!(
@@ -47,8 +104,8 @@ impl StateMachine for LactoStore {
             ))
         })?;
 
-        // UNIFIED LEDGER: We only update inventory for successful mutations.
-        // Rejections and Vetoes only impact the Session Table (implemented in Step 3).
+        // UNIFIED LEDGER: We acknowledge all facts to advance the apply index,
+        // but only update physical inventory if status is COMMITTED.
         if mutation.status != MutationStatus::Committed as i32 {
             info!(
                 "FSM[{}]: Recording completion of sequence {} with status {:?}",
@@ -56,38 +113,51 @@ impl StateMachine for LactoStore {
                 mutation.sequence_id,
                 MutationStatus::try_from(mutation.status).unwrap_or(MutationStatus::Unspecified)
             );
+
+            // Even for Vetoes, we must update the last_applied index to ensure
+            // replay logic (Step 3.2) correctly skips processed entries.
+            self.meta
+                .insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())
+                .map_err(|e| Status::internal(format!("Failed to update last_applied: {}", e)))?;
+            self.db
+                .flush()
+                .map_err(|e| Status::internal(format!("FSM flush failure: {}", e)))?;
             return Ok(());
         }
 
-        let mut inventory = self.inventory.write().await;
+        // --- Physical Mutation & Index Update ---
+        // Using a transaction to ensure that the inventory update and the
+        // last_applied advancement are atomic.
+        let inventory_tree = self.inventory.clone();
+        let meta_tree = self.meta.clone();
 
-        if mutation.is_delete {
-            info!(
-                "FSM[{}]: Deleting item '{}'",
-                index, mutation.resolved_item_key
-            );
-            inventory.remove(&mutation.resolved_item_key);
-        } else {
-            info!(
-                "FSM[{}]: Upserting item '{}' (qty: {}, unit: {})",
-                index,
-                mutation.resolved_item_key,
-                mutation.updated_base_quantity,
-                mutation.base_unit
-            );
+        let res: TransactionResult<(), ()> =
+            (&inventory_tree, &meta_tree).transaction(|(inventory, meta)| {
+                if mutation.is_delete {
+                    inventory.remove(mutation.resolved_item_key.as_bytes())?;
+                } else {
+                    let item = Self::item_from_mutation(index, mutation.clone());
+                    inventory.insert(
+                        mutation.resolved_item_key.as_bytes(),
+                        item.encode_to_vec().as_slice(),
+                    )?;
+                }
 
-            let item = GroceryItem {
-                item_key: mutation.resolved_item_key.clone(),
-                quantity: mutation.updated_base_quantity,
-                unit: mutation.base_unit,
-                category: mutation.updated_category,
-                last_modifier_id: mutation.client_id,
-                last_activity: mutation.event_time,
-                state_version: index.value(),
-            };
+                meta.insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())?;
+                Ok(())
+            });
 
-            inventory.insert(mutation.resolved_item_key, item);
-        }
+        res.map_err(|e| Status::internal(format!("FSM transaction failed: {:?}", e)))?;
+
+        info!(
+            "FSM[{}]: Recording completion of sequence {} with status Committed",
+            index, mutation.sequence_id
+        );
+
+        // Synchronous flush as mandated by ADR 001
+        self.db.flush().map_err(|e| {
+            Status::internal(format!("FSM persistence failure during flush: {}", e))
+        })?;
 
         Ok(())
     }
@@ -98,8 +168,15 @@ mod tests {
     use common::proto::v1::app::MutationStatus;
     use common::types::ClientId;
     use common::types::SequenceId;
+    use tempfile::tempdir;
 
     use super::*;
+
+    fn setup_store() -> LactoStore {
+        let dir = tempdir().unwrap();
+        let db = sled::open(dir.path()).unwrap();
+        LactoStore::new(db).unwrap()
+    }
 
     mod apply {
         use super::*;
@@ -124,7 +201,7 @@ mod tests {
 
         #[tokio::test]
         async fn updates_inventory_when_status_is_committed() {
-            let store = LactoStore::new();
+            let store = setup_store();
             let mutation = mock_mutation(MutationStatus::Committed);
             let mut data = Vec::new();
             mutation.encode(&mut data).unwrap();
@@ -135,26 +212,26 @@ mod tests {
             assert_eq!(inventory.len(), 1);
             assert_eq!(inventory[0].item_key, "milk");
             assert_eq!(inventory[0].quantity, "1000");
+            assert_eq!(store.last_applied_index(), LogIndex::new(1));
         }
 
         #[tokio::test]
         async fn does_not_update_inventory_when_status_is_vetoed() {
-            let store = LactoStore::new();
+            let store = setup_store();
             let mutation = mock_mutation(MutationStatus::Vetoed);
             let mut data = Vec::new();
             mutation.encode(&mut data).unwrap();
 
-            // apply Vetoed mutation
             store.apply(LogIndex::new(1), &data).await.unwrap();
 
-            // Verify inventory is still empty
             let inventory = store.get_inventory().await;
             assert!(inventory.is_empty());
+            assert_eq!(store.last_applied_index(), LogIndex::new(1));
         }
 
         #[tokio::test]
         async fn deletes_item_when_is_delete_is_true() {
-            let store = LactoStore::new();
+            let store = setup_store();
 
             // 1. Add item
             let add_mut = mock_mutation(MutationStatus::Committed);
@@ -172,6 +249,36 @@ mod tests {
             // 3. Verify
             let inventory = store.get_inventory().await;
             assert!(inventory.is_empty());
+            assert_eq!(store.last_applied_index(), LogIndex::new(2));
+        }
+
+        #[tokio::test]
+        async fn survives_restart_with_consistent_state() {
+            let dir = tempdir().unwrap();
+            let db_path = dir.path();
+
+            // 1. apply and shutdown
+            {
+                let db = sled::open(db_path).unwrap();
+                let store = LactoStore::new(db).unwrap();
+                let mut data = Vec::new();
+                mock_mutation(MutationStatus::Committed)
+                    .encode(&mut data)
+                    .unwrap();
+
+                store.apply(LogIndex::new(42), &data).await.unwrap();
+            }
+
+            // 2. Restart and verify
+            {
+                let db = sled::open(db_path).unwrap();
+                let store = LactoStore::new(db).unwrap();
+
+                let inventory = store.get_inventory().await;
+                assert_eq!(inventory.len(), 1);
+                assert_eq!(inventory[0].item_key, "milk");
+                assert_eq!(store.last_applied_index(), LogIndex::new(42));
+            }
         }
     }
 }

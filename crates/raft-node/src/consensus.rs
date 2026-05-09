@@ -656,6 +656,7 @@ mod tests {
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
+    use tonic::async_trait;
 
     use super::*;
     use crate::engine::Follower;
@@ -664,8 +665,12 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
-    #[tonic::async_trait]
+    #[async_trait]
     impl StateMachine for MockFsm {
+        fn last_applied_index(&self) -> LogIndex {
+            LogIndex::ZERO
+        }
+
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
             Ok(())
         }

@@ -139,6 +139,7 @@ impl ConsensusService for ConsensusDispatcher {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use common::types::ClusterId;
 
     use super::*;
@@ -150,8 +151,12 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
-    #[tonic::async_trait]
+    #[async_trait]
     impl StateMachine for MockFsm {
+        fn last_applied_index(&self) -> LogIndex {
+            LogIndex::ZERO
+        }
+
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
             Ok(())
         }

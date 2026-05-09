@@ -3,10 +3,11 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, TypedDict, TextIO, Generator
+from typing import Dict, List, Optional, TypedDict, IO, Generator
 
 # Lact-O-Sensus: Consensus Verification Suite
 # Verifies the Raft "Consensus Heart" and AI Egress logic via isolated test cases.
@@ -56,9 +57,9 @@ class ClusterManager:
     """Manages the lifecycle of a local 3-node Raft cluster and an AI Veto Node."""
 
     processes: Dict[int, subprocess.Popen]
-    log_files: Dict[int, TextIO]
+    log_files: Dict[int, IO]
     veto_process: Optional[subprocess.Popen]
-    veto_log: Optional[TextIO]
+    veto_log: Optional[IO]
 
     def __init__(self) -> None:
         self.processes = {}
@@ -66,16 +67,57 @@ class ClusterManager:
         self.veto_process = None
         self.veto_log = None
 
-    def start_all(self, start_veto: bool = False) -> None:
-        """Starts all nodes defined in NODES and optionally the AI Veto Node."""
-        print(f"--- Starting cluster (AI Veto: {start_veto}) ---")
+    def start_node(self, node_id: int, wipe_data: bool = False) -> None:
+        """Starts or restarts a specific node."""
+        node = next(n for n in NODES if n["id"] == node_id)
 
-        # Capture and prepare environment once to ensure consistency across the cluster.
+        if wipe_data:
+            # 1. Wipe diagnostic logs
+            if os.path.exists(node["log"]):
+                os.remove(node["log"])
+
+            # 2. Wipe physical persistence directory (ADR 001/009)
+            data_dir = f"data/node_{node_id}"
+            if os.path.exists(data_dir):
+                shutil.rmtree(data_dir)
+
+        # Capture and prepare environment
         cluster_env = os.environ.copy()
         cluster_env["RUST_LOG"] = "info"
 
+        mode = "w" if wipe_data else "a"
+        log_file: IO = open(node["log"], mode, encoding="utf-8")
+        self.log_files[node["id"]] = log_file
+
+        cmd = [
+            "cargo",
+            "run",
+            "-p",
+            "raft-node",
+            "--",
+            "--config",
+            node["config"],
+        ]
+        p = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=cluster_env,
+        )
+        self.processes[node["id"]] = p
+
+    def start_all(
+        self, start_veto: bool = False, wipe_data: bool = True
+    ) -> None:
+        """Starts all nodes defined in NODES and optionally the AI Veto Node."""
+        print(
+            f"--- Starting cluster (AI Veto: {start_veto}, Wipe: {wipe_data}) ---"
+        )
+
         # 1. Start AI Veto Node if requested
         if start_veto:
+            cluster_env = os.environ.copy()
+            cluster_env["RUST_LOG"] = "info"
             if os.path.exists(VETO_LOG):
                 os.remove(VETO_LOG)
 
@@ -97,30 +139,9 @@ class ClusterManager:
                 env=cluster_env,
             )
 
-        # 2. Start Raft Nodes
+        # 2. Start Raft Nodes (with data wipe if requested)
         for node in NODES:
-            if os.path.exists(node["log"]):
-                os.remove(node["log"])
-
-            log_file = open(node["log"], "w", encoding="utf-8")
-            self.log_files[node["id"]] = log_file
-
-            cmd = [
-                "cargo",
-                "run",
-                "-p",
-                "raft-node",
-                "--",
-                "--config",
-                node["config"],
-            ]
-            p = subprocess.Popen(
-                cmd,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env=cluster_env,
-            )
-            self.processes[node["id"]] = p
+            self.start_node(node["id"], wipe_data=wipe_data)
 
         # Give nodes time to initialize and Cargo to finish building if necessary
         time.sleep(2)
@@ -219,7 +240,7 @@ def find_current_leader() -> Optional[int]:
     for node in NODES:
         for line in get_complete_lines(node["log"], 0):
             ts = parse_log_timestamp(line)
-            if "Transitioning to Leader" in line and ts > latest_ts:
+            if "Transitioning to Leader" in line and ts >= latest_ts:
                 latest_ts, leader_id = ts, node["id"]
             if (
                 "Demoting to Follower" in line
@@ -439,8 +460,6 @@ def run_client_command(command: str, seed_port: int) -> str:
     if os.path.exists(state_file):
         os.remove(state_file)
     if os.path.exists(wal_dir):
-        import shutil
-
         shutil.rmtree(wal_dir)
 
     cmd = [
@@ -481,13 +500,15 @@ def run_client_command(command: str, seed_port: int) -> str:
 
 def extract_version(output: str) -> int:
     """Extracts the state version from client-cli output."""
-    match = re.search(r"\(version (\d+)\)", output)
+    match = re.search(r"version (\d+)", output)
     if match:
         return int(match.group(1))
     return 0
 
 
-def verify_convergence(index: int, status_str: str, timeout: float = 5.0) -> None:
+def verify_convergence(
+    index: int, status_str: str, timeout: float = 5.0
+) -> None:
     """Verifies that ALL nodes applied the mutation at the given index."""
     print(
         f"Action: Verifying cluster convergence for index {index} ({status_str})..."
@@ -639,6 +660,63 @@ def test_linearizable_query_rejection() -> None:
         raise RuntimeError("Malformed response from follower.") from exc
 
 
+def test_persistence_restart(cluster: ClusterManager) -> None:
+    """Verifies that inventory state survives a total cluster shutdown."""
+    leader_id = wait_for_leader()
+    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+    print(f"Stabilizing cluster around Leader {leader_id} (2s)...")
+    time.sleep(2)
+
+    # 1. Add an item
+    print("Action: Adding test item (apple)...")
+    output = run_client_command(
+        'add "apple" 1 units PrimaryFlora', leader_port
+    )
+    if "SUCCESS" not in output:
+        raise RuntimeError(f"Failed to add item: {output}")
+
+    # Ensure it reaches absolute convergence before shutdown
+    version = extract_version(output)
+    if version > 0:
+        print(
+            f"Confirmed commitment at version {version}. Verifying cluster-wide convergence..."
+        )
+        verify_convergence(version, "Committed")
+    else:
+        print(f"DEBUG: Client Output: {output}")
+        raise RuntimeError(
+            "Failed to extract version from client output."
+        )
+
+    # 2. Total Cluster Shutdown
+    cluster.cleanup()
+    print(
+        "Action: Cluster is OFFLINE. (Causal history exists only on disk)"
+    )
+    time.sleep(2)
+
+    # 3. Total Cluster Restart (No Wipe)
+    cluster.start_all(start_veto=True, wipe_data=False)
+    print("Waiting for cluster recovery...")
+    new_leader_id = wait_for_leader()
+    new_leader_port = next(
+        n["port"] for n in NODES if n["id"] == new_leader_id
+    )
+
+    # 4. Verify item existence via the new leader
+    print(
+        f"Action: Verifying item survival via authoritative Leader {new_leader_id}..."
+    )
+
+    output = run_client_command("query apple", new_leader_port)
+
+    if "apple" in output.lower() and "1 units" in output:
+        print("SUCCESS: Inventory survived total cluster restart.")
+    else:
+        print(f"FAILURE: Item not found after restart:\n{output}")
+        raise RuntimeError("Inventory data lost after total shutdown.")
+
+
 # --- Runner Logic ---
 
 
@@ -680,6 +758,12 @@ def main() -> None:
             "Smart Client (Veto Path)",
             True,
             lambda c: test_smart_client_veto(),
+        ),
+        (
+            "Inventory Durability (Restart Recovery)",
+            True,
+            # pylint: disable=W0108
+            lambda c: test_persistence_restart(c),
         ),
     ]
 

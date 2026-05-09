@@ -46,18 +46,18 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `LactoStore` correctly acknowledges a vetoed mutation without changing inventory.
   - [x] Integration test: `smoke_test.py` verifies that a vetoed mutation appears in the Raft log of all nodes.
 
-### Step 3.1: Persistent FSM (Physical Inventory)
+### Step 3.1: Persistent FSM (Physical Inventory) [DONE]
 
-**Commit:** `feat(raft): transition LactoStore inventory to sled`
+**Commit:** `feat(raft): implement persistent FSM inventory and total cluster restart verification`
 
 - **Description:** Transition the State Machine from a volatile `HashMap` to a persistent `sled` tree.
 - **Changes:**
-  - [ ] Initialize the `fsm` database handle in `raft-node/src/main.rs`.
-  - [ ] Refactor `LactoStore` to use `sled::Tree` for inventory storage.
-  - [ ] Update `InventorySource` to stream data from `sled`.
+  - [x] Initialize the `fsm` database handle in `raft-node/src/main.rs`.
+  - [x] Refactor `LactoStore` to use `sled::Tree` for inventory storage.
+  - [x] Update `InventorySource` to stream data from `sled`.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
-  - [ ] Integration test: `smoke_test.py` verifies that inventory survives a node restart.
+  - [x] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
+  - [x] Integration test: `smoke_test.py` verifies that inventory survives a total cluster shutdown.
 
 ### Step 3.2: Persistent Session Table & Recovery
 
@@ -98,5 +98,5 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 📈 Completion Status
 
-- **Total Progress:** 50%
-- **Current Focus:** Step 3: Isolated Storage: State Machine & Session Table
+- **Total Progress:** 60%
+- **Current Focus:** Step 3.2: Persistent Session Table & Recovery

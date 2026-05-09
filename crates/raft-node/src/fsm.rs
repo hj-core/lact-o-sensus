@@ -9,6 +9,12 @@ use tonic::Status;
 /// applying the mutation to their internal state.
 #[async_trait]
 pub trait StateMachine: Send + Sync + std::fmt::Debug {
+    /// Returns the last log index applied to this state machine.
+    ///
+    /// Used by the Raft engine during startup to align volatile pointers
+    /// with persistent application state.
+    fn last_applied_index(&self) -> LogIndex;
+
     /// Applies a committed log entry to the application state.
     ///
     /// This method is called sequentially by the Raft engine as the
