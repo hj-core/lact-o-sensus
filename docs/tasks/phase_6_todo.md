@@ -32,19 +32,19 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: Log entries appended to `sled` can be successfully retrieved after a `db` restart.
   - [x] Integration test: Node restarts and correctly initializes `current_term` and `voted_for` from disk.
 
-### Step 2.5: The Unified Ledger (Veto Logging)
+### Step 2.5: The Unified Ledger (Veto Logging) [DONE]
 
 **Commit:** `feat(contract): implement Unified Ledger by logging AI vetoes`
 
 - **Description:** Align the Gateway and Ledger by recording rejections as first-class Raft events.
 - **Changes:**
-  - Update `app.proto`: Add `MutationStatus` (APPROVED/VETOED) and `moral_justification` to `CommittedMutation`.
-  - Refactor `IngressDispatcher` (Gateway): Propose **every** evaluation outcome to Raft, regardless of the AI's decision.
-  - Update `LactoStore` (FSM): Apply every log entry to the Session Table, but update Inventory only for `APPROVED` status.
-  - **Documentation Audit**: Review and update `roadmap.md` and `ADR 006` / `ADR 007` to reflect the transition from "Firewall Veto" to "Ledger Veto."
+  - [x] Update `app.proto`: Add `MutationStatus` (APPROVED/VETOED) and `moral_justification` to `CommittedMutation`.
+  - [x] Refactor `IngressDispatcher` (Gateway): Propose **every** evaluation outcome to Raft, regardless of the AI's decision.
+  - [x] Update `LactoStore` (FSM): Apply every log entry to the Session Table, but update Inventory only for `APPROVED` status.
+  - [x] **Documentation Audit**: Review and update `roadmap.md` and `ADR 006` / `ADR 007` to reflect the transition from "Firewall Veto" to "Ledger Veto."
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: `LactoStore` correctly updates session sequence for a vetoed mutation without changing inventory.
-  - [ ] Integration test: `smoke_test.py` verifies that a vetoed mutation appears in the Raft log of all nodes.
+  - [x] Unit test: `LactoStore` correctly acknowledges a vetoed mutation without changing inventory.
+  - [x] Integration test: `smoke_test.py` verifies that a vetoed mutation appears in the Raft log of all nodes.
 
 ### Step 3: Isolated Storage: State Machine & Session Table
 
@@ -52,10 +52,10 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Persist the Application State and EOS tracking data using a second, strictly isolated `sled` database.
 - **Changes:**
-  - Initialize a second `sled::Db` instance (e.g., `data_dir/fsm`).
-  - Transition `LactoStore` inventory from `HashMap` to the `sled` tree.
-  - Implement the **Session Table** (ADR 006) within this FSM database to track `client_id` -> `last_sequence_id` and the corresponding `LogIndex`.
-  - Implement recovery logic: on startup, compare the FSM applied index against the Raft commit index and replay logs if the FSM fell behind.
+  - [ ] Initialize a second `sled::Db` instance (e.g., `data_dir/fsm`).
+  - [ ] Transition `LactoStore` inventory from `HashMap` to the `sled` tree.
+  - [ ] Implement the **Session Table** (ADR 006) within this FSM database to track `client_id` -> `last_sequence_id` and the corresponding `LogIndex`.
+  - [ ] Implement recovery logic: on startup, compare the FSM applied index against the Raft commit index and replay logs if the FSM fell behind.
 - **Acceptance Tests (TDD):**
   - [ ] Unit test: `LactoStore::apply` writes item data and updates the session table atomically in `sled`.
   - [ ] Unit test: Client deduplication successfully returns cached responses using the persisted Session Table.
@@ -66,8 +66,8 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Enforce "Read-Your-Writes" consistency by blocking queries until the local State Machine catches up to the client's requested index.
 - **Changes:**
-  - Update `query_state` to accept and enforce `min_state_version`.
-  - If the local FSM index is lower than `min_state_version`, asynchronously wait until the state machine catches up (via `tokio::sync::watch` on the Consensus Progress channel).
+  - [ ] Update `query_state` to accept and enforce `min_state_version`.
+  - [ ] If the local FSM index is lower than `min_state_version`, asynchronously wait until the state machine catches up (via `tokio::sync::watch` on the Consensus Progress channel).
 - **Acceptance Tests (TDD):**
   - [ ] Unit test: Query requests block and eventually resolve when the FSM index advances past `min_state_version`.
 
@@ -77,8 +77,8 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Guarantee safety during recovery by aggressively testing crash scenarios and divergence.
 - **Changes:**
-  - Implement the `Poison-then-Panic` sequence (ADR 009) if the FSM index ever exceeds the Raft commit index during recovery (which indicates corruption).
-  - Expand `smoke_test.py` to aggressively kill nodes during mutation proposals.
+  - [ ] Implement the `Poison-then-Panic` sequence (ADR 009) if the FSM index ever exceeds the Raft commit index during recovery (which indicates corruption).
+  - [ ] Expand `smoke_test.py` to aggressively kill nodes during mutation proposals.
 - **Acceptance Tests (TDD):**
   - [ ] Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
 
@@ -86,5 +86,5 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 📈 Completion Status
 
-- **Total Progress:** 40%
-- **Current Focus:** Step 2.5: The Unified Ledger (Veto Logging)
+- **Total Progress:** 50%
+- **Current Focus:** Step 3: Isolated Storage: State Machine & Session Table
