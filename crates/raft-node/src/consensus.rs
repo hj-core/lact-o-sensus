@@ -660,7 +660,7 @@ mod tests {
 
     use super::*;
     use crate::engine::Follower;
-    use crate::fsm::StateMachine;
+    use common::raft_api::StateMachine;
     use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]

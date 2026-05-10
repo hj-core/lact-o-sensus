@@ -12,7 +12,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 
-use crate::fsm::StateMachine;
+use common::raft_api::StateMachine;
 use crate::storage::LogStorage;
 
 // =============================================================================

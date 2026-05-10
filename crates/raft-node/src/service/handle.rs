@@ -148,7 +148,7 @@ mod tests {
     use super::*;
     use crate::engine::Follower;
     use crate::engine::LogicalNode;
-    use crate::fsm::StateMachine;
+    use common::raft_api::StateMachine;
     use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
 

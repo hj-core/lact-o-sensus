@@ -307,7 +307,7 @@ mod tests {
     use common::types::errors::FsmError;
 
     use super::*;
-    use crate::fsm::StateMachine;
+    use common::raft_api::StateMachine;
     use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]

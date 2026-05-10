@@ -140,13 +140,13 @@ impl ConsensusService for ConsensusDispatcher {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
+    use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::errors::FsmError;
 
     use super::*;
     use crate::engine::Follower;
     use crate::engine::LogicalNode;
-    use crate::fsm::StateMachine;
     use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
 

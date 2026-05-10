@@ -4,13 +4,13 @@ use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationStatus;
 use common::types::LogIndex;
 use common::types::errors::FsmError;
-use gateway::ingress::InventorySource;
+use common::raft_api::InventorySource;
 use prost::Message;
 use sled::Transactional;
 use sled::transaction::TransactionResult;
 use tracing::info;
 
-use crate::fsm::StateMachine;
+use common::raft_api::StateMachine;
 
 /// Persistent implementation of the Lact-O-Sensus state machine using `sled`.
 ///

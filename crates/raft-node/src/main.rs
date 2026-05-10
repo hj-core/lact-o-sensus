@@ -1,7 +1,6 @@
 mod config;
 mod consensus;
 pub mod engine;
-mod fsm;
 mod identity;
 mod node;
 mod peer;

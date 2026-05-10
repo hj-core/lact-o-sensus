@@ -3,9 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use common::proto::v1::app::CommittedMutation;
-use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::OperationType;
@@ -16,6 +14,7 @@ use common::proto::v1::app::QueryStateResponse;
 use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
 use common::raft_api::ConsensusStatus;
+use common::raft_api::InventorySource;
 use common::raft_api::RaftHandle;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
@@ -37,16 +36,6 @@ use tracing::warn;
 use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
-
-/// Trait for fetching the current state of the grocery inventory.
-#[async_trait]
-pub trait InventorySource: Send + Sync + Debug {
-    /// Returns the current list of items in the inventory.
-    async fn get_inventory(&self) -> Vec<GroceryItem>;
-
-    /// Returns the version (LogIndex) that this snapshot represents.
-    async fn current_version(&self) -> LogIndex;
-}
 
 /// Validated and mathematically stabilized data ready for consensus.
 ///
