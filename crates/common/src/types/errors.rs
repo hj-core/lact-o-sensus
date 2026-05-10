@@ -18,7 +18,7 @@ pub enum FsmError {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum DomainError {
+pub enum IdentityError {
     #[error("Invalid NodeId format: '{input}' ({source})")]
     InvalidNodeIdFormat {
         input: String,

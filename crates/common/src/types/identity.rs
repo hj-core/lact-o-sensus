@@ -4,7 +4,7 @@ use std::str::FromStr;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::types::errors::DomainError;
+use crate::types::errors::IdentityError;
 
 /// Unique identifier for a node within a cluster.
 ///
@@ -16,9 +16,9 @@ pub struct NodeId(u64);
 
 impl NodeId {
     /// Constructs a new NodeId. Returns an error if the ID is 0.
-    pub fn try_new(id: u64) -> Result<Self, DomainError> {
+    pub fn try_new(id: u64) -> Result<Self, IdentityError> {
         if id == 0 {
-            return Err(DomainError::ReservedNodeId);
+            return Err(IdentityError::ReservedNodeId);
         }
         Ok(Self(id))
     }
@@ -43,12 +43,12 @@ impl fmt::Display for NodeId {
 }
 
 impl FromStr for NodeId {
-    type Err = DomainError;
+    type Err = IdentityError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let id = s
             .parse::<u64>()
-            .map_err(|e| DomainError::InvalidNodeIdFormat {
+            .map_err(|e| IdentityError::InvalidNodeIdFormat {
                 input: s.to_string(),
                 source: e,
             })?;
@@ -57,7 +57,7 @@ impl FromStr for NodeId {
 }
 
 impl TryFrom<u64> for NodeId {
-    type Error = DomainError;
+    type Error = IdentityError;
 
     fn try_from(id: u64) -> Result<Self, Self::Error> {
         Self::try_new(id)
@@ -65,7 +65,7 @@ impl TryFrom<u64> for NodeId {
 }
 
 impl TryFrom<String> for NodeId {
-    type Error = DomainError;
+    type Error = IdentityError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         value.parse()
@@ -85,17 +85,17 @@ impl ClusterId {
     ///
     /// Trims whitespace and verifies it is not empty and contains valid
     /// characters.
-    pub fn try_new(id: impl AsRef<str>) -> Result<Self, DomainError> {
+    pub fn try_new(id: impl AsRef<str>) -> Result<Self, IdentityError> {
         let trimmed = id.as_ref().trim();
         if trimmed.is_empty() {
-            return Err(DomainError::EmptyClusterId);
+            return Err(IdentityError::EmptyClusterId);
         }
 
         if !trimmed
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
         {
-            return Err(DomainError::InvalidClusterId {
+            return Err(IdentityError::InvalidClusterId {
                 id: trimmed.to_string(),
             });
         }
@@ -115,7 +115,7 @@ impl fmt::Display for ClusterId {
 }
 
 impl TryFrom<String> for ClusterId {
-    type Error = DomainError;
+    type Error = IdentityError;
 
     fn try_from(id: String) -> Result<Self, Self::Error> {
         Self::try_new(id)
@@ -123,7 +123,7 @@ impl TryFrom<String> for ClusterId {
 }
 
 impl TryFrom<&str> for ClusterId {
-    type Error = DomainError;
+    type Error = IdentityError;
 
     fn try_from(id: &str) -> Result<Self, Self::Error> {
         Self::try_new(id)
@@ -173,7 +173,7 @@ mod tests {
             #[test]
             fn rejects_reserved_zero() {
                 let id = NodeId::try_new(0);
-                assert_eq!(id.unwrap_err(), DomainError::ReservedNodeId);
+                assert_eq!(id.unwrap_err(), IdentityError::ReservedNodeId);
             }
         }
 
@@ -190,14 +190,14 @@ mod tests {
                 let result: Result<NodeId, _> = "abc".parse();
                 assert!(matches!(
                     result.unwrap_err(),
-                    DomainError::InvalidNodeIdFormat { .. }
+                    IdentityError::InvalidNodeIdFormat { .. }
                 ));
             }
 
             #[test]
             fn fails_on_zero_string() {
                 let result: Result<NodeId, _> = "0".parse();
-                assert_eq!(result.unwrap_err(), DomainError::ReservedNodeId);
+                assert_eq!(result.unwrap_err(), IdentityError::ReservedNodeId);
             }
         }
     }
@@ -216,7 +216,7 @@ mod tests {
             fn rejects_empty_string() {
                 assert_eq!(
                     ClusterId::try_new("  ").unwrap_err(),
-                    DomainError::EmptyClusterId
+                    IdentityError::EmptyClusterId
                 );
             }
 
@@ -226,7 +226,7 @@ mod tests {
                 let result = ClusterId::try_new(id);
                 assert!(matches!(
                     result.unwrap_err(),
-                    DomainError::InvalidClusterId { .. }
+                    IdentityError::InvalidClusterId { .. }
                 ));
             }
 

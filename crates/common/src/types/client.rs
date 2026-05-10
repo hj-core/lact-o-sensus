@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::types::errors::DomainError;
+use crate::types::errors::IdentityError;
 
 /// Unique identifier for a specific client session.
 ///
@@ -36,10 +36,11 @@ impl ClientId {
 }
 
 impl FromStr for ClientId {
-    type Err = DomainError;
+    type Err = IdentityError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let inner = Uuid::parse_str(s).map_err(|e| DomainError::InvalidClientId(e.to_string()))?;
+        let inner =
+            Uuid::parse_str(s).map_err(|e| IdentityError::InvalidClientId(e.to_string()))?;
         Ok(Self {
             inner,
             cached_str: Arc::from(inner.to_string()),

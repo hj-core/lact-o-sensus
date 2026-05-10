@@ -8,7 +8,7 @@
 
 ### 🏛 Summary of Achievements
 
-1. **Domain Hardening:** Eliminated "Primitive Obsession" by introducing specialized error types (`DomainError`, `ConfigError`, `IdentityError`, `PeerError`) and removing fragile `Default` derivations for core identifiers (`NodeId`, `ClusterId`).
+1. **Domain Hardening:** Eliminated "Primitive Obsession" by introducing specialized error types (`IdentityError`, `ConfigError`, `PeerError`) and removing fragile `Default` derivations for core identifiers (`NodeId`, `ClusterId`).
 2. **Network Mesh Optimization:** Implemented a pre-populated gRPC channel cache in the `PeerManager`, reducing the latency of the first RPC call and ensuring high-availability through proactive connection management.
 3. **Opportunistic Leadership:** Refactored the election cycle to use `FuturesUnordered`. The candidate now transitions to Leader immediately upon reaching a quorum, bypassing slow or partitioned peers.
 4. **Reactive Timing Model:** Replaced the polling-based election timer with a `tokio::select!` model driven by `tokio::sync::Notify`. This ensures sub-millisecond reaction times to leader failures and valid heartbeats.
