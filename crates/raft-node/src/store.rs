@@ -3,11 +3,11 @@ use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationStatus;
 use common::types::LogIndex;
+use common::types::errors::FsmError;
 use gateway::ingress::InventorySource;
 use prost::Message;
 use sled::Transactional;
 use sled::transaction::TransactionResult;
-use tonic::Status;
 use tracing::info;
 
 use crate::fsm::StateMachine;
@@ -36,13 +36,13 @@ impl LactoStore {
     const TREE_INVENTORY: &'static str = "inventory";
     const TREE_META: &'static str = "meta";
 
-    pub fn new(db: sled::Db) -> Result<Self, Status> {
+    pub fn new(db: sled::Db) -> Result<Self, FsmError> {
         let inventory = db
             .open_tree(Self::TREE_INVENTORY)
-            .map_err(|e| Status::internal(format!("Failed to open inventory tree: {}", e)))?;
+            .map_err(|e| FsmError::Persistence(format!("Failed to open inventory tree: {}", e)))?;
         let meta = db
             .open_tree(Self::TREE_META)
-            .map_err(|e| Status::internal(format!("Failed to open meta tree: {}", e)))?;
+            .map_err(|e| FsmError::Persistence(format!("Failed to open meta tree: {}", e)))?;
 
         Ok(Self {
             db,
@@ -96,9 +96,9 @@ impl StateMachine for LactoStore {
             .unwrap_or(LogIndex::ZERO)
     }
 
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status> {
+    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
-            Status::internal(format!(
+            FsmError::Deserialization(format!(
                 "Failed to deserialize mutation at index {}: {}",
                 index, e
             ))
@@ -118,10 +118,12 @@ impl StateMachine for LactoStore {
             // replay logic (Step 3.2) correctly skips processed entries.
             self.meta
                 .insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())
-                .map_err(|e| Status::internal(format!("Failed to update last_applied: {}", e)))?;
+                .map_err(|e| {
+                    FsmError::Persistence(format!("Failed to update last_applied: {}", e))
+                })?;
             self.db
                 .flush()
-                .map_err(|e| Status::internal(format!("FSM flush failure: {}", e)))?;
+                .map_err(|e| FsmError::Persistence(format!("FSM flush failure: {}", e)))?;
             return Ok(());
         }
 
@@ -147,7 +149,7 @@ impl StateMachine for LactoStore {
                 Ok(())
             });
 
-        res.map_err(|e| Status::internal(format!("FSM transaction failed: {:?}", e)))?;
+        res.map_err(|e| FsmError::Persistence(format!("FSM transaction failed: {:?}", e)))?;
 
         info!(
             "FSM[{}]: Recording completion of sequence {} with status Committed",
@@ -156,7 +158,7 @@ impl StateMachine for LactoStore {
 
         // Synchronous flush as mandated by ADR 001
         self.db.flush().map_err(|e| {
-            Status::internal(format!("FSM persistence failure during flush: {}", e))
+            FsmError::Persistence(format!("FSM persistence failure during flush: {}", e))
         })?;
 
         Ok(())

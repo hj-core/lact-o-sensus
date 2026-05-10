@@ -665,13 +665,14 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
+    use common::types::errors::FsmError;
     #[async_trait]
     impl StateMachine for MockFsm {
         fn last_applied_index(&self) -> LogIndex {
             LogIndex::ZERO
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
             Ok(())
         }
     }

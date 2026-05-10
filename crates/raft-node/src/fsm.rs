@@ -1,6 +1,8 @@
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use common::types::LogIndex;
-use tonic::Status;
+use common::types::errors::FsmError;
 
 /// Boundary trait between the generic Raft consensus engine and the
 /// application logic.
@@ -8,7 +10,7 @@ use tonic::Status;
 /// Implementations are responsible for deserializing the opaque bytes and
 /// applying the mutation to their internal state.
 #[async_trait]
-pub trait StateMachine: Send + Sync + std::fmt::Debug {
+pub trait StateMachine: Send + Sync + Debug {
     /// Returns the last log index applied to this state machine.
     ///
     /// Used by the Raft engine during startup to align volatile pointers
@@ -19,5 +21,5 @@ pub trait StateMachine: Send + Sync + std::fmt::Debug {
     ///
     /// This method is called sequentially by the Raft engine as the
     /// commit_index advances.
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status>;
+    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError>;
 }

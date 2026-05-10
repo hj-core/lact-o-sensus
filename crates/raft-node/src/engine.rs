@@ -304,7 +304,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use tonic::Status;
+    use common::types::errors::FsmError;
 
     use super::*;
     use crate::fsm::StateMachine;
@@ -318,7 +318,7 @@ mod tests {
             LogIndex::ZERO
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
             Ok(())
         }
     }

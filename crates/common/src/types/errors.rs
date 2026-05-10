@@ -1,5 +1,20 @@
 use thiserror::Error;
 
+#[derive(Debug, Error)]
+pub enum FsmError {
+    #[error("Physical persistence failure: {0}")]
+    Persistence(String),
+
+    #[error("Internal encoding failure: {0}")]
+    Serialization(String),
+
+    #[error("Data corruption or decoding failure: {0}")]
+    Deserialization(String),
+
+    #[error("Foundation invariant violation: {0}")]
+    Invariant(String),
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DomainError {
     #[error("Invalid NodeId format: '{input}' ({source})")]

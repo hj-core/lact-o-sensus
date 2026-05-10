@@ -659,7 +659,7 @@ mod tests {
     use std::sync::Mutex;
 
     use async_trait::async_trait;
-    use tonic::Status;
+    use common::types::errors::FsmError;
 
     use super::*;
     use crate::storage::MemoryStorage;
@@ -676,7 +676,7 @@ mod tests {
             LogIndex::ZERO
         }
 
-        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Status> {
+        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
             self.applied_indices.lock().unwrap().push(index);
             self.applied_data.lock().unwrap().push(data.to_vec());
             Ok(())

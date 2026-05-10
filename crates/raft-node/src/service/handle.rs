@@ -143,6 +143,7 @@ mod tests {
     use common::types::NodeId;
     use common::types::NodeIdentity;
     use common::types::Term;
+    use common::types::errors::FsmError;
 
     use super::*;
     use crate::engine::Follower;
@@ -159,7 +160,7 @@ mod tests {
             LogIndex::ZERO
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
             Ok(())
         }
     }

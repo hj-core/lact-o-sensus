@@ -141,6 +141,7 @@ impl ConsensusService for ConsensusDispatcher {
 mod tests {
     use async_trait::async_trait;
     use common::types::ClusterId;
+    use common::types::errors::FsmError;
 
     use super::*;
     use crate::engine::Follower;
@@ -157,7 +158,7 @@ mod tests {
             LogIndex::ZERO
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Status> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
             Ok(())
         }
     }
