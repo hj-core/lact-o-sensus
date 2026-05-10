@@ -26,7 +26,7 @@
 
 * **Semantic Rigor:** The "Registry Firewall" in Task 3 proved that we can treat AI as a fallible component without compromising the integrity of the Replicated State Machine.
 * **Hardware Realism:** Benchmarking on an RTX 2080 forced us to adopt advanced industry optimizations (Prompt Caching, Model Distillation) that would have been ignored in a "perfect" cloud environment.
-* **Decoupling as Growth:** Moving the grocery logic out of `raft-node` allowed the consensus engine to remain a "pure" distributed systems primitive, fulfilling the project's long-term maintainability goals.
+* **Decoupling as Growth:** Moving the grocery logic out of `raft-engine` allowed the consensus engine to remain a "pure" distributed systems primitive, fulfilling the project's long-term maintainability goals.
 * **BDD Specification:** Adopting descriptive, verb-based test names (e.g., `rejects_hallucinated_units_with_internal_error`) transformed the test suite into a readable clinical specification.
 
 ---

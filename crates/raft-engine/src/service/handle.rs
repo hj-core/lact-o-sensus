@@ -139,6 +139,7 @@ impl RaftHandle for LocalRaftHandle {
 
 #[cfg(test)]
 mod tests {
+    use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
@@ -148,7 +149,6 @@ mod tests {
     use super::*;
     use crate::engine::Follower;
     use crate::engine::LogicalNode;
-    use common::raft_api::StateMachine;
     use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
 

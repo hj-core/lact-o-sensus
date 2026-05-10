@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::proto::v1::raft::LogEntry;
+use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
@@ -12,7 +13,6 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 
-use common::raft_api::StateMachine;
 use crate::storage::LogStorage;
 
 // =============================================================================

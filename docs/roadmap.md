@@ -16,17 +16,17 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - Set up `tonic-build` for automatic Rust code generation.
 - **Success Metric:** All crates can import shared types without duplication.
 
-## 🏗 Phase 2: The Infrastructure (`raft-node` Skeleton) [DONE]
+## 🏗 Phase 2: The Infrastructure (`raft-engine` Skeleton) [DONE]
 
 - **Goal:** Establish the network mesh and basic RPC handlers.
 - **Key Actions:**
-  - Initialize `crates/raft-node` binary.
+  - Initialize `crates/raft-engine` binary.
   - Implement gRPC server stubs for `RequestVote` and `AppendEntries`.
   - Establish the **Leader-Centric Hub-and-Spoke** topology (ADR 002).
   - Verify connectivity: 3 nodes can ping each other via RPC.
 - **Success Metric:** A cluster of 3 nodes can start up and "listen" for traffic.
 
-## ❤️ Phase 3: The Consensus Heart (`raft-node` Core) [DONE]
+## ❤️ Phase 3: The Consensus Heart (`raft-engine` Core) [DONE]
 
 - **Goal:** Implement the Raft Leader Election and Heartbeat logic.
 - **Key Actions:**
@@ -40,9 +40,9 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Connect external actors and verify the full request lifecycle using mock policy logic.
 - **Key Actions:**
-  - Implement the in-memory Log and `AppendEntries` replication logic in `raft-node`.
+  - Implement the in-memory Log and `AppendEntries` replication logic in `raft-engine`.
   - Initialize `crates/client-cli` as an interactive REPL with "Smart Client" logic.
-  - Implement the `GrpcVetoRelay` in `raft-node` to bridge the Leader to the `ai-veto` node.
+  - Implement the `GrpcVetoRelay` in `raft-engine` to bridge the Leader to the `ai-veto` node.
   - Verify: Client -> Leader -> Mock AI -> Consensus -> Commit (Round Trip).
 - **Success Metric:** A client mutation is "Committed" after replication and a mock veto.
 

@@ -8,7 +8,7 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
 
 ## ✅ Completed Tasks
 
-- [x] **NewType Migration (ADR 001/005):** Verified that all domain identifiers (`LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`) have transitioned from primitive types to self-validating NewTypes. These are now consistently used across `raft-node`, `client-cli`, and `common`.
+- [x] **NewType Migration (ADR 001/005):** Verified that all domain identifiers (`LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`) have transitioned from primitive types to self-validating NewTypes. These are now consistently used across `raft-engine`, `client-cli`, and `common`.
 
 ---
 
@@ -18,11 +18,11 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
 
 **Commit:** `feat(raft): implement centralized identity gRPC interceptors`
 
-- [x] Create `IdentityInterceptor` in `crates/raft-node/src/service/common.rs`.
+- [x] Create `IdentityInterceptor` in `crates/raft-engine/src/service/common.rs`.
   - [x] Extract `x-cluster-id` and `x-target-node-id` from gRPC metadata.
   - [x] Validate against local `ClusterId` and `NodeId`.
   - [x] Return `Status::unauthenticated` or `Status::invalid_argument` on mismatch.
-- [x] Register the interceptor in `crates/raft-node/src/main.rs` for both `ConsensusService` and `IngressService`.
+- [x] Register the interceptor in `crates/raft-engine/src/main.rs` for both `ConsensusService` and `IngressService`.
 - [x] Remove manual identity checks from `service/consensus.rs` and `service/ingress.rs`.
 - [x] **Verification:**
   - [x] Unit tests for `IdentityInterceptor` with mocked metadata.
@@ -32,7 +32,7 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
 
 **Commit:** `refactor(common): upgrade identity protocol for target_node_id`
 
-- [x] Update `crates/raft-node/src/peer.rs` to attach `x-cluster-id` and `x-target-node-id` to all outbound `AppendEntries` and `RequestVote` calls.
+- [x] Update `crates/raft-engine/src/peer.rs` to attach `x-cluster-id` and `x-target-node-id` to all outbound `AppendEntries` and `RequestVote` calls.
 - [x] Update `crates/client-cli/src/client.rs` to attach these headers to `ProposeMutation` and `QueryState` calls.
 - [x] **Verification:**
   - [x] `smoke_test.py` confirms cluster still achieves consensus.
@@ -69,7 +69,7 @@ Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandate
 
 ## 📈 Verification Summary
 
-- [x] **NewType Migration Check:** Verified that `Term`, `LogIndex`, `SequenceId`, `ClientId`, and `NodeId` are used throughout `raft-node` and `client-cli`. (Completed).
+- [x] **NewType Migration Check:** Verified that `Term`, `LogIndex`, `SequenceId`, `ClientId`, and `NodeId` are used throughout `raft-engine` and `client-cli`. (Completed).
 - [x] **Identity Integrity:** Cluster rejects misconfigured traffic via middleware.
 - [x] **Durability:** Client recovers pending mutations after a crash.
 - [x] **Stability:** Retries are disciplined and respect the 30s timeout window.

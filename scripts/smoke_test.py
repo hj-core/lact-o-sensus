@@ -24,19 +24,19 @@ NODES: List[NodeConfig] = [
     {
         "id": 1,
         "port": 50051,
-        "config": "crates/raft-node/configs/node_1.toml",
+        "config": "crates/raft-engine/configs/node_1.toml",
         "log": "node_1.log",
     },
     {
         "id": 2,
         "port": 50052,
-        "config": "crates/raft-node/configs/node_2.toml",
+        "config": "crates/raft-engine/configs/node_2.toml",
         "log": "node_2.log",
     },
     {
         "id": 3,
         "port": 50053,
-        "config": "crates/raft-node/configs/node_3.toml",
+        "config": "crates/raft-engine/configs/node_3.toml",
         "log": "node_3.log",
     },
 ]
@@ -93,7 +93,7 @@ class ClusterManager:
             "cargo",
             "run",
             "-p",
-            "raft-node",
+            "raft-engine",
             "--",
             "--config",
             node["config"],

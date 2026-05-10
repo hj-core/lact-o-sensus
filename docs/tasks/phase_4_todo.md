@@ -2,7 +2,7 @@
 
 ## 🎯 Goal
 
-Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensus group and verify the full request lifecycle from user intent to committed consensus using mock policy logic.
+Connect external actors (`client-cli` and `ai-veto`) to the `raft-engine` consensus group and verify the full request lifecycle from user intent to committed consensus using mock policy logic.
 
 ---
 
@@ -19,15 +19,15 @@ Connect external actors (`client-cli` and `ai-veto`) to the `raft-node` consensu
 - [x] Return deterministic "Mock Approval" for all requests.
 - [x] Acceptance: `ai-veto` binary starts and responds to `EvaluateProposal` RPCs.
 
-## Step 2: Implement Leader Egress Bridge (`raft-node`) [x]
+## Step 2: Implement Leader Egress Bridge (`raft-engine`) [x]
 
-- [x] Create `GrpcVetoRelay` in `crates/raft-node/src/service/veto.rs`.
+- [x] Create `GrpcVetoRelay` in `crates/raft-engine/src/service/veto.rs`.
 - [x] Implement the `VetoRelay` trait to call the `ai-veto` gRPC service.
 - [x] Acceptance: Leader successfully calls out to `ai-veto`.
 
-## Step 3: Implement Leader Proposal Logic (`raft-node`) [x]
+## Step 3: Implement Leader Proposal Logic (`raft-engine`) [x]
 
-- [x] Update `IngressDispatcher` in `crates/raft-node/src/service/ingress.rs`.
+- [x] Update `IngressDispatcher` in `crates/raft-engine/src/service/ingress.rs`.
 - [x] Implement `ProposeMutation` for the `Leader` state:
   - [x] Call `ai_vet_relay.evaluate()`.
   - [x] If approved: Append to log, replicate via `AppendEntries`, and return `COMMITTED` once a quorum acknowledges.

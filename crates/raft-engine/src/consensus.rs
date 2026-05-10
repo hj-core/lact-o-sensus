@@ -653,6 +653,7 @@ async fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
 mod tests {
     use std::collections::HashMap;
 
+    use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
@@ -660,7 +661,6 @@ mod tests {
 
     use super::*;
     use crate::engine::Follower;
-    use common::raft_api::StateMachine;
     use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]

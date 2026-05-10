@@ -304,10 +304,10 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use common::raft_api::StateMachine;
     use common::types::errors::FsmError;
 
     use super::*;
-    use common::raft_api::StateMachine;
     use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]

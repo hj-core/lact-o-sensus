@@ -10,7 +10,7 @@
 
 1. **The Smart Client:** Implemented a resilient `LactoClient` that handles automatic leader discovery and redirection hints. It enforces **Exactly-Once Semantics (EOS)** by persisting a unique `client_id` and monotonic `sequence_id` to a local `.client_state.json` file.
 2. **Testable Interactive REPL:** Built a robust command-line interface in `client-cli` using a `shlex`-based parser. By abstracting the REPL loop over generic `AsyncRead`/`AsyncWrite` streams, we achieved **"Parity of Tests & Production"** for the interactive UI layer via memory-stream unit tests.
-3. **Consensus Ingress:** Updated the `raft-node` Ingress layer to handle `ProposeMutation` and `QueryState`. Implemented strict **Leader-Only Reads** to guarantee linearizable query results.
+3. **Consensus Ingress:** Updated the `raft-engine` Ingress layer to handle `ProposeMutation` and `QueryState`. Implemented strict **Leader-Only Reads** to guarantee linearizable query results.
 4. **AI Veto Egress Bridge:** Established a gRPC egress from the Raft Leader to the `ai-veto` node, allowing grocery mutations to be evaluated against external policy logic before log entry.
 5. **The "Follower Identity Gap" Fix:** Identified and resolved a critical protocol bug where Followers remained "blind" to the Leader's identity if they transitioned to the Follower state via a vote request.
 

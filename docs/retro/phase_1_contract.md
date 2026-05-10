@@ -9,7 +9,7 @@
 ### 🏛 Summary of Achievements
 
 1. **High-Level Design:** Documented 6 Architecture Decision Records (ADRs) covering failure models, topology, timing, identity, interfaces, and EOS.
-2. **Infrastructure:** Initialized a four-crate Cargo Workspace (`common`, `raft-node`, `client-cli`, `ai-veto`) using the latest Rust 2024 Edition and stable library versions (Tonic 0.14).
+2. **Infrastructure:** Initialized a four-crate Cargo Workspace (`common`, `raft-engine`, `client-cli`, `ai-veto`) using the latest Rust 2024 Edition and stable library versions (Tonic 0.14).
 3. **Logical Interface:** Defined a comprehensive Protobuf contract that enforces "Intent vs. Record" separation and provides "Holistic Context" for AI evaluation.
 4. **Domain Integrity:** Implemented the "12-Point Authorized Taxonomy" as a strictly typed Rust Enum with string-mapping capabilities.
 

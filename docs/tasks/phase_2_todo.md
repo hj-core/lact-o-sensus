@@ -1,4 +1,4 @@
-# Phase 2 TODO: The Infrastructure (raft-node Skeleton)
+# Phase 2 TODO: The Infrastructure (raft-engine Skeleton)
 
 ## 🎯 Goal
 

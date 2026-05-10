@@ -38,10 +38,10 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 
 - **Description:** Extract the generic State Machine interface and decouple the Raft node.
 - **Changes:**
-  - [x] Create `crates/raft-node/src/fsm.rs` defining `StateMachine` trait.
+  - [x] Create `crates/raft-engine/src/fsm.rs` defining `StateMachine` trait.
   - [x] Update `RaftNode` to hold `Arc<dyn StateMachine>` and change `log` to store `Vec<u8>` payloads.
   - [x] Modify `set_commit_index` to iterate and call `state_machine.apply(entry.data)` (via `apply_to_state_machine` orchestrator).
-  - [x] Create `crates/raft-node/src/store.rs` defining `LactoStore` (implements `StateMachine`).
+  - [x] Create `crates/raft-engine/src/store.rs` defining `LactoStore` (implements `StateMachine`).
 - **Acceptance Tests (TDD):**
   - [x] Write a unit test in `node.rs` verifying that `apply` is called with the correct bytes when `commit_index` advances. (Verified via integration and existing tests adapted to new fsm).
   - [x] `cargo test` passes.
@@ -64,12 +64,12 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 
 **Commit:** `refactor(gateway): extract ingress and veto logic to dedicated crate`
 
-- **Description:** Move grocery-specific logic out of `raft-node` to enforce domain isolation.
+- **Description:** Move grocery-specific logic out of `raft-engine` to enforce domain isolation.
 - **Changes:**
-  - [x] Create `crates/gateway` and migrate `ingress.rs` and `veto.rs` from `raft-node`.
+  - [x] Create `crates/gateway` and migrate `ingress.rs` and `veto.rs` from `raft-engine`.
   - [x] Define generic `RaftHandle` trait in `crates/common/src/raft_api.rs`.
-  - [x] Implement `RaftHandle` in `raft-node` and update `gateway` to consume it.
-  - [x] Wire up the `gateway` services in `raft-node/src/main.rs`.
+  - [x] Implement `RaftHandle` in `raft-engine` and update `gateway` to consume it.
+  - [x] Wire up the `gateway` services in `raft-engine/src/main.rs`.
 - **Acceptance Tests (TDD):**
   - [x] `cargo check` passes across the workspace.
   - [x] `smoke_test.py` passes (verifying identical external behavior).
@@ -80,9 +80,9 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 
 - **Description:** Refactor the node engine to strictly separate Physical, Logical, and Execution layers and implement the Poison-then-Panic mandate.
 - **Changes:**
-  - [x] Update `crates/raft-node/src/engine.rs` to implement the "Poison-then-Panic" sequence for all invariant violations.
-  - [x] Refactor `crates/raft-node/src/state.rs` (Execution Shell) to ensure Lock-Signal Atomicity.
-  - [x] Audit all `panic!` calls in `crates/raft-node/src/node.rs` to ensure they are trapped by the Logical layer.
+  - [x] Update `crates/raft-engine/src/engine.rs` to implement the "Poison-then-Panic" sequence for all invariant violations.
+  - [x] Refactor `crates/raft-engine/src/state.rs` (Execution Shell) to ensure Lock-Signal Atomicity.
+  - [x] Audit all `panic!` calls in `crates/raft-engine/src/node.rs` to ensure they are trapped by the Logical layer.
 - **Acceptance Tests (TDD):**
   - [x] Unit test in `engine.rs` verifying that a node transitioned to `Poisoned` panics on any subsequent access.
   - [x] Integration test verifying that a task panic does not leave a "Zombie Node" accessible to other tasks.

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/common",
-    "crates/raft-node",
+    "crates/raft-engine",
     "crates/client-cli",
     "crates/ai-veto",
     "crates/gateway",

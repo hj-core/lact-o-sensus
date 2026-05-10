@@ -33,7 +33,7 @@
 ### 3.3. Error Categorization & Boundary Defense
 
 - **3.3.1. Explicit Failure Modes:** Map all library-returned errors to domain-specific Error enums (via `thiserror`) before they exit their originating layer.
-- **3.3.2. The Core Boundary:** Prohibit the use of `anyhow` in internal core logic (all files in `crates/common`, `crates/raft-node/src/`, and `crates/gateway`). `anyhow` is permitted EXCLUSIVELY in `main.rs` and binary-entry modules for top-level bootstrap reporting.
+- **3.3.2. The Core Boundary:** Prohibit the use of `anyhow` in internal core logic (all files in `crates/common`, `crates/raft-engine/src/`, and `crates/gateway`). `anyhow` is permitted EXCLUSIVELY in `main.rs` and binary-entry modules for top-level bootstrap reporting.
 
 ### 3.4. Data Fidelity & Physical Truth
 
