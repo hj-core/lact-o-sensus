@@ -9,10 +9,11 @@
 
 ## 2. Architecture
 
-- **2.1. Nature:** Domain-Agnostic Replicated State Machine (RSM) with Decoupled App Logic.
-- **2.2. Topology:** Leader-Centric Hub-and-Spoke (**ADR 002**). Full-Mesh Internal Consensus.
-- **2.3. Persistence:** Crash-Recovery (**ADR 001**) via `sled`. Exactly-Once WAL (**ADR 006**).
-- **2.4. Physicality:** Universal SI Unit Registry (**ADR 008**) with high-precision SI stabilization.
+- **2.1. Clinical Decoupling:** Structured as a 7-crate workspace enforcing **Clean Architecture**. The system decouples the consensus mechanism (`raft-engine`), business logic (`lacto-fsm`), and delivery layer (`gateway`) via a central contract (`common`), unified by a composition root (`node-server`). External semantic resolution and consumer interactions are isolated in dedicated actors (`ai-veto`, `client-cli`).
+- **2.2. Nature:** Domain-Agnostic Replicated State Machine (RSM) with Decoupled App Logic.
+- **2.3. Topology:** Leader-Centric Hub-and-Spoke (**ADR 002**). Full-Mesh Internal Consensus.
+- **2.4. Persistence:** Crash-Recovery (**ADR 001**) via `sled`. Exactly-Once WAL (**ADR 006**).
+- **2.5. Physicality:** Universal SI Unit Registry (**ADR 008**) with high-precision SI stabilization.
 
 ## 3. Technical Mandates
 

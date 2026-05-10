@@ -20,7 +20,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Establish the network mesh and basic RPC handlers.
 - **Key Actions:**
-  - Initialize `crates/raft-engine` binary.
+  - Initialize `crates/raft-engine` library (originally `crates/raft-node` binary).
   - Implement gRPC server stubs for `RequestVote` and `AppendEntries`.
   - Establish the **Leader-Centric Hub-and-Spoke** topology (ADR 002).
   - Verify connectivity: 3 nodes can ping each other via RPC.
@@ -30,7 +30,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Implement the Raft Leader Election and Heartbeat logic.
 - **Key Actions:**
-  - Implement the Raft State Machine (Follower, Candidate, Leader states).
+  - Implement the Raft State Machine (Follower, Candidate, Leader states) within `raft-engine`.
   - Integrate **Randomized Election Timeouts** (ADR 003).
   - Implement Heartbeat logic to maintain leadership.
   - Verify: Killing the leader triggers a successful re-election.
@@ -42,7 +42,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 - **Key Actions:**
   - Implement the in-memory Log and `AppendEntries` replication logic in `raft-engine`.
   - Initialize `crates/client-cli` as an interactive REPL with "Smart Client" logic.
-  - Implement the `GrpcVetoRelay` in `raft-engine` to bridge the Leader to the `ai-veto` node.
+  - Implement the `GrpcVetoRelay` to bridge the Leader to the `ai-veto` node.
   - Verify: Client -> Leader -> Mock AI -> Consensus -> Commit (Round Trip).
 - **Success Metric:** A client mutation is "Committed" after replication and a mock veto.
 
@@ -51,22 +51,23 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 - **Goal:** Resolve "Legacy Debt" by aligning infrastructure with refined "Fortress" mandates.
 - **Key Actions:**
   - **Identity Interceptors:** Migrate `cluster_id` and `target_node_id` validation from manual service guards to centralized gRPC middleware for all node types (ADR 004/005).
-  - **NewType Migration:** Complete the transition for all domain identifiers (`LogIndex`, `SequenceId`, `Term`, `ClientId`) to prevent primitive obsession.
+  - **NewType Migration:** Complete the transition for all domain identifiers (`LogIndex`, `SequenceId`, `Term`, `ClientId`) across `common` and `raft-engine`.
   - **Client-Side WAL:** Implement local persistence for pending `MutationIntent` and a recovery manager to ensure linearizable re-submission after client crashes (ADR 001).
-  - **Resilient Client Loop:** Implement exponential backoff with jitter for retries and align default mutation timeouts with the 30s mandate to prevent thundering herds and premature timeouts (ADR 003).
-  - **Identity Protocol Upgrade:** Update Protobuf and gRPC interceptors to enforce the `target_node_id` invariant, preventing logical misrouting and identity collisions (ADR 004/005).
-- **Success Metric:** Cluster rejects misconfigured identity traffic via centralized middleware and client provides high-availability guarantees through durable WALs and stabilized retry backoff.
+  - **Resilient Client Loop:** Implement exponential backoff with jitter for retries and align default mutation timeouts with the 30s mandate.
+  - **Identity Protocol Upgrade:** Update Protobuf and gRPC interceptors to enforce the `target_node_id` invariant.
+- **Success Metric:** Cluster rejects misconfigured identity traffic via centralized middleware.
 
 ## 🧠 Phase 5: The AI Moral Advocate (Semantic Oracle) [DONE]
 
 - **Goal:** Implement the 5-Layer Defensive Onion (ADR 007) and transition from mock logic to a relational AI evaluation engine.
 - **Key Actions:**
-  - **Internal Onion Alignment:** Refactor the Raft node engine into the tri-layered **Onion Model** (ADR 009). [DONE]
-  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005). [DONE]
-  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence). [DONE]
-  - **Real AI Integration:** Integrate OpenAI API or local Llama via `ollama-rs` into `crates/ai-veto`. [DONE]
-  - **Moral Heuristics:** Develop the "Moral Advocate" persona (e.g., rejecting sweets based on existing inventory context). [DONE]
-  - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures. [DONE]
+  - **Internal Onion Alignment:** Refactor the Raft engine into the tri-layered **Onion Model** (ADR 009).
+  - **Clean Architecture Refactor:** Establish the **node-server** composition root and decouple the State Machine into **lacto-fsm**. This inverted the dependency between consensus and delivery layers.
+  - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005).
+  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence).
+  - **Real AI Integration:** Integrate local Llama via `ollama-rs` into `crates/ai-veto`.
+  - **Moral Heuristics:** Develop the "Moral Advocate" persona.
+  - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures.
 - **Success Metric:** Messy user input is correctly resolved and vetoed by the LLM based on context-aware moral judgement.
 
 ## 🛡️ Phase 6: Persistence & Session Integrity (sled & EOS)

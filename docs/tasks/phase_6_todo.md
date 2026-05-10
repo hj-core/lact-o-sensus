@@ -16,7 +16,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 - [x] Update `RaftHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
 - [x] Implement `verify_leadership` in `crates/raft-engine/src/service/handle.rs` (forcing a heartbeat or using the local epoch).
 - [x] Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventorySource`, and support basic `query_filter` matching on `item_key`.
-- [x] Update `raft-engine/src/main.rs` to pass the `LactoStore` as the `InventorySource`.
+- [x] Update `main.rs` (originally in `raft-node`) to pass the `LactoStore` as the `InventorySource`.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: `query_state` returns data filtered by `item_key`.
   - [x] Integration test: A deposed leader correctly rejects a `query_state` request due to failing the Quorum Read.
@@ -25,7 +25,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 **Commit:** `feat(raft): implement isolated sled persistence for consensus log`
 
-- [x] Initialize a dedicated `sled::Db` instance (e.g., `data_dir/log`) in `raft-engine/src/main.rs`.
+- [x] Initialize a dedicated `sled::Db` instance (e.g., `data_dir/log`) in `main.rs` (originally in `raft-node`).
 - [x] Update `RaftNode` (or a dedicated storage struct) to read/write `current_term`, `voted_for`, and the log entries to `sled`.
 - [x] Ensure synchronous `fsync` (`db.flush()`) on every append to satisfy crash-recovery mandates.
 - **Acceptance Tests (TDD):**
@@ -52,7 +52,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Transition the State Machine from a volatile `HashMap` to a persistent `sled` tree.
 - **Changes:**
-  - [x] Initialize the `fsm` database handle in `raft-engine/src/main.rs`.
+  - [x] Initialize the `fsm` database handle in `main.rs` (originally in `raft-node`).
   - [x] Refactor `LactoStore` to use `sled::Tree` for inventory storage.
   - [x] Update `InventorySource` to stream data from `sled`.
 - **Acceptance Tests (TDD):**
@@ -83,7 +83,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Synchronize the State Machine with the Consensus Log during startup.
 - **Changes:**
-  - [ ] Implement the replay loop in `raft-engine/src/main.rs`.
+  - [ ] Implement the replay loop in `node-server/src/main.rs`.
   - [ ] Compare `fsm.last_applied_index()` with the persisted `commit_index` from `sled`.
   - [ ] Fetch missing entries from the consensus log and apply them to the FSM before starting the gRPC listener.
 - **Acceptance Tests (TDD):**
