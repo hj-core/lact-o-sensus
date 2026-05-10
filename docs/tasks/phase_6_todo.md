@@ -59,18 +59,35 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
   - [x] Integration test: `smoke_test.py` verifies that inventory survives a total cluster shutdown.
 
-### Step 3.2: Persistent Session Table & Recovery
+### Step 3.2: Persistent Session Table (Exactly-Once Semantics)
 
-**Commit:** `feat(raft): implement persistent Session Table and FSM recovery`
+**Commit:** `feat(raft): implement persistent Session Table for EOS durability`
 
-- **Description:** Implement exactly-once metadata and startup log-replay logic.
+- **Description:** Implement durable tracking of client session records to enforce sequence strictness and provide linearizable replays (ADR 006).
 - **Changes:**
-  - [ ] Implement the **Session Table** (ADR 006) within the FSM database (`client_id` -> `last_seq` mapping).
-  - [ ] Implement `RaftHandle::check_session` by querying the persistent Session Table.
-  - [ ] Implement **FSM Recovery**: On startup, compare the FSM's last applied index with the Raft log and replay missing entries.
+  - [ ] Define `SessionRecord` containing `SequenceId`, `MutationStatus`, `LogIndex`, and `moral_justification`.
+  - [ ] Initialize the `sessions` tree within the FSM database in `LactoStore`.
+  - [ ] Add `check_session(&self, client_id: &ClientId) -> Option<SessionRecord>` to the `StateMachine` trait.
+  - [ ] Implement **Strict Apply Logic** in `LactoStore::apply`:
+    - [ ] **Deduplication:** If `seq == last_seen`, return cached metadata (replay path).
+    - [ ] **Halt Mandate:** If `seq > last_seen + 1`, trigger `Poison-then-Panic` (ADR 006).
+    - [ ] **Atomic Commitment:** Persist `SessionRecord` and inventory changes in a single `sled` transaction.
+  - [ ] Update `IngressDispatcher` to use `check_session` for Layer 2 deduplication and replaying cached rejections.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: `check_session` correctly identifies duplicate sequence IDs from disk.
-  - [ ] Integration test: `smoke_test.py` verifies that client deduplication works across node restarts.
+  - [ ] Unit test: `LactoStore` panics on sequence gaps and correctly replays cached Vetoes.
+  - [ ] Integration test: `smoke_test.py` verifies that a client receives the exact same response (with justification) when retrying a mutation after a failover.
+
+### Step 3.3: FSM Recovery (Cold-Boot Replay)
+
+**Commit:** `feat(raft): implement cold-boot FSM recovery loop`
+
+- **Description:** Synchronize the State Machine with the Consensus Log during startup.
+- **Changes:**
+  - [ ] Implement the replay loop in `raft-node/src/main.rs`.
+  - [ ] Compare `fsm.last_applied_index()` with the persisted `commit_index` from `sled`.
+  - [ ] Fetch missing entries from the consensus log and apply them to the FSM before starting the gRPC listener.
+- **Acceptance Tests (TDD):**
+  - [ ] Integration test: Chaos verification (SIGKILL) proves that entries committed to the log but not yet applied to the FSM are recovered on boot, preventing double-writes.
 
 ### Step 4: Exactly-Once Semantics (EOS) Barrier
 
