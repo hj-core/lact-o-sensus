@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Mutation Request Lifecycle (Client, Leader, AI-Veto)
 - **Primary Goal:** Transform ambiguous human intent into immutable, deterministic consensus data via a multi-layered defensive pipeline.
-- **Last Updated:** 2026-05-05
+- **Last Updated:** 2026-05-10
 
 ## Context
 
@@ -26,12 +26,13 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
 
 ### Layer 2: The Leader-Preprocess (Syntactic Fortress)
 
-- **Responsibility:** Syntactic normalization and concurrency control.
+- **Responsibility:** Syntactic normalization and linearizable sequence control.
 - **Logic:**
-  - **Deduplication:** Verifies `sequence_id` against the Session Table (ADR 006); returns the cached logical outcome (including `state_version`) for retries.
+  - **Firewall Deduplication (CQRS):** Verifies `sequence_id` against the **authoritative State Machine** (`InventorySource`). This decouples application-level standing from the generic consensus pipe. Returns the cached logical outcome (including `state_version`) for retries.
+  - **Bootstrap Enforcement:** Rejects any initial connection from a new `client_id` that does not originate at `SequenceId(1)`.
   - **Syntactic Scrubbing:** Performs `trim()` and `to_lowercase()` on `item_key`, `unit`, and user-supplied `category` hints.
   - **Taxonomy Guard:** Validates that user-supplied category hints exist in the authorized registry; rejects unknown categories.
-  - **Strict Serialization:** Acquires a **Leader-Local MutationLock**. This lock is transient and exists only for the duration of the current leader's tenure. If the leader steps down or crashes, the lock is implicitly invalidated to prevent system deadlocks.
+  - **Strict Serialization:** Acquires a **Leader-Local MutationLock**. This ensures that the AI resolution and consensus proposal for a specific item happen sequentially, preventing race conditions in quantity stabilization.
 - **Outbound:** `EvaluateProposalRequest` (containing normalized intent and `current_inventory` context).
 
 ### Layer 3: The AI-Resolution (Semantic Oracle)

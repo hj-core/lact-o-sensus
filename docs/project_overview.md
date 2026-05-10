@@ -13,66 +13,81 @@ The system is built on a **Clean Architecture** (Hexagonal Architecture) to ensu
 The project is structured as a multi-crate Cargo workspace to enforce strict boundary defense and dependency inversion.
 
 ### 1. `common` (The System Contract)
+
 - **Role:** Foundational types and shared interfaces.
 - **Key Components:**
-    - **Domain Primitives:** `LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`.
-    - **System Contract:** `RaftHandle` (mutation path), `InventorySource` (query path), and `StateMachine` (boundary trait).
-    - **Physicality:** Universal SI Unit Registry and stabilization logic.
-    - **Protocol:** Compiled Protobufs for both internal consensus and external application layers.
+  - **Domain Primitives:** `LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`.
+  - **System Contract:** `RaftHandle` (mutation path), `InventorySource` (linearizable query path), and `StateMachine` (boundary trait).
+  - **Physicality:** Universal SI Unit Registry and stabilization logic.
+  - **Protocol:** Compiled Protobufs for both internal consensus and external application layers.
 
 ### 2. `raft-engine` (The Infrastructure)
+
 - **Role:** A generic, domain-agnostic implementation of the Raft Consensus Protocol.
 - **Responsibility:**
-    - Manages leader election and heartbeat orchestration.
-    - Replicates opaque byte payloads across a quorum of nodes.
-    - Enforces sequential log application via the generic `StateMachine` trait.
-    - **Clean Boundary:** Operates without any knowledge of "Groceries" or application-specific logic.
+  - Manages leader election and heartbeat orchestration.
+  - Replicates opaque byte payloads across a quorum of nodes.
+  - Enforces sequential log application via the generic `StateMachine` trait.
+  - **Clean Boundary:** Operates without any knowledge of "Groceries" or application-specific logic.
 
 ### 3. `lacto-fsm` (The Business Logic)
+
 - **Role:** The application-specific State Machine implementation.
 - **Responsibility:**
-    - Implements the `StateMachine` trait to interpret the replicated log.
-    - Manages the persistent grocery inventory using **`sled`**.
-    - Implements the `InventorySource` trait to provide authoritative query results.
-    - **Physical Truth:** Enforces SI stabilization and the "Dimensional Fence" for all inventory updates.
+  - Implements the `StateMachine` trait to interpret the replicated log.
+  - Manages the persistent grocery inventory and **Session Table** using **`sled`**.
+  - Implements the `InventorySource` trait to provide authoritative, linearizable query results.
+  - **Physical Truth:** Enforces SI stabilization and the "Dimensional Fence" for all inventory updates.
 
 ### 4. `gateway` (The Delivery Layer)
+
 - **Role:** External application interface and policy enforcement.
 - **Responsibility:**
-    - Implements the gRPC `IngressService` for client communication.
-    - **The Defensive Onion (ADR 007):** Orchestrates the 5-layer pipeline from user intent to consensus proposal.
+  - Implements the gRPC `IngressService` for client communication.
+  - **The Defensive Onion (ADR 007):** Orchestrates the 5-layer pipeline from user intent to consensus proposal.
 
 ### 5. `ai-veto` (The Oracle)
+
 - **Role:** Relational AI evaluation engine.
 - **Responsibility:**
-    - Resolves natural language intents to clinical slugs and SI base units.
-    - Performs context-aware moral evaluation of mutations.
+  - Resolves natural language intents to clinical slugs and SI base units.
+  - Performs context-aware moral evaluation of mutations.
 
 ### 6. `client-cli` (The Consumer)
+
 - **Role:** Interactive REPL for human operators.
 - **Responsibility:**
-    - Manages a local Write-Ahead Log (WAL) for client-side linearizability.
-    - Implements resilient retry loops with exponential backoff.
+  - Manages a local Write-Ahead Log (WAL) for client-side linearizability.
+  - Implements resilient retry loops with exponential backoff.
 
 ### 7. `node-server` (The Composition Root)
+
 - **Role:** The binary entry point that wires the system together.
 - **Responsibility:**
-    - Parses configuration and initializes all local services.
-    - Instantiates the `raft-engine`, `lacto-fsm`, and `gateway`.
-    - Performs **Dependency Injection** to bind the layers together into a functional cluster node.
+  - Parses configuration and initializes all local services.
+  - Instantiates the `raft-engine`, `lacto-fsm`, and `gateway`.
+  - Performs **Dependency Injection** to bind the layers together into a functional cluster node.
 
 ---
 
 ## 🛡️ Core Mandates
 
 ### 1. Poison-then-Panic (ADR 009)
+
 To mitigate structural fragility, any detection of invariant violation (protocol errors, data corruption) triggers a transition to a `Poisoned` state followed by an immediate `panic!`. This prevents "Zombie Nodes" from participating in consensus.
 
 ### 2. Exactly-Once Semantics (ADR 006)
+
 The system guarantees linearizability through a replicated Session Table. Every mutation (Success or Veto) is logged as a consensus event, and client sequence IDs are strictly enforced (`seq == last_seen + 1`).
 
 ### 3. Registry Firewall (ADR 007)
+
 All AI-provided metadata is verified against clinical system registries. The system acts as a **Clinical Notary**, ensuring that the AI cannot redefine physical laws or unregistered taxonomies.
 
 ### 4. SI Stabilization (ADR 008)
+
 All physical quantities are stabilized to canonical SI base units (grams, milliliters) using **Banker's Rounding** to eliminate cumulative numeric bias across the cluster.
+
+### 5. Information Opacity (The Fortress Mandate)
+
+To prevent session probing and state disclosure, the Ingress Firewall utilizes **Opaque Clinical Error Messages**. Rejections explicitly identify the protocol violation (e.g., Sequence Continuity Violation) but withhold internal state values, forcing clients to rely on their local persistent WAL for recovery.

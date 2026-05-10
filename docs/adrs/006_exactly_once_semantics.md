@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** State Machine Reliability and Linearizability
 - **Primary Goal:** Ensure every mutation is executed exactly once, regardless of network retries or leader elections.
-- **Last Updated:** 2026-05-05
+- **Last Updated:** 2026-05-10
 
 ## Context
 
@@ -35,20 +35,35 @@ Upon applying a command from the Raft log, the state machine must execute the fo
 - **`seq_id == last_seen_seq + 1`**: **Process**. This is a new, valid mutation. The state machine must record the outcome (whether `APPROVED` or `VETOED`) in the Session Table and update the `last_sequence_id`. The application-level inventory is only modified if the status is `APPROVED`. This ensures that even rejected mutations consume a sequence ID, maintaining a contiguous, gap-free ledger.
 - **`seq_id > last_seen_seq + 1`**: **Reject**. A "gap" in sequences indicates a client-side failure or an ordering violation. By logging vetoes as ledger events, we ensure that clients can always progress monotonically (`1, 2, 3...`) without needing to reuse IDs after a rejection.
 
-### 3. The Unified Ledger Mandate
+### 3. Permanent Session Metadata (No-Purge Policy)
+
+To eliminate the **"Double-Bootstrap" hazard** (where a network replay is mistaken for a new session after a purge), the Session Table is considered **Permanent Metadata**. Client session records MUST NOT be purged from the state machine.
+
+Given the high clinical value of grocery linearizability and the low storage cost (~64 bytes per client), the system prioritizes absolute integrity over storage reclamation.
+
+### 4. Secure Clinical Reporting (Opaque Errors)
+
+To prevent attackers from "probing" session state or predicting valid sequence numbers for hijacked IDs, the Ingress Firewall MUST utilize **Opaque Error Messages**.
+
+- **Requirement:** Error strings must explicitly identify the violation but MUST NOT disclose internal values.
+- **Consequence:** Legitimate clients must rely exclusively on their local **Write-Ahead Log (WAL)** to determine the correct next sequence ID.
+
+### 5. Stateful Temporal Determinism
+
+The State Machine MUST maintain a persistent `last_effective_time` metadata field.
+
+- **Calculation:** `last_effective_time = max(entry.event_time, last_effective_time)` for every applied log entry.
+- **Rationale:** This ensures the cluster maintains a deterministic logical clock derived from the consensus log, providing a stable temporal context for all nodes.
+
+### 6. The Unified Ledger Mandate
 
 To ensure cluster-wide linearizability, **all AI evaluation outcomes (Approvals and Vetoes) must be proposed to the Raft Ledger.**
 
 Treating a Veto as a "Silent Gateway Event" is prohibited. If a leader vetoes a request and crashes before notifying the client, the new leader must be able to recover that same Veto from the log. This clinical approach ensures that the Session Table remains a perfectly synchronized mirror of the client's progress across all nodes.
 
-### 4. Deterministic Session Expiration (Monotonic TTL)
+### 7. The Halt Mandate
 
-To prevent the Session Table from growing indefinitely, inactive sessions will be purged. To ensure absolute cluster-wide agreement across leader elections and clock drift:
-
-- **Effective Time:** The State Machine maintains a `last_effective_time`. For every log entry applied, `effective_time = max(entry.timestamp, last_effective_time)`.
-- **Monotonic Purge:** Sessions are purged only when their `last_activity_effective_time` plus the TTL duration (e.g., 30 days) is less than the current `effective_time`.
-- **Atomic Snapshotting:** Any implementation of Log Compaction **must** include the complete Session Table.
-- **The Halt Mandate:** Any detection of session table inconsistency (e.g., during snapshot loading or hash verification) MUST trigger an immediate node panic to prevent linearizability violations.
+Any detection of session table inconsistency (e.g., during snapshot loading or hash verification) or sequence gap violation during log replay MUST trigger an immediate node panic to prevent linearizability violations. This follows the **Poison-then-Panic** sequence defined in ADR 009.
 
 ## Rationale
 

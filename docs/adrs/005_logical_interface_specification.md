@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Logical RPC Contracts and Service Definitions
 - **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
-- **Last Updated:** 2026-05-05
+- **Last Updated:** 2026-05-10
 
 ## Context
 
@@ -14,9 +14,13 @@ Lact-O-Sensus consists of three distinct interaction domains: internal consensus
 
 ## Decision
 
-We will define three logical services with strict contracts, decoupled into two distinct protobuf definitions to separate the generic consensus engine from the grocery application logic. All messages must include the `cluster_id` to prevent cross-environment contamination.
+We will define three logical services with strict contracts, decoupled into two distinct protobuf definitions to separate the generic consensus engine from the grocery application logic.
 
-### 1. The Generic Consensus Interface (`raft.proto`)
+### 1. Centralized Identity Guarding (ADR 004)
+
+Every gRPC request MUST be validated at the **Interceptor/Middleware layer** against the local logical identity. Messages with mismatched `ClusterId` or `TargetNodeId` MUST be rejected with a `PermissionDenied` status before reaching application logic. This ensures that individual service implementations do not need to manually verify cluster identity, preventing cross-environment contamination.
+
+### 2. The Generic Consensus Interface (`raft.proto`)
 
 Used exclusively for Raft peer-to-peer communication. This interface is domain-agnostic and replicates opaque byte payloads.
 

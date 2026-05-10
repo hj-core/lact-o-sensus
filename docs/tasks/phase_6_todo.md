@@ -61,21 +61,23 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ### Step 3.2: Persistent Session Table (Exactly-Once Semantics)
 
-**Commit:** `feat(raft): implement persistent Session Table for EOS durability`
+**Commit:** `feat(raft): implement permanent Session Table and Secure Clinical reporting`
 
-- **Description:** Implement durable tracking of client session records to enforce sequence strictness and provide linearizable replays (ADR 006).
+- **Description:** Implement durable tracking of client session records to enforce sequence strictness and provide linearizable replays (ADR 006). Hardens the engine with the Poison-then-Panic protocol (ADR 009).
 - **Changes:**
-  - [ ] Define `SessionRecord` containing `SequenceId`, `MutationStatus`, `LogIndex`, and `moral_justification`.
-  - [ ] Initialize the `sessions` tree within the FSM database in `LactoStore`.
-  - [ ] Add `check_session(&self, client_id: &ClientId) -> Option<SessionRecord>` to the `StateMachine` trait.
-  - [ ] Implement **Strict Apply Logic** in `LactoStore::apply`:
+  - [ ] Initialize the `sessions` tree within the FSM database tree in `LactoStore`.
+  - [ ] **Eternal Persistence:** Implement the "No-Purge" policy for session records to eliminate the Double-Bootstrap hazard.
+  - [ ] **Opaque Firewall:** Update `IngressDispatcher` to use `check_session` for Layer 2 deduplication and return `**Secure Clinical**` opaque error messages.
+  - [ ] **Stateful Determinism:** Implement persistent `last_effective_time` metadata in the State Machine, derived from consensus log timestamps.
+  - [ ] **Strict Apply Logic** in `LactoStore::apply`:
     - [ ] **Deduplication:** If `seq == last_seen`, return cached metadata (replay path).
-    - [ ] **Halt Mandate:** If `seq > last_seen + 1`, trigger `Poison-then-Panic` (ADR 006).
-    - [ ] **Atomic Commitment:** Persist `SessionRecord` and inventory changes in a single `sled` transaction.
-  - [ ] Update `IngressDispatcher` to use `check_session` for Layer 2 deduplication and replaying cached rejections.
+    - [ ] **Continuity:** Reject sequence gaps (`seq > last_seen + 1`).
+    - [ ] **Atomic Commitment:** Persist `SessionRecord`, inventory changes, `last_applied`, and `last_effective_time` in a single `sled` transaction.
+  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode` to ensure Zombie Nodes are halted immediately upon detecting FSM invariant violations.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: `LactoStore` panics on sequence gaps and correctly replays cached Vetoes.
-  - [ ] Integration test: `smoke_test.py` verifies that a client receives the exact same response (with justification) when retrying a mutation after a failover.
+  - [ ] Unit tests: Verify that the FSM rejects gaps and the Engine poisons itself on failure.
+  - [ ] Security test: Verify that firewall error messages do not disclose internal sequence numbers.
+  - [ ] Integration test: Verify that a client receives the exact same response (with justification) when retrying a mutation after a leader failover.
 
 ### Step 3.3: FSM Recovery (Cold-Boot Replay)
 

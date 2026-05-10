@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Internal Raft Node Structure and Concurrency
 - **Primary Goal:** Define the structural hierarchy of the Raft node to ensure strict isolation between protocol logic, concurrency management, and reactive signaling.
-- **Last Updated:** 2026-04-25
+- **Last Updated:** 2026-05-10
 
 ## Context
 
@@ -18,25 +18,25 @@ Furthermore, the choice of `tokio::sync::RwLock` for concurrency introduces a sa
 
 We will implement a tri-layered "Onion" architecture for the internal Raft node, strictly separating the Physical, Logical, and Execution domains.
 
-### 1. Layer 1: The Physical Foundation
+### 1. Layer 1: The Physical Foundation (Isolated Persistence)
 
 - **Nature:** Pure Data Mutator.
-- **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern**.
+- **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
 - **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application).
-- **Constraint:** This layer must be synchronous and deterministic. It has no knowledge of networking, I/O, or thread synchronization. It is the "Silent State Machine."
+- **Constraint:** This layer must be synchronous and deterministic. It uses dedicated `sled` database handles (`log`, `fsm`, `system`) to ensure component isolation. It is the "Silent State Machine."
 
-### 2. Layer 2: The Logical Orchestrator
+### 2. Layer 2: The Logical Orchestrator (Safety Barrier)
 
 - **Nature:** Protocol Dispatcher and Safety Barrier.
 - **Abstractions:** `LogicalNode` enum (Follower, Candidate, Leader, Poisoned).
 - **Responsibility:** Mapping high-level RPC intents (AppendEntries, RequestVote) to Physical mutations, managing role transitions, and enforcing protocol invariants.
 - **The Halt Mandate (Poison-then-Panic):** To mitigate the lack of lock poisoning in Tokio, any terminal failure or invariant violation MUST follow a strict sequence:
-    1. **Detect** the violation (e.g., rival leader detection).
-    2. **Transition** the `LogicalNode` state to `Poisoned`.
+    1. **Detect** the violation (e.g., sequence gap in log, rival leader detection).
+    2. **Transition** the `LogicalNode` state to `Poisoned` (utilizing `std::mem::replace`).
     3. **Panic** to halt the current task.
-  This ensures that once a node is compromised, all subsequent attempts to acquire the lock and access the node (via the `delegate_to_inner!` macro) will trigger an immediate panic.
+  This ensures that once a node is compromised, all subsequent attempts to acquire the lock and access the node (via the `delegate_to_inner!` macro) will trigger an immediate panic, preventing "Zombie Node" behavior.
 
-### 3. Layer 3: The Execution Shell
+### 3. Layer 3: The Execution Shell (Signaling Hub)
 
 - **Nature:** Imperative Shell and Signaling Hub.
 - **Abstractions:** `ConsensusShell` wrapping `Arc<RwLock<LogicalNode>>` and a `tokio::sync::watch` signaling channel.

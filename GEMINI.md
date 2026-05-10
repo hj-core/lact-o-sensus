@@ -30,6 +30,7 @@
 - **3.2.2. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
 - **3.2.3. Timing (ADR 003):** Maintain 1:3–1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
 - **3.2.4. Identity Guarding (ADR 004):** Every gRPC request MUST be validated at the **Interceptor/Middleware layer** against the local logical identity. Messages with mismatched `ClusterId` or `TargetNodeId` MUST be rejected before reaching application logic.
+- **3.2.5. Information Opacity (The Fortress Mandate):** All external-facing error responses MUST maintain strict information opacity to mitigate state-probing and reconnaissance. Rejections MUST identify the category of failure but MUST NOT disclose internal system state, specific invariant values, or metadata that could be used to map the cluster's logical standing.
 
 ### 3.3. Error Categorization & Boundary Defense
 
