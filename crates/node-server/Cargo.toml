@@ -1,10 +1,14 @@
 [package]
-name = "raft-engine"
+name = "node-server"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+raft-engine = { path = "../raft-engine" }
+lacto-fsm = { path = "../lacto-fsm" }
+gateway = { path = "../gateway" }
+
 async-trait.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -24,5 +28,6 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 futures.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
+[[bin]]
+name = "raft-node"
+path = "src/main.rs"

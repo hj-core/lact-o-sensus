@@ -1236,6 +1236,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "node-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "common",
+ "futures",
+ "gateway",
+ "lacto-fsm",
+ "prost",
+ "raft-engine",
+ "rand 0.10.1",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sled",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1614,8 +1642,6 @@ dependencies = [
  "clap",
  "common",
  "futures",
- "gateway",
- "lacto-fsm",
  "prost",
  "rand 0.10.1",
  "rust_decimal",
