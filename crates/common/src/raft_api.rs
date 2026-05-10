@@ -1,12 +1,12 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use tonic::Status;
 
 use crate::proto::v1::app::GroceryItem;
 use crate::types::ClientId;
 use crate::types::LogIndex;
 use crate::types::SequenceId;
+use crate::types::errors::ConsensusError;
 use crate::types::errors::FsmError;
 
 /// Snapshot of the current consensus state relative to this node.
@@ -29,10 +29,10 @@ pub trait RaftHandle: Send + Sync + Debug {
     /// Proposes an opaque payload to the consensus log.
     ///
     /// Returns the assigned LogIndex if successful.
-    async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, Status>;
+    async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError>;
 
     /// Waits until the given index has been committed to a quorum.
-    async fn await_commit(&self, index: LogIndex) -> Result<(), Status>;
+    async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError>;
 
     /// Returns a consistent snapshot of the node's current consensus status.
     /// This is preferred over individual checks to ensure atomicity in
@@ -48,13 +48,13 @@ pub trait RaftHandle: Send + Sync + Debug {
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
-    ) -> Result<Option<LogIndex>, Status>;
+    ) -> Result<Option<LogIndex>, ConsensusError>;
 
     /// Verifies that this node is still the current cluster leader.
     ///
     /// For strict linearizability, this should perform a quorum check
     /// (e.g., a heartbeat round-trip) to ensure it hasn't been deposed.
-    async fn verify_leadership(&self) -> Result<(), Status>;
+    async fn verify_leadership(&self) -> Result<(), ConsensusError>;
 }
 
 /// Boundary trait between the generic Raft consensus engine and the

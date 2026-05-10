@@ -2,7 +2,7 @@ use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
-use thiserror::Error;
+use common::types::errors::ConsensusError;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -12,12 +12,6 @@ pub use crate::node::ConsensusProgress;
 pub use crate::node::Follower;
 pub use crate::node::Leader;
 pub use crate::node::RaftNode;
-
-#[derive(Error, Debug)]
-pub enum ConsensusError {
-    #[error("Node is not the leader")]
-    NotLeader,
-}
 
 /// The Dispatcher Enum (Logical State Machine).
 ///

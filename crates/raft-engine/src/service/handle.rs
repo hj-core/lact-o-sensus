@@ -7,9 +7,8 @@ use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::SequenceId;
-use tonic::Status;
+use common::types::errors::ConsensusError;
 
-use crate::engine::ConsensusError;
 use crate::engine::LogicalNode;
 use crate::peer::PeerManager;
 use crate::state::ConsensusShell;
@@ -65,15 +64,12 @@ impl LocalRaftHandle {
 
 #[async_trait]
 impl RaftHandle for LocalRaftHandle {
-    async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, Status> {
+    async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
         let mut guard = self.state.write().await;
-        match guard.propose(data) {
-            Ok(idx) => Ok(idx),
-            Err(ConsensusError::NotLeader) => Err(Status::failed_precondition("Not the leader")),
-        }
+        guard.propose(data)
     }
 
-    async fn await_commit(&self, index: LogIndex) -> Result<(), Status> {
+    async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {
         let mut progress_rx = self.state.subscribe();
 
         loop {
@@ -86,17 +82,18 @@ impl RaftHandle for LocalRaftHandle {
                             return Ok(());
                         }
                     }
+                    LogicalNode::Poisoned => {
+                        return Err(ConsensusError::Poisoned);
+                    }
                     _ => {
-                        return Err(Status::unavailable(
-                            "Leadership lost while waiting for quorum",
-                        ));
+                        return Err(ConsensusError::NotLeader);
                     }
                 }
             }
 
             // Park until something changes (LogIndex OR Term/Role)
             if progress_rx.changed().await.is_err() {
-                return Err(Status::internal("Consensus engine terminated"));
+                return Err(ConsensusError::Terminated);
             }
         }
     }
@@ -117,22 +114,22 @@ impl RaftHandle for LocalRaftHandle {
         &self,
         _client_id: &ClientId,
         _sequence_id: SequenceId,
-    ) -> Result<Option<LogIndex>, Status> {
+    ) -> Result<Option<LogIndex>, ConsensusError> {
         // TODO: Phase 9/10 - Wire to LactoStore Session Table (sled)
         Ok(None)
     }
 
-    async fn verify_leadership(&self) -> Result<(), Status> {
+    async fn verify_leadership(&self) -> Result<(), ConsensusError> {
         let guard = self.state.read().await;
-        if matches!(&*guard, LogicalNode::Leader(_)) {
-            // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability
-            Ok(())
-        } else {
-            let (hint, reason) = self.calculate_redirection(&guard);
-            Err(Status::failed_precondition(format!(
-                "Not the leader. Hint: {} ({})",
-                hint, reason
-            )))
+        match &*guard {
+            LogicalNode::Leader(_) => {
+                // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability.
+                // Currently, this only performs a local authority check which is
+                // vulnerable to stale reads in partitioned scenarios.
+                Ok(())
+            }
+            LogicalNode::Poisoned => Err(ConsensusError::Poisoned),
+            _ => Err(ConsensusError::NotLeader),
         }
     }
 }
@@ -225,7 +222,7 @@ mod tests {
             let result = handle.propose(vec![1, 2, 3]).await;
 
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            assert_eq!(result.unwrap_err(), ConsensusError::NotLeader);
         }
 
         #[tokio::test]
@@ -306,7 +303,7 @@ mod tests {
 
             let result = handle.await_commit(index).await;
             assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+            assert_eq!(result.unwrap_err(), ConsensusError::NotLeader);
         }
     }
 }

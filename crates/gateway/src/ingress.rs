@@ -20,6 +20,7 @@ use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
+use common::types::errors::ConsensusError;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
 use prost::Message;
@@ -100,7 +101,8 @@ impl IngressService for IngressDispatcher {
         if let Some(original_index) = self
             .raft_handle
             .check_session(&client_id, sequence_id)
-            .await?
+            .await
+            .map_err(|e| self.map_consensus_error(e, &status))?
         {
             info!(
                 "Duplicate request detected for client {} (seq {}). Returning cached index {}.",
@@ -213,6 +215,7 @@ impl IngressService for IngressDispatcher {
                 stabilized,
                 raw_user_input,
                 final_status,
+                &status,
             )
             .await?;
 
@@ -244,14 +247,15 @@ impl IngressService for IngressDispatcher {
         let _enter = span.enter();
 
         // 1. Leadership Authority (Quorum Read Verification)
-        if let Err(status) = self.raft_handle.verify_leadership().await {
+        if let Err(err) = self.raft_handle.verify_leadership().await {
             let consensus_status = self.raft_handle.consensus_status().await;
+            let grpc_status = self.map_consensus_error(err, &consensus_status);
             return Ok(Response::new(QueryStateResponse {
                 items: Vec::new(),
                 current_state_version: 0,
                 status: QueryStatus::Rejected as i32,
                 leader_hint: consensus_status.leader_hint,
-                error_message: status.message().to_string(),
+                error_message: grpc_status.message().to_string(),
             }));
         }
 
@@ -600,6 +604,7 @@ impl IngressDispatcher {
     }
 
     /// Phase 3 & 4 Implementation: Consensus and Quorum.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_to_consensus(
         &self,
         client_id: &ClientId,
@@ -608,6 +613,7 @@ impl IngressDispatcher {
         stabilized: StabilizedMutation,
         raw_user_input: String,
         status: MutationStatus,
+        consensus_status: &ConsensusStatus,
     ) -> Result<LogIndex, Status> {
         let is_delete = intent.operation == OperationType::Delete as i32;
 
@@ -632,15 +638,48 @@ impl IngressDispatcher {
             .encode(&mut command)
             .map_err(|e| self.internal_error(e.to_string()))?;
 
-        let proposal_index = self.raft_handle.propose(command).await?;
+        let proposal_index = self
+            .raft_handle
+            .propose(command)
+            .await
+            .map_err(|e| self.map_consensus_error(e, consensus_status))?;
 
         info!(
             "Mutation index {} appended. Waiting for quorum...",
             proposal_index
         );
 
-        self.raft_handle.await_commit(proposal_index).await?;
+        self.raft_handle
+            .await_commit(proposal_index)
+            .await
+            .map_err(|e| self.map_consensus_error(e, consensus_status))?;
         Ok(proposal_index)
+    }
+
+    /// Clinical Error Mapping: Translates domain ConsensusErrors to gRPC
+    /// Status. Performs boundary sanitization for internal failures.
+    fn map_consensus_error(&self, err: ConsensusError, status: &ConsensusStatus) -> Status {
+        match err {
+            ConsensusError::NotLeader => Status::failed_precondition(format!(
+                "Not the leader. Hint: {} ({})",
+                status.leader_hint, status.rejection_reason
+            )),
+            ConsensusError::LeaderUnknown => {
+                Status::unavailable("Leader unknown. Election in progress.")
+            }
+            ConsensusError::CommitTimeout(idx) => {
+                Status::deadline_exceeded(format!("Proposal at index {} timed out", idx))
+            }
+            ConsensusError::Poisoned => {
+                error!("CRITICAL: Node is in a poisoned state due to fatal safety violation.");
+                Status::aborted("Node is in a fatal state and cannot process requests.")
+            }
+            ConsensusError::Internal(msg) => {
+                error!("Consensus Internal Error: {}", msg);
+                Status::internal("Internal Consensus Failure")
+            }
+            ConsensusError::Terminated => Status::unavailable("Consensus engine is shutting down"),
+        }
     }
 }
 
@@ -663,13 +702,21 @@ mod tests {
 
     #[async_trait]
     impl RaftHandle for MockRaftHandle {
-        async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, Status> {
-            self.proposals.lock().unwrap().push(data);
-            Ok(LogIndex::new(1))
+        async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
+            if self.is_leader {
+                self.proposals.lock().unwrap().push(data);
+                Ok(LogIndex::new(1))
+            } else {
+                Err(ConsensusError::NotLeader)
+            }
         }
 
-        async fn await_commit(&self, _index: LogIndex) -> Result<(), Status> {
-            Ok(())
+        async fn await_commit(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+            if self.is_leader {
+                Ok(())
+            } else {
+                Err(ConsensusError::NotLeader)
+            }
         }
 
         async fn consensus_status(&self) -> ConsensusStatus {
@@ -684,15 +731,15 @@ mod tests {
             &self,
             _client_id: &ClientId,
             _sequence_id: SequenceId,
-        ) -> Result<Option<LogIndex>, Status> {
+        ) -> Result<Option<LogIndex>, ConsensusError> {
             Ok(None)
         }
 
-        async fn verify_leadership(&self) -> Result<(), Status> {
+        async fn verify_leadership(&self) -> Result<(), ConsensusError> {
             if self.is_leader {
                 Ok(())
             } else {
-                Err(Status::failed_precondition("Not leader"))
+                Err(ConsensusError::NotLeader)
             }
         }
     }
@@ -897,11 +944,11 @@ mod tests {
             }
             #[async_trait]
             impl RaftHandle for DuplicateRaft {
-                async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, Status> {
+                async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
                     self.mock.propose(data).await
                 }
 
-                async fn await_commit(&self, index: LogIndex) -> Result<(), Status> {
+                async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {
                     self.mock.await_commit(index).await
                 }
 
@@ -913,11 +960,11 @@ mod tests {
                     &self,
                     _client_id: &ClientId,
                     _sequence_id: SequenceId,
-                ) -> Result<Option<LogIndex>, Status> {
+                ) -> Result<Option<LogIndex>, ConsensusError> {
                     Ok(Some(self.committed_index))
                 }
 
-                async fn verify_leadership(&self) -> Result<(), Status> {
+                async fn verify_leadership(&self) -> Result<(), ConsensusError> {
                     self.mock.verify_leadership().await
                 }
             }
@@ -1426,11 +1473,11 @@ mod tests {
             struct FailingRaft;
             #[async_trait]
             impl RaftHandle for FailingRaft {
-                async fn propose(&self, _data: Vec<u8>) -> Result<LogIndex, Status> {
-                    Err(Status::internal("Consensus failure"))
+                async fn propose(&self, _data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
+                    Err(ConsensusError::Internal("Consensus failure".to_string()))
                 }
 
-                async fn await_commit(&self, _index: LogIndex) -> Result<(), Status> {
+                async fn await_commit(&self, _index: LogIndex) -> Result<(), ConsensusError> {
                     Ok(())
                 }
 
@@ -1445,11 +1492,11 @@ mod tests {
                     &self,
                     _client_id: &ClientId,
                     _sequence_id: SequenceId,
-                ) -> Result<Option<LogIndex>, Status> {
+                ) -> Result<Option<LogIndex>, ConsensusError> {
                     Ok(None)
                 }
 
-                async fn verify_leadership(&self) -> Result<(), Status> {
+                async fn verify_leadership(&self) -> Result<(), ConsensusError> {
                     Ok(())
                 }
             }
@@ -1979,8 +2026,11 @@ mod tests {
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Success as i32);
             assert_eq!(response.items.len(), 2);
-            assert_eq!(response.items[0].item_key, "milk");
-            assert_eq!(response.items[1].item_key, "eggs");
+
+            let mut response_items = response.items;
+            response_items.sort_by_key(|i| i.item_key.clone());
+            assert_eq!(response_items[0].item_key, "eggs");
+            assert_eq!(response_items[1].item_key, "milk");
         }
 
         #[tokio::test]
@@ -2024,8 +2074,13 @@ mod tests {
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Success as i32);
-            assert_eq!(response.items.len(), 2);
-            assert!(response.items.iter().all(|i| i.item_key.contains("milk")));
+
+            let mut response_items = response.items;
+            response_items.sort_by_key(|i| i.item_key.clone());
+
+            assert_eq!(response_items.len(), 2);
+            assert_eq!(response_items[0].item_key, "milk-skim");
+            assert_eq!(response_items[1].item_key, "milk-whole");
         }
     }
 }
