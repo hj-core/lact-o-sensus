@@ -1116,6 +1116,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lacto-fsm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "common",
+ "prost",
+ "serde",
+ "sled",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1601,6 +1615,7 @@ dependencies = [
  "common",
  "futures",
  "gateway",
+ "lacto-fsm",
  "prost",
  "rand 0.10.1",
  "rust_decimal",

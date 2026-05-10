@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 common = { path = "../common" }
 gateway = { path = "../gateway" }
+lacto-fsm = { path = "../lacto-fsm" }
 async-trait.workspace = true
 tokio.workspace = true
 tonic.workspace = true

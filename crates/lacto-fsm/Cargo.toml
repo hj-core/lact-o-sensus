@@ -1,0 +1,16 @@
+[package]
+name = "lacto-fsm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+async-trait.workspace = true
+sled.workspace = true
+prost.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true

@@ -2,6 +2,7 @@
 members = [
     "crates/common",
     "crates/raft-engine",
+    "crates/lacto-fsm",
     "crates/client-cli",
     "crates/ai-veto",
     "crates/gateway",
