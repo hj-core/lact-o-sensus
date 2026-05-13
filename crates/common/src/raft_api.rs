@@ -26,7 +26,7 @@ pub struct ConsensusStatus {
 /// This trait decouples application-specific gateway logic from the
 /// underlying consensus engine (ADR 005/007).
 #[async_trait]
-pub trait RaftHandle: Send + Sync + Debug {
+pub trait ConsensusHandle: Send + Sync + Debug {
     /// Proposes an opaque payload to the consensus log.
     ///
     /// Returns the assigned LogIndex if successful.

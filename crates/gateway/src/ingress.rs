@@ -13,9 +13,9 @@ use common::proto::v1::app::QueryStateRequest;
 use common::proto::v1::app::QueryStateResponse;
 use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
+use common::raft_api::ConsensusHandle;
 use common::raft_api::ConsensusStatus;
 use common::raft_api::InventorySource;
-use common::raft_api::RaftHandle;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
@@ -58,7 +58,7 @@ struct StabilizedMutation {
 /// cluster identity and redirecting clients to the current leader.
 #[derive(Debug)]
 pub struct IngressDispatcher {
-    raft_handle: Arc<dyn RaftHandle>,
+    raft_handle: Arc<dyn ConsensusHandle>,
     inventory_source: Arc<dyn InventorySource>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
@@ -200,7 +200,7 @@ impl IngressService for IngressDispatcher {
 impl IngressDispatcher {
     /// Creates a new IngressDispatcher with configured AI policy parameters.
     pub fn new(
-        raft_handle: Arc<dyn RaftHandle>,
+        raft_handle: Arc<dyn ConsensusHandle>,
         inventory_source: Arc<dyn InventorySource>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
@@ -784,9 +784,9 @@ mod tests {
     use common::proto::v1::app::QueryStateRequest;
     use common::proto::v1::app::QueryStatus;
     use common::proto::v1::app::SessionRecord;
+    use common::raft_api::ConsensusHandle;
     use common::raft_api::ConsensusStatus;
     use common::raft_api::InventorySource;
-    use common::raft_api::RaftHandle;
     use common::types::ClientId;
     use common::types::LogIndex;
     use common::types::SequenceId;
@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl RaftHandle for MockRaftHandle {
+    impl ConsensusHandle for MockRaftHandle {
         async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
             if self.is_leader {
                 self.proposals.lock().unwrap().push(data);
@@ -985,7 +985,7 @@ mod tests {
     }
 
     fn mock_dispatcher(
-        raft_handle: Arc<dyn RaftHandle>,
+        raft_handle: Arc<dyn ConsensusHandle>,
         inventory_source: Arc<dyn InventorySource>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
@@ -1052,7 +1052,7 @@ mod tests {
                 mock: Arc<MockRaftHandle>,
             }
             #[async_trait]
-            impl RaftHandle for DuplicateRaft {
+            impl ConsensusHandle for DuplicateRaft {
                 async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
                     self.mock.propose(data).await
                 }
@@ -1616,7 +1616,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct FailingRaft;
             #[async_trait]
-            impl RaftHandle for FailingRaft {
+            impl ConsensusHandle for FailingRaft {
                 async fn propose(&self, _data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
                     Err(ConsensusError::Internal("Consensus failure".to_string()))
                 }

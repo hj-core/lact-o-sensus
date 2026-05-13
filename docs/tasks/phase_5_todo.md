@@ -67,8 +67,8 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 - **Description:** Move grocery-specific logic out of `raft-engine` to enforce domain isolation.
 - **Changes:**
   - [x] Create `crates/gateway` and migrate `ingress.rs` and `veto.rs` from `raft-engine`.
-  - [x] Define generic `RaftHandle` trait in `crates/common/src/raft_api.rs`.
-  - [x] Implement `RaftHandle` in `raft-engine` and update `gateway` to consume it.
+  - [x] Define generic `ConsensusHandle` trait in `crates/common/src/raft_api.rs`.
+  - [x] Implement `ConsensusHandle` in `raft-engine` and update `gateway` to consume it.
   - [x] Wire up the `gateway` services in `raft-engine/src/main.rs`.
 - **Acceptance Tests (TDD):**
   - [x] `cargo check` passes across the workspace.

@@ -13,7 +13,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 **Commit:** `feat(gateway): implement InventorySource and linearizable query path`
 
 - [x] Define `InventorySource` trait in `crates/gateway/src/ingress.rs`.
-- [x] Update `RaftHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
+- [x] Update `ConsensusHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
 - [x] Implement `verify_leadership` in `crates/raft-engine/src/service/handle.rs` (forcing a heartbeat or using the local epoch).
 - [x] Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventorySource`, and support basic `query_filter` matching on `item_key`.
 - [x] Update `main.rs` (originally in `raft-node`) to pass the `LactoStore` as the `InventorySource`.

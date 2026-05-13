@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::raft_api::ConsensusHandle;
 use common::raft_api::ConsensusStatus;
-use common::raft_api::RaftHandle;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::ConsensusError;
@@ -61,7 +61,7 @@ impl LocalRaftHandle {
 }
 
 #[async_trait]
-impl RaftHandle for LocalRaftHandle {
+impl ConsensusHandle for LocalRaftHandle {
     async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
         let mut guard = self.state.write().await;
         guard.propose(data)

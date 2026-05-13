@@ -17,7 +17,7 @@ The project is structured as a multi-crate Cargo workspace to enforce strict bou
 - **Role:** Foundational types and shared interfaces.
 - **Key Components:**
   - **Domain Primitives:** `LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`.
-  - **System Contract:** `RaftHandle` (mutation path), `InventorySource` (linearizable query path), and `StateMachine` (boundary trait).
+  - **System Contract:** `ConsensusHandle` (mutation path), `InventorySource` (linearizable query path), and `StateMachine` (boundary trait).
   - **Physicality:** Universal SI Unit Registry and stabilization logic.
   - **Protocol:** Compiled Protobufs for both internal consensus and external application layers.
 
