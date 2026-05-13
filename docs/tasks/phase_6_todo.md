@@ -59,25 +59,25 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
   - [x] Integration test: `smoke_test.py` verifies that inventory survives a total cluster shutdown.
 
-### Step 3.2: Persistent Session Table (Exactly-Once Semantics)
+### Step 3.2: Persistent Session Table (Exactly-Once Semantics) [DONE]
 
 **Commit:** `feat(raft): implement permanent Session Table and Secure Clinical reporting`
 
-- **Description:** Implement durable tracking of client session records to enforce sequence strictness and provide linearizable replays (ADR 006). Hardens the engine with the Poison-then-Panic protocol (ADR 009).
+- **Description:** Implement durable tracking of client session records to enforce sequence strictness and provide linearizable replays (ADR 006).
 - **Changes:**
-  - [ ] Initialize the `sessions` tree within the FSM database tree in `LactoStore`.
-  - [ ] **Eternal Persistence:** Implement the "No-Purge" policy for session records to eliminate the Double-Bootstrap hazard.
-  - [ ] **Opaque Firewall:** Update `IngressDispatcher` to use `check_session` for Layer 2 deduplication and return `**Secure Clinical**` opaque error messages.
-  - [ ] **Stateful Determinism:** Implement persistent `last_effective_time` metadata in the State Machine, derived from consensus log timestamps.
-  - [ ] **Strict Apply Logic** in `LactoStore::apply`:
-    - [ ] **Deduplication:** If `seq == last_seen`, return cached metadata (replay path).
-    - [ ] **Continuity:** Reject sequence gaps (`seq > last_seen + 1`).
-    - [ ] **Atomic Commitment:** Persist `SessionRecord`, inventory changes, `last_applied`, and `last_effective_time` in a single `sled` transaction.
-  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode` to ensure Zombie Nodes are halted immediately upon detecting FSM invariant violations.
+  - [x] Initialize the `sessions` tree within the FSM database tree in `LactoStore`.
+  - [x] **Eternal Persistence:** Implement the "No-Purge" policy for session records to eliminate the Double-Bootstrap hazard.
+  - [x] **ADR 006 Alignment:** Update `SessionRecord` (Protobuf) to include `last_activity_effective_time`.
+  - [x] **Opaque Firewall:** Update `IngressDispatcher` to use `check_session` for Layer 2 deduplication and return `**Secure Clinical**` opaque error messages.
+  - [x] **Stateful Determinism:** Implement persistent `last_effective_time` metadata in the State Machine, derived from consensus log timestamps.
+  - [x] **Strict Apply Logic** in `LactoStore::apply`:
+    - [x] **Deduplication:** If `seq == last_seen`, return cached metadata (replay path).
+    - [x] **Continuity:** Reject sequence gaps (`seq > last_seen + 1`).
+    - [x] **Atomic Commitment:** Persist `SessionRecord` (including `last_activity_effective_time`), inventory changes, `last_applied`, and `last_effective_time` in a single `sled` transaction.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit tests: Verify that the FSM rejects gaps and the Engine poisons itself on failure.
-  - [ ] Security test: Verify that firewall error messages do not disclose internal sequence numbers.
-  - [ ] Integration test: Verify that a client receives the exact same response (with justification) when retrying a mutation after a leader failover.
+  - [x] Unit tests: Verify that the FSM rejects gaps.
+  - [x] Security test: Verify that firewall error messages do not disclose internal sequence numbers.
+  - [x] Integration test: Verify that a client receives the exact same response (with justification and timestamp) when retrying a mutation after a leader failover.
 
 ### Step 3.3: FSM Recovery (Cold-Boot Replay)
 
@@ -104,18 +104,20 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ### Step 5: The Halt Mandate & Chaos Testing
 
-**Commit:** `test(system): verify crash recovery and Poison-then-Panic invariants`
+**Commit:** `feat(raft): implement Poison-then-Panic protocol and verify via chaos`
 
-- **Description:** Guarantee safety during recovery by aggressively testing crash scenarios and divergence.
+- **Description:** Guarantee safety by implementing the mandatory Poison-then-Panic machinery (ADR 009). This ensures that any node detecting an invariant violation (FSM failure, storage corruption, or recovery divergence) immediately halts to prevent cluster-wide state drift.
 - **Changes:**
-  - [ ] Implement the `Poison-then-Panic` sequence (ADR 009) if the FSM index ever exceeds the Raft commit index during recovery (which indicates corruption).
-  - [ ] Expand `smoke_test.py` to aggressively kill nodes during mutation proposals.
+  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
+  - [ ] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (indicates disk corruption).
+  - [ ] **Chaos Engineering:** Expand `smoke_test.py` to aggressively kill nodes during mutation proposals and verify recovery stability.
 - **Acceptance Tests (TDD):**
+  - [ ] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
   - [ ] Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
 
 ---
 
 ## 📈 Completion Status
 
-- **Total Progress:** 60%
-- **Current Focus:** Step 3.2: Persistent Session Table & Recovery
+- **Total Progress:** 62%
+- **Current Focus:** Step 3.3: FSM Recovery (Cold-Boot Replay)
