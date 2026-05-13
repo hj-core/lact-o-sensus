@@ -783,6 +783,8 @@ def main() -> None:
         except Exception as e:  # pylint: disable=broad-except
             print(f"RESULT: FAILED -> {e}")
             print_cluster_logs()
+            # Fail-Fast: stop immediately to preserve logs/state of the failure
+            break
         finally:
             cluster.cleanup()
             time.sleep(1)
