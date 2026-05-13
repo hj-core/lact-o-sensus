@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 
 use crate::proto::v1::app::GroceryItem;
+use crate::proto::v1::app::SessionRecord;
 use crate::types::ClientId;
 use crate::types::LogIndex;
 use crate::types::SequenceId;
@@ -39,17 +40,6 @@ pub trait RaftHandle: Send + Sync + Debug {
     /// response generation.
     async fn consensus_status(&self) -> ConsensusStatus;
 
-    /// Checks the session cache for deduplication (EOS).
-    ///
-    /// If the sequence ID has already been committed for this client,
-    /// returns the LogIndex of the original mutation to allow the Gateway
-    /// to return a cached success response without re-processing.
-    async fn check_session(
-        &self,
-        client_id: &ClientId,
-        sequence_id: SequenceId,
-    ) -> Result<Option<LogIndex>, ConsensusError>;
-
     /// Verifies that this node is still the current cluster leader.
     ///
     /// For strict linearizability, this should perform a quorum check
@@ -85,4 +75,14 @@ pub trait InventorySource: Send + Sync + Debug {
 
     /// Returns the version (LogIndex) that this snapshot represents.
     async fn current_version(&self) -> LogIndex;
+
+    /// Checks the local session table for Exactly-Once deduplication.
+    ///
+    /// Providing a `sequence_id` of `0` returns the most recent record for the
+    /// client, which allows the Gateway to validate sequence continuity.
+    async fn check_session(
+        &self,
+        client_id: &ClientId,
+        sequence_id: SequenceId,
+    ) -> Result<Option<SessionRecord>, FsmError>;
 }

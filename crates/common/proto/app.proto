@@ -59,6 +59,17 @@ message CommittedMutation {
     MutationStatus status = 13;
 }
 
+// --- Session Management (ADR 006) ---
+
+message SessionRecord {
+    string client_id = 1;
+    uint64 last_sequence_id = 2;
+    MutationStatus status = 3;
+    uint64 log_index = 4;
+    string moral_justification = 5;
+    google.protobuf.Timestamp last_activity_effective_time = 6;
+}
+
 // --- Ingress Service (Client-to-Leader) ---
 
 service IngressService {

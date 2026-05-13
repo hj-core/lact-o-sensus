@@ -91,128 +91,43 @@ impl IngressService for IngressDispatcher {
         let span = info_span!("propose_mutation", client = %client_id, seq = %sequence_id);
         let _enter = span.enter();
 
-        // --- Phase 0: Leadership Authority & Consensus Status ---
+        // 1. Verifies that this node is the authorized leader.
         let status = self.raft_handle.consensus_status().await;
         if !status.is_leader {
             return Ok(self.rejection_response_with_status(status));
         }
 
-        // --- Phase 1: Deduplication (Layer 2 - EOS) ---
-        if let Some(original_index) = self
-            .raft_handle
-            .check_session(&client_id, sequence_id)
-            .await
-            .map_err(|e| self.map_consensus_error(e, &status))?
+        // 2. Enforces linearizability via the sequence firewall.
+        if let Some(cached_response) = self
+            .enforce_sequence_firewall(&client_id, sequence_id)
+            .await?
         {
-            info!(
-                "Duplicate request detected for client {} (seq {}). Returning cached index {}.",
-                client_id, sequence_id, original_index
-            );
-            return Ok(Response::new(ProposeMutationResponse {
-                status: MutationStatus::Committed as i32,
-                state_version: original_index.value(),
-                leader_hint: String::new(),
-                error_message: String::new(),
-            }));
+            return Ok(cached_response);
         }
 
-        // --- Phase 2: Concurrency Control (Layer 2) ---
-        let _lock = self.acquire_mutation_lock().await;
+        // 3. Guards against concurrent mutation attempts.
+        let _lock = self.mutation_lock.lock().await;
 
-        // --- Phase 3 & 4: Semantic Resolution & Validation Loop ---
+        // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
         let mut intent = req.intent.clone().ok_or_else(|| {
             self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
         })?;
         let raw_user_input = self.format_raw_input(&intent);
         self.normalize_intent(&mut intent)?;
 
-        let mut stabilized_mutation = None;
-        let mut final_status = MutationStatus::Committed;
+        // 5. Resolves semantic metadata and stabilizes physical quantities via the AI
+        //    resolution loop.
+        let (final_status, stabilized) = self
+            .resolve_semantic_mutation(req.client_id.clone(), &intent)
+            .await?;
 
-        for attempt in 0..=self.veto_max_retries {
-            if attempt > 0 {
-                info!(
-                    "Retrying AI resolution (attempt {}/{})...",
-                    attempt + 1,
-                    self.veto_max_retries + 1
-                );
-            }
-
-            // --- Phase 3: Semantic AI Policy Egress (Layer 3) ---
-            let veto = match self.evaluate_policy(req.client_id.clone(), &intent).await {
-                Ok(v) => v,
-                Err(e) if attempt < self.veto_max_retries => {
-                    warn!(
-                        "Transient AI failure on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        e
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            if !veto.is_approved {
-                final_status = MutationStatus::Vetoed;
-                stabilized_mutation = Some(StabilizedMutation {
-                    resolved_item_key: veto.resolved_item_key,
-                    suggested_display_name: veto.suggested_display_name,
-                    updated_base_quantity: "0".to_string(), // Rejection has zero impact
-                    base_unit: "units".to_string(),
-                    display_unit: "units".to_string(),
-                    category: GroceryCategory::AnomalousInputs,
-                    moral_justification: veto.moral_justification,
-                });
-                break;
-            }
-
-            // --- Phase 4: Validation Proxy & Physical Invariants (Layer 4) ---
-            match self.validate_and_stabilize(&intent, &veto, &[]) {
-                Ok(s) => {
-                    stabilized_mutation = Some(s);
-                    break;
-                }
-                Err(status) if attempt < self.veto_max_retries => {
-                    warn!(
-                        "AI response failed Layer 4 validation on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        status.message()
-                    );
-                    continue;
-                }
-                Err(status) => {
-                    warn!(
-                        "AI resolution exhausted retries and failed Layer 4 validation: {}",
-                        status.message()
-                    );
-                    final_status = MutationStatus::Vetoed;
-                    stabilized_mutation = Some(StabilizedMutation {
-                        resolved_item_key: veto.resolved_item_key,
-                        suggested_display_name: veto.suggested_display_name,
-                        updated_base_quantity: "0".to_string(),
-                        base_unit: "units".to_string(),
-                        display_unit: "units".to_string(),
-                        category: GroceryCategory::AnomalousInputs,
-                        moral_justification: format!("AI Hallucination: {}", status.message()),
-                    });
-                    break;
-                }
-            }
-        }
-
-        let stabilized = stabilized_mutation
-            .ok_or_else(|| self.internal_error("Retry loop failed to produce an outcome record"))?;
-
-        let moral_justification = stabilized.moral_justification.clone();
-
-        // --- Phase 5: Consensus Proposal & Quorum (Layer 5) ---
-        // UNIFIED LEDGER: We propose EVERYTHING to Raft.
+        // 6. Proposes the finalized intent to the cluster for consensus.
         let proposal_index = self
             .commit_to_consensus(
                 &client_id,
                 sequence_id,
                 intent,
-                stabilized,
+                stabilized.clone(),
                 raw_user_input,
                 final_status,
                 &status,
@@ -224,16 +139,12 @@ impl IngressService for IngressDispatcher {
             proposal_index, final_status
         );
 
-        Ok(Response::new(ProposeMutationResponse {
-            status: final_status as i32,
-            state_version: proposal_index.value(),
-            leader_hint: String::new(),
-            error_message: if final_status == MutationStatus::Vetoed {
-                moral_justification
-            } else {
-                String::new()
-            },
-        }))
+        // 7. Constructs the final response reflecting the committed lifecycle status.
+        Ok(self.build_mutation_response(
+            proposal_index,
+            final_status,
+            stabilized.moral_justification,
+        ))
     }
 
     /// High-level orchestrator for state queries.
@@ -248,13 +159,13 @@ impl IngressService for IngressDispatcher {
 
         // 1. Leadership Authority (Quorum Read Verification)
         if let Err(err) = self.raft_handle.verify_leadership().await {
-            let consensus_status = self.raft_handle.consensus_status().await;
-            let grpc_status = self.map_consensus_error(err, &consensus_status);
+            let status = self.raft_handle.consensus_status().await;
+            let grpc_status = self.map_consensus_error(err, &status);
             return Ok(Response::new(QueryStateResponse {
                 items: Vec::new(),
                 current_state_version: 0,
                 status: QueryStatus::Rejected as i32,
-                leader_hint: consensus_status.leader_hint,
+                leader_hint: status.leader_hint,
                 error_message: grpc_status.message().to_string(),
             }));
         }
@@ -307,42 +218,97 @@ impl IngressDispatcher {
         }
     }
 
-    /// Acquires the Layer 2 MutationLock.
-    ///
-    /// This ensures that AI evaluation and proposal happen sequentially,
-    /// providing the AI with a stable view of the inventory.
-    async fn acquire_mutation_lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.mutation_lock.lock().await
-    }
+    // --- High-Level Orchestration Helpers (Top-Down Call Order) ---
 
-    /// Helper to construct a standard "Rejected/Redirection" response from a
-    /// status snapshot.
-    fn rejection_response_with_status(
+    /// Enforces Exactly-Once Semantics by validating request sequences against
+    /// the authoritative session table.
+    ///
+    /// Returns a cached response if the request is a duplicate, or a logical
+    /// rejection if it violates session continuity.
+    async fn enforce_sequence_firewall(
         &self,
-        status: ConsensusStatus,
-    ) -> Response<ProposeMutationResponse> {
-        Response::new(ProposeMutationResponse {
-            status: MutationStatus::Rejected as i32,
-            state_version: 0,
-            leader_hint: status.leader_hint,
-            error_message: status.rejection_reason,
-        })
+        client_id: &ClientId,
+        sequence_id: SequenceId,
+    ) -> Result<Option<Response<ProposeMutationResponse>>, Status> {
+        if sequence_id.value() == 0 {
+            return Ok(Some(Response::new(ProposeMutationResponse {
+                status: MutationStatus::Rejected as i32,
+                state_version: 0,
+                leader_hint: String::new(),
+                error_message: "Secure Clinical: Protocol Violation (Sequence ID 0)".to_string(),
+            })));
+        }
+
+        let last_session = self
+            .inventory_source
+            .check_session(client_id, SequenceId::new(0))
+            .await
+            .map_err(|e| self.invalid_argument(format!("Session lookup failed: {}", e)))?;
+
+        if let Some(record) = last_session {
+            if sequence_id.value() == record.last_sequence_id {
+                info!(
+                    "Deduplicating request for client {} (seq {}). Returning cached outcome.",
+                    client_id, sequence_id
+                );
+                return Ok(Some(Response::new(ProposeMutationResponse {
+                    status: record.status,
+                    state_version: record.log_index,
+                    leader_hint: String::new(),
+                    error_message: if record.status == MutationStatus::Vetoed as i32 {
+                        record.moral_justification
+                    } else {
+                        String::new()
+                    },
+                })));
+            }
+
+            if sequence_id.value() < record.last_sequence_id {
+                warn!(
+                    "Rejecting stale request for client {} (got {}, cluster at {}).",
+                    client_id, sequence_id, record.last_sequence_id
+                );
+                return Ok(Some(Response::new(ProposeMutationResponse {
+                    status: MutationStatus::Rejected as i32,
+                    state_version: record.log_index,
+                    leader_hint: String::new(),
+                    error_message: "Secure Clinical: Stale Sequence".to_string(),
+                })));
+            }
+
+            if sequence_id.value() > record.last_sequence_id + 1 {
+                warn!(
+                    "Rejecting sequence gap for client {}: expected {}, got {}.",
+                    client_id,
+                    record.last_sequence_id + 1,
+                    sequence_id
+                );
+                return Ok(Some(Response::new(ProposeMutationResponse {
+                    status: MutationStatus::Rejected as i32,
+                    state_version: 0,
+                    leader_hint: String::new(),
+                    error_message: "Secure Clinical: Sequence Continuity Violation".to_string(),
+                })));
+            }
+        } else if sequence_id.value() != 1 {
+            // New client must start with sequence 1
+            warn!(
+                "Rejecting session bootstrap gap for client {}: expected 1, got {}.",
+                client_id, sequence_id
+            );
+            return Ok(Some(Response::new(ProposeMutationResponse {
+                status: MutationStatus::Rejected as i32,
+                state_version: 0,
+                leader_hint: String::new(),
+                error_message: "Secure Clinical: Session Initialization Violation".to_string(),
+            })));
+        }
+
+        Ok(None)
     }
 
-    /// Returns a standard gRPC InvalidArgument status.
-    fn invalid_argument(&self, msg: impl Into<String>) -> Status {
-        Status::invalid_argument(msg)
-    }
-
-    /// Returns a standard gRPC Internal status.
-    fn internal_error(&self, msg: impl Into<String>) -> Status {
-        Status::internal(msg)
-    }
-
-    /// Normalizes and validates the user's intent before it is processed by
-    /// the AI or added to the consensus log.
-    ///
-    /// Implements Layer 2 (Syntactic Scrubbing & Taxonomy Guard).
+    /// Normalizes user intents and enforces clinical taxonomy constraints
+    /// before semantic resolution.
     fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
         intent.item_key = intent.item_key.trim().to_lowercase();
 
@@ -371,7 +337,6 @@ impl IngressDispatcher {
         if let Some(category) = intent.category.as_mut() {
             let trimmed = category.trim();
             if !trimmed.is_empty() {
-                // Verify hint against the 12-Point Authorized Taxonomy
                 GroceryCategory::from_str(trimmed).map_err(|_| {
                     self.invalid_argument(format!(
                         "Invalid category hint: '{}'. Must be one of the 12 clinical categories.",
@@ -386,7 +351,6 @@ impl IngressDispatcher {
             return Err(self.invalid_argument("item_key cannot be empty"));
         }
 
-        // Validate quantity requirement based on operation type
         if intent.operation != OperationType::Delete as i32 && intent.quantity.is_none() {
             return Err(self.invalid_argument("quantity is required for this operation"));
         }
@@ -394,216 +358,95 @@ impl IngressDispatcher {
         Ok(())
     }
 
-    /// Validates AI-provided metadata against system registries and calculates
-    /// the stabilized SI base quantity.
-    ///
-    /// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
-    fn validate_and_stabilize(
-        &self,
-        intent: &MutationIntent,
-        veto: &VetoOutcome,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
-    ) -> Result<StabilizedMutation, Status> {
-        let category = self.verify_category_registry(&veto.category_assignment)?;
-
-        // For DELETE operations, we bypass physical stabilization
-        if intent.operation == OperationType::Delete as i32 {
-            return Ok(StabilizedMutation {
-                resolved_item_key: veto.resolved_item_key.clone(),
-                suggested_display_name: veto.suggested_display_name.clone(),
-                updated_base_quantity: "0".to_string(),
-                base_unit: "units".to_string(), // Placeholder for non-physical delete
-                display_unit: veto.resolved_unit.clone(),
-                category,
-                moral_justification: veto.moral_justification.clone(),
-            });
-        }
-
-        let q_str = intent
-            .quantity
-            .as_deref()
-            .ok_or_else(|| self.invalid_argument("quantity is missing"))?;
-
-        let base_quantity = self.verify_unit_stabilization(
-            q_str,
-            &veto.resolved_unit,
-            &veto.conversion_multiplier_to_base,
-        )?;
-
-        self.enforce_physical_invariants(
-            intent,
-            &veto.resolved_item_key,
-            &base_quantity,
-            current_inventory,
-        )?;
-
-        Ok(StabilizedMutation {
-            resolved_item_key: veto.resolved_item_key.clone(),
-            suggested_display_name: veto.suggested_display_name.clone(),
-            updated_base_quantity: base_quantity.value().to_string(),
-            base_unit: base_quantity.dimension().base_unit().to_string(),
-            display_unit: veto.resolved_unit.clone(),
-            category,
-            moral_justification: veto.moral_justification.clone(),
-        })
-    }
-
-    /// Registry Firewall: Verifies the AI's category assignment.
-    fn verify_category_registry(&self, category_str: &str) -> Result<GroceryCategory, Status> {
-        GroceryCategory::from_str(category_str).map_err(|_| {
-            self.internal_error(format!(
-                "AI Hallucination: Unregistered category '{}'",
-                category_str
-            ))
-        })
-    }
-
-    /// Registry Firewall & SI Math: Verifies unit existence and stabilizes
-    /// quantity.
-    fn verify_unit_stabilization(
-        &self,
-        quantity: &str,
-        unit_symbol: &str,
-        ai_multiplier: &str,
-    ) -> Result<PhysicalQuantity, Status> {
-        // 1. Resolve unit metadata from the clinical registry
-        let entry = UnitRegistry::resolve_symbol(unit_symbol).map_err(|e| {
-            self.invalid_argument(format!(
-                "Physical Invariant Violation: Invalid unit '{}' ({}).",
-                unit_symbol, e
-            ))
-        })?;
-
-        // 2. Parse the AI resolved multiplier
-        let ai_val = Decimal::from_str(ai_multiplier).map_err(|_| {
-            self.internal_error(format!(
-                "AI Hallucination: Malformed multiplier '{}' for contextual unit.",
-                ai_multiplier
-            ))
-        })?;
-
-        // 3. Safe Delegation: Determine Source of Authority
-        let base_quantity_res = if entry.is_contextual {
-            // Authority: AI (Contextual units like 'pack' or 'misc')
-            UnitRegistry::parse_and_convert_with_multiplier(quantity, unit_symbol, ai_val)
-        } else {
-            // Authority: REGISTRY (Universal constants like 'kg' or 'l')
-            // We ignore the AI's multiplier resolution to ensure physical laws are not
-            // redefined.
-            UnitRegistry::parse_and_convert(quantity, unit_symbol)
-        };
-
-        let base_quantity = base_quantity_res.map_err(|e| {
-            self.invalid_argument(format!(
-                "Physical Invariant Violation: Stabilization failed ({}).",
-                e
-            ))
-        })?;
-
-        // 4. Final Result Guard: Strictly Positive mass/volume/count
-        if base_quantity.value().is_sign_negative() || base_quantity.value().is_zero() {
-            return Err(self.invalid_argument(
-                "Physical Invariant Violation: Stabilized quantity must be strictly positive.",
-            ));
-        }
-
-        Ok(base_quantity)
-    }
-
-    /// Captures the un-normalized human intent for the audit log.
-    fn format_raw_input(&self, intent: &MutationIntent) -> String {
-        let op = match OperationType::try_from(intent.operation) {
-            Ok(OperationType::Add) => "Add",
-            Ok(OperationType::Subtract) => "Sub",
-            Ok(OperationType::Set) => "Set",
-            Ok(OperationType::Delete) => "Delete",
-            _ => "Unknown",
-        };
-
-        format!(
-            "{} {} {} {}",
-            op,
-            intent.quantity.as_deref().unwrap_or(""),
-            intent.unit.as_deref().unwrap_or(""),
-            intent.item_key
-        )
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-    }
-
-    /// Physical Invariant Check: Enforces the Dimensional Fence (ADR 008).
-    fn enforce_physical_invariants(
-        &self,
-        intent: &MutationIntent,
-        resolved_key: &str,
-        new_quantity: &PhysicalQuantity,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
-    ) -> Result<(), Status> {
-        if (intent.operation == OperationType::Add as i32
-            || intent.operation == OperationType::Subtract as i32)
-            && let Some(existing_item) = current_inventory
-                .iter()
-                .find(|i| i.item_key == resolved_key)
-        {
-            let existing_unit = UnitRegistry::resolve_symbol(&existing_item.unit).map_err(|e| {
-                self.internal_error(format!(
-                    "Internal state corruption: Existing item has invalid unit '{}' ({})",
-                    existing_item.unit, e
-                ))
-            })?;
-
-            if existing_unit.dimension != new_quantity.dimension() {
-                return Err(self.invalid_argument(format!(
-                    "Physical Invariant Violation: Cannot perform arithmetic between {:?} and \
-                     {:?} (Dimensional Fence).",
-                    existing_unit.dimension,
-                    new_quantity.dimension()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Phase 2 Implementation: Semantic validation via AI Veto Relay.
-    async fn evaluate_policy(
+    /// Orchestrates the semantic resolution loop, managing AI policy evaluation
+    /// and SI stabilization retries.
+    async fn resolve_semantic_mutation(
         &self,
         client_id: String,
         intent: &MutationIntent,
-    ) -> Result<VetoOutcome, Status> {
-        info!("Triggering AI Veto evaluation for normalized intent...");
-        let outcome = self
-            .veto_relay
-            .evaluate(
-                client_id,
-                intent,
-                &[], // Inventory store implemented in Phase 5
-                self.veto_timeout,
-                self.max_justification_len,
-            )
-            .await;
+    ) -> Result<(MutationStatus, StabilizedMutation), Status> {
+        let mut stabilized_mutation = None;
+        let mut final_status = MutationStatus::Committed;
 
-        match outcome {
-            Ok(v) => {
-                if !v.is_approved {
-                    info!("Mutation VETOED by AI: {}", v.moral_justification);
+        for attempt in 0..=self.veto_max_retries {
+            if attempt > 0 {
+                info!(
+                    "Retrying AI resolution (attempt {}/{})...",
+                    attempt + 1,
+                    self.veto_max_retries + 1
+                );
+            }
+
+            let veto = match self.evaluate_policy(client_id.clone(), intent).await {
+                Ok(v) => v,
+                Err(e) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "Transient AI failure on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        e
+                    );
+                    continue;
                 }
-                Ok(v)
+                Err(e) => return Err(e),
+            };
+
+            if !veto.is_approved {
+                final_status = MutationStatus::Vetoed;
+                stabilized_mutation = Some(StabilizedMutation {
+                    resolved_item_key: veto.resolved_item_key,
+                    suggested_display_name: veto.suggested_display_name,
+                    updated_base_quantity: "0".to_string(), // Rejection has zero impact
+                    base_unit: "units".to_string(),
+                    display_unit: "units".to_string(),
+                    category: GroceryCategory::AnomalousInputs,
+                    moral_justification: veto.moral_justification,
+                });
+                break;
             }
-            Err(VetoError::Timeout(d)) => {
-                warn!("AI Veto evaluation timed out after {:?}", d);
-                Err(Status::deadline_exceeded(
-                    "AI evaluation timed out. Please retry shortly.",
-                ))
-            }
-            Err(e) => {
-                error!("AI Veto infrastructure failure: {}", e);
-                Err(self.internal_error("Internal policy engine failure"))
+
+            match self.validate_and_stabilize(intent, &veto, &[]) {
+                Ok(s) => {
+                    stabilized_mutation = Some(s);
+                    break;
+                }
+                Err(status) if attempt < self.veto_max_retries => {
+                    warn!(
+                        "AI response failed physical validation on attempt {}: {}. Retrying...",
+                        attempt + 1,
+                        status.message()
+                    );
+                    continue;
+                }
+                Err(status) => {
+                    warn!(
+                        "AI resolution exhausted retries and failed validation: {}",
+                        status.message()
+                    );
+                    final_status = MutationStatus::Vetoed;
+                    stabilized_mutation = Some(StabilizedMutation {
+                        resolved_item_key: veto.resolved_item_key,
+                        suggested_display_name: veto.suggested_display_name,
+                        updated_base_quantity: "0".to_string(),
+                        base_unit: "units".to_string(),
+                        display_unit: "units".to_string(),
+                        category: GroceryCategory::AnomalousInputs,
+                        moral_justification: "Semantic Integrity Violation: AI-resolved metadata \
+                                              failed internal verification."
+                            .to_string(),
+                    });
+                    break;
+                }
             }
         }
+
+        let stabilized = stabilized_mutation
+            .ok_or_else(|| self.internal_error("Retry loop failed to produce an outcome record"))?;
+
+        Ok((final_status, stabilized))
     }
 
-    /// Phase 3 & 4 Implementation: Consensus and Quorum.
+    /// Commits the finalized intent to the consensus log and waits for quorum
+    /// commitment.
     #[allow(clippy::too_many_arguments)]
     async fn commit_to_consensus(
         &self,
@@ -656,8 +499,241 @@ impl IngressDispatcher {
         Ok(proposal_index)
     }
 
-    /// Clinical Error Mapping: Translates domain ConsensusErrors to gRPC
-    /// Status. Performs boundary sanitization for internal failures.
+    /// Constructs the final gRPC response reflecting the committed lifecycle
+    /// status.
+    fn build_mutation_response(
+        &self,
+        index: LogIndex,
+        status: MutationStatus,
+        moral_justification: String,
+    ) -> Response<ProposeMutationResponse> {
+        Response::new(ProposeMutationResponse {
+            status: status as i32,
+            state_version: index.value(),
+            leader_hint: String::new(),
+            error_message: if status == MutationStatus::Vetoed {
+                moral_justification
+            } else {
+                String::new()
+            },
+        })
+    }
+
+    // --- Implementation Detail Helpers ---
+
+    /// Generates a logical rejection response containing a leader hint for
+    /// redirection.
+    fn rejection_response_with_status(
+        &self,
+        status: ConsensusStatus,
+    ) -> Response<ProposeMutationResponse> {
+        Response::new(ProposeMutationResponse {
+            status: MutationStatus::Rejected as i32,
+            state_version: 0,
+            leader_hint: status.leader_hint,
+            error_message: status.rejection_reason,
+        })
+    }
+
+    /// Audits AI-resolved metadata against system registries and stabilizes
+    /// physical quantities.
+    fn validate_and_stabilize(
+        &self,
+        intent: &MutationIntent,
+        veto: &VetoOutcome,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
+    ) -> Result<StabilizedMutation, Status> {
+        let category = self.verify_category_registry(&veto.category_assignment)?;
+
+        if intent.operation == OperationType::Delete as i32 {
+            return Ok(StabilizedMutation {
+                resolved_item_key: veto.resolved_item_key.clone(),
+                suggested_display_name: veto.suggested_display_name.clone(),
+                updated_base_quantity: "0".to_string(),
+                base_unit: "units".to_string(),
+                display_unit: veto.resolved_unit.clone(),
+                category,
+                moral_justification: veto.moral_justification.clone(),
+            });
+        }
+
+        let q_str = intent
+            .quantity
+            .as_deref()
+            .ok_or_else(|| self.invalid_argument("quantity is missing"))?;
+
+        let base_quantity = self.verify_unit_stabilization(
+            q_str,
+            &veto.resolved_unit,
+            &veto.conversion_multiplier_to_base,
+        )?;
+
+        self.enforce_physical_invariants(
+            intent,
+            &veto.resolved_item_key,
+            &base_quantity,
+            current_inventory,
+        )?;
+
+        Ok(StabilizedMutation {
+            resolved_item_key: veto.resolved_item_key.clone(),
+            suggested_display_name: veto.suggested_display_name.clone(),
+            updated_base_quantity: base_quantity.value().to_string(),
+            base_unit: base_quantity.dimension().base_unit().to_string(),
+            display_unit: veto.resolved_unit.clone(),
+            category,
+            moral_justification: veto.moral_justification.clone(),
+        })
+    }
+
+    /// Verifies AI-resolved categories against the clinical registry.
+    fn verify_category_registry(&self, category_str: &str) -> Result<GroceryCategory, Status> {
+        GroceryCategory::from_str(category_str).map_err(|_| {
+            self.internal_error(format!(
+                "AI Hallucination: Unregistered category '{}'",
+                category_str
+            ))
+        })
+    }
+
+    /// Stabilizes user-provided units and quantities to their SI base
+    /// representations.
+    fn verify_unit_stabilization(
+        &self,
+        quantity: &str,
+        unit_symbol: &str,
+        ai_multiplier: &str,
+    ) -> Result<PhysicalQuantity, Status> {
+        let entry = UnitRegistry::resolve_symbol(unit_symbol).map_err(|e| {
+            self.invalid_argument(format!(
+                "Physical Invariant Violation: Invalid unit '{}' ({}).",
+                unit_symbol, e
+            ))
+        })?;
+
+        let ai_val = Decimal::from_str(ai_multiplier).map_err(|_| {
+            self.internal_error(format!(
+                "AI Hallucination: Malformed multiplier '{}' for contextual unit.",
+                ai_multiplier
+            ))
+        })?;
+
+        let base_quantity_res = if entry.is_contextual {
+            UnitRegistry::parse_and_convert_with_multiplier(quantity, unit_symbol, ai_val)
+        } else {
+            UnitRegistry::parse_and_convert(quantity, unit_symbol)
+        };
+
+        let base_quantity = base_quantity_res.map_err(|e| {
+            self.invalid_argument(format!(
+                "Physical Invariant Violation: Stabilization failed ({}).",
+                e
+            ))
+        })?;
+
+        if base_quantity.value().is_sign_negative() || base_quantity.value().is_zero() {
+            return Err(self.invalid_argument(
+                "Physical Invariant Violation: Stabilized quantity must be strictly positive.",
+            ));
+        }
+
+        Ok(base_quantity)
+    }
+
+    /// Captures the raw human intent for audit logging.
+    fn format_raw_input(&self, intent: &MutationIntent) -> String {
+        let op = match OperationType::try_from(intent.operation) {
+            Ok(OperationType::Add) => "Add",
+            Ok(OperationType::Subtract) => "Sub",
+            Ok(OperationType::Set) => "Set",
+            Ok(OperationType::Delete) => "Delete",
+            _ => "Unknown",
+        };
+
+        format!(
+            "{} {} {} {}",
+            op,
+            intent.quantity.as_deref().unwrap_or(""),
+            intent.unit.as_deref().unwrap_or(""),
+            intent.item_key
+        )
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+
+    /// Enforces the Dimensional Fence to prevent cross-dimensional arithmetic.
+    fn enforce_physical_invariants(
+        &self,
+        intent: &MutationIntent,
+        resolved_key: &str,
+        new_quantity: &PhysicalQuantity,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
+    ) -> Result<(), Status> {
+        if (intent.operation == OperationType::Add as i32
+            || intent.operation == OperationType::Subtract as i32)
+            && let Some(existing_item) = current_inventory
+                .iter()
+                .find(|i| i.item_key == resolved_key)
+        {
+            let existing_unit = UnitRegistry::resolve_symbol(&existing_item.unit).map_err(|e| {
+                self.internal_error(format!(
+                    "Internal state corruption: Existing item has invalid unit '{}' ({})",
+                    existing_item.unit, e
+                ))
+            })?;
+
+            if existing_unit.dimension != new_quantity.dimension() {
+                return Err(self.invalid_argument(format!(
+                    "Physical Invariant Violation: Cannot perform arithmetic between {:?} and \
+                     {:?} (Dimensional Fence).",
+                    existing_unit.dimension,
+                    new_quantity.dimension()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Executes the AI policy evaluation with timeout and error handling.
+    async fn evaluate_policy(
+        &self,
+        client_id: String,
+        intent: &MutationIntent,
+    ) -> Result<VetoOutcome, Status> {
+        info!("Triggering AI Veto evaluation for normalized intent...");
+        let outcome = self
+            .veto_relay
+            .evaluate(
+                client_id,
+                intent,
+                &[], // Inventory store implemented in Phase 5
+                self.veto_timeout,
+                self.max_justification_len,
+            )
+            .await;
+
+        match outcome {
+            Ok(v) => {
+                if !v.is_approved {
+                    info!("Mutation VETOED by AI: {}", v.moral_justification);
+                }
+                Ok(v)
+            }
+            Err(VetoError::Timeout(d)) => {
+                warn!("AI Veto evaluation timed out after {:?}", d);
+                Err(Status::deadline_exceeded(
+                    "AI evaluation timed out. Please retry shortly.",
+                ))
+            }
+            Err(e) => {
+                error!("AI Veto infrastructure failure: {}", e);
+                Err(self.internal_error("Internal policy engine failure"))
+            }
+        }
+    }
+
+    /// Translates domain ConsensusErrors into standard gRPC Status objects.
     fn map_consensus_error(&self, err: ConsensusError, status: &ConsensusStatus) -> Status {
         match err {
             ConsensusError::NotLeader => Status::failed_precondition(format!(
@@ -681,14 +757,43 @@ impl IngressDispatcher {
             ConsensusError::Terminated => Status::unavailable("Consensus engine is shutting down"),
         }
     }
+
+    /// Generates a standard gRPC InvalidArgument status.
+    fn invalid_argument(&self, msg: impl Into<String>) -> Status {
+        Status::invalid_argument(msg)
+    }
+
+    /// Generates a standard gRPC Internal error status.
+    fn internal_error(&self, msg: impl Into<String>) -> Status {
+        Status::internal(msg)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use common::proto::v1::app::GroceryItem;
+    use common::proto::v1::app::MutationIntent;
+    use common::proto::v1::app::MutationStatus;
+    use common::proto::v1::app::OperationType;
+    use common::proto::v1::app::ProposeMutationRequest;
+    use common::proto::v1::app::QueryStateRequest;
+    use common::proto::v1::app::QueryStatus;
+    use common::proto::v1::app::SessionRecord;
+    use common::raft_api::ConsensusStatus;
+    use common::raft_api::InventorySource;
+    use common::raft_api::RaftHandle;
+    use common::types::ClientId;
+    use common::types::LogIndex;
+    use common::types::SequenceId;
+    use common::types::errors::ConsensusError;
+    use common::types::errors::FsmError;
+    use prost::Message;
+    use tonic::Request;
 
     use super::*;
 
@@ -725,14 +830,6 @@ mod tests {
                 leader_hint: self.leader_hint.clone(),
                 rejection_reason: self.rejection_reason.clone(),
             }
-        }
-
-        async fn check_session(
-            &self,
-            _client_id: &ClientId,
-            _sequence_id: SequenceId,
-        ) -> Result<Option<LogIndex>, ConsensusError> {
-            Ok(None)
         }
 
         async fn verify_leadership(&self) -> Result<(), ConsensusError> {
@@ -877,15 +974,24 @@ mod tests {
         async fn current_version(&self) -> LogIndex {
             self.version
         }
+
+        async fn check_session(
+            &self,
+            _client_id: &ClientId,
+            _sequence_id: SequenceId,
+        ) -> Result<Option<SessionRecord>, FsmError> {
+            Ok(None)
+        }
     }
 
     fn mock_dispatcher(
         raft_handle: Arc<dyn RaftHandle>,
+        inventory_source: Arc<dyn InventorySource>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
         IngressDispatcher::new(
             raft_handle,
-            Arc::new(MockInventorySource::default()),
+            inventory_source,
             veto_relay,
             Duration::from_secs(1),
             1,
@@ -893,22 +999,26 @@ mod tests {
         )
     }
 
+    fn successful_raft() -> Arc<MockRaftHandle> {
+        Arc::new(MockRaftHandle {
+            is_leader: true,
+            ..Default::default()
+        })
+    }
+
+    fn successful_inventory() -> Arc<MockInventorySource> {
+        Arc::new(MockInventorySource::default())
+    }
+
+    fn successful_veto() -> Arc<MockVetoRelay> {
+        Arc::new(MockVetoRelay {
+            outcome: Some(valid_outcome()),
+            ..Default::default()
+        })
+    }
+
     mod propose_mutation {
         use super::*;
-
-        fn successful_raft() -> Arc<MockRaftHandle> {
-            Arc::new(MockRaftHandle {
-                is_leader: true,
-                ..Default::default()
-            })
-        }
-
-        fn successful_veto() -> Arc<MockVetoRelay> {
-            Arc::new(MockVetoRelay {
-                outcome: Some(valid_outcome()),
-                ..Default::default()
-            })
-        }
 
         // --- Phase 0: Leadership Authority ---
 
@@ -920,7 +1030,7 @@ mod tests {
                 rejection_reason: "Node is a Follower".to_string(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, successful_veto());
+            let dispatcher = mock_dispatcher(raft, successful_inventory(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -940,7 +1050,6 @@ mod tests {
             #[derive(Debug)]
             struct DuplicateRaft {
                 mock: Arc<MockRaftHandle>,
-                committed_index: LogIndex,
             }
             #[async_trait]
             impl RaftHandle for DuplicateRaft {
@@ -956,26 +1065,48 @@ mod tests {
                     self.mock.consensus_status().await
                 }
 
-                async fn check_session(
-                    &self,
-                    _client_id: &ClientId,
-                    _sequence_id: SequenceId,
-                ) -> Result<Option<LogIndex>, ConsensusError> {
-                    Ok(Some(self.committed_index))
-                }
-
                 async fn verify_leadership(&self) -> Result<(), ConsensusError> {
                     self.mock.verify_leadership().await
                 }
             }
 
-            let committed_index = LogIndex::new(42);
-            let raft_with_dup = Arc::new(DuplicateRaft {
-                mock: successful_raft(),
-                committed_index,
-            });
+            #[derive(Debug)]
+            struct DuplicateSource {
+                committed_index: LogIndex,
+            }
+            #[async_trait]
+            impl InventorySource for DuplicateSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft_with_dup, successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(Some(SessionRecord::new(
+                        cid,
+                        SequenceId::new(1),
+                        MutationStatus::Committed,
+                        self.committed_index,
+                        String::new(),
+                        prost_types::Timestamp::default(),
+                    )))
+                }
+            }
+
+            let committed_index = LogIndex::new(42);
+            let raft = Arc::new(DuplicateRaft {
+                mock: successful_raft(),
+            });
+            let inventory = Arc::new(DuplicateSource { committed_index });
+
+            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1000,6 +1131,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1038,6 +1170,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1053,7 +1186,7 @@ mod tests {
             );
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 42,
+                sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "  MiLk  ".to_string(),
                     quantity: Some(" 1.5 ".to_string()),
@@ -1083,7 +1216,8 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_missing_quantity_for_add_operation() {
-            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let dispatcher =
+                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1105,6 +1239,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1120,7 +1255,7 @@ mod tests {
             );
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 42,
+                sequence_id: 1,
                 intent: Some(MutationIntent {
                     item_key: "milk".to_string(),
                     quantity: None,
@@ -1141,7 +1276,8 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_when_item_key_is_empty() {
-            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let dispatcher =
+                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1160,7 +1296,8 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_when_category_hint_is_invalid() {
-            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let dispatcher =
+                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1182,7 +1319,8 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_negative_quantity_for_mutation_intents() {
-            let dispatcher = mock_dispatcher(successful_raft(), successful_veto());
+            let dispatcher =
+                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1256,7 +1394,7 @@ mod tests {
                 max_concurrent: max_concurrent.clone(),
             });
 
-            let dispatcher = Arc::new(mock_dispatcher(raft, veto));
+            let dispatcher = Arc::new(mock_dispatcher(raft, successful_inventory(), veto));
 
             let d1 = dispatcher.clone();
             let h1 = tokio::spawn(async move {
@@ -1313,7 +1451,7 @@ mod tests {
                 }),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(successful_raft(), veto);
+            let dispatcher = mock_dispatcher(successful_raft(), successful_inventory(), veto);
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1341,7 +1479,7 @@ mod tests {
                 }),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft.clone(), veto);
+            let dispatcher = mock_dispatcher(raft.clone(), successful_inventory(), veto);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1378,7 +1516,7 @@ mod tests {
                 error: Some(VetoError::Timeout(Duration::from_secs(1))),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(successful_raft(), veto);
+            let dispatcher = mock_dispatcher(successful_raft(), successful_inventory(), veto);
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1401,6 +1539,7 @@ mod tests {
         async fn returns_vetoed_when_ai_hallucinates_metadata() {
             let dispatcher = mock_dispatcher(
                 successful_raft(),
+                successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1427,13 +1566,18 @@ mod tests {
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
-            assert!(response.error_message.contains("AI Hallucination"));
+            assert!(
+                response
+                    .error_message
+                    .contains("Semantic Integrity Violation:")
+            );
         }
 
         #[tokio::test]
         async fn returns_vetoed_when_ai_provides_invalid_conversion() {
             let dispatcher = mock_dispatcher(
                 successful_raft(),
+                successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1463,7 +1607,7 @@ mod tests {
             assert!(
                 response
                     .error_message
-                    .contains("Physical Invariant Violation")
+                    .contains("Semantic Integrity Violation:")
             );
         }
 
@@ -1488,20 +1632,16 @@ mod tests {
                     }
                 }
 
-                async fn check_session(
-                    &self,
-                    _client_id: &ClientId,
-                    _sequence_id: SequenceId,
-                ) -> Result<Option<LogIndex>, ConsensusError> {
-                    Ok(None)
-                }
-
                 async fn verify_leadership(&self) -> Result<(), ConsensusError> {
                     Ok(())
                 }
             }
 
-            let dispatcher = mock_dispatcher(Arc::new(FailingRaft), successful_veto());
+            let dispatcher = mock_dispatcher(
+                Arc::new(FailingRaft),
+                successful_inventory(),
+                successful_veto(),
+            );
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1528,7 +1668,7 @@ mod tests {
             // Configured for 1 retry (max 2 attempts)
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                Arc::new(MockInventorySource::default()),
+                successful_inventory(),
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1578,7 +1718,7 @@ mod tests {
             });
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                Arc::new(MockInventorySource::default()),
+                successful_inventory(),
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1618,7 +1758,7 @@ mod tests {
             });
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                Arc::new(MockInventorySource::default()),
+                successful_inventory(),
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1638,7 +1778,11 @@ mod tests {
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
-            assert!(response.error_message.contains("AI Hallucination"));
+            assert!(
+                response
+                    .error_message
+                    .contains("Semantic Integrity Violation:")
+            );
         }
 
         #[tokio::test]
@@ -1660,7 +1804,7 @@ mod tests {
             // Configured for 1 retry (2 attempts total)
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                Arc::new(MockInventorySource::default()),
+                successful_inventory(),
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1685,7 +1829,11 @@ mod tests {
             // Attempt 2: Hallucination (Consumed 1 retry quota)
             // Quota exhausted -> definitive Veto
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
-            assert!(response.error_message.contains("AI Hallucination"));
+            assert!(
+                response
+                    .error_message
+                    .contains("Semantic Integrity Violation:")
+            );
         }
 
         #[tokio::test]
@@ -1723,7 +1871,7 @@ mod tests {
             });
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                Arc::new(MockInventorySource::default()),
+                successful_inventory(),
                 veto,
                 Duration::from_secs(1),
                 10,
@@ -1754,6 +1902,7 @@ mod tests {
         fn test_dispatcher() -> IngressDispatcher {
             mock_dispatcher(
                 Arc::new(MockRaftHandle::default()),
+                successful_inventory(),
                 Arc::new(MockVetoRelay::default()),
             )
         }
@@ -1962,6 +2111,382 @@ mod tests {
         }
     }
 
+    mod exactly_once_semantics {
+        use common::proto::v1::app::SessionRecord;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn returns_cached_outcome_when_sequence_is_duplicate() {
+            let raft = successful_raft();
+            let sid = SequenceId::new(42);
+            let committed_index = LogIndex::new(100);
+
+            #[derive(Debug, Default)]
+            struct MockSource {
+                record: Option<SessionRecord>,
+            }
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    _cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(self.record.clone())
+                }
+            }
+
+            let inventory = Arc::new(MockSource {
+                record: Some(SessionRecord::new(
+                    &ClientId::generate(), // Dummy for duplicate check
+                    sid,
+                    MutationStatus::Committed,
+                    committed_index,
+                    "Approved".to_string(),
+                    prost_types::Timestamp::default(),
+                )),
+            });
+
+            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: sid.value(),
+                intent: Some(MutationIntent::default()),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+            assert_eq!(response.state_version, committed_index.value());
+        }
+
+        #[tokio::test]
+        async fn replays_cached_veto_with_justification() {
+            let raft = successful_raft();
+            let sid = SequenceId::new(42);
+
+            #[derive(Debug, Default)]
+            struct MockSource {
+                record: Option<SessionRecord>,
+            }
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    _cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(self.record.clone())
+                }
+            }
+
+            let inventory = Arc::new(MockSource {
+                record: Some(SessionRecord::new(
+                    &ClientId::generate(),
+                    sid,
+                    MutationStatus::Vetoed,
+                    LogIndex::new(10),
+                    "Reason".to_string(),
+                    prost_types::Timestamp::default(),
+                )),
+            });
+
+            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: sid.value(),
+                intent: Some(MutationIntent::default()),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert_eq!(response.error_message, "Reason");
+        }
+
+        #[tokio::test]
+        async fn rejects_request_when_sequence_is_stale() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource;
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(Some(SessionRecord::new(
+                        cid,
+                        SequenceId::new(10),
+                        MutationStatus::Committed,
+                        LogIndex::ZERO,
+                        String::new(),
+                        prost_types::Timestamp::default(),
+                    )))
+                }
+            }
+
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 5, // Stale: cluster is at 10
+                intent: Some(MutationIntent::default()),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Rejected as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("Secure Clinical: Stale Sequence")
+            );
+            assert!(!response.error_message.contains("10")); // Opaque check
+        }
+
+        #[tokio::test]
+        async fn rejects_request_when_sequence_gap_detected() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource;
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(Some(SessionRecord::new(
+                        cid,
+                        SequenceId::new(1),
+                        MutationStatus::Committed,
+                        LogIndex::ZERO,
+                        String::new(),
+                        prost_types::Timestamp::default(),
+                    )))
+                }
+            }
+
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 3, // Gap: expecting 2
+                intent: Some(MutationIntent::default()),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Rejected as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("Secure Clinical: Sequence Continuity Violation")
+            );
+            assert!(!response.error_message.contains("2")); // Opaque check
+        }
+
+        #[tokio::test]
+        async fn rejects_request_when_new_client_skips_start_sequence() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource; // Returns None for check_session
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    _cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(None)
+                }
+            }
+
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 5, // Should be 1
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Rejected as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("Secure Clinical: Session Initialization Violation")
+            );
+        }
+
+        #[tokio::test]
+        async fn accepts_request_when_new_client_starts_at_sequence_one() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource;
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    _cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(None) // New client
+                }
+            }
+
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1, // Correct start
+                intent: Some(MutationIntent {
+                    item_key: "item".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+        }
+
+        #[tokio::test]
+        async fn accepts_request_when_sequence_is_next_in_line() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource;
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(Some(SessionRecord::new(
+                        cid,
+                        SequenceId::new(1),
+                        MutationStatus::Committed,
+                        LogIndex::ZERO,
+                        String::new(),
+                        prost_types::Timestamp::default(),
+                    )))
+                }
+            }
+
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 2, // Valid: 1 + 1
+                intent: Some(MutationIntent {
+                    item_key: "item".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Committed as i32);
+        }
+
+        #[tokio::test]
+        async fn rejects_request_when_sequence_id_is_zero() {
+            let raft = successful_raft();
+            #[derive(Debug, Default)]
+            struct MockSource;
+            #[async_trait]
+            impl InventorySource for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+
+                async fn check_session(
+                    &self,
+                    _cid: &ClientId,
+                    _sid: SequenceId,
+                ) -> Result<Option<SessionRecord>, FsmError> {
+                    Ok(None)
+                }
+            }
+            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            let req = Request::new(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 0, // Forbidden by protocol
+                intent: Some(MutationIntent::default()),
+            });
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Rejected as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("Secure Clinical: Protocol Violation")
+            );
+        }
+    }
+
     mod query_state {
         use super::*;
 
@@ -1973,7 +2498,7 @@ mod tests {
                 rejection_reason: "Node is a Follower".to_string(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockVetoRelay::default()));
+            let dispatcher = mock_dispatcher(raft, successful_inventory(), successful_veto());
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
@@ -2009,14 +2534,7 @@ mod tests {
                 items: items.clone(),
                 ..Default::default()
             });
-            let dispatcher = IngressDispatcher::new(
-                raft,
-                inventory,
-                Arc::new(MockVetoRelay::default()),
-                Duration::from_secs(1),
-                1,
-                512,
-            );
+            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
 
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
@@ -2058,14 +2576,7 @@ mod tests {
                 items: items.clone(),
                 ..Default::default()
             });
-            let dispatcher = IngressDispatcher::new(
-                raft,
-                inventory,
-                Arc::new(MockVetoRelay::default()),
-                Duration::from_secs(1),
-                1,
-                512,
-            );
+            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
 
             let req = Request::new(QueryStateRequest {
                 query_filter: Some("milk".to_string()),

@@ -1122,6 +1122,7 @@ dependencies = [
  "async-trait",
  "common",
  "prost",
+ "prost-types",
  "serde",
  "sled",
  "tempfile",

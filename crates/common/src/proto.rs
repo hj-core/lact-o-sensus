@@ -129,6 +129,26 @@ pub mod v1 {
             }
         }
 
+        impl SessionRecord {
+            pub fn new(
+                client_id: &ClientId,
+                last_sequence_id: SequenceId,
+                status: MutationStatus,
+                log_index: LogIndex,
+                moral_justification: String,
+                last_activity_effective_time: Timestamp,
+            ) -> Self {
+                Self {
+                    client_id: client_id.as_str().to_string(),
+                    last_sequence_id: last_sequence_id.value(),
+                    status: status as i32,
+                    log_index: log_index.value(),
+                    moral_justification,
+                    last_activity_effective_time: Some(last_activity_effective_time),
+                }
+            }
+        }
+
         impl EvaluateProposalResponse {
             /// Creates a new AI evaluation response with full semantic
             /// resolution.
