@@ -16,7 +16,7 @@ use tracing::error;
 use tracing::info_span;
 
 use crate::engine::LogicalNode;
-use crate::state::ConsensusShell;
+use crate::shell::ConsensusShell;
 
 /// Implementation of the internal Raft consensus RPCs.
 ///

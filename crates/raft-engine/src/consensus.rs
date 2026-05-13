@@ -24,7 +24,7 @@ use crate::engine::Leader;
 use crate::engine::LogicalNode;
 use crate::node::RaftNode;
 use crate::peer::PeerManager;
-use crate::state::ConsensusShell;
+use crate::shell::ConsensusShell;
 
 // --- Semantic vocabulary for the consensus engine ---
 

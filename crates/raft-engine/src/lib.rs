@@ -5,5 +5,5 @@ pub mod identity;
 pub mod node;
 pub mod peer;
 pub mod service;
-pub mod state;
+pub mod shell;
 pub mod storage;

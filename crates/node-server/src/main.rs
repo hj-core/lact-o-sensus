@@ -19,7 +19,7 @@ use raft_engine::node::RaftNode;
 use raft_engine::peer::PeerManager;
 use raft_engine::service::consensus::ConsensusDispatcher;
 use raft_engine::service::handle::LocalRaftHandle;
-use raft_engine::state::ConsensusShell;
+use raft_engine::shell::ConsensusShell;
 use raft_engine::storage::SledStorage;
 use tonic::transport::Server;
 use tracing::Instrument;

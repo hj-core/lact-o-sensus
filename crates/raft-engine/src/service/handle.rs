@@ -9,7 +9,7 @@ use common::types::errors::ConsensusError;
 
 use crate::engine::LogicalNode;
 use crate::peer::PeerManager;
-use crate::state::ConsensusShell;
+use crate::shell::ConsensusShell;
 
 #[derive(Debug)]
 pub struct LocalRaftHandle {
