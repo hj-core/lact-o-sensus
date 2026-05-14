@@ -67,15 +67,9 @@ pub trait StateMachine: Send + Sync + Debug {
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError>;
 }
 
-/// Trait for fetching the current state of the grocery inventory.
+/// Trait for Exactly-Once session validation (ADR 006).
 #[async_trait]
-pub trait InventorySource: Send + Sync + Debug {
-    /// Returns the current list of items in the inventory.
-    async fn get_inventory(&self) -> Vec<GroceryItem>;
-
-    /// Returns the version (LogIndex) that this snapshot represents.
-    async fn current_version(&self) -> LogIndex;
-
+pub trait SessionProvider: Send + Sync + Debug {
     /// Checks the local session table for Exactly-Once deduplication.
     ///
     /// Providing a `sequence_id` of `0` returns the most recent record for the
@@ -85,4 +79,14 @@ pub trait InventorySource: Send + Sync + Debug {
         client_id: &ClientId,
         sequence_id: SequenceId,
     ) -> Result<Option<SessionRecord>, FsmError>;
+}
+
+/// Trait for authoritative business state retrieval.
+#[async_trait]
+pub trait InventoryReader: Send + Sync + Debug {
+    /// Returns the current list of items in the inventory.
+    async fn get_inventory(&self) -> Vec<GroceryItem>;
+
+    /// Returns the version (LogIndex) that this snapshot represents.
+    async fn current_version(&self) -> LogIndex;
 }

@@ -127,6 +127,7 @@ async fn main() -> Result<()> {
     let ingress_dispatcher = IngressDispatcher::new(
         raft_handle,
         fsm.clone(),
+        fsm.clone(),
         veto_relay,
         config.policy.veto_timeout(),
         config.policy.veto_max_retries,

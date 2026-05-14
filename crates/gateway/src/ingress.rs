@@ -15,7 +15,8 @@ use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
 use common::raft_api::ConsensusHandle;
 use common::raft_api::ConsensusStatus;
-use common::raft_api::InventorySource;
+use common::raft_api::InventoryReader;
+use common::raft_api::SessionProvider;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
@@ -59,7 +60,8 @@ struct StabilizedMutation {
 #[derive(Debug)]
 pub struct IngressDispatcher {
     raft_handle: Arc<dyn ConsensusHandle>,
-    inventory_source: Arc<dyn InventorySource>,
+    session_provider: Arc<dyn SessionProvider>,
+    inventory_reader: Arc<dyn InventoryReader>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
     /// Maximum number of leader-internal retries for AI resolution.
@@ -171,8 +173,8 @@ impl IngressService for IngressDispatcher {
         }
 
         // 2. Fetch inventory from the authoritative state machine
-        let all_items = self.inventory_source.get_inventory().await;
-        let state_version = self.inventory_source.current_version().await;
+        let all_items = self.inventory_reader.get_inventory().await;
+        let state_version = self.inventory_reader.current_version().await;
 
         // 3. Apply semantic filters
         let filtered_items = if let Some(filter) = req.query_filter {
@@ -201,7 +203,8 @@ impl IngressDispatcher {
     /// Creates a new IngressDispatcher with configured AI policy parameters.
     pub fn new(
         raft_handle: Arc<dyn ConsensusHandle>,
-        inventory_source: Arc<dyn InventorySource>,
+        session_provider: Arc<dyn SessionProvider>,
+        inventory_reader: Arc<dyn InventoryReader>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
         veto_max_retries: usize,
@@ -209,7 +212,8 @@ impl IngressDispatcher {
     ) -> Self {
         Self {
             raft_handle,
-            inventory_source,
+            session_provider,
+            inventory_reader,
             veto_relay,
             veto_timeout,
             veto_max_retries,
@@ -240,7 +244,7 @@ impl IngressDispatcher {
         }
 
         let last_session = self
-            .inventory_source
+            .session_provider
             .check_session(client_id, SequenceId::new(0))
             .await
             .map_err(|e| self.invalid_argument(format!("Session lookup failed: {}", e)))?;
@@ -786,7 +790,8 @@ mod tests {
     use common::proto::v1::app::SessionRecord;
     use common::raft_api::ConsensusHandle;
     use common::raft_api::ConsensusStatus;
-    use common::raft_api::InventorySource;
+    use common::raft_api::InventoryReader;
+    use common::raft_api::SessionProvider;
     use common::types::ClientId;
     use common::types::LogIndex;
     use common::types::SequenceId;
@@ -966,15 +971,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl InventorySource for MockInventorySource {
-        async fn get_inventory(&self) -> Vec<GroceryItem> {
-            self.items.clone()
-        }
-
-        async fn current_version(&self) -> LogIndex {
-            self.version
-        }
-
+    impl SessionProvider for MockInventorySource {
         async fn check_session(
             &self,
             _client_id: &ClientId,
@@ -984,14 +981,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl InventoryReader for MockInventorySource {
+        async fn get_inventory(&self) -> Vec<GroceryItem> {
+            self.items.clone()
+        }
+
+        async fn current_version(&self) -> LogIndex {
+            self.version
+        }
+    }
+
     fn mock_dispatcher(
         raft_handle: Arc<dyn ConsensusHandle>,
-        inventory_source: Arc<dyn InventorySource>,
+        session_provider: Arc<dyn SessionProvider>,
+        inventory_reader: Arc<dyn InventoryReader>,
         veto_relay: Arc<dyn VetoRelay>,
     ) -> IngressDispatcher {
         IngressDispatcher::new(
             raft_handle,
-            inventory_source,
+            session_provider,
+            inventory_reader,
             veto_relay,
             Duration::from_secs(1),
             1,
@@ -1030,7 +1040,8 @@ mod tests {
                 rejection_reason: "Node is a Follower".to_string(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, successful_inventory(), successful_veto());
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1075,15 +1086,7 @@ mod tests {
                 committed_index: LogIndex,
             }
             #[async_trait]
-            impl InventorySource for DuplicateSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for DuplicateSource {
                 async fn check_session(
                     &self,
                     cid: &ClientId,
@@ -1099,6 +1102,16 @@ mod tests {
                     )))
                 }
             }
+            #[async_trait]
+            impl InventoryReader for DuplicateSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
 
             let committed_index = LogIndex::new(42);
             let raft = Arc::new(DuplicateRaft {
@@ -1106,7 +1119,7 @@ mod tests {
             });
             let inventory = Arc::new(DuplicateSource { committed_index });
 
-            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1131,6 +1144,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
@@ -1170,6 +1184,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
@@ -1216,8 +1231,15 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_missing_quantity_for_add_operation() {
-            let dispatcher =
-                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    successful_raft(),
+                    inventory.clone(),
+                    inventory,
+                    successful_veto(),
+                )
+            };
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1239,6 +1261,7 @@ mod tests {
             let raft = successful_raft();
             let dispatcher = mock_dispatcher(
                 raft.clone(),
+                successful_inventory(),
                 successful_inventory(),
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
@@ -1276,8 +1299,15 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_when_item_key_is_empty() {
-            let dispatcher =
-                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    successful_raft(),
+                    inventory.clone(),
+                    inventory,
+                    successful_veto(),
+                )
+            };
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1296,8 +1326,15 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_when_category_hint_is_invalid() {
-            let dispatcher =
-                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    successful_raft(),
+                    inventory.clone(),
+                    inventory,
+                    successful_veto(),
+                )
+            };
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1319,8 +1356,15 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_negative_quantity_for_mutation_intents() {
-            let dispatcher =
-                mock_dispatcher(successful_raft(), successful_inventory(), successful_veto());
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    successful_raft(),
+                    inventory.clone(),
+                    inventory,
+                    successful_veto(),
+                )
+            };
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1394,7 +1438,10 @@ mod tests {
                 max_concurrent: max_concurrent.clone(),
             });
 
-            let dispatcher = Arc::new(mock_dispatcher(raft, successful_inventory(), veto));
+            let dispatcher = Arc::new({
+                let inventory = successful_inventory();
+                mock_dispatcher(raft, inventory.clone(), inventory, veto)
+            });
 
             let d1 = dispatcher.clone();
             let h1 = tokio::spawn(async move {
@@ -1451,7 +1498,8 @@ mod tests {
                 }),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(successful_raft(), successful_inventory(), veto);
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1479,7 +1527,8 @@ mod tests {
                 }),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft.clone(), successful_inventory(), veto);
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft.clone(), inventory.clone(), inventory, veto);
 
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
@@ -1516,7 +1565,8 @@ mod tests {
                 error: Some(VetoError::Timeout(Duration::from_secs(1))),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(successful_raft(), successful_inventory(), veto);
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
@@ -1537,9 +1587,11 @@ mod tests {
 
         #[tokio::test]
         async fn returns_vetoed_when_ai_hallucinates_metadata() {
+            let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(
                 successful_raft(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1575,9 +1627,11 @@ mod tests {
 
         #[tokio::test]
         async fn returns_vetoed_when_ai_provides_invalid_conversion() {
+            let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(
                 successful_raft(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 Arc::new(MockVetoRelay {
                     outcome: Some(VetoOutcome {
                         is_approved: true,
@@ -1637,9 +1691,11 @@ mod tests {
                 }
             }
 
+            let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(
                 Arc::new(FailingRaft),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 successful_veto(),
             );
             let req = Request::new(ProposeMutationRequest {
@@ -1665,10 +1721,12 @@ mod tests {
                 max_fails: 1,
                 ..Default::default()
             });
+            let inventory = successful_inventory();
             // Configured for 1 retry (max 2 attempts)
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1716,9 +1774,11 @@ mod tests {
                 success_outcome: success,
                 call_count: Mutex::new(0),
             });
+            let inventory = successful_inventory();
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1756,9 +1816,11 @@ mod tests {
                 outcome: Some(hallucination),
                 ..Default::default()
             });
+            let inventory = successful_inventory();
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1801,10 +1863,12 @@ mod tests {
                 hallucination_outcome: hallucination,
                 call_count: Mutex::new(0),
             });
+            let inventory = successful_inventory();
             // Configured for 1 retry (2 attempts total)
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 veto,
                 Duration::from_secs(1),
                 1,
@@ -1869,9 +1933,11 @@ mod tests {
             let veto = Arc::new(CountingVetoRelay {
                 call_count: call_count.clone(),
             });
+            let inventory = successful_inventory();
             let dispatcher = IngressDispatcher::new(
                 raft.clone(),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 veto,
                 Duration::from_secs(1),
                 10,
@@ -1900,9 +1966,11 @@ mod tests {
         use super::*;
 
         fn test_dispatcher() -> IngressDispatcher {
+            let inventory = successful_inventory();
             mock_dispatcher(
                 Arc::new(MockRaftHandle::default()),
-                successful_inventory(),
+                inventory.clone(),
+                inventory,
                 Arc::new(MockVetoRelay::default()),
             )
         }
@@ -2127,21 +2195,23 @@ mod tests {
                 record: Option<SessionRecord>,
             }
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
                 ) -> Result<Option<SessionRecord>, FsmError> {
                     Ok(self.record.clone())
+                }
+            }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
                 }
             }
 
@@ -2156,7 +2226,7 @@ mod tests {
                 )),
             });
 
-            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: sid.value(),
@@ -2178,21 +2248,23 @@ mod tests {
                 record: Option<SessionRecord>,
             }
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
                 ) -> Result<Option<SessionRecord>, FsmError> {
                     Ok(self.record.clone())
+                }
+            }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
                 }
             }
 
@@ -2207,7 +2279,7 @@ mod tests {
                 )),
             });
 
-            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: sid.value(),
@@ -2225,15 +2297,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource;
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     cid: &ClientId,
@@ -2249,8 +2313,20 @@ mod tests {
                     )))
                 }
             }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 5, // Stale: cluster is at 10
@@ -2273,15 +2349,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource;
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     cid: &ClientId,
@@ -2297,8 +2365,20 @@ mod tests {
                     )))
                 }
             }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 3, // Gap: expecting 2
@@ -2321,15 +2401,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource; // Returns None for check_session
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     _cid: &ClientId,
@@ -2338,8 +2410,20 @@ mod tests {
                     Ok(None)
                 }
             }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 5, // Should be 1
@@ -2366,15 +2450,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource;
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     _cid: &ClientId,
@@ -2383,8 +2459,20 @@ mod tests {
                     Ok(None) // New client
                 }
             }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1, // Correct start
@@ -2406,15 +2494,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource;
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     cid: &ClientId,
@@ -2430,8 +2510,20 @@ mod tests {
                     )))
                 }
             }
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
 
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 2, // Valid: 1 + 1
@@ -2453,15 +2545,7 @@ mod tests {
             #[derive(Debug, Default)]
             struct MockSource;
             #[async_trait]
-            impl InventorySource for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
-                    vec![]
-                }
-
-                async fn current_version(&self) -> LogIndex {
-                    LogIndex::ZERO
-                }
-
+            impl SessionProvider for MockSource {
                 async fn check_session(
                     &self,
                     _cid: &ClientId,
@@ -2470,7 +2554,19 @@ mod tests {
                     Ok(None)
                 }
             }
-            let dispatcher = mock_dispatcher(raft, Arc::new(MockSource), successful_veto());
+            #[async_trait]
+            impl InventoryReader for MockSource {
+                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                    vec![]
+                }
+
+                async fn current_version(&self) -> LogIndex {
+                    LogIndex::ZERO
+                }
+            }
+            let mock_source = Arc::new(MockSource);
+            let dispatcher =
+                mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
             let req = Request::new(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 0, // Forbidden by protocol
@@ -2498,7 +2594,8 @@ mod tests {
                 rejection_reason: "Node is a Follower".to_string(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, successful_inventory(), successful_veto());
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
@@ -2534,7 +2631,7 @@ mod tests {
                 items: items.clone(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
             let req = Request::new(QueryStateRequest {
                 query_filter: None,
@@ -2576,7 +2673,7 @@ mod tests {
                 items: items.clone(),
                 ..Default::default()
             });
-            let dispatcher = mock_dispatcher(raft, inventory, successful_veto());
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
             let req = Request::new(QueryStateRequest {
                 query_filter: Some("milk".to_string()),

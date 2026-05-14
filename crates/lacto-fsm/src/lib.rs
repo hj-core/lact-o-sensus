@@ -5,7 +5,8 @@ use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::SessionRecord;
-use common::raft_api::InventorySource;
+use common::raft_api::InventoryReader;
+use common::raft_api::SessionProvider;
 use common::raft_api::StateMachine;
 use common::types::ClientId;
 use common::types::LogIndex;
@@ -154,18 +155,7 @@ impl LactoStore {
 }
 
 #[async_trait]
-impl InventorySource for LactoStore {
-    async fn get_inventory(&self) -> Vec<GroceryItem> {
-        self.inventory
-            .iter()
-            .filter_map(Self::decode_inventory_entry)
-            .collect()
-    }
-
-    async fn current_version(&self) -> LogIndex {
-        StateMachine::last_applied_index(self)
-    }
-
+impl SessionProvider for LactoStore {
     async fn check_session(
         &self,
         client_id: &ClientId,
@@ -179,6 +169,20 @@ impl InventorySource for LactoStore {
             }
             _ => Ok(None),
         }
+    }
+}
+
+#[async_trait]
+impl InventoryReader for LactoStore {
+    async fn get_inventory(&self) -> Vec<GroceryItem> {
+        self.inventory
+            .iter()
+            .filter_map(Self::decode_inventory_entry)
+            .collect()
+    }
+
+    async fn current_version(&self) -> LogIndex {
+        StateMachine::last_applied_index(self)
     }
 }
 
