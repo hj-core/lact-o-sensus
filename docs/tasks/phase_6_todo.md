@@ -10,13 +10,13 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ### Step 1: The Linearizable Query Path (Instrumentation) [DONE]
 
-**Commit:** `feat(gateway): implement InventorySource and linearizable query path`
+**Commit:** `feat(gateway): implement SessionProvider / InventoryReader and linearizable query path`
 
-- [x] Define `InventorySource` trait in `crates/gateway/src/ingress.rs`.
+- [x] Define `SessionProvider` and `InventoryReader` traits in `crates/common/src/raft_api.rs`.
 - [x] Update `ConsensusHandle` in `crates/common/src/raft_api.rs` to support `verify_leadership()` (Quorum Read).
 - [x] Implement `verify_leadership` in `crates/raft-engine/src/service/handle.rs` (forcing a heartbeat or using the local epoch).
-- [x] Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventorySource`, and support basic `query_filter` matching on `item_key`.
-- [x] Update `main.rs` (originally in `raft-node`) to pass the `LactoStore` as the `InventorySource`.
+- [x] Implement `IngressDispatcher::query_state` to perform the Quorum Read, fetch data via `InventoryReader`, and support basic `query_filter` matching on `item_key`.
+- [x] Update `main.rs` (originally in `raft-node`) to pass the `LactoStore` as both `SessionProvider` and `InventoryReader`.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: `query_state` returns data filtered by `item_key`.
   - [x] Integration test: A deposed leader correctly rejects a `query_state` request due to failing the Quorum Read.
@@ -54,7 +54,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 - **Changes:**
   - [x] Initialize the `fsm` database handle in `main.rs` (originally in `raft-node`).
   - [x] Refactor `LactoStore` to use `sled::Tree` for inventory storage.
-  - [x] Update `InventorySource` to stream data from `sled`.
+  - [x] Update `InventoryReader` to stream data from `sled`.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: `LactoStore::apply` persists items across `sled` instance restarts.
   - [x] Integration test: `smoke_test.py` verifies that inventory survives a total cluster shutdown.

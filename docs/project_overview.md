@@ -17,7 +17,7 @@ The project is structured as a multi-crate Cargo workspace to enforce strict bou
 - **Role:** Foundational types and shared interfaces.
 - **Key Components:**
   - **Domain Primitives:** `LogIndex`, `Term`, `SequenceId`, `ClientId`, `NodeId`.
-  - **System Contract:** `ConsensusHandle` (mutation path), `InventorySource` (linearizable query path), and `StateMachine` (boundary trait).
+  - **System Contract:** `ConsensusHandle` (mutation path), `SessionProvider` / `InventoryReader` (linearizable query path), and `StateMachine` (boundary trait).
   - **Physicality:** Universal SI Unit Registry and stabilization logic.
   - **Protocol:** Compiled Protobufs for both internal consensus and external application layers.
 
@@ -36,7 +36,7 @@ The project is structured as a multi-crate Cargo workspace to enforce strict bou
 - **Responsibility:**
   - Implements the `StateMachine` trait to interpret the replicated log.
   - Manages the persistent grocery inventory and **Session Table** using **`sled`**.
-  - Implements the `InventorySource` trait to provide authoritative, linearizable query results.
+  - Implements the `SessionProvider` and `InventoryReader` traits to provide authoritative, linearizable query results.
   - **Physical Truth:** Enforces SI stabilization and the "Dimensional Fence" for all inventory updates.
 
 ### 4. `gateway` (The Delivery Layer)

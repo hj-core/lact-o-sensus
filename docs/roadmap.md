@@ -74,7 +74,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Implement Exactly-Once Semantics and transition to high-fidelity persistent disk storage.
 - **Key Actions:**
-  - **Consistent Query Path:** Implement the `InventorySource` trait and the `query_state` RPC with Quorum Read verification (ADR 007). [DONE]
+  - **Consistent Query Path:** Implement the `SessionProvider` and `InventoryReader` traits and the `query_state` RPC with Quorum Read verification (ADR 007). [DONE]
   - **Unified Ledger Alignment**: Record all AI evaluation outcomes (Approvals and Vetoes) as first-class consensus events to ensure ledger continuity (ADR 006). [DONE]
   - **Isolated Persistent Storage:** Transition Raft logs, FSM inventory, and system identity to dedicated `sled` database trees with synchronous `fsync` (ADR 001/009). [IN PROGRESS]
   - **Eternal Session Table:** Implement the Session Table as **Permanent Metadata** to prevent the Double-Bootstrap hazard. Deduplicate requests and provide linearizable replays.

@@ -28,7 +28,7 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
 
 - **Responsibility:** Syntactic normalization and linearizable sequence control.
 - **Logic:**
-  - **Firewall Deduplication (CQRS):** Verifies `sequence_id` against the **authoritative State Machine** (`InventorySource`). This decouples application-level standing from the generic consensus pipe. Returns the cached logical outcome (including `state_version`) for retries.
+  - **Firewall Deduplication (CQRS):** Verifies `sequence_id` against the **authoritative State Machine** (`SessionProvider`). This decouples application-level standing from the generic consensus pipe. Returns the cached logical outcome (including `state_version`) for retries.
   - **Bootstrap Enforcement:** Rejects any initial connection from a new `client_id` that does not originate at `SequenceId(1)`.
   - **Syntactic Scrubbing:** Performs `trim()` and `to_lowercase()` on `item_key`, `unit`, and user-supplied `category` hints.
   - **Taxonomy Guard:** Validates that user-supplied category hints exist in the authorized registry; rejects unknown categories.
