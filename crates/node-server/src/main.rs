@@ -17,6 +17,7 @@ use raft_engine::engine::LogicalNode;
 use raft_engine::identity::initialize_node_identity;
 use raft_engine::node::RaftNode;
 use raft_engine::peer::PeerManager;
+use raft_engine::recovery::RecoveryManager;
 use raft_engine::service::consensus::ConsensusDispatcher;
 use raft_engine::service::handle::LocalRaftHandle;
 use raft_engine::shell::ConsensusShell;
@@ -90,12 +91,20 @@ async fn main() -> Result<()> {
     let fsm_store = LactoStore::new(fsm_db.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize LactoStore: {}", e))?;
     let fsm = Arc::new(fsm_store);
-    let storage = Box::new(
+    let storage = Arc::new(
         SledStorage::new(log_db.clone())
             .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
     );
 
-    let initial_node = RaftNode::<Follower>::new((*identity).clone(), fsm.clone(), storage);
+    // 6.1 Cold-Boot Recovery (ADR 001/009)
+    // Synchronize FSM with Consensus Log before accepting any network events.
+    let recovery = RecoveryManager::new(fsm.clone(), storage.clone());
+    recovery
+        .recover()
+        .await
+        .map_err(|e| anyhow::anyhow!("Cold-boot recovery failed: {}", e))?;
+
+    let initial_node = RaftNode::<Follower>::new((*identity).clone(), fsm.clone(), storage.clone());
     let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)

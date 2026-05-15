@@ -134,7 +134,7 @@ mod tests {
         #[tokio::test]
         async fn replays_missing_entries_when_fsm_is_behind() {
             let fsm = Arc::new(MockFsm::default());
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
 
             // Setup: Log has 3 entries, commit_index is 3, FSM is at 0.
             storage
@@ -163,7 +163,7 @@ mod tests {
             {
                 *fsm.last_applied.lock().unwrap() = LogIndex::new(3);
             }
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             storage.save_commit_index(LogIndex::new(3)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
@@ -179,7 +179,7 @@ mod tests {
             {
                 *fsm.last_applied.lock().unwrap() = LogIndex::new(5);
             }
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             storage.save_commit_index(LogIndex::new(3)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
@@ -197,7 +197,7 @@ mod tests {
         #[tokio::test]
         async fn returns_error_when_committed_entry_is_missing() {
             let fsm = Arc::new(MockFsm::default());
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             // commit_index is 1, but log is empty
             storage.save_commit_index(LogIndex::new(1)).unwrap();
 

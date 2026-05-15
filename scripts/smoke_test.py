@@ -164,6 +164,8 @@ class ClusterManager:
     def cleanup(self) -> None:
         """
         Performs deterministic resource reclamation for all nodes.
+        It shuts down processes and closes log files, but does NOT wipe
+        persistent data directories.
         """
         print("--- Cleaning up cluster ---")
 
@@ -717,6 +719,73 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
         raise RuntimeError("Inventory data lost after total shutdown.")
 
 
+def test_cold_boot_recovery(cluster: ClusterManager) -> None:
+    """Verifies that a node can recover FSM state from log when FSM data is lost."""
+    leader_id = wait_for_leader()
+    # 1. Identify a follower dynamically
+    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
+    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+
+    # 2. Add test items to ensure non-zero log index
+    print("Action: Adding test items (milk, bread)...")
+    run_client_command('add "milk" 1 l LiquefiedHydration', leader_port)
+    output = run_client_command(
+        'add "bread" 1 units NutrientSparseCommodities', leader_port
+    )
+    version = extract_version(output)
+    if version == 0:
+        raise RuntimeError("Failed to commit items for recovery test.")
+
+    verify_convergence(version, "Committed")
+
+    # 3. Kill the node FIRST, then record log offset
+    cluster.kill_node(follower_id)
+    log_path = next(n["log"] for n in NODES if n["id"] == follower_id)
+    log_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+
+    # 4. Surgical Wipe: Delete ONLY the FSM database of the follower
+    fsm_path = f"data/node_{follower_id}/fsm"
+    print(f"Action: Surgical Wipe of FSM at {fsm_path}")
+    if os.path.exists(fsm_path):
+        shutil.rmtree(fsm_path)
+    else:
+        raise RuntimeError(f"FSM path {fsm_path} not found for wiping.")
+
+    # 5. Restart the follower (Wipe=False, so log survives)
+    print(f"Action: Restarting Node {follower_id} from existing log...")
+    cluster.start_node(follower_id, wipe_data=False)
+
+    # 6. Verify recovery in the follower's logs (looking only at new lines)
+    print(f"Action: Verifying recovery logs for Node {follower_id}...")
+    recovered = False
+    fsm_applied = False
+    start_time = time.time()
+    while (time.time() - start_time) < 15.0:
+        for line in get_complete_lines(log_path, log_offset):
+            if "Recovery: REPLAY COMPLETE" in line and str(version) in line:
+                recovered = True
+            # FSM marker proving the data was actually applied to the DB
+            if f"FSM[{version}]:" in line:
+                fsm_applied = True
+        if recovered and fsm_applied:
+            break
+        time.sleep(0.5)
+
+    if not recovered:
+        print_cluster_logs(20)
+        raise RuntimeError(
+            f"Node {follower_id} failed to perform recovery replay log."
+        )
+    if not fsm_applied:
+        raise RuntimeError(
+            f"Node {follower_id} logged recovery completion but FSM markers are missing."
+        )
+
+    print(
+        f"SUCCESS: Node {follower_id} replayed {version} entries and restored FSM state."
+    )
+
+
 # --- Runner Logic ---
 
 
@@ -764,6 +833,11 @@ def main() -> None:
             True,
             # pylint: disable=W0108
             lambda c: test_persistence_restart(c),
+        ),
+        (
+            "Cold-Boot Recovery (Log Replay)",
+            True,
+            lambda c: test_cold_boot_recovery(c),
         ),
     ]
 

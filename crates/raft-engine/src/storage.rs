@@ -41,19 +41,19 @@ pub trait LogStorage: Send + Sync + Debug {
 
     /// Persists the Raft Hard State (Term and Vote).
     /// MUST perform a synchronous flush to disk.
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError>;
+    fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError>;
 
     /// Persists the Raft commit index.
     /// MUST perform a synchronous flush to disk.
-    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError>;
+    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError>;
 
     /// Appends a batch of entries to the log.
     /// MUST perform a synchronous flush to disk.
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError>;
+    fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError>;
 
     /// Truncates the log, removing all entries from `index` to the end.
     /// MUST perform a synchronous flush to disk.
-    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError>;
+    fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError>;
 }
 
 /// Persistent implementation of LogStorage using the `sled` database.
@@ -255,7 +255,7 @@ impl LogStorage for SledStorage {
         Ok(entries)
     }
 
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
+    fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         let data = Self::serialize_hard_state(term, vote);
         self.meta.insert(Self::KEY_HARD_STATE, data).map_err(|e| {
             LogStorageError::persistence(format!("Failed to persist hard_state: {}", e))
@@ -266,7 +266,7 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError> {
         self.meta
             .insert(Self::KEY_COMMIT_INDEX, &index.value().to_be_bytes())
             .map_err(|e| {
@@ -278,7 +278,7 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
+    fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for entry in entries {
             let key = entry.index.to_be_bytes();
@@ -294,7 +294,7 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+    fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
         let last_idx = self.last_log_index()?;
         if index > last_idx {
             return Ok(());
@@ -315,9 +315,14 @@ impl LogStorage for SledStorage {
 }
 
 /// In-memory implementation of LogStorage for testing and initial bootstrap.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub struct MemoryStorage {
+    state: std::sync::Mutex<MemoryState>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryState {
     current_term: Term,
     voted_for: Option<NodeId>,
     commit_index: LogIndex,
@@ -325,17 +330,6 @@ pub struct MemoryStorage {
     ///
     /// Index 0 in the vector corresponds to LogIndex(1).
     log: Vec<LogEntry>,
-}
-
-impl Default for MemoryStorage {
-    fn default() -> Self {
-        Self {
-            current_term: Term::ZERO,
-            voted_for: None,
-            commit_index: LogIndex::ZERO,
-            log: Vec::new(),
-        }
-    }
 }
 
 impl MemoryStorage {
@@ -347,15 +341,16 @@ impl MemoryStorage {
 
 impl LogStorage for MemoryStorage {
     fn current_term(&self) -> Result<Term, LogStorageError> {
-        Ok(self.current_term)
+        Ok(self.state.lock().unwrap().current_term)
     }
 
     fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
-        Ok(self.voted_for)
+        Ok(self.state.lock().unwrap().voted_for)
     }
 
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
-        Ok(self
+        let state = self.state.lock().unwrap();
+        Ok(state
             .log
             .last()
             .map(|e| LogIndex::new(e.index))
@@ -363,7 +358,8 @@ impl LogStorage for MemoryStorage {
     }
 
     fn last_log_term(&self) -> Result<Term, LogStorageError> {
-        Ok(self
+        let state = self.state.lock().unwrap();
+        Ok(state
             .log
             .last()
             .map(|e| Term::new(e.term))
@@ -371,14 +367,15 @@ impl LogStorage for MemoryStorage {
     }
 
     fn commit_index(&self) -> Result<LogIndex, LogStorageError> {
-        Ok(self.commit_index)
+        Ok(self.state.lock().unwrap().commit_index)
     }
 
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         if index == LogIndex::ZERO {
             return Ok(None);
         }
-        Ok(self.log.get((index.value() - 1) as usize).cloned())
+        let state = self.state.lock().unwrap();
+        Ok(state.log.get((index.value() - 1) as usize).cloned())
     }
 
     fn read_entries(
@@ -396,45 +393,55 @@ impl LogStorage for MemoryStorage {
             return Ok(Vec::new());
         }
 
+        let state = self.state.lock().unwrap();
         let start_idx = (start.value() - 1) as usize;
         let end_idx = (end.value() - 1) as usize;
-        Ok(self
+        Ok(state
             .log
             .get(start_idx..=end_idx)
             .map(|s| s.to_vec())
             .unwrap_or_default())
     }
 
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
-        self.current_term = term;
-        self.voted_for = vote;
+    fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
+        let mut state = self.state.lock().unwrap();
+        state.current_term = term;
+        state.voted_for = vote;
         Ok(())
     }
 
-    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
-        self.commit_index = index;
+    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError> {
+        let mut state = self.state.lock().unwrap();
+        state.commit_index = index;
         Ok(())
     }
 
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
+    fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
+        let mut state = self.state.lock().unwrap();
         for entry in entries {
-            let expected_idx = self.last_log_index()? + 1;
+            let last_idx = state
+                .log
+                .last()
+                .map(|e| LogIndex::new(e.index))
+                .unwrap_or(LogIndex::ZERO);
+            let expected_idx = last_idx + 1;
             if LogIndex::new(entry.index) != expected_idx {
                 return Err(LogStorageError::invariant(format!(
                     "Non-contiguous log append: expected index {}, got {}",
                     expected_idx, entry.index
                 )));
             }
-            self.log.push(entry);
+            state.log.push(entry);
         }
         Ok(())
     }
 
-    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+    fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
+        let mut state = self.state.lock().unwrap();
         if index == LogIndex::ZERO {
-            self.log.clear();
+            state.log.clear();
         } else {
-            self.log.truncate((index.value() - 1) as usize);
+            state.log.truncate((index.value() - 1) as usize);
         }
         Ok(())
     }
@@ -457,7 +464,7 @@ mod tests {
 
         #[test]
         fn persists_hard_state() {
-            let mut storage = setup_storage();
+            let storage = setup_storage();
             let term = Term::new(5);
             let vote = Some(NodeId::new(1));
 
@@ -469,7 +476,7 @@ mod tests {
 
         #[test]
         fn persists_commit_index() {
-            let mut storage = setup_storage();
+            let storage = setup_storage();
             let index = LogIndex::new(42);
 
             storage.save_commit_index(index).unwrap();
@@ -479,7 +486,7 @@ mod tests {
 
         #[test]
         fn appends_and_retrieves_entries() {
-            let mut storage = setup_storage();
+            let storage = setup_storage();
             let entry1 = LogEntry {
                 index: 1,
                 term: 1,
@@ -509,7 +516,7 @@ mod tests {
 
         #[test]
         fn truncates_log_at_given_index() {
-            let mut storage = setup_storage();
+            let storage = setup_storage();
             storage
                 .append_entries(vec![
                     LogEntry {
@@ -545,7 +552,7 @@ mod tests {
             // 1. Initial write
             {
                 let db = sled::open(db_path).unwrap();
-                let mut storage = SledStorage::new(db).unwrap();
+                let storage = SledStorage::new(db).unwrap();
                 storage
                     .save_hard_state(Term::new(10), Some(NodeId::new(42)))
                     .unwrap();
@@ -584,7 +591,7 @@ mod tests {
 
         #[test]
         fn persists_hard_state() {
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             let term = Term::new(5);
             let vote = Some(NodeId::new(1));
 
@@ -596,7 +603,7 @@ mod tests {
 
         #[test]
         fn persists_commit_index() {
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             let index = LogIndex::new(42);
 
             storage.save_commit_index(index).unwrap();
@@ -606,7 +613,7 @@ mod tests {
 
         #[test]
         fn appends_and_retrieves_entries() {
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             let entry1 = LogEntry {
                 index: 1,
                 term: 1,
@@ -636,7 +643,7 @@ mod tests {
 
         #[test]
         fn truncates_log_at_given_index() {
-            let mut storage = MemoryStorage::new();
+            let storage = MemoryStorage::new();
             storage
                 .append_entries(vec![
                     LogEntry {

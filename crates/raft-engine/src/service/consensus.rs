@@ -172,7 +172,7 @@ mod tests {
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
-        let storage = Box::new(MemoryStorage::new());
+        let storage = Arc::new(MemoryStorage::new());
         let node = LogicalNode::Follower(RaftNode::<Follower>::new((*id).clone(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         ConsensusDispatcher::new(id, state)
@@ -211,7 +211,7 @@ mod tests {
         async fn panics_on_node_id_mismatch() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
-            let storage = Box::new(MemoryStorage::new());
+            let storage = Arc::new(MemoryStorage::new());
             // Different NodeId, same ClusterId
             let node =
                 LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
@@ -234,7 +234,7 @@ mod tests {
         async fn panics_on_cluster_id_mismatch() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
-            let storage = Box::new(MemoryStorage::new());
+            let storage = Arc::new(MemoryStorage::new());
             // Same NodeId, different ClusterId
             let cluster_mismatch =
                 NodeIdentity::new(ClusterId::try_new("wrong-cluster").unwrap(), id.node_id());
@@ -258,7 +258,7 @@ mod tests {
         async fn identity_mismatch_poisons_node() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
-            let storage = Box::new(MemoryStorage::new());
+            let storage = Arc::new(MemoryStorage::new());
             let node =
                 LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
             let state = Arc::new(ConsensusShell::new(node));
@@ -356,7 +356,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage_mut()
+                    node.storage()
                         .append_entries(vec![
                             LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
                             LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
@@ -384,7 +384,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage_mut()
+                    node.storage()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(2), vec![])])
                         .unwrap();
                 }
@@ -409,7 +409,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage_mut()
+                    node.storage()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
                         .unwrap();
                 }
@@ -438,7 +438,7 @@ mod tests {
                     for i in 1..=10 {
                         entries.push(LogEntry::new(LogIndex::new(i as u64), Term::new(1), vec![]));
                     }
-                    node.storage_mut().append_entries(entries).unwrap();
+                    node.storage().append_entries(entries).unwrap();
                 }
             }
 
@@ -506,7 +506,7 @@ mod tests {
         async fn demotes_candidate_on_equal_term() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
-            let storage = Box::new(MemoryStorage::new());
+            let storage = Arc::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
             let follower = RaftNode::<Follower>::new((*id).clone(), fsm, storage);
             let candidate = follower.into_candidate().unwrap();
@@ -535,7 +535,7 @@ mod tests {
         async fn panics_on_rival_leader_same_term() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
-            let storage = Box::new(MemoryStorage::new());
+            let storage = Arc::new(MemoryStorage::new());
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new((*id).clone(), fsm, storage);
             let candidate = follower.into_candidate().unwrap();

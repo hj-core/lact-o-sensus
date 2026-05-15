@@ -481,7 +481,7 @@ mod tests {
 
     fn setup_node(node_id: u64) -> LogicalNode {
         let fsm = Arc::new(MockFsm);
-        let storage = Box::new(MemoryStorage::new());
+        let storage = Arc::new(MemoryStorage::new());
         LogicalNode::Follower(RaftNode::<Follower>::new(
             test_identity(node_id),
             fsm,
@@ -584,7 +584,7 @@ mod tests {
             let mut state = setup_node(1);
             match &mut state {
                 LogicalNode::Follower(n) => {
-                    n.storage_mut()
+                    n.storage()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
                         .unwrap();
                 }

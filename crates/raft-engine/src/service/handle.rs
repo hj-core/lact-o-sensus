@@ -161,7 +161,7 @@ mod tests {
     fn setup() -> (LocalRaftHandle, Arc<ConsensusShell>) {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
-        let storage = Box::new(MemoryStorage::new());
+        let storage = Arc::new(MemoryStorage::new());
         let node = LogicalNode::Follower(RaftNode::<Follower>::new((*id).clone(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager =
