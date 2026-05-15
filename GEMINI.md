@@ -1,62 +1,51 @@
-# GEMINI.md - Project: Lact-O-Sensus
+# Project: Lact-O-Sensus
 
-## 1. Mission & Philosophy
+## 1. Project Overview
 
-- **1.1. Senior Technical Mentor:** Guide conceptual growth. Explain the **why** before the **how**.
-- **1.2. Ledger Reverence:** Treat grocery data with the same clinical rigor as financial transactions. Grocery state is a clinical record of the physical world, not a mere approximation.
-- **1.3. Fallibility Awareness:** Assume users and peers make inconsistent or disruptive decisions. Proactively block changes that introduce structural fragility.
-- **1.4. Tone & Rigor:** Academic, objective, and precise. Industry-standard terminology only.
+**Lact-O-Sensus** is a clinical, leader-centric distributed ledger designed for high-fidelity grocery inventory management. It treats physical grocery state with the same rigor as financial transactions, utilizing a **Domain-Agnostic Replicated State Machine (RSM)** powered by the Raft consensus protocol. The system adheres to **Clean Architecture** principles to ensure that consensus, business logic, and delivery layers are strictly decoupled.
 
-## 2. Architecture
+## 2. Project Structure
 
-- **2.1. Clinical Decoupling:** Structured as a 7-crate workspace enforcing **Clean Architecture**. The system decouples the consensus mechanism (`raft-engine`), business logic (`lacto-fsm`), and delivery layer (`gateway`) via a central contract (`common`), unified by a composition root (`node-server`). External semantic resolution and consumer interactions are isolated in dedicated actors (`ai-veto`, `client-cli`).
-- **2.2. Nature:** Domain-Agnostic Replicated State Machine (RSM) with Decoupled App Logic.
-- **2.3. Topology:** Leader-Centric Hub-and-Spoke (**ADR 002**). Full-Mesh Internal Consensus.
-- **2.4. Persistence:** Crash-Recovery (**ADR 001**) via `sled`. Exactly-Once WAL (**ADR 006**).
-- **2.5. Physicality:** Universal SI Unit Registry (**ADR 008**) with high-precision SI stabilization.
+The workspace is organized into 7 specialized crates to enforce dependency inversion and boundary defense:
 
-## 3. Technical Mandates
+- **`common`**: Foundational types, Protobuf contracts, and the Universal SI Unit Registry.
+- **`raft-engine`**: Domain-agnostic Raft implementation (Election, Replication, Heartbeats).
+- **`lacto-fsm`**: The business logic; implements the `StateMachine` trait and manages `sled` persistence.
+- **`gateway`**: The gRPC delivery layer and defensive "Ingress Firewall."
+- **`ai-veto`**: External Oracle for semantic resolution and moral evaluation.
+- **`client-cli`**: Consumer REPL with local WAL for linearizable retries.
+- **`node-server`**: The composition root that wires all layers via dependency injection.
 
-### 3.1. Structural Integrity (The Onion Model)
+## 3. Architectural Decision Records
 
-- **3.1.1. Poison-then-Panic (ADR 009):** To mitigate the lack of poisoning in `tokio::sync::RwLock`, you MUST transition logical state to `Poisoned` immediately before any invariant-violation `panic!`. This protocol MUST also be triggered if a persisted identity (`ClusterId`/`NodeId`) mismatch is detected at startup (**ADR 004**).
-- **3.1.2. Tri-Layer Onion (Internal):** Strictly isolate the **Physical Foundation** (deterministic logic), **Logical Orchestrator** (Raft protocol rules), and **Execution Shell** (concurrency and signaling).
-- **3.1.3. Registry Firewall (ADR 007):** Verify all AI metadata (Categories/Units) against system registries. AI is for resolution; the Gateway acts as a **Clinical Notary**, proposing both Approvals and Vetoes to the ledger to maintain contiguous sequence integrity.
-- **3.1.4. Storage Integrity (ADR 001):** Utilize specialized trees (`hard_state`, `logs`, `conf_state`) within the `sled` database. Every physical mutation to the Raft core state (`currentTerm`, `votedFor`, and `log[]`) MUST be followed by an explicit `flush_async()` before responding to an RPC to prevent "Phantom Votes" or log loss after a crash.
+- **3.1. Node Failure Model (ADR 001):** Implements a Crash-Recovery (CR) model for cluster nodes and treats the AI Veto as a Byzantine Oracle to preserve cluster determinism.
+- **3.2. Network Topology (ADR 002):** Enforces a Leader-Centric Hub-and-Spoke model for external interactions and a Full-Mesh for internal consensus.
+- **3.3. Timing & Synchrony (ADR 003):** 1:3–1:6 Heartbeat-to-Election ratio (50ms/150ms-300ms). Safety is independent of time; liveness is partially synchronous.
+- **3.4. Bootstrapping & Identity (ADR 004):** Identifies nodes by `(ClusterId, NodeId)` NewTypes. Prohibits cross-cluster contamination via Middleware identity guards.
+- **3.5. Logical Interface (ADR 005):** Strict separation between generic consensus (`raft.proto`) and application logic (`app.proto`).
+- **3.6. Exactly-Once Semantics (ADR 006):** Guarantees linearizability via a replicated Session Table. Every mutation outcome (Success or Veto) is a logged consensus event.
+- **3.7. Defensive Mutation Lifecycle (ADR 007):** A 5-layer "Defense Onion" pipeline: Structural Intent -> Syntactic Fortress -> Semantic Oracle -> Registry Firewall -> Consensus Commit.
+- **3.8. Universal Unit Registry (ADR 008):** Internal SI stabilization using `rust_decimal`. All physical state is normalized to `g` or `ml` using Banker's Rounding.
+- **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Implements **Poison-then-Panic** to handle invariant violations.
 
-### 3.2. Network & Boundary
+## 4. Technical Mandates
 
-- **3.2.1. Split Contract (ADR 005):** Isolate generic consensus (`raft.proto`) from App intents (`app.proto`).
-- **3.2.2. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
-- **3.2.3. Timing (ADR 003):** Maintain 1:3–1:6 heartbeat-to-election ratio. RPC Timeout < Heartbeat Interval.
-- **3.2.4. Identity Guarding (ADR 004):** Every gRPC request MUST be validated at the **Interceptor/Middleware layer** against the local logical identity. Messages with mismatched `ClusterId` or `TargetNodeId` MUST be rejected before reaching application logic.
-- **3.2.5. Information Opacity (The Fortress Mandate):** All external-facing error responses MUST maintain strict information opacity to mitigate state-probing and reconnaissance. Rejections MUST identify the category of failure but MUST NOT disclose internal system state, specific invariant values, or metadata that could be used to map the cluster's logical standing.
+- **4.1. Clinical Decoupling:** Prohibit the leak of grocery domain logic into `raft-engine`. All communication between layers must occur via the `common` contract.
+- **4.2. Poison-then-Panic:** Transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
+- **4.3. Information Opacity:** External errors must identify the category of failure (e.g., Sequence Gap) but MUST NOT disclose internal metadata or state values.
+- **4.4. Physical Truth:** Prohibit non-canonical measurements. All mutations must be stabilized to SI base units before being logged.
+- **4.5. Registry Firewall:** All AI-provided metadata must be verified against hardcoded system registries before finalization.
+- **4.6. Error Categorization (`thiserror` vs `anyhow`):** Map all library-returned errors to domain-specific Error enums via `thiserror`. The use of `anyhow` is strictly PROHIBITED in core logic (`crates/common`, `crates/raft-engine`, `crates/gateway`), and is permitted exclusively in top-level `main.rs` binaries.
+- **4.7. Storage Integrity:** Every physical mutation to the Raft core state must be followed by an explicit `flush_async()` before responding to an RPC to prevent log loss after a crash.
+- **4.8. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
+- **4.9. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (e.g., `NodeId`, `ClusterId`) for all domain identifiers.
+- **4.10. Safety Prohibitions:** Never use `unwrap()` or `expect()` in production-level code.
 
-### 3.3. Error Categorization & Boundary Defense
+## 5. Workflow
 
-- **3.3.1. Explicit Failure Modes:** Map all library-returned errors to domain-specific Error enums (via `thiserror`) before they exit their originating layer.
-- **3.3.2. The Core Boundary:** Prohibit the use of `anyhow` in internal core logic (all files in `crates/common`, `crates/raft-engine/src/`, and `crates/gateway`). `anyhow` is permitted EXCLUSIVELY in `main.rs` and binary-entry modules for top-level bootstrap reporting.
-
-### 3.4. Data Fidelity & Physical Truth
-
-- **3.4.1. Physical Determinism (ADR 008):** Strictly prohibit the entry of non-canonical or un-stabilized measurements. The SI Unit Registry is the absolute source of physical truth. All physical quantities MUST be represented using `rust_decimal::Decimal` to avoid floating-point inaccuracies.
-- **3.4.2. Drift Prevention:** All physical state mutations MUST be stabilized to SI base units using **Banker's Rounding** (`RoundingStrategy::MidpointNearestEven`) to eliminate cumulative numeric bias within the Replicated State Machine.
-
-### 3.5. Linearizability & Session Integrity (ADR 006)
-
-- **3.5.1. Replicated Session Table:** Exactly-Once deduplication MUST be implemented as a deterministic, replicated side-effect within the State Machine.
-- **3.5.2. Sequence Strictness:** The State Machine MUST strictly enforce the `seq == last_seen + 1` invariant for new mutations. Out-of-order or "gapped" sequences MUST be rejected. To satisfy this without client-side complexity, **every evaluation outcome (Success/Veto) MUST be logged as a first-class consensus event.**
-- **3.5.3. Session Halt Mandate:** Any detection of session table inconsistency (e.g., during snapshot loading or hash verification) MUST trigger an immediate `Poison-then-Panic`.
-
-## 4. Implementation & Workflow
-
-### 4.1. Design First
-
-Establish an implementation plan before modification. Plans must be arranged in manageable Git commits, each with designed and mandated acceptance tests.
-
-### 4.2. Anatomy of a Clinical Specification (BDD)
-
-All non-trivial logic MUST be documented via a nested BDD-style module hierarchy. This structure serves as the project's living clinical specification, ensuring behavioral invariants are easily discoverable and auditable:
+- **5.1. Planning & Atomic Commits:** All changes require an implementation plan. Commits must be atomic, manageable (fight for less than 300 line of changes), and follow [Conventional Commits](https://www.conventionalcommits.org/). Design acceptance tests as well.
+- **5.2. Orchestration Pattern:** Major functions must act as high-level orchestrators, delegating implementation to specialized sub-functions for top-down readability.
+- **5.3. BDD Specification:** All non-trivial logic MUST be documented via a nested BDD-style module hierarchy. This structure serves as the project's living clinical specification:
 
 ```rust
 #[cfg(test)]
@@ -73,40 +62,12 @@ mod tests {
 }
 ```
 
-### 4.3. TDD Protocol (Atomic Specification)
-
-Strictly enforce the three-phase implementation sequence for all non-trivial logic:
-
-1. **Signature Alignment:** Define or advance the function signature. Use `todo!()` or a mock as a placeholder to satisfy the compiler without implementing logic.
-2. **Invariant Specification (Red):** Codify behavioral requirements through tests (following the BDD anatomy above) that fail against the placeholder.
-3. **Logic Consolidation (Green):** Implement or refactor the logic until all specification tests pass. Test modification is prohibited during this phase unless a signature adjustment is required.
-
-### 4.4. Information Hierarchy
-
-Major functions must act as high-level orchestrators, delegating implementation to specialized sub-functions. In the source file, the orchestrator appears first, followed by its sub-functions to ensure top-down readability.
-
-### 4.5. Clinical VCS Protocol
-
-- **4.5.1. Commit Style:** Mandatory [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). Atomic commits for every sub-task.
-
-### 4.6. Defensive Patterns
-
-- **4.6.1. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (`NodeId`, `ClusterId`, etc.).
-- **4.6.2. Time-Dilation Testability:** Prohibit hardcoded timing. Use dependency injection to allow test suites to set delays to zero for high-speed failure-path verification.
-- **4.6.3. Reactive Concurrency:** Prefer `tokio::select!` and `tokio::sync::Notify` over polling loops.
-
-## 5. Standard Operations (Verification)
-
-Before every commit, the following clinical verification sequence MUST be executed:
-
-1. **Formatting:** `cargo +nightly fmt --all` (verify zero diff).
-2. **Logic Check:** `cargo test --all-features`
-3. **Static Analysis:** `cargo clippy --all-targets -- -D warnings`
-4. **Physicality Validation:** `python3 scripts/smoke_test.py`
-
-## 6. Prohibitions
-
-- **6.1. Safety:** Never use `unwrap()` or `expect()` in production-level code.
-- **6.2. Types:** No raw primitives for domain identifiers.
-- **6.3. Size:** No changes or refactors affecting >500 lines.
-- **6.4. Legacy:** No deprecated patterns or pre-2024 edition idioms.
+- **5.4. TDD Protocol:** Strictly enforce the three-phase implementation sequence:
+    1. Define/align syntax (with `todo!()`).
+    2. Define behavior through failing invariant tests (Red).
+    3. Implement logic until tests pass (Green).
+- **5.5. Verification Pipeline:** Before every commit, execute the clinical verification sequence:
+  - `cargo +nightly fmt --all` (verify zero diff)
+  - `cargo test --all-features`
+  - `cargo clippy --all-targets -- -D warnings`
+  - `python3 scripts/smoke_test.py`
