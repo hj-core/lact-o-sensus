@@ -85,11 +85,15 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 - **Description:** Synchronize the State Machine with the Consensus Log during startup.
 - **Changes:**
-  - [ ] Implement the replay loop in `node-server/src/main.rs`.
-  - [ ] Compare `fsm.last_applied_index()` with the persisted `commit_index` from `sled`.
-  - [ ] Fetch missing entries from the consensus log and apply them to the FSM before starting the gRPC listener.
+  - [ ] Implement `RecoveryManager` in `crates/raft-engine/src/recovery.rs` to decouple replay logic from the composition root.
+  - [ ] Implement the replay loop: compare `fsm.last_applied_index()` with `storage.commit_index()` and apply missing entries.
+  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol if `fsm > storage.commit` (indicates log regression or disk corruption).
+  - [ ] Integrate recovery into `node-server/src/main.rs` to block gRPC listener start until state convergence is achieved.
 - **Acceptance Tests (TDD):**
-  - [ ] Integration test: Chaos verification (SIGKILL) proves that entries committed to the log but not yet applied to the FSM are recovered on boot, preventing double-writes.
+  - [ ] **Unit Test (Recovery Logic):** Verify that `RecoveryManager` correctly identifies and applies missing log entries.
+  - [ ] **Unit Test (Safety Guard):** Verify that `RecoveryManager` triggers `Poison-then-Panic` (fatal error) if the FSM index is ahead of the Log's commit index.
+  - [ ] **Integration Test (Cold-Boot Convergence):** Verify that a node killed after a log commit but before FSM apply correctly recovers state on restart.
+  - [ ] **Stress Test (Idempotent Chaos):** Verify that replaying the entire log (via manual index reset) results in an identical final state.
 
 ### Step 4: Exactly-Once Semantics (EOS) Barrier
 
@@ -104,20 +108,21 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ### Step 5: The Halt Mandate & Chaos Testing
 
-**Commit:** `feat(raft): implement Poison-then-Panic protocol and verify via chaos`
+### Step 5: The Halt Mandate & Chaos Testing [IN PROGRESS]
 
 - **Description:** Guarantee safety by implementing the mandatory Poison-then-Panic machinery (ADR 009). This ensures that any node detecting an invariant violation (FSM failure, storage corruption, or recovery divergence) immediately halts to prevent cluster-wide state drift.
 - **Changes:**
-  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
-  - [ ] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (indicates disk corruption).
+  - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
+  - [ ] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (already partially planned in Step 3.3).
   - [ ] **Chaos Engineering:** Expand `smoke_test.py` to aggressively kill nodes during mutation proposals and verify recovery stability.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
+  - [x] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
   - [ ] Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
 
 ---
 
 ## 📈 Completion Status
 
-- **Total Progress:** 62%
+- **Total Progress:** 76%
 - **Current Focus:** Step 3.3: FSM Recovery (Cold-Boot Replay)
+

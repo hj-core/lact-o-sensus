@@ -1,8 +1,8 @@
-use anyhow::Result;
 use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
+use common::types::errors::LogStorageError;
 use prost::Message;
 
 /// Physical storage abstraction for Raft consensus state (§5.1, §5.3).
@@ -13,34 +13,38 @@ use prost::Message;
 pub trait LogStorage: Send + Sync + std::fmt::Debug {
     // --- Persistent State Accessors ---
 
-    fn current_term(&self) -> Term;
-    fn voted_for(&self) -> Option<NodeId>;
-    fn last_log_index(&self) -> LogIndex;
-    fn last_log_term(&self) -> Term;
+    fn current_term(&self) -> Result<Term, LogStorageError>;
+    fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError>;
+    fn last_log_index(&self) -> Result<LogIndex, LogStorageError>;
+    fn last_log_term(&self) -> Result<Term, LogStorageError>;
 
     /// Retrieves a single log entry by its index.
     ///
     /// Performs a deep copy/deserialization.
-    fn read_entry(&self, index: LogIndex) -> Option<LogEntry>;
+    fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError>;
 
     /// Retrieves a range of log entries in the closed interval [start, end].
     ///
     /// Both bounds are inclusive. Performs a deep copy/deserialization.
-    fn read_entries(&self, start: LogIndex, end: LogIndex) -> Vec<LogEntry>;
+    fn read_entries(
+        &self,
+        start: LogIndex,
+        end: LogIndex,
+    ) -> Result<Vec<LogEntry>, LogStorageError>;
 
     // --- Persistent State Mutations ---
 
     /// Persists the Raft Hard State (Term and Vote).
     /// MUST perform a synchronous flush to disk.
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<()>;
+    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError>;
 
     /// Appends a batch of entries to the log.
     /// MUST perform a synchronous flush to disk.
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<()>;
+    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError>;
 
     /// Truncates the log, removing all entries from `index` to the end.
     /// MUST perform a synchronous flush to disk.
-    fn truncate_log(&mut self, index: LogIndex) -> Result<()>;
+    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError>;
 }
 
 /// Persistent implementation of LogStorage using the `sled` database.
@@ -65,9 +69,13 @@ impl SledStorage {
     const TREE_LOG: &'static str = "log";
     const TREE_META: &'static str = "meta";
 
-    pub fn new(db: sled::Db) -> Result<Self> {
-        let log = db.open_tree(Self::TREE_LOG)?;
-        let meta = db.open_tree(Self::TREE_META)?;
+    pub fn new(db: sled::Db) -> Result<Self, LogStorageError> {
+        let log = db
+            .open_tree(Self::TREE_LOG)
+            .map_err(|e| LogStorageError::persistence(format!("Failed to open log tree: {}", e)))?;
+        let meta = db.open_tree(Self::TREE_META).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to open meta tree: {}", e))
+        })?;
         Ok(Self { db, log, meta })
     }
 
@@ -89,17 +97,27 @@ impl SledStorage {
         data
     }
 
-    fn deserialize_hard_state(data: &[u8]) -> Result<(Term, Option<NodeId>)> {
+    fn deserialize_hard_state(data: &[u8]) -> Result<(Term, Option<NodeId>), LogStorageError> {
         if data.len() < 9 {
-            anyhow::bail!("Corrupted HardState: insufficient data length");
+            return Err(LogStorageError::deserialization(
+                "Corrupted HardState: insufficient data length",
+            ));
         }
-        let term = Term::new(u64::from_be_bytes(data[0..8].try_into()?));
+        let term = Term::new(u64::from_be_bytes(data[0..8].try_into().map_err(|_| {
+            LogStorageError::deserialization("Term byte conversion failed")
+        })?));
         let has_vote = data[8] == 1;
         let vote = if has_vote {
             if data.len() < 17 {
-                anyhow::bail!("Corrupted HardState: missing vote data");
+                return Err(LogStorageError::deserialization(
+                    "Corrupted HardState: missing vote data",
+                ));
             }
-            Some(NodeId::new(u64::from_be_bytes(data[9..17].try_into()?)))
+            Some(NodeId::new(u64::from_be_bytes(
+                data[9..17].try_into().map_err(|_| {
+                    LogStorageError::deserialization("NodeId byte conversion failed")
+                })?,
+            )))
         } else {
             None
         };
@@ -108,100 +126,138 @@ impl SledStorage {
 }
 
 impl LogStorage for SledStorage {
-    fn current_term(&self) -> Term {
+    fn current_term(&self) -> Result<Term, LogStorageError> {
         self.meta
             .get(Self::KEY_HARD_STATE)
-            .ok()
-            .flatten()
-            .and_then(|d| Self::deserialize_hard_state(&d).ok())
-            .map(|(t, _)| t)
-            .unwrap_or(Term::ZERO)
+            .map_err(|e| LogStorageError::persistence(format!("Failed to read hard_state: {}", e)))?
+            .map(|d| Self::deserialize_hard_state(&d))
+            .transpose()
+            .map(|opt| opt.map(|(t, _)| t).unwrap_or(Term::ZERO))
     }
 
-    fn voted_for(&self) -> Option<NodeId> {
+    fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
         self.meta
             .get(Self::KEY_HARD_STATE)
-            .ok()
-            .flatten()
-            .and_then(|d| Self::deserialize_hard_state(&d).ok())
-            .and_then(|(_, v)| v)
+            .map_err(|e| LogStorageError::persistence(format!("Failed to read hard_state: {}", e)))?
+            .map(|d| Self::deserialize_hard_state(&d))
+            .transpose()
+            .map(|opt| opt.and_then(|(_, v)| v))
     }
 
-    fn last_log_index(&self) -> LogIndex {
+    fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
         self.log
             .last()
-            .ok()
-            .flatten()
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to read last log entry: {}", e))
+            })?
             .map(|(k, _)| {
-                let bytes: [u8; 8] = k.as_ref().try_into().unwrap_or([0; 8]);
-                LogIndex::new(u64::from_be_bytes(bytes))
+                let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
+                    LogStorageError::deserialization("LogIndex byte conversion failed")
+                })?;
+                Ok(LogIndex::new(u64::from_be_bytes(bytes)))
             })
-            .unwrap_or(LogIndex::ZERO)
+            .transpose()
+            .map(|opt| opt.unwrap_or(LogIndex::ZERO))
     }
 
-    fn last_log_term(&self) -> Term {
+    fn last_log_term(&self) -> Result<Term, LogStorageError> {
         self.log
             .last()
-            .ok()
-            .flatten()
-            .and_then(|(_, v)| LogEntry::decode(v.as_ref()).ok())
-            .map(|e| Term::new(e.term))
-            .unwrap_or(Term::ZERO)
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to read last log entry: {}", e))
+            })?
+            .map(|(_, v)| {
+                LogEntry::decode(v.as_ref()).map_err(|e| {
+                    LogStorageError::deserialization(format!(
+                        "Failed to decode last log entry: {}",
+                        e
+                    ))
+                })
+            })
+            .transpose()
+            .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))
     }
 
-    fn read_entry(&self, index: LogIndex) -> Option<LogEntry> {
+    fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         let key = index.value().to_be_bytes();
         self.log
             .get(key)
-            .ok()
-            .flatten()
-            .and_then(|v| LogEntry::decode(v.as_ref()).ok())
+            .map_err(|e| {
+                LogStorageError::persistence(format!(
+                    "Failed to read log entry at {}: {}",
+                    index, e
+                ))
+            })?
+            .map(|v| {
+                LogEntry::decode(v.as_ref()).map_err(|e| {
+                    LogStorageError::deserialization(format!(
+                        "Failed to decode log entry at {}: {}",
+                        index, e
+                    ))
+                })
+            })
+            .transpose()
     }
 
-    fn read_entries(&self, start: LogIndex, end: LogIndex) -> Vec<LogEntry> {
+    fn read_entries(
+        &self,
+        start: LogIndex,
+        end: LogIndex,
+    ) -> Result<Vec<LogEntry>, LogStorageError> {
         if start == LogIndex::ZERO {
-            tracing::error!("PROTOCOL VIOLATION: Attempted to read range starting at index 0");
-            debug_assert!(false, "LogIndex is 1-indexed; range start cannot be 0");
-            return Vec::new();
+            return Err(LogStorageError::invariant(
+                "LogIndex is 1-indexed; range start cannot be 0",
+            ));
         }
 
         if start > end {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let start_key = start.value().to_be_bytes();
         let end_key = end.value().to_be_bytes();
 
-        self.log
-            .range(start_key..=end_key)
-            .filter_map(|res| {
-                res.ok()
-                    .and_then(|(_, v)| LogEntry::decode(v.as_ref()).ok())
-            })
-            .collect()
+        let mut entries = Vec::new();
+        for res in self.log.range(start_key..=end_key) {
+            let (_, v) = res.map_err(|e| {
+                LogStorageError::persistence(format!("Log iteration failure: {}", e))
+            })?;
+            entries.push(LogEntry::decode(v.as_ref()).map_err(|e| {
+                LogStorageError::deserialization(format!("Failed to decode log entry: {}", e))
+            })?);
+        }
+        Ok(entries)
     }
 
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<()> {
+    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         let data = Self::serialize_hard_state(term, vote);
-        self.meta.insert(Self::KEY_HARD_STATE, data)?;
-        self.db.flush()?;
+        self.meta.insert(Self::KEY_HARD_STATE, data).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to persist hard_state: {}", e))
+        })?;
+        self.db
+            .flush()
+            .map_err(|e| LogStorageError::persistence(format!("Sled flush failure: {}", e)))?;
         Ok(())
     }
 
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<()> {
+    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for entry in entries {
             let key = entry.index.to_be_bytes();
             let val = entry.encode_to_vec();
             batch.insert(&key, val);
         }
-        self.log.apply_batch(batch)?;
-        self.db.flush()?;
+        self.log.apply_batch(batch).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to apply log append batch: {}", e))
+        })?;
+        self.db.flush().map_err(|e| {
+            LogStorageError::persistence(format!("Sled flush failure after log append: {}", e))
+        })?;
         Ok(())
     }
 
-    fn truncate_log(&mut self, index: LogIndex) -> Result<()> {
-        let last_idx = self.last_log_index();
+    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+        let last_idx = self.last_log_index()?;
         if index > last_idx {
             return Ok(());
         }
@@ -210,8 +266,12 @@ impl LogStorage for SledStorage {
         for i in index.value()..=last_idx.value() {
             batch.remove(&i.to_be_bytes());
         }
-        self.log.apply_batch(batch)?;
-        self.db.flush()?;
+        self.log.apply_batch(batch).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to apply log truncation batch: {}", e))
+        })?;
+        self.db.flush().map_err(|e| {
+            LogStorageError::persistence(format!("Sled flush failure after log truncation: {}", e))
+        })?;
         Ok(())
     }
 }
@@ -246,76 +306,82 @@ impl MemoryStorage {
 }
 
 impl LogStorage for MemoryStorage {
-    fn current_term(&self) -> Term {
-        self.current_term
+    fn current_term(&self) -> Result<Term, LogStorageError> {
+        Ok(self.current_term)
     }
 
-    fn voted_for(&self) -> Option<NodeId> {
-        self.voted_for
+    fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
+        Ok(self.voted_for)
     }
 
-    fn last_log_index(&self) -> LogIndex {
-        self.log
+    fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
+        Ok(self
+            .log
             .last()
             .map(|e| LogIndex::new(e.index))
-            .unwrap_or(LogIndex::ZERO)
+            .unwrap_or(LogIndex::ZERO))
     }
 
-    fn last_log_term(&self) -> Term {
-        self.log
+    fn last_log_term(&self) -> Result<Term, LogStorageError> {
+        Ok(self
+            .log
             .last()
             .map(|e| Term::new(e.term))
-            .unwrap_or(Term::ZERO)
+            .unwrap_or(Term::ZERO))
     }
 
-    fn read_entry(&self, index: LogIndex) -> Option<LogEntry> {
+    fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         if index == LogIndex::ZERO {
-            return None;
+            return Ok(None);
         }
-        self.log.get((index.value() - 1) as usize).cloned()
+        Ok(self.log.get((index.value() - 1) as usize).cloned())
     }
 
-    fn read_entries(&self, start: LogIndex, end: LogIndex) -> Vec<LogEntry> {
+    fn read_entries(
+        &self,
+        start: LogIndex,
+        end: LogIndex,
+    ) -> Result<Vec<LogEntry>, LogStorageError> {
         if start == LogIndex::ZERO {
-            tracing::error!("PROTOCOL VIOLATION: Attempted to read range starting at index 0");
-            debug_assert!(false, "LogIndex is 1-indexed; range start cannot be 0");
-            return Vec::new();
+            return Err(LogStorageError::invariant(
+                "LogIndex is 1-indexed; range start cannot be 0",
+            ));
         }
 
         if start > end {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let start_idx = (start.value() - 1) as usize;
         let end_idx = (end.value() - 1) as usize;
-        self.log
+        Ok(self
+            .log
             .get(start_idx..=end_idx)
             .map(|s| s.to_vec())
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
-    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<()> {
+    fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         self.current_term = term;
         self.voted_for = vote;
         Ok(())
     }
 
-    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<()> {
+    fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         for entry in entries {
-            let expected_idx = self.last_log_index() + 1;
+            let expected_idx = self.last_log_index()? + 1;
             if LogIndex::new(entry.index) != expected_idx {
-                anyhow::bail!(
+                return Err(LogStorageError::invariant(format!(
                     "Non-contiguous log append: expected index {}, got {}",
-                    expected_idx,
-                    entry.index
-                );
+                    expected_idx, entry.index
+                )));
             }
             self.log.push(entry);
         }
         Ok(())
     }
 
-    fn truncate_log(&mut self, index: LogIndex) -> Result<()> {
+    fn truncate_log(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
         if index == LogIndex::ZERO {
             self.log.clear();
         } else {
@@ -348,8 +414,8 @@ mod tests {
 
             storage.save_hard_state(term, vote).unwrap();
 
-            assert_eq!(storage.current_term(), term);
-            assert_eq!(storage.voted_for(), vote);
+            assert_eq!(storage.current_term().unwrap(), term);
+            assert_eq!(storage.voted_for().unwrap(), vote);
         }
 
         #[test]
@@ -370,10 +436,16 @@ mod tests {
                 .append_entries(vec![entry1.clone(), entry2.clone()])
                 .unwrap();
 
-            assert_eq!(storage.last_log_index(), LogIndex::new(2));
-            assert_eq!(storage.last_log_term(), Term::new(1));
-            assert_eq!(storage.read_entry(LogIndex::new(1)).unwrap(), entry1);
-            assert_eq!(storage.read_entry(LogIndex::new(2)).unwrap(), entry2);
+            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+            assert_eq!(storage.last_log_term().unwrap(), Term::new(1));
+            assert_eq!(
+                storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
+                entry1
+            );
+            assert_eq!(
+                storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
+                entry2
+            );
         }
 
         #[test]
@@ -401,9 +473,9 @@ mod tests {
 
             storage.truncate_log(LogIndex::new(2)).unwrap();
 
-            assert_eq!(storage.last_log_index(), LogIndex::new(1));
-            assert!(storage.read_entry(LogIndex::new(2)).is_none());
-            assert!(storage.read_entry(LogIndex::new(3)).is_none());
+            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
+            assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+            assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_none());
         }
 
         #[test]
@@ -432,12 +504,18 @@ mod tests {
                 let db = sled::open(db_path).unwrap();
                 let storage = SledStorage::new(db).unwrap();
 
-                assert_eq!(storage.current_term(), Term::new(10));
-                assert_eq!(storage.voted_for(), Some(NodeId::new(42)));
-                assert_eq!(storage.last_log_index(), LogIndex::new(2));
-                assert_eq!(storage.last_log_term(), Term::new(10));
-                assert_eq!(storage.read_entry(LogIndex::new(1)).unwrap().data, b"data1");
-                assert_eq!(storage.read_entry(LogIndex::new(2)).unwrap().data, b"data2");
+                assert_eq!(storage.current_term().unwrap(), Term::new(10));
+                assert_eq!(storage.voted_for().unwrap(), Some(NodeId::new(42)));
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+                assert_eq!(storage.last_log_term().unwrap(), Term::new(10));
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(1)).unwrap().unwrap().data,
+                    b"data1"
+                );
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(2)).unwrap().unwrap().data,
+                    b"data2"
+                );
             }
         }
     }
@@ -453,8 +531,8 @@ mod tests {
 
             storage.save_hard_state(term, vote).unwrap();
 
-            assert_eq!(storage.current_term(), term);
-            assert_eq!(storage.voted_for(), vote);
+            assert_eq!(storage.current_term().unwrap(), term);
+            assert_eq!(storage.voted_for().unwrap(), vote);
         }
 
         #[test]
@@ -475,10 +553,16 @@ mod tests {
                 .append_entries(vec![entry1.clone(), entry2.clone()])
                 .unwrap();
 
-            assert_eq!(storage.last_log_index(), LogIndex::new(2));
-            assert_eq!(storage.last_log_term(), Term::new(1));
-            assert_eq!(storage.read_entry(LogIndex::new(1)).unwrap(), entry1);
-            assert_eq!(storage.read_entry(LogIndex::new(2)).unwrap(), entry2);
+            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+            assert_eq!(storage.last_log_term().unwrap(), Term::new(1));
+            assert_eq!(
+                storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
+                entry1
+            );
+            assert_eq!(
+                storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
+                entry2
+            );
         }
 
         #[test]
@@ -506,8 +590,8 @@ mod tests {
 
             storage.truncate_log(LogIndex::new(2)).unwrap();
 
-            assert_eq!(storage.last_log_index(), LogIndex::new(1));
-            assert!(storage.read_entry(LogIndex::new(2)).is_none());
+            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
+            assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
         }
     }
 }

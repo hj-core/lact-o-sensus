@@ -9,10 +9,10 @@ use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
+use common::types::errors::NodeError;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
-use tracing::error;
 use tracing::info_span;
 
 use crate::engine::LogicalNode;
@@ -35,18 +35,18 @@ impl ConsensusDispatcher {
 
     /// Verifies that the node engine is healthy and matches the service
     /// node ID.
-    fn verify_node_integrity(&self, node: &LogicalNode) -> Result<(), Status> {
+    fn verify_node_integrity(&self, node: &mut LogicalNode) -> Result<(), Status> {
         let engine_node_id = node.node_id();
         if engine_node_id == self.identity.node_id() {
             Ok(())
         } else {
             let msg = format!(
-                "CRITICAL: Node ID divergence detected! ServiceNodeID='{}' EngineNodeID='{}'",
+                "Node ID divergence detected! ServiceNodeID='{}' EngineNodeID='{}'",
                 self.identity.node_id(),
                 engine_node_id
             );
-            error!("{}", msg);
-            panic!("{}", msg);
+            // ADR 009: Poison the node via apply_fatal before panicking.
+            node.apply_fatal(NodeError::Identity(msg));
         }
     }
 
@@ -78,7 +78,7 @@ impl ConsensusService for ConsensusDispatcher {
 
         let result = {
             let mut guard = self.state.write().await;
-            self.verify_node_integrity(&guard)?;
+            self.verify_node_integrity(&mut guard)?;
 
             guard.handle_request_vote(
                 candidate_id,
@@ -115,7 +115,7 @@ impl ConsensusService for ConsensusDispatcher {
 
         let result = {
             let mut guard = self.state.write().await;
-            self.verify_node_integrity(&guard)?;
+            self.verify_node_integrity(&mut guard)?;
 
             guard
                 .handle_append_entries(
@@ -180,6 +180,10 @@ mod tests {
     }
 
     mod integrity_check {
+        use std::panic::AssertUnwindSafe;
+
+        use futures::FutureExt;
+
         use super::*;
 
         #[tokio::test]
@@ -204,7 +208,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[should_panic(expected = "CRITICAL: Node ID divergence detected")]
+        #[should_panic(expected = "Identity Integrity Violation: Node ID divergence detected")]
         async fn panics_on_identity_mismatch() {
             let id = mock_identity();
             // Create a node with a DIFFERENT identity (different node_id)
@@ -225,6 +229,35 @@ mod tests {
             });
 
             let _ = dispatcher.request_vote(req).await;
+        }
+
+        #[tokio::test]
+        async fn identity_mismatch_poisons_node() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm);
+            let storage = Box::new(MemoryStorage::new());
+            let node =
+                LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm, storage));
+            let state = Arc::new(ConsensusShell::new(node));
+            let dispatcher = ConsensusDispatcher::new(id, state.clone());
+
+            let req = Request::new(RequestVoteRequest {
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            // Catch the panic to inspect the state afterwards
+            let result = AssertUnwindSafe(dispatcher.request_vote(req))
+                .catch_unwind()
+                .await;
+
+            assert!(result.is_err());
+
+            // Verify that the node is now permanently poisoned
+            let guard = state.read().await;
+            assert!(guard.is_poisoned());
         }
     }
 
@@ -255,7 +288,7 @@ mod tests {
             // Pre-initialize to term 1
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(Term::new(1), None));
+                state.into_follower(Term::new(1), None);
             }
 
             let req = Request::new(RequestVoteRequest {
@@ -277,7 +310,7 @@ mod tests {
             // First, update node to term 2
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(Term::new(2), None));
+                state.into_follower(Term::new(2), None);
             }
 
             let req = Request::new(RequestVoteRequest {
@@ -429,7 +462,7 @@ mod tests {
             // Update node to term 2
             {
                 let mut state = dispatcher.state.write().await;
-                state.transition(|old| old.into_follower(Term::new(2), None));
+                state.into_follower(Term::new(2), None);
             }
 
             let req = Request::new(AppendEntriesRequest {
@@ -453,7 +486,7 @@ mod tests {
             let storage = Box::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
             let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
-            let candidate = follower.into_candidate();
+            let candidate = follower.into_candidate().unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 
@@ -469,7 +502,7 @@ mod tests {
             let response = dispatcher.append_entries(req).await.unwrap().into_inner();
             assert!(response.success);
 
-            let state_guard = dispatcher.state.read().await;
+            let mut state_guard = dispatcher.state.write().await;
             assert!(matches!(&*state_guard, LogicalNode::Follower(_)));
             assert_eq!(state_guard.current_term(), Term::new(1));
         }
@@ -482,8 +515,8 @@ mod tests {
             let storage = Box::new(MemoryStorage::new());
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
-            let candidate = follower.into_candidate();
-            let leader = candidate.into_leader(Vec::new());
+            let candidate = follower.into_candidate().unwrap();
+            let leader = candidate.into_leader(Vec::new()).unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 

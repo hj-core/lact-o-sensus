@@ -51,13 +51,13 @@ impl LactoStore {
     pub fn new(db: sled::Db) -> Result<Self, FsmError> {
         let inventory = db
             .open_tree(Self::TREE_INVENTORY)
-            .map_err(|e| FsmError::Persistence(format!("Failed to open inventory tree: {}", e)))?;
+            .map_err(|e| FsmError::persistence(format!("Failed to open inventory tree: {}", e)))?;
         let sessions = db
             .open_tree(Self::TREE_SESSIONS)
-            .map_err(|e| FsmError::Persistence(format!("Failed to open sessions tree: {}", e)))?;
+            .map_err(|e| FsmError::persistence(format!("Failed to open sessions tree: {}", e)))?;
         let meta = db
             .open_tree(Self::TREE_META)
-            .map_err(|e| FsmError::Persistence(format!("Failed to open meta tree: {}", e)))?;
+            .map_err(|e| FsmError::persistence(format!("Failed to open meta tree: {}", e)))?;
 
         Ok(Self {
             db,
@@ -71,7 +71,7 @@ impl LactoStore {
     pub fn last_effective_time(&self) -> Result<prost_types::Timestamp, FsmError> {
         self.meta
             .get(Self::KEY_LAST_EFFECTIVE_TIME)
-            .map_err(|e| FsmError::Persistence(format!("Failed to read meta tree: {}", e)))?
+            .map_err(|e| FsmError::persistence(format!("Failed to read meta tree: {}", e)))?
             .map(|bytes| Self::decode_timestamp(bytes.as_ref()))
             .transpose()
             .map(|opt| {
@@ -99,10 +99,10 @@ impl LactoStore {
     fn get_session_record(&self, client_id: &str) -> Result<Option<SessionRecord>, FsmError> {
         self.sessions
             .get(client_id.as_bytes())
-            .map_err(|e| FsmError::Persistence(format!("Failed to read session table: {}", e)))?
+            .map_err(|e| FsmError::persistence(format!("Failed to read session table: {}", e)))?
             .map(|bytes| {
                 SessionRecord::decode(bytes.as_ref()).map_err(|e| {
-                    FsmError::Deserialization(format!(
+                    FsmError::deserialization(format!(
                         "Corrupt SessionRecord for client {}: {}",
                         client_id, e
                     ))
@@ -115,10 +115,7 @@ impl LactoStore {
     /// Returns an error on deserialization failure to trigger the Halt Mandate.
     fn decode_timestamp(bytes: &[u8]) -> Result<prost_types::Timestamp, FsmError> {
         prost_types::Timestamp::decode(bytes).map_err(|e| {
-            FsmError::Deserialization(format!(
-                "State Machine Corruption: Failed to decode timestamp: {}",
-                e
-            ))
+            FsmError::deserialization(format!("Failed to decode clinical timestamp: {}", e))
         })
     }
 
@@ -202,8 +199,8 @@ impl StateMachine for LactoStore {
 
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
-            FsmError::Deserialization(format!(
-                "Physical Integrity Violation: Failed to deserialize mutation at index {}: {}",
+            FsmError::deserialization(format!(
+                "Failed to deserialize mutation at index {}: {}",
                 index, e
             ))
         })?;
@@ -211,9 +208,8 @@ impl StateMachine for LactoStore {
         // 1. Physical Log Monotonicity (Physical Fence)
         let current_applied = self.last_applied_index();
         if index != current_applied + 1 {
-            return Err(FsmError::Invariant(format!(
-                "Physical Integrity Violation: Non-sequential LogIndex apply attempted. \
-                 last_applied={}, got {}",
+            return Err(FsmError::invariant(format!(
+                "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
                 current_applied, index
             )));
         }
@@ -237,16 +233,10 @@ impl StateMachine for LactoStore {
             self.meta
                 .insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())
                 .map_err(|e| {
-                    FsmError::Persistence(format!(
-                        "Physical Integrity Violation: Failed to persist last_applied index: {}",
-                        e
-                    ))
+                    FsmError::persistence(format!("Failed to persist last_applied index: {}", e))
                 })?;
             self.db.flush().map_err(|e| {
-                FsmError::Persistence(format!(
-                    "Physical Integrity Violation: FSM flush failure during deduplication: {}",
-                    e
-                ))
+                FsmError::persistence(format!("FSM flush failure during deduplication: {}", e))
             })?;
             return Ok(());
         }
@@ -260,8 +250,8 @@ impl StateMachine for LactoStore {
                 last_seen + 1,
                 seq
             );
-            return Err(FsmError::Invariant(format!(
-                "Logical Integrity Violation: Sequence gap for client {}: expected {}, got {}",
+            return Err(FsmError::invariant(format!(
+                "Sequence gap for client {}: expected {}, got {}",
                 client_id,
                 last_seen + 1,
                 seq
@@ -274,9 +264,9 @@ impl StateMachine for LactoStore {
         let meta_tree = self.meta.clone();
 
         let status = MutationStatus::try_from(mutation.status).map_err(|_| {
-            FsmError::Invariant(format!(
-                "Semantic Integrity Violation: Unknown MutationStatus integer {} at index {}. The \
-                 node is likely running an obsolete version or the ledger is corrupted.",
+            FsmError::invariant(format!(
+                "Unknown MutationStatus integer {} at index {}. The node is likely running an \
+                 obsolete version or the ledger is corrupted.",
                 mutation.status, index
             ))
         })?;
@@ -284,9 +274,9 @@ impl StateMachine for LactoStore {
 
         // Stateful Temporal Determinism (ADR 006)
         let event_time = mutation.event_time.ok_or_else(|| {
-            FsmError::Invariant(format!(
-                "Clinical Integrity Violation: Mutation at index {} is missing mandatory \
-                 event_time. Cannot update deterministic clinical clock.",
+            FsmError::invariant(format!(
+                "Mutation at index {} is missing mandatory event_time. Cannot update \
+                 deterministic clinical clock.",
                 index
             ))
         })?;
@@ -296,9 +286,8 @@ impl StateMachine for LactoStore {
         let next_effective = Self::max_timestamp(event_time, current_effective);
 
         let client_id_obj = ClientId::from_str(&client_id).map_err(|e| {
-            FsmError::Invariant(format!(
-                "Clinical Integrity Violation: Invalid client_id '{}' in ledger at index {}. \
-                 Identity metadata is corrupted: {}",
+            FsmError::invariant(format!(
+                "Invalid client_id '{}' in ledger at index {}. Identity metadata is corrupted: {}",
                 client_id, index, e
             ))
         })?;
@@ -339,19 +328,11 @@ impl StateMachine for LactoStore {
                 Ok(())
             });
 
-        res.map_err(|e| {
-            FsmError::Persistence(format!(
-                "Physical Integrity Violation: Atomic transaction failure: {:?}",
-                e
-            ))
-        })?;
+        res.map_err(|e| FsmError::persistence(format!("Atomic transaction failure: {:?}", e)))?;
 
         // Synchronous flush as mandated by ADR 001
         self.db.flush().map_err(|e| {
-            FsmError::Persistence(format!(
-                "Physical Integrity Violation: FSM flush failure after commitment: {}",
-                e
-            ))
+            FsmError::persistence(format!("FSM flush failure after commitment: {}", e))
         })?;
 
         info!(
@@ -417,8 +398,8 @@ mod tests {
                 // 2. Failure: Try to apply Index 3 (skipping Index 2)
                 let result = store.apply(LogIndex::new(3), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Physical Integrity Violation")),
-                    "Expected Invariant error with Physical Integrity prefix, got {:?}",
+                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Non-sequential")),
+                    "Expected Invariant error for non-sequential apply, got {:?}",
                     result
                 );
             }
@@ -476,8 +457,8 @@ mod tests {
 
                 let result = store.apply(LogIndex::new(1), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Logical Integrity Violation")),
-                    "Expected Invariant error with Logical Integrity prefix, got {:?}",
+                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Sequence gap")),
+                    "Expected Invariant error for sequence gap, got {:?}",
                     result
                 );
             }
@@ -589,8 +570,8 @@ mod tests {
 
                 let result = store.apply(LogIndex::new(1), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Deserialization(ref msg)) if msg.contains("Physical Integrity Violation")),
-                    "Expected Deserialization error with Physical Integrity prefix, got {:?}",
+                    matches!(result, Err(FsmError::Deserialization(ref msg)) if msg.contains("deserialize mutation")),
+                    "Expected Deserialization error, got {:?}",
                     result
                 );
             }
@@ -607,7 +588,7 @@ mod tests {
 
                 let result = store.apply(LogIndex::new(1), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Clinical Integrity Violation")),
+                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("mandatory event_time")),
                     "Expected Invariant error for missing event_time, got {:?}",
                     result
                 );
@@ -625,7 +606,7 @@ mod tests {
 
                 let result = store.apply(LogIndex::new(1), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Semantic Integrity Violation")),
+                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Unknown MutationStatus")),
                     "Expected Invariant error for unknown status, got {:?}",
                     result
                 );
@@ -643,7 +624,7 @@ mod tests {
 
                 let result = store.apply(LogIndex::new(1), &data).await;
                 assert!(
-                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Clinical Integrity Violation")),
+                    matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Invalid client_id")),
                     "Expected Invariant error for invalid client_id, got {:?}",
                     result
                 );

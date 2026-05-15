@@ -89,7 +89,7 @@ impl ConsensusHandle for LocalRaftHandle {
                 }
             }
 
-            // Park until something changes (LogIndex OR Term/Role)
+            // Park until something changes (LogIndex OR Term/Role/Poison)
             if progress_rx.changed().await.is_err() {
                 return Err(ConsensusError::Terminated);
             }
@@ -187,12 +187,8 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
-                    }
-                    _ => panic!("Expected follower"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![]);
             }
             let status = handle.consensus_status().await;
 
@@ -219,12 +215,8 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
-                    }
-                    _ => panic!("Expected follower"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![]);
             }
 
             let result = handle.propose(vec![1, 2, 3]).await;
@@ -243,12 +235,8 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
-                    }
-                    _ => panic!("Expected follower"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![]);
             }
 
             let index = handle.propose(vec![1]).await.unwrap();
@@ -258,8 +246,8 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
-                if let LogicalNode::Leader(node) = &mut *guard {
-                    node.set_commit_index(index).await;
+                if let LogicalNode::Leader(_) = &mut *guard {
+                    guard.set_commit_index(index).await;
                 }
             });
 
@@ -272,12 +260,8 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
-                    }
-                    _ => panic!("Expected follower"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![]);
             }
 
             let index = LogIndex::new(10); // A high index that won't be reached immediately
@@ -287,12 +271,79 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
-                guard.transition(|old| old.into_follower(Term::new(2), None));
+                guard.into_follower(Term::new(2), None);
             });
 
             let result = handle.await_commit(index).await;
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), ConsensusError::NotLeader);
+        }
+    }
+
+    mod poison_safety {
+        use super::*;
+
+        #[tokio::test]
+        async fn consensus_status_reports_poisoning() {
+            let (handle, state) = setup();
+            {
+                // Manually transition to poisoned state
+                let mut guard = state.write().await;
+                *guard = LogicalNode::Poisoned;
+            }
+
+            let status = handle.consensus_status().await;
+            assert!(!status.is_leader);
+            assert_eq!(status.rejection_reason, "Node is in a poisoned state.");
+        }
+
+        #[tokio::test]
+        async fn verify_leadership_returns_poisoned_error() {
+            let (handle, state) = setup();
+            {
+                let mut guard = state.write().await;
+                *guard = LogicalNode::Poisoned;
+            }
+
+            let result = handle.verify_leadership().await;
+            assert!(matches!(result, Err(ConsensusError::Poisoned)));
+        }
+
+        #[tokio::test]
+        async fn await_commit_fails_immediately_if_already_poisoned() {
+            let (handle, state) = setup();
+            {
+                let mut guard = state.write().await;
+                *guard = LogicalNode::Poisoned;
+            }
+
+            let result = handle.await_commit(LogIndex::new(1)).await;
+            assert!(matches!(result, Err(ConsensusError::Poisoned)));
+        }
+
+        #[tokio::test]
+        async fn await_commit_terminates_when_poisoned_during_wait() {
+            let (handle, state) = setup();
+            {
+                let mut guard = state.write().await;
+                guard.into_candidate();
+                guard.into_leader(vec![]);
+            }
+
+            // Start waiting for a high index
+            let wait_task =
+                tokio::spawn(async move { handle.await_commit(LogIndex::new(100)).await });
+
+            // Simulate a fatal crash in a background task
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            {
+                let mut guard = state.write().await;
+                *guard = LogicalNode::Poisoned;
+                // MutationGuard drop triggers the watch channel update
+            }
+
+            let result = wait_task.await.unwrap();
+            assert!(matches!(result, Err(ConsensusError::Poisoned)));
         }
     }
 }

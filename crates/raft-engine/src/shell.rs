@@ -23,8 +23,10 @@ pub struct ConsensusShell {
 
 impl ConsensusShell {
     /// Creates a new consensus state shell and initializes the signal channel.
-    pub fn new(initial_state: LogicalNode) -> Self {
-        let (progress_tx, _) = watch::channel(initial_state.consensus_progress());
+    pub fn new(mut initial_state: LogicalNode) -> Self {
+        let progress = initial_state.consensus_progress();
+
+        let (progress_tx, _) = watch::channel(progress);
         Self {
             inner: Arc::new(RwLock::new(initial_state)),
             progress_tx,
@@ -44,7 +46,7 @@ impl ConsensusShell {
     /// changes to the logical epoch or physical state are published to
     /// observers before the write lock is released.
     pub async fn write(&self) -> MutationGuard<'_> {
-        let guard = self.inner.write().await;
+        let mut guard = self.inner.write().await;
         let before = guard.consensus_progress();
         MutationGuard {
             shell: self,
@@ -86,20 +88,34 @@ impl<'a> DerefMut for MutationGuard<'a> {
 
 impl<'a> Drop for MutationGuard<'a> {
     fn drop(&mut self) {
-        // SAFETY: If the thread is already panicking, we MUST NOT trigger
-        // a secondary panic in the destructor, as this leads to an abort.
-        if std::thread::panicking() {
-            return;
-        }
-
-        // Only attempt to broadcast if the node is NOT poisoned.
-        // If it is poisoned, accessing it would trigger the Halt Mandate
-        // panic, which we want to avoid in a destructor.
-        if !self.guard.is_poisoned() {
-            let after = self.guard.consensus_progress();
-            if self.before != after {
-                let _ = self.shell.progress_tx.send_replace(after);
+        // We determine the 'after' state. If the thread is already panicking,
+        // we MUST transition the node to Poisoned and broadcast a terminal
+        // signal to halt other tasks (ADR 009).
+        let after = if std::thread::panicking() {
+            *self.guard = LogicalNode::Poisoned;
+            ConsensusProgress {
+                term: self.before.term,
+                commit_index: self.before.commit_index,
+                is_poisoned: true,
+                signal_counter: self.before.signal_counter + 1,
             }
+        } else if self.guard.is_poisoned() {
+            ConsensusProgress {
+                term: self.before.term,
+                commit_index: self.before.commit_index,
+                is_poisoned: true,
+                signal_counter: self.before.signal_counter + 1,
+            }
+        } else {
+            // In the normal case, we extract the progress from the healthy node.
+            // We use the try_ version here to avoid a panic-in-drop if the logic
+            // itself has a bug.
+            self.guard.try_consensus_progress().unwrap_or(self.before)
+        };
+
+        // Broadcast if anything has changed (Term, Role, Index, or Poison).
+        if self.before != after {
+            let _ = self.shell.progress_tx.send_replace(after);
         }
     }
 }

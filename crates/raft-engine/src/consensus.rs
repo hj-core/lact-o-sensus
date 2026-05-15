@@ -20,9 +20,7 @@ use tracing::error;
 use tracing::info;
 
 use crate::config::Config;
-use crate::engine::Leader;
 use crate::engine::LogicalNode;
-use crate::node::RaftNode;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
@@ -96,7 +94,8 @@ pub fn spawn_election_timer(
                     LogicalNode::Follower(node) => Some(node.state().heartbeat_signal().clone()),
                     LogicalNode::Candidate(_) | LogicalNode::Leader(_) => None,
                     LogicalNode::Poisoned => {
-                        panic!("HALT: Node is poisoned (ADR 001)");
+                        error!("Node is poisoned. Election timer stopping (ADR 009).");
+                        return;
                     }
                 }
             };
@@ -118,7 +117,10 @@ pub fn spawn_election_timer(
                 match &*guard {
                     LogicalNode::Candidate(_) => handle_candidate_tick(&guard),
                     LogicalNode::Leader(_) => handle_leader_tick(&guard),
-                    LogicalNode::Poisoned => panic!("HALT: Node is poisoned (ADR 001)"),
+                    LogicalNode::Poisoned => {
+                        error!("Node is poisoned. Election timer stopping (ADR 009).");
+                        return;
+                    }
                     _ => TimerAction::Restart,
                 }
             };
@@ -142,28 +144,24 @@ async fn initiate_transition_to_candidate(
     state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) {
-    let new_term = {
-        let guard = state.read().await;
-        match &*guard {
-            LogicalNode::Follower(n) => n.current_term() + 1,
-            LogicalNode::Candidate(n) => n.current_term() + 1,
-            _ => return, // Only Followers and Candidates can start elections
+    let term = {
+        let mut guard = state.write().await;
+        let is_follower_or_candidate = matches!(
+            &*guard,
+            LogicalNode::Follower(_) | LogicalNode::Candidate(_)
+        );
+        if !is_follower_or_candidate {
+            return;
         }
+        let t = guard.current_term();
+        guard.into_candidate();
+        t + 1
     };
 
     info!(
-        "Election timeout reached. Transitioning to Candidate for term {}",
-        new_term
+        "Election timeout reached. Transitioned to Candidate for term {}",
+        term
     );
-
-    {
-        let mut guard = state.write().await;
-        guard.transition(|old| match old {
-            LogicalNode::Follower(n) => LogicalNode::Candidate(n.into_candidate()),
-            LogicalNode::Candidate(n) => LogicalNode::Candidate(n.into_restarted_candidate()),
-            other => other,
-        });
-    }
 
     let state_clone = state.clone();
     let peer_manager_clone = peer_manager.clone();
@@ -183,15 +181,13 @@ async fn initiate_election(
 ) -> Result<()> {
     // 1. Gather election parameters from the current state.
     let (term, node_id, last_log_index, last_log_term) = {
-        let guard = state.read().await;
-        let nid = guard.node_id();
-
-        let (last_idx, last_term) = match &*guard {
-            LogicalNode::Candidate(n) => (n.last_log_index(), n.last_log_term()),
-            _ => (LogIndex::ZERO, Term::ZERO), // Should be Candidate
-        };
-
-        (guard.current_term(), nid, last_idx, last_term)
+        let mut guard = state.write().await;
+        (
+            guard.current_term(),
+            guard.node_id(),
+            guard.last_log_index(),
+            guard.last_log_term(),
+        )
     };
 
     info!(
@@ -233,7 +229,8 @@ async fn initiate_election(
     // Loop finished without reaching quorum or being demoted.
     let still_candidate = {
         let guard = state.read().await;
-        matches!(&*guard, LogicalNode::Candidate(n) if n.current_term() == term)
+        let current = guard.try_current_term().unwrap_or(Term::ZERO);
+        matches!(&*guard, LogicalNode::Candidate(_) if current == term)
     };
 
     if still_candidate {
@@ -294,9 +291,8 @@ async fn replicate_to_peers(
 ) -> Result<()> {
     // 1. Gather global replication parameters.
     let (term, node_id, commit_index) = {
-        let guard = state.read().await;
-        let nid = guard.node_id();
-        (guard.current_term(), nid, guard.commit_index())
+        let mut guard = state.write().await;
+        (guard.current_term(), guard.node_id(), guard.commit_index())
     };
 
     // 2. Prepare and send AppendEntries concurrently to all peers.
@@ -420,45 +416,40 @@ async fn process_vote_response(
         }
     };
 
+    let mut guard = state.write().await;
     let resp_term = Term::new(resp.term);
+
+    // 1. Term check and opportunistic demotion (§5.1)
     if resp_term > term {
         info!(
             "Found higher term ({}) during election. Demoting to Follower.",
             resp_term
         );
-        {
-            let mut guard = state.write().await;
-            guard.transition(|old| old.into_follower(resp_term, None));
-        }
+        guard.into_follower(resp_term, None);
         return Ok(VoteProcessingResult::Demoted);
     }
 
+    // 2. Tally vote if granted and we are still campaigning for the same term
     if resp.vote_granted {
-        let mut is_leader = false;
+        let mut quorum_reached = false;
         let total_nodes = peer_ids.len() + 1;
         let quorum = (total_nodes / 2) + 1;
 
+        if let LogicalNode::Candidate(node) = &mut *guard
+            && node.current_term().unwrap_or(Term::ZERO) == term
         {
-            let mut guard = state.write().await;
-            guard.transition(|old| match old {
-                LogicalNode::Candidate(mut n) if n.current_term() == term => {
-                    n.state_mut().add_vote(peer_id);
-                    if n.state().vote_count() >= quorum {
-                        is_leader = true;
-                        LogicalNode::Leader(n.into_leader(peer_ids.to_vec()))
-                    } else {
-                        LogicalNode::Candidate(n)
-                    }
-                }
-                other => other,
-            });
+            node.state_mut().add_vote(peer_id);
+            if node.state().vote_count() >= quorum {
+                quorum_reached = true;
+            }
         }
 
-        if is_leader {
+        if quorum_reached {
             info!(
                 "Quorum reached early! Transitioning to Leader for term {}.",
                 term
             );
+            guard.into_leader(peer_ids.to_vec());
             return Ok(VoteProcessingResult::QuorumReached);
         }
     }
@@ -486,11 +477,15 @@ fn broadcast_append_entries(
             async move {
                 // Prepare the request for this specific peer
                 let request = {
-                    let guard = state.read().await;
-                    match &*guard {
-                        LogicalNode::Leader(node) => {
-                            build_append_entries_request(node, peer_id, term, node_id, commit_index)
-                        }
+                    let mut guard = state.write().await;
+                    match &mut *guard {
+                        LogicalNode::Leader(_) => build_append_entries_request(
+                            &mut guard,
+                            peer_id,
+                            term,
+                            node_id,
+                            commit_index,
+                        ),
                         _ => return Ok(None),
                     }
                 };
@@ -522,17 +517,20 @@ fn broadcast_append_entries(
 
 /// Builds an AppendEntriesRequest for a specific peer based on its next_index.
 fn build_append_entries_request(
-    node: &RaftNode<Leader>,
+    node: &mut LogicalNode,
     peer_id: NodeId,
     term: Term,
     node_id: NodeId,
     commit_index: LogIndex,
 ) -> AppendEntriesRequest {
-    let next_idx = *node
-        .state()
-        .next_index()
-        .get(&peer_id)
-        .unwrap_or(&LogIndex::new(1));
+    let next_idx = if let LogicalNode::Leader(n) = node {
+        *n.state()
+            .next_index()
+            .get(&peer_id)
+            .unwrap_or(&LogIndex::new(1))
+    } else {
+        LogIndex::new(1)
+    };
     let last_log_idx = node.last_log_index();
 
     let prev_log_index = next_idx - 1;
@@ -570,61 +568,67 @@ async fn process_append_entries_response(
         }
     };
 
+    let mut guard = state.write().await;
     let resp_term = Term::new(resp.term);
+
+    // 1. Term check and opportunistic demotion (§5.1)
     if resp_term > term {
         info!(
             "Found higher term ({}) from peer {}. Demoting to Follower.",
             resp_term, peer_id
         );
-        {
-            let mut guard = state.write().await;
-            guard.transition(|old| old.into_follower(resp_term, None));
-        }
+        guard.into_follower(resp_term, None);
         return Ok(ReplicationResult::Demoted);
     }
 
+    // 2. Process replication success/failure if we are still the leader for this
+    //    term
+    let mut commit_index_updated = false;
+    if let LogicalNode::Leader(node) = &mut *guard
+        && node.current_term().unwrap_or(Term::ZERO) == term
     {
-        let mut guard = state.write().await;
-        if let LogicalNode::Leader(node) = &mut *guard {
-            if resp.success {
-                let new_match = sent_prev_index + sent_entries_len;
-                let new_next = new_match + 1;
+        if resp.success {
+            let new_match = sent_prev_index + sent_entries_len;
+            let new_next = new_match + 1;
 
-                let current_match = *node
-                    .state()
-                    .match_index()
-                    .get(&peer_id)
-                    .unwrap_or(&LogIndex::ZERO);
+            let current_match = *node
+                .state()
+                .match_index()
+                .get(&peer_id)
+                .unwrap_or(&LogIndex::ZERO);
 
-                if new_match > current_match {
-                    node.state_mut().next_index_mut().insert(peer_id, new_next);
-                    node.state_mut()
-                        .match_index_mut()
-                        .insert(peer_id, new_match);
-                }
-
-                update_leader_commit_index(node).await;
-            } else {
-                let current_next = *node
-                    .state()
-                    .next_index()
-                    .get(&peer_id)
-                    .unwrap_or(&LogIndex::new(1));
-
-                let last_log_index = LogIndex::new(resp.last_log_index);
-                let new_next = if last_log_index > LogIndex::ZERO {
-                    std::cmp::min(current_next, last_log_index + 1)
-                } else {
-                    (current_next - 1).max(LogIndex::new(1))
-                };
-
+            if new_match > current_match {
                 node.state_mut().next_index_mut().insert(peer_id, new_next);
-                debug!(
-                    "Peer {} rejected AppendEntries (log mismatch). Retrying with next_index={}",
-                    peer_id, new_next
-                );
+                node.state_mut()
+                    .match_index_mut()
+                    .insert(peer_id, new_match);
+                commit_index_updated = true;
             }
+        } else {
+            let current_next = *node
+                .state()
+                .next_index()
+                .get(&peer_id)
+                .unwrap_or(&LogIndex::new(1));
+
+            let last_log_index = LogIndex::new(resp.last_log_index);
+            let new_next = if last_log_index > LogIndex::ZERO {
+                std::cmp::min(current_next, last_log_index + 1)
+            } else {
+                (current_next - 1).max(LogIndex::new(1))
+            };
+
+            node.state_mut().next_index_mut().insert(peer_id, new_next);
+            debug!(
+                "Peer {} rejected AppendEntries (log mismatch). Retrying with next_index={}",
+                peer_id, new_next
+            );
         }
+    }
+
+    // 3. Opportunistically advance commit index if progress was made
+    if commit_index_updated {
+        update_leader_commit_index(&mut guard).await;
     }
 
     Ok(ReplicationResult::Continue)
@@ -632,20 +636,25 @@ async fn process_append_entries_response(
 
 /// Helper to update the Leader's commit index based on a quorum of peer
 /// match_indices.
-async fn update_leader_commit_index(node: &mut RaftNode<Leader>) {
+async fn update_leader_commit_index(node: &mut LogicalNode) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
-    let mut match_indices: Vec<LogIndex> = node.state().match_index().values().cloned().collect();
-    match_indices.push(last_idx); // Include self
-    match_indices.sort_unstable();
+    let (median_idx, commit_idx) = if let LogicalNode::Leader(n) = node {
+        let mut match_indices: Vec<LogIndex> = n.state().match_index().values().cloned().collect();
+        match_indices.push(last_idx); // Include self
+        match_indices.sort_unstable();
 
-    // The index that is replicated on a majority of nodes.
-    // For 3 nodes, index 1 (middle element of sorted [idx1, idx2, idx3]).
-    let quorum_idx = match_indices[(match_indices.len() - 1) / 2];
+        // The index that is replicated on a majority of nodes.
+        // For 3 nodes, index 1 (middle element of sorted [idx1, idx2, idx3]).
+        let median = match_indices[(match_indices.len() - 1) / 2];
+        (median, node.commit_index())
+    } else {
+        return;
+    };
 
-    if quorum_idx > node.commit_index() && node.get_term_at(quorum_idx) == current_term {
-        info!("Quorum reached for log index {}. Committing.", quorum_idx);
-        node.set_commit_index(quorum_idx).await;
+    if median_idx > commit_idx && node.get_term_at(median_idx) == current_term {
+        info!("Quorum reached for log index {}. Committing.", median_idx);
+        node.set_commit_index(median_idx).await;
     }
 }
 
@@ -661,6 +670,7 @@ mod tests {
 
     use super::*;
     use crate::engine::Follower;
+    use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
 
     #[derive(Debug, Default)]
@@ -769,12 +779,9 @@ mod tests {
             // Start as Candidate
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => LogicalNode::Candidate(n.into_candidate()),
-                    other => other,
-                });
+                guard.into_candidate();
             }
-            let initial_term = state.read().await.current_term();
+            let initial_term = state.read().await.try_current_term().unwrap();
 
             spawn_election_timer(config, state.clone(), peer_manager);
 
@@ -784,7 +791,7 @@ mod tests {
             let guard = state.read().await;
             assert!(matches!(&*guard, LogicalNode::Candidate(_)));
             assert!(
-                guard.current_term() > initial_term,
+                guard.try_current_term().unwrap() > initial_term,
                 "Candidate should have incremented term due to timeout"
             );
         }
@@ -796,12 +803,8 @@ mod tests {
             // Start as Leader
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![]))
-                    }
-                    other => other,
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![]);
             }
 
             spawn_election_timer(config, state.clone(), peer_manager);
@@ -813,7 +816,7 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 let term = guard.current_term();
-                guard.transition(|old| old.into_follower(term, None));
+                guard.into_follower(term, None);
             }
 
             // If the timer task returned when it was Leader (the bug), it won't trigger
@@ -850,7 +853,7 @@ mod tests {
 
             let guard = state.read().await;
             assert!(matches!(&*guard, LogicalNode::Follower(_)));
-            assert_eq!(guard.current_term(), Term::new(2));
+            assert_eq!(guard.try_current_term().unwrap(), Term::new(2));
         }
 
         #[tokio::test]
@@ -862,10 +865,7 @@ mod tests {
             // Transition to Candidate manually
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => LogicalNode::Candidate(n.into_candidate()),
-                    _ => panic!("Setup failed"),
-                });
+                guard.into_candidate();
             }
 
             let res = Ok(VoteOutcome {
@@ -896,12 +896,8 @@ mod tests {
             // Transition to Leader manually
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![peer_id]))
-                    }
-                    _ => panic!("Setup failed"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![peer_id]);
             }
 
             let res = Ok(Some(ReplicationOutcome {
@@ -934,12 +930,8 @@ mod tests {
             // Transition to Leader manually
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        LogicalNode::Leader(n.into_candidate().into_leader(vec![peer_id]))
-                    }
-                    _ => panic!("Setup failed"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![peer_id]);
             }
 
             // Manually set a high next_index to test optimization
@@ -985,22 +977,19 @@ mod tests {
             // Transition to Leader manually and add dummy log entries
             {
                 let mut guard = state.write().await;
-                guard.transition(|old| match old {
-                    LogicalNode::Follower(n) => {
-                        let mut leader = n.into_candidate().into_leader(vec![peer_id_2, peer_id_3]);
-                        // Add 5 entries in current term
-                        let entries: Vec<_> = (1..=5)
-                            .map(|i| common::proto::v1::raft::LogEntry {
-                                index: i,
-                                term: 1,
-                                data: vec![],
-                            })
-                            .collect();
-                        leader.storage_mut().append_entries(entries).unwrap();
-                        LogicalNode::Leader(leader)
-                    }
-                    _ => panic!("Setup failed"),
-                });
+                guard.into_candidate();
+                guard.into_leader(vec![peer_id_2, peer_id_3]);
+                if let LogicalNode::Leader(leader) = &mut *guard {
+                    // Add 5 entries in current term
+                    let entries: Vec<_> = (1..=5)
+                        .map(|i| common::proto::v1::raft::LogEntry {
+                            index: i,
+                            term: 1,
+                            data: vec![],
+                        })
+                        .collect();
+                    leader.storage_mut().append_entries(entries).unwrap();
+                }
             }
 
             {
@@ -1015,12 +1004,9 @@ mod tests {
                     node.state_mut()
                         .match_index_mut()
                         .insert(peer_id_3, LogIndex::new(1));
-
-                    update_leader_commit_index(node).await;
-
-                    // Sorted: [1, 4, 5]. Median is 4.
-                    assert_eq!(node.commit_index().value(), 4);
                 }
+                update_leader_commit_index(&mut guard).await;
+                assert_eq!(guard.commit_index().value(), 4);
             }
         }
     }
