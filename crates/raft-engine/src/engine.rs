@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use common::proto::v1::raft::LogEntry;
 use common::types::ClusterId;
 use common::types::LogIndex;
@@ -438,7 +440,7 @@ impl LogicalNode {
         delegate_to_inner!(self, node_id)
     }
 
-    pub fn identity(&self) -> &NodeIdentity {
+    pub fn identity(&self) -> Arc<NodeIdentity> {
         delegate_to_inner!(self, identity)
     }
 
@@ -475,8 +477,11 @@ mod tests {
         }
     }
 
-    fn test_identity(id: u64) -> NodeIdentity {
-        NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(id))
+    fn test_identity(id: u64) -> Arc<NodeIdentity> {
+        Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            NodeId::new(id),
+        ))
     }
 
     fn setup_node(node_id: u64) -> LogicalNode {

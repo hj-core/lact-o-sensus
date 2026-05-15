@@ -721,7 +721,7 @@ mod tests {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
-        let node = LogicalNode::Follower(RaftNode::<Follower>::new((*id).clone(), fsm, storage));
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.clone(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
         (config, state, peer_manager)

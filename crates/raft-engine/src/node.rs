@@ -110,7 +110,7 @@ impl NodeState for Leader {}
 /// high-level orchestrator shell.
 #[derive(Debug)]
 pub struct RaftNode<S: NodeState> {
-    identity: NodeIdentity,
+    identity: Arc<NodeIdentity>,
     fsm: Arc<dyn StateMachine>,
     storage: Arc<dyn LogStorage>,
 
@@ -138,8 +138,8 @@ impl<S: NodeState> RaftNode<S> {
         self.identity.node_id()
     }
 
-    pub fn identity(&self) -> &NodeIdentity {
-        &self.identity
+    pub fn identity(&self) -> Arc<NodeIdentity> {
+        self.identity.clone()
     }
 
     pub fn current_term(&self) -> Result<Term, NodeError> {
@@ -337,10 +337,11 @@ impl<S: NodeState> RaftNode<S> {
         self.signal_counter += 1;
     }
 
+    #[allow(clippy::type_complexity)]
     fn into_parts(
         self,
     ) -> (
-        NodeIdentity,
+        Arc<NodeIdentity>,
         Arc<dyn StateMachine>,
         Arc<dyn LogStorage>,
         LogIndex,
@@ -364,7 +365,7 @@ impl<S: NodeState> RaftNode<S> {
 
 impl RaftNode<Follower> {
     pub fn new(
-        identity: NodeIdentity,
+        identity: Arc<NodeIdentity>,
         fsm: Arc<dyn StateMachine>,
         storage: Arc<dyn LogStorage>,
     ) -> Self {
@@ -745,8 +746,11 @@ mod tests {
         }
     }
 
-    fn test_identity(id: u64) -> NodeIdentity {
-        NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(id))
+    fn test_identity(id: u64) -> Arc<NodeIdentity> {
+        Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            NodeId::new(id),
+        ))
     }
 
     mod shared_primitives {
