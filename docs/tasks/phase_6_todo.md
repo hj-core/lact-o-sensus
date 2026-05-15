@@ -79,21 +79,21 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Security test: Verify that firewall error messages do not disclose internal sequence numbers.
   - [x] Integration test: Verify that a client receives the exact same response (with justification and timestamp) when retrying a mutation after a leader failover.
 
-### Step 3.3: FSM Recovery (Cold-Boot Replay)
+### Step 3.3: FSM Recovery (Cold-Boot Replay) [DONE]
 
 **Commit:** `feat(raft): implement cold-boot FSM recovery loop`
 
 - **Description:** Synchronize the State Machine with the Consensus Log during startup.
 - **Changes:**
-  - [ ] Implement `RecoveryManager` in `crates/raft-engine/src/recovery.rs` to decouple replay logic from the composition root.
-  - [ ] Implement the replay loop: compare `fsm.last_applied_index()` with `storage.commit_index()` and apply missing entries.
-  - [ ] **Safety Barrier:** Implement the **Poison-then-Panic** protocol if `fsm > storage.commit` (indicates log regression or disk corruption).
-  - [ ] Integrate recovery into `node-server/src/main.rs` to block gRPC listener start until state convergence is achieved.
+  - [x] Implement `RecoveryManager` in `crates/raft-engine/src/recovery.rs` to decouple replay logic from the composition root.
+  - [x] Implement the replay loop: compare `fsm.last_applied_index()` with `storage.commit_index()` and apply missing entries.
+  - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol if `fsm > storage.commit` (indicates log regression or disk corruption).
+  - [x] Integrate recovery into `node-server/src/main.rs` to block gRPC listener start until state convergence is achieved.
 - **Acceptance Tests (TDD):**
-  - [ ] **Unit Test (Recovery Logic):** Verify that `RecoveryManager` correctly identifies and applies missing log entries.
-  - [ ] **Unit Test (Safety Guard):** Verify that `RecoveryManager` triggers `Poison-then-Panic` (fatal error) if the FSM index is ahead of the Log's commit index.
-  - [ ] **Integration Test (Cold-Boot Convergence):** Verify that a node killed after a log commit but before FSM apply correctly recovers state on restart.
-  - [ ] **Stress Test (Idempotent Chaos):** Verify that replaying the entire log (via manual index reset) results in an identical final state.
+  - [x] **Unit Test (Recovery Logic):** Verify that `RecoveryManager` correctly identifies and applies missing log entries.
+  - [x] **Unit Test (Safety Guard):** Verify that `RecoveryManager` triggers `Poison-then-Panic` (fatal error) if the FSM index is ahead of the Log's commit index.
+  - [x] **Integration Test (Cold-Boot Convergence):** Verify that a node killed after a log commit but before FSM apply correctly recovers state on restart.
+  - [x] **Stress Test (Idempotent Chaos):** Verify that replaying the entire log (via manual index reset) results in an identical final state.
 
 ### Step 4: Exactly-Once Semantics (EOS) Barrier
 
@@ -106,14 +106,12 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 - **Acceptance Tests (TDD):**
   - [ ] Unit test: Query requests block and eventually resolve when the FSM index advances past `min_state_version`.
 
-### Step 5: The Halt Mandate & Chaos Testing
-
 ### Step 5: The Halt Mandate & Chaos Testing [IN PROGRESS]
 
 - **Description:** Guarantee safety by implementing the mandatory Poison-then-Panic machinery (ADR 009). This ensures that any node detecting an invariant violation (FSM failure, storage corruption, or recovery divergence) immediately halts to prevent cluster-wide state drift.
 - **Changes:**
   - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
-  - [ ] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (already partially planned in Step 3.3).
+  - [x] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (already partially planned in Step 3.3).
   - [ ] **Chaos Engineering:** Expand `smoke_test.py` to aggressively kill nodes during mutation proposals and verify recovery stability.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
@@ -123,6 +121,5 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 📈 Completion Status
 
-- **Total Progress:** 76%
-- **Current Focus:** Step 3.3: FSM Recovery (Cold-Boot Replay)
-
+- **Total Progress:** 84%
+- **Current Focus:** Step 4: Exactly-Once Semantics (EOS) Barrier
