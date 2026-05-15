@@ -727,10 +727,10 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     # 2. Add test items to ensure non-zero log index
-    print("Action: Adding test items (milk, bread)...")
+    print("Action: Adding test items (milk, apple)...")
     run_client_command('add "milk" 1 l LiquefiedHydration', leader_port)
     output = run_client_command(
-        'add "bread" 1 units NutrientSparseCommodities', leader_port
+        'add "apple" 1 units PrimaryFlora', leader_port
     )
     version = extract_version(output)
     if version == 0:
@@ -741,7 +741,9 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     # 3. Kill the node FIRST, then record log offset
     cluster.kill_node(follower_id)
     log_path = next(n["log"] for n in NODES if n["id"] == follower_id)
-    log_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    log_offset = (
+        os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    )
 
     # 4. Surgical Wipe: Delete ONLY the FSM database of the follower
     fsm_path = f"data/node_{follower_id}/fsm"
@@ -762,7 +764,10 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     start_time = time.time()
     while (time.time() - start_time) < 15.0:
         for line in get_complete_lines(log_path, log_offset):
-            if "Recovery: REPLAY COMPLETE" in line and str(version) in line:
+            if (
+                "Recovery: REPLAY COMPLETE" in line
+                and str(version) in line
+            ):
                 recovered = True
             # FSM marker proving the data was actually applied to the DB
             if f"FSM[{version}]:" in line:
@@ -837,6 +842,7 @@ def main() -> None:
         (
             "Cold-Boot Recovery (Log Replay)",
             True,
+            # pylint: disable=W0108
             lambda c: test_cold_boot_recovery(c),
         ),
     ]
