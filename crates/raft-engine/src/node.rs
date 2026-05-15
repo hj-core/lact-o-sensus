@@ -259,6 +259,12 @@ impl<S: NodeState> RaftNode<S> {
         }
 
         if index > self.commit_index {
+            // Persist commit_index BEFORE applying to FSM to ensure safety
+            // across crashes.
+            self.storage
+                .save_commit_index(index)
+                .map_err(NodeError::from)?;
+
             self.commit_index = index;
             self.apply_to_state_machine().await?;
             self.increment_signal();
@@ -269,6 +275,15 @@ impl<S: NodeState> RaftNode<S> {
     /// Orchestrates the sequential application of committed log entries to the
     /// State Machine.
     async fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
+        // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
+        let fsm_last = self.fsm.last_applied_index().map_err(NodeError::from)?;
+        if fsm_last > self.commit_index {
+            return Err(NodeError::Logical(format!(
+                "FSM index {} is ahead of commit_index {}. Possible log regression.",
+                fsm_last, self.commit_index
+            )));
+        }
+
         while self.last_applied < self.commit_index {
             let apply_idx = self.last_applied + 1;
             let entry = self.storage.read_entry(apply_idx)?.ok_or_else(|| {
@@ -353,13 +368,17 @@ impl RaftNode<Follower> {
         fsm: Arc<dyn StateMachine>,
         storage: Box<dyn LogStorage>,
     ) -> Self {
-        let initial_index = fsm.last_applied_index();
+        let last_applied = fsm.last_applied_index().expect("FSM corruption at startup");
+        let commit_index = storage
+            .commit_index()
+            .expect("Log storage corruption at startup");
+
         Self {
             identity,
             fsm,
             storage,
-            commit_index: initial_index,
-            last_applied: initial_index,
+            commit_index,
+            last_applied,
             signal_counter: 0,
             state: Follower::new(None),
         }
@@ -715,8 +734,8 @@ mod tests {
 
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> LogIndex {
-            LogIndex::ZERO
+        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+            Ok(LogIndex::ZERO)
         }
 
         async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
@@ -742,6 +761,58 @@ mod tests {
             let result = node.set_term(Term::new(5));
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("regression"));
+        }
+
+        #[tokio::test]
+        async fn set_commit_index_persists_to_storage() {
+            let fsm = Arc::new(MockFsm::default());
+            let mut storage = MemoryStorage::new();
+            storage
+                .append_entries(vec![LogEntry {
+                    index: 1,
+                    term: 1,
+                    data: vec![],
+                }])
+                .unwrap();
+            let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, Box::new(storage));
+
+            node.set_commit_index(LogIndex::new(1)).await.unwrap();
+
+            assert_eq!(node.storage.commit_index().unwrap(), LogIndex::new(1));
+        }
+
+        #[tokio::test]
+        async fn apply_to_state_machine_detects_fsm_regression() {
+            // Manually advance FSM index beyond commit_index
+            // Note: In real life this would happen due to disk corruption or log loss
+            // We'll mock it by returning a high index from MockFsm.
+            #[derive(Debug, Default)]
+            struct RegressionFsm;
+            #[async_trait]
+            impl StateMachine for RegressionFsm {
+                fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+                    Ok(LogIndex::new(100))
+                }
+
+                async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+                    Ok(())
+                }
+            }
+
+            let mut node = RaftNode::<Follower>::new(
+                test_identity(1),
+                Arc::new(RegressionFsm),
+                Box::new(MemoryStorage::new()),
+            );
+
+            let result = node.apply_to_state_machine().await;
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ahead of commit_index")
+            );
         }
 
         #[tokio::test]
@@ -842,8 +913,8 @@ mod tests {
             struct PoisonFsm;
             #[async_trait]
             impl StateMachine for PoisonFsm {
-                fn last_applied_index(&self) -> LogIndex {
-                    LogIndex::ZERO
+                fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+                    Ok(LogIndex::ZERO)
                 }
 
                 async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {

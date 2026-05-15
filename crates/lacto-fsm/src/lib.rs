@@ -179,22 +179,26 @@ impl InventoryReader for LactoStore {
     }
 
     async fn current_version(&self) -> LogIndex {
-        StateMachine::last_applied_index(self)
+        StateMachine::last_applied_index(self).unwrap_or(LogIndex::ZERO)
     }
 }
 
 #[async_trait]
 impl StateMachine for LactoStore {
-    fn last_applied_index(&self) -> LogIndex {
+    fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
         self.meta
             .get(Self::KEY_LAST_APPLIED)
-            .ok()
-            .flatten()
+            .map_err(|e| {
+                FsmError::persistence(format!("Failed to read last_applied index: {}", e))
+            })?
             .map(|k| {
-                let bytes: [u8; 8] = k.as_ref().try_into().unwrap_or([0; 8]);
-                LogIndex::new(u64::from_be_bytes(bytes))
+                let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
+                    FsmError::deserialization("last_applied index byte conversion failed")
+                })?;
+                Ok(LogIndex::new(u64::from_be_bytes(bytes)))
             })
-            .unwrap_or(LogIndex::ZERO)
+            .transpose()
+            .map(|opt| opt.unwrap_or(LogIndex::ZERO))
     }
 
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
@@ -206,7 +210,7 @@ impl StateMachine for LactoStore {
         })?;
 
         // 1. Physical Log Monotonicity (Physical Fence)
-        let current_applied = self.last_applied_index();
+        let current_applied = self.last_applied_index()?;
         if index != current_applied + 1 {
             return Err(FsmError::invariant(format!(
                 "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
@@ -420,7 +424,7 @@ mod tests {
                 store.apply(LogIndex::new(1), &data).await.unwrap();
                 store.apply(LogIndex::new(2), &data).await.unwrap();
 
-                assert_eq!(store.last_applied_index(), LogIndex::new(2));
+                assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(2));
                 assert_eq!(store.get_inventory().await.len(), 1);
             }
 
@@ -443,7 +447,7 @@ mod tests {
 
                 // Late arrival of seq 1 at Index 3
                 store.apply(LogIndex::new(3), &data1).await.unwrap();
-                assert_eq!(store.last_applied_index(), LogIndex::new(3));
+                assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(3));
             }
 
             #[tokio::test]
@@ -554,7 +558,7 @@ mod tests {
                 {
                     let db = sled::open(db_path).unwrap();
                     let store = LactoStore::new(db).unwrap();
-                    assert_eq!(store.last_applied_index(), LogIndex::new(1));
+                    assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(1));
                     assert_eq!(store.get_inventory().await.len(), 1);
                 }
             }

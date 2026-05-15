@@ -58,7 +58,7 @@ pub trait StateMachine: Send + Sync + Debug {
     ///
     /// Used by the Raft engine during startup to align volatile pointers
     /// with persistent application state.
-    fn last_applied_index(&self) -> LogIndex;
+    fn last_applied_index(&self) -> Result<LogIndex, FsmError>;
 
     /// Applies a committed log entry to the application state.
     ///

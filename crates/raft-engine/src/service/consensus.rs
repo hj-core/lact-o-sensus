@@ -152,8 +152,8 @@ mod tests {
     struct MockFsm;
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> LogIndex {
-            LogIndex::ZERO
+        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+            Ok(LogIndex::ZERO)
         }
 
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {

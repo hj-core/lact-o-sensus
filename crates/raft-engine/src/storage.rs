@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -10,13 +12,16 @@ use prost::Message;
 /// Implementations are responsible for persisting the Hard State (Term, Vote)
 /// and the Log entries to stable storage, ensuring crash-recovery mandates
 /// (ADR 001) are met via synchronous flushing.
-pub trait LogStorage: Send + Sync + std::fmt::Debug {
+pub trait LogStorage: Send + Sync + Debug {
     // --- Persistent State Accessors ---
 
     fn current_term(&self) -> Result<Term, LogStorageError>;
     fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError>;
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError>;
     fn last_log_term(&self) -> Result<Term, LogStorageError>;
+
+    /// Returns the last committed log index known to this node.
+    fn commit_index(&self) -> Result<LogIndex, LogStorageError>;
 
     /// Retrieves a single log entry by its index.
     ///
@@ -37,6 +42,10 @@ pub trait LogStorage: Send + Sync + std::fmt::Debug {
     /// Persists the Raft Hard State (Term and Vote).
     /// MUST perform a synchronous flush to disk.
     fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError>;
+
+    /// Persists the Raft commit index.
+    /// MUST perform a synchronous flush to disk.
+    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError>;
 
     /// Appends a batch of entries to the log.
     /// MUST perform a synchronous flush to disk.
@@ -65,6 +74,7 @@ pub struct SledStorage {
 }
 
 impl SledStorage {
+    const KEY_COMMIT_INDEX: &'static [u8] = b"commit_index";
     const KEY_HARD_STATE: &'static [u8] = b"hard_state";
     const TREE_LOG: &'static str = "log";
     const TREE_META: &'static str = "meta";
@@ -178,6 +188,22 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))
     }
 
+    fn commit_index(&self) -> Result<LogIndex, LogStorageError> {
+        self.meta
+            .get(Self::KEY_COMMIT_INDEX)
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to read commit_index: {}", e))
+            })?
+            .map(|k| {
+                let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
+                    LogStorageError::deserialization("commit_index byte conversion failed")
+                })?;
+                Ok(LogIndex::new(u64::from_be_bytes(bytes)))
+            })
+            .transpose()
+            .map(|opt| opt.unwrap_or(LogIndex::ZERO))
+    }
+
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         let key = index.value().to_be_bytes();
         self.log
@@ -240,6 +266,18 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
+    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+        self.meta
+            .insert(Self::KEY_COMMIT_INDEX, &index.value().to_be_bytes())
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to persist commit_index: {}", e))
+            })?;
+        self.db
+            .flush()
+            .map_err(|e| LogStorageError::persistence(format!("Sled flush failure: {}", e)))?;
+        Ok(())
+    }
+
     fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for entry in entries {
@@ -282,6 +320,7 @@ impl LogStorage for SledStorage {
 pub struct MemoryStorage {
     current_term: Term,
     voted_for: Option<NodeId>,
+    commit_index: LogIndex,
     /// 1-indexed vector of consensus entries.
     ///
     /// Index 0 in the vector corresponds to LogIndex(1).
@@ -293,6 +332,7 @@ impl Default for MemoryStorage {
         Self {
             current_term: Term::ZERO,
             voted_for: None,
+            commit_index: LogIndex::ZERO,
             log: Vec::new(),
         }
     }
@@ -330,6 +370,10 @@ impl LogStorage for MemoryStorage {
             .unwrap_or(Term::ZERO))
     }
 
+    fn commit_index(&self) -> Result<LogIndex, LogStorageError> {
+        Ok(self.commit_index)
+    }
+
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         if index == LogIndex::ZERO {
             return Ok(None);
@@ -364,6 +408,11 @@ impl LogStorage for MemoryStorage {
     fn save_hard_state(&mut self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         self.current_term = term;
         self.voted_for = vote;
+        Ok(())
+    }
+
+    fn save_commit_index(&mut self, index: LogIndex) -> Result<(), LogStorageError> {
+        self.commit_index = index;
         Ok(())
     }
 
@@ -416,6 +465,16 @@ mod tests {
 
             assert_eq!(storage.current_term().unwrap(), term);
             assert_eq!(storage.voted_for().unwrap(), vote);
+        }
+
+        #[test]
+        fn persists_commit_index() {
+            let mut storage = setup_storage();
+            let index = LogIndex::new(42);
+
+            storage.save_commit_index(index).unwrap();
+
+            assert_eq!(storage.commit_index().unwrap(), index);
         }
 
         #[test]
@@ -533,6 +592,16 @@ mod tests {
 
             assert_eq!(storage.current_term().unwrap(), term);
             assert_eq!(storage.voted_for().unwrap(), vote);
+        }
+
+        #[test]
+        fn persists_commit_index() {
+            let mut storage = MemoryStorage::new();
+            let index = LogIndex::new(42);
+
+            storage.save_commit_index(index).unwrap();
+
+            assert_eq!(storage.commit_index().unwrap(), index);
         }
 
         #[test]
