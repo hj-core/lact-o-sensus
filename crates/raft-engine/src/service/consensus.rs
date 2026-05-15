@@ -34,16 +34,15 @@ impl ConsensusDispatcher {
     }
 
     /// Verifies that the node engine is healthy and matches the service
-    /// node ID.
+    /// identity.
     fn verify_node_integrity(&self, node: &mut LogicalNode) -> Result<(), Status> {
-        let engine_node_id = node.node_id();
-        if engine_node_id == self.identity.node_id() {
+        let engine_id = node.identity();
+        if engine_id == &*self.identity {
             Ok(())
         } else {
             let msg = format!(
-                "Node ID divergence detected! ServiceNodeID='{}' EngineNodeID='{}'",
-                self.identity.node_id(),
-                engine_node_id
+                "Identity divergence detected! ServiceIdentity='{:?}' EngineIdentity='{:?}'",
+                self.identity, engine_id
             );
             // ADR 009: Poison the node via apply_fatal before panicking.
             node.apply_fatal(NodeError::Identity(msg));
@@ -146,7 +145,6 @@ mod tests {
 
     use super::*;
     use crate::engine::Follower;
-    use crate::engine::LogicalNode;
     use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
 
@@ -163,18 +161,19 @@ mod tests {
         }
     }
 
+    fn test_identity(id: u64) -> NodeIdentity {
+        NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(id))
+    }
+
     fn mock_identity() -> Arc<NodeIdentity> {
-        Arc::new(NodeIdentity::new(
-            ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(1),
-        ))
+        Arc::new(test_identity(1))
     }
 
     fn mock_dispatcher() -> ConsensusDispatcher {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Box::new(MemoryStorage::new());
-        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.node_id(), fsm, storage));
+        let node = LogicalNode::Follower(RaftNode::<Follower>::new((*id).clone(), fsm, storage));
         let state = Arc::new(ConsensusShell::new(node));
         ConsensusDispatcher::new(id, state)
     }
@@ -208,17 +207,41 @@ mod tests {
         }
 
         #[tokio::test]
-        #[should_panic(expected = "Identity Integrity Violation: Node ID divergence detected")]
-        async fn panics_on_identity_mismatch() {
+        #[should_panic(expected = "Identity Integrity Violation: Identity divergence detected")]
+        async fn panics_on_node_id_mismatch() {
             let id = mock_identity();
-            // Create a node with a DIFFERENT identity (different node_id)
             let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
+            // Different NodeId, same ClusterId
             let node =
-                LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm, storage));
+                LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
             let state = Arc::new(ConsensusShell::new(node));
 
-            // Use the original ID for the dispatcher but the wrong ID for the node
+            let dispatcher = ConsensusDispatcher::new(id, state);
+
+            let req = Request::new(RequestVoteRequest {
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            let _ = dispatcher.request_vote(req).await;
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "Identity Integrity Violation: Identity divergence detected")]
+        async fn panics_on_cluster_id_mismatch() {
+            let id = mock_identity();
+            let fsm = Arc::new(MockFsm);
+            let storage = Box::new(MemoryStorage::new());
+            // Same NodeId, different ClusterId
+            let cluster_mismatch =
+                NodeIdentity::new(ClusterId::try_new("wrong-cluster").unwrap(), id.node_id());
+            let node =
+                LogicalNode::Follower(RaftNode::<Follower>::new(cluster_mismatch, fsm, storage));
+            let state = Arc::new(ConsensusShell::new(node));
+
             let dispatcher = ConsensusDispatcher::new(id, state);
 
             let req = Request::new(RequestVoteRequest {
@@ -237,7 +260,7 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             let node =
-                LogicalNode::Follower(RaftNode::<Follower>::new(NodeId::new(99), fsm, storage));
+                LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
             let state = Arc::new(ConsensusShell::new(node));
             let dispatcher = ConsensusDispatcher::new(id, state.clone());
 
@@ -262,7 +285,7 @@ mod tests {
     }
 
     mod request_vote {
-        use common::proto::v1::LogEntry;
+        use common::proto::v1::raft::LogEntry;
 
         use super::*;
 
@@ -485,7 +508,7 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
-            let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
+            let follower = RaftNode::<Follower>::new((*id).clone(), fsm, storage);
             let candidate = follower.into_candidate().unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
@@ -514,7 +537,7 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Box::new(MemoryStorage::new());
             // Start as Leader term 1
-            let follower = RaftNode::<Follower>::new(id.node_id(), fsm, storage);
+            let follower = RaftNode::<Follower>::new((*id).clone(), fsm, storage);
             let candidate = follower.into_candidate().unwrap();
             let leader = candidate.into_leader(Vec::new()).unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));

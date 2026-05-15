@@ -1,6 +1,8 @@
 use common::proto::v1::raft::LogEntry;
+use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
+use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
@@ -428,8 +430,16 @@ impl LogicalNode {
         matches!(self, LogicalNode::Poisoned)
     }
 
+    pub fn cluster_id(&self) -> &ClusterId {
+        delegate_to_inner!(self, cluster_id)
+    }
+
     pub fn node_id(&self) -> NodeId {
         delegate_to_inner!(self, node_id)
+    }
+
+    pub fn identity(&self) -> &NodeIdentity {
+        delegate_to_inner!(self, identity)
     }
 
     pub fn commit_index(&self) -> LogIndex {
@@ -465,11 +475,15 @@ mod tests {
         }
     }
 
+    fn test_identity(id: u64) -> NodeIdentity {
+        NodeIdentity::new(ClusterId::try_new("test-cluster").unwrap(), NodeId::new(id))
+    }
+
     fn setup_node(node_id: u64) -> LogicalNode {
         let fsm = Arc::new(MockFsm);
         let storage = Box::new(MemoryStorage::new());
         LogicalNode::Follower(RaftNode::<Follower>::new(
-            NodeId::new(node_id),
+            test_identity(node_id),
             fsm,
             storage,
         ))

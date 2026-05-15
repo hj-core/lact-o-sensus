@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
     );
 
-    let initial_node = RaftNode::<Follower>::new(identity.node_id(), fsm.clone(), storage);
+    let initial_node = RaftNode::<Follower>::new((*identity).clone(), fsm.clone(), storage);
     let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)
