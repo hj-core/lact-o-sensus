@@ -116,20 +116,21 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] Unit test: `rejects_query_exceeding_horizon` verifies the strict EOS boundary.
   - [x] Integration test: `Read-Your-Writes Consistency` smoke test verifies end-to-end synchronization.
 
-### Step 5: The Halt Mandate & Chaos Testing [IN PROGRESS]
+### Step 5: The Halt Mandate & Chaos Testing [DONE]
 
 - **Description:** Guarantee safety by implementing the mandatory Poison-then-Panic machinery (ADR 009). This ensures that any node detecting an invariant violation (FSM failure, storage corruption, or recovery divergence) immediately halts to prevent cluster-wide state drift.
 - **Changes:**
   - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
   - [x] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery.
-  - [ ] **Chaos Engineering:** Expand `smoke_test.py` to aggressively kill nodes during mutation proposals and verify recovery stability.
+  - [x] **Chaos Engineering:** Expand `smoke_test.py` with the **Replication Chaos Audit**, verifying data integrity under concurrent pressure.
+  - [x] **Robustness Audit:** Implement Raft-native **Term Sovereignty** in the test runner to ensure deterministic leader discovery during rapid failover.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
-  - [ ] Integration test: "Chaos Testing" verifies 100% data integrity across all 3 nodes after SIGKILL during active replication.
+  - [x] Integration test: **Replication Chaos Audit** verifies 100% data integrity and state machine parity across all 3 nodes after randomized SIGKILL during active replication.
 
 ---
 
 ## 📈 Completion Status
 
-- **Total Progress:** 90%
-- **Current Focus:** Step 5: The Halt Mandate & Chaos Testing
+- **Total Progress:** 100%
+- **Current Focus:** Phase 6 Complete (Persistence & EOS)

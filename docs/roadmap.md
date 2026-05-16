@@ -70,20 +70,20 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures.
 - **Success Metric:** Messy user input is correctly resolved and vetoed by the LLM based on context-aware moral judgement.
 
-## 🛡️ Phase 6: Persistence & Session Integrity (sled & EOS)
+## 🛡️ Phase 6: Persistence & Session Integrity (sled & EOS) [DONE]
 
 - **Goal:** Implement Exactly-Once Semantics and transition to high-fidelity persistent disk storage.
 - **Key Actions:**
-  - **Consistent Query Path:** Implement the `SessionProvider` and `InventoryReader` traits and the `query_state` RPC with Quorum Read verification (ADR 007). [DONE]
-  - **Unified Ledger Alignment**: Record all AI evaluation outcomes (Approvals and Vetoes) as first-class consensus events to ensure ledger continuity (ADR 006). [DONE]
-  - **Isolated Persistent Storage:** Transition Raft logs, FSM inventory, and system identity to dedicated `sled` database trees with synchronous `fsync` (ADR 001/009). [IN PROGRESS]
+  - **Consistent Query Path:** Implement the `SessionProvider` and `InventoryReader` traits and the `query_state` RPC with Quorum Read verification (ADR 007).
+  - **Unified Ledger Alignment**: Record all AI evaluation outcomes (Approvals and Vetoes) as first-class consensus events to ensure ledger continuity (ADR 006).
+  - **Isolated Persistent Storage:** Transition Raft logs, FSM inventory, and system identity to dedicated `sled` database trees with synchronous `fsync` (ADR 001/009).
   - **Eternal Session Table:** Implement the Session Table as **Permanent Metadata** to prevent the Double-Bootstrap hazard. Deduplicate requests and provide linearizable replays.
   - **Opaque Clinical Reporting:** Implement the `**Secure Clinical**` error standard to prevent session probing and information disclosure.
   - **Stateful Temporal Determinism:** Maintain a persistent logical clock (`last_effective_time`) derived from consensus log timestamps to ensure temporal consistency across the cluster.
   - **The Halt Mandate:** Implement the **Poison-then-Panic** sequence (ADR 009) to prevent "Zombie Node" behavior during state machine or session table divergence.
 - **Success Metric:** Idempotent recovery from the log with 100% linearizability and zero internal state disclosure in error responses.
 
-## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting)
+## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting) [IN PROGRESS]
 
 - **Goal:** Implement state machine snapshots to manage log growth and accelerate recovery.
 - **Key Actions:**
