@@ -172,11 +172,30 @@ impl IngressService for IngressDispatcher {
             }));
         }
 
-        // 2. Fetch inventory from the authoritative state machine
+        // 2. Consistent Horizon Check (Strict EOS)
+        // Ensure the client isn't querying for a version that hasn't reached
+        // cluster-wide agreement yet (ADR 006).
+        let status = self.raft_handle.consensus_status().await;
+        if let Some(min_version) = req.min_state_version.filter(|&v| v > 0) {
+            let requested_index = LogIndex::new(min_version);
+
+            if requested_index > status.commit_index {
+                return Err(Status::failed_precondition(
+                    "Requested version exceeds consistent horizon",
+                ));
+            }
+
+            // 3. State Machine Convergence (Wait for apply)
+            if let Err(err) = self.raft_handle.await_apply(requested_index).await {
+                return Err(self.map_consensus_error(err, &status));
+            }
+        }
+
+        // 4. Fetch inventory from the authoritative state machine
         let all_items = self.inventory_reader.get_inventory().await;
         let state_version = self.inventory_reader.current_version().await;
 
-        // 3. Apply semantic filters
+        // 5. Apply semantic filters
         let filtered_items = if let Some(filter) = req.query_filter {
             let filter = filter.to_lowercase();
             all_items
@@ -186,8 +205,6 @@ impl IngressService for IngressDispatcher {
         } else {
             all_items
         };
-
-        // TODO: Step 4 - Wait for min_state_version (EOS Barrier)
 
         Ok(Response::new(QueryStateResponse {
             items: filtered_items,
@@ -805,6 +822,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockRaftHandle {
         is_leader: bool,
+        commit_index: LogIndex,
         leader_hint: String,
         rejection_reason: String,
         proposals: Mutex<Vec<Vec<u8>>>,
@@ -836,6 +854,7 @@ mod tests {
         async fn consensus_status(&self) -> ConsensusStatus {
             ConsensusStatus {
                 is_leader: self.is_leader,
+                commit_index: self.commit_index,
                 leader_hint: self.leader_hint.clone(),
                 rejection_reason: self.rejection_reason.clone(),
             }
@@ -2701,6 +2720,75 @@ mod tests {
             assert_eq!(response_items.len(), 2);
             assert_eq!(response_items[0].item_key, "milk-skim");
             assert_eq!(response_items[1].item_key, "milk-whole");
+        }
+
+        #[tokio::test]
+        async fn rejects_query_when_await_apply_fails() {
+            #[derive(Debug, Default)]
+            struct FailingApplyRaft;
+            #[async_trait]
+            impl ConsensusHandle for FailingApplyRaft {
+                async fn propose(&self, _data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
+                    Ok(LogIndex::new(1))
+                }
+
+                async fn await_commit(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+                    Ok(())
+                }
+
+                async fn await_apply(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+                    Err(ConsensusError::Poisoned)
+                }
+
+                async fn consensus_status(&self) -> ConsensusStatus {
+                    ConsensusStatus {
+                        is_leader: true,
+                        commit_index: LogIndex::new(100),
+                        ..Default::default()
+                    }
+                }
+
+                async fn verify_leadership(&self) -> Result<(), ConsensusError> {
+                    Ok(())
+                }
+            }
+
+            let raft = Arc::new(FailingApplyRaft);
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
+
+            let req = Request::new(QueryStateRequest {
+                query_filter: None,
+                min_state_version: Some(10),
+            });
+
+            let result = dispatcher.query_state(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Aborted);
+            assert!(status.message().contains("fatal state"));
+        }
+
+        #[tokio::test]
+        async fn rejects_query_exceeding_horizon() {
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                commit_index: LogIndex::new(5),
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
+
+            let req = Request::new(QueryStateRequest {
+                query_filter: None,
+                min_state_version: Some(10), // Exceeds horizon (5)
+            });
+
+            let result = dispatcher.query_state(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(status.message().contains("exceeds consistent horizon"));
         }
     }
 }
