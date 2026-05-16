@@ -2,10 +2,12 @@
 import datetime
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, TypedDict, IO, Generator
 
@@ -144,7 +146,7 @@ class ClusterManager:
             self.start_node(node["id"], wipe_data=wipe_data)
 
         # Give nodes time to initialize and Cargo to finish building if necessary
-        time.sleep(2)
+        time.sleep(5)
 
     def kill_node(self, node_id: int) -> float:
         """Kills a specific node and returns kill timestamp in ms."""
@@ -236,20 +238,39 @@ def parse_log_timestamp(line: str) -> float:
 
 
 def find_current_leader() -> Optional[int]:
-    """Robust leader discovery using most recent election event."""
-    leader_id: Optional[int] = None
-    latest_ts: float = -1.0
+    """Robust leader discovery using most recent election event and term sovereignty."""
+    leaders = []  # List of (term, timestamp, node_id)
     for node in NODES:
         for line in get_complete_lines(node["log"], 0):
+            if "Transitioning to Leader" in line:
+                ts = parse_log_timestamp(line)
+                # Try to extract term: "term=4" or "term 4"
+                term_match = re.search(r"term[= ](\d+)", line)
+                term = int(term_match.group(1)) if term_match else 0
+                leaders.append((term, ts, node["id"]))
+
+    if not leaders:
+        return None
+
+    # Sort by term first (Sovereignty), then timestamp
+    leaders.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best_leader = leaders[0]
+
+    leader_term = best_leader[0]
+    latest_ts = best_leader[1]
+    leader_id = best_leader[2]
+
+    # Now verify this leader hasn't demoted in a later log entry
+    for line in get_complete_lines(next(n["log"] for n in NODES if n["id"] == leader_id), 0):
+        if "Demoting to Follower" in line:
             ts = parse_log_timestamp(line)
-            if "Transitioning to Leader" in line and ts >= latest_ts:
-                latest_ts, leader_id = ts, node["id"]
-            if (
-                "Demoting to Follower" in line
-                and ts >= latest_ts
-                and leader_id == node["id"]
-            ):
-                leader_id = None
+            # Try to extract term from demotion if available
+            term_match = re.search(r"term[= ](\d+)", line)
+            demoted_term = int(term_match.group(1)) if term_match else 0
+            
+            # If demoted in the same or higher term, or if timestamp is newer
+            if ts >= latest_ts and demoted_term >= leader_term:
+                return None
     return leader_id
 
 
@@ -834,6 +855,140 @@ def test_read_your_writes_consistency() -> None:
     print("SUCCESS: Read-Your-Writes consistency and Strict Horizon verified.")
 
 
+class MutationFlooder(threading.Thread):
+    """Continuously spams mutations to the cluster in a background thread."""
+
+    GROCERY_LEXICON = ["milk", "bread", "apple", "cheese", "water", "carrot"]
+
+    def __init__(self, cluster: ClusterManager) -> None:
+        super().__init__(daemon=True)
+        self.cluster = cluster
+        self.stop_event = threading.Event()
+        self.successful_items: List[str] = []
+        self.counter = 0
+        self.exception: Optional[Exception] = None
+
+    def run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                self.counter += 1
+                base_name = self.GROCERY_LEXICON[
+                    self.counter % len(self.GROCERY_LEXICON)
+                ]
+                item_name = f"{base_name}_{self.counter}"
+
+                # Dynamic Seed Selection: Pick a living node to avoid stale seeds
+                living_ports = [
+                    n["port"]
+                    for n in NODES
+                    if n["id"] in self.cluster.processes
+                ]
+                if not living_ports:
+                    time.sleep(0.5)
+                    continue
+
+                seed_port = random.choice(living_ports)
+
+                try:
+                    output = run_client_command(
+                        f'add "{item_name}" 1 units PrimaryFlora',
+                        seed_port,
+                        timeout=15,
+                    )
+                    if "SUCCESS: Committed" in output:
+                        print(f"DEBUG: Flooder committed '{item_name}'")
+                        self.successful_items.append(item_name)
+                    else:
+                        # Log failure for visibility
+                        first_line = output.split("\n")[0]
+                        print(f"DEBUG: Flooder failed '{item_name}': {first_line}")
+                except (subprocess.TimeoutExpired, RuntimeError) as e:
+                    print(f"DEBUG: Flooder error '{item_name}': {e}")
+                    pass
+                time.sleep(0.1)
+        except Exception as e:  # pylint: disable=broad-except
+            self.exception = e
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.join()
+
+
+def test_replication_chaos(cluster: ClusterManager) -> None:
+    """Verify data integrity after multiple SIGKILLs during active replication."""
+    wait_for_leader()
+
+    flooder = MutationFlooder(cluster)
+    print("Action: Starting background mutation flood...")
+    flooder.start()
+
+    try:
+        # Perform 3 rounds of chaos
+        for i in range(1, 4):
+            time.sleep(3)  # Let some mutations fly
+            victim_id = random.choice([n["id"] for n in NODES])
+            print(f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---")
+
+            cluster.kill_node(victim_id)
+            time.sleep(2)  # Wait for cluster to react
+
+            print(f"Action: Restarting Node {victim_id}...")
+            cluster.start_node(victim_id, wipe_data=False)
+
+            # Wait for cluster to re-stabilize and elect a leader
+            wait_for_leader(timeout=20)
+
+        print("\nAction: Chaos phase complete. Stopping flood...")
+        flooder.stop()
+        if flooder.exception:
+            raise flooder.exception
+
+        print(
+            f"Action: Flood stopped. {len(flooder.successful_items)} items successfully committed."
+        )
+        if flooder.successful_items:
+            print(f"DEBUG: Expected items: {', '.join(flooder.successful_items)}")
+
+        # 1. Final Convergence Check
+        # Get the highest version among successful mutations
+        # Actually, we can just wait for a bit and then check the leader.
+        time.sleep(3)
+        leader_id = wait_for_leader()
+        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+
+        # 2. Verify Data Parity
+        print("Action: Verifying final inventory parity on Leader...")
+        inventory_output = run_client_command("query", leader_port)
+        print(f"DEBUG: Final Inventory Output:\n{inventory_output}")
+
+        missing_items = []
+        # Normalize output for easier matching
+        normalized_output = inventory_output.lower().replace("_", "")
+        for item in flooder.successful_items:
+            # Check for the item key as a distinct entry in the inventory
+            # We look for the pattern " - {item_name} "
+            search_key = item.lower().replace("_", "")
+            if f"- {search_key} (" not in normalized_output:
+                missing_items.append(item)
+
+        if missing_items:
+            raise RuntimeError(
+                f"Data Integrity Violation! {len(missing_items)} successful items missing from Leader inventory: {missing_items[:5]}..."
+            )
+
+        # 3. Verify Cluster-Wide Convergence via Logs
+        # We check that every node reached at least the same FSM index.
+        # We'll use a conservative version from the leader's output.
+        final_version = extract_version(inventory_output)
+        if final_version > 0:
+            verify_convergence(final_version, "Committed")
+
+        print("SUCCESS: 100% Data Integrity and Parity achieved after Chaos.")
+
+    finally:
+        flooder.stop()
+
+
 # --- Runner Logic ---
 
 
@@ -892,6 +1047,11 @@ def main() -> None:
             "Read-Your-Writes Consistency",
             True,
             lambda c: test_read_your_writes_consistency(),
+        ),
+        (
+            "Replication Chaos Audit",
+            True,
+            lambda c: test_replication_chaos(c),
         ),
     ]
 
