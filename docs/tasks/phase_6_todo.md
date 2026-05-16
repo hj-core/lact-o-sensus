@@ -95,23 +95,33 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] **Integration Test (Cold-Boot Convergence):** Verify that a node killed after a log commit but before FSM apply correctly recovers state on restart.
   - [x] **Stress Test (Idempotent Chaos):** Verify that replaying the entire log (via manual index reset) results in an identical final state.
 
-### Step 4: Exactly-Once Semantics (EOS) Barrier
+### Step 4: Exactly-Once Semantics (EOS) Barrier [DONE]
 
 **Commit:** `feat(gateway): enforce min_state_version for read-your-writes consistency`
 
 - **Description:** Enforce "Read-Your-Writes" consistency by blocking queries until the local State Machine catches up to the client's requested index.
 - **Changes:**
-  - [ ] Update `query_state` to accept and enforce `min_state_version`.
-  - [ ] If the local FSM index is lower than `min_state_version`, asynchronously wait until the state machine catches up (via `tokio::sync::watch` on the Consensus Progress channel).
+  - [x] **Reactive Instrumentation:**
+    - Add `last_applied` to `ConsensusProgress` in `crates/raft-engine/src/node.rs`.
+    - Update `LogicalNode::try_consensus_progress` to populate this field.
+  - [x] **Handle Extension:**
+    - Add `await_apply(index: LogIndex)` to the `ConsensusHandle` trait.
+    - Implement `await_apply` in `LocalRaftHandle` using the `ConsensusShell` subscription.
+    - Update `ConsensusStatus` to include `commit_index` for horizon checks.
+  - [x] **Gateway Enforcement:**
+    - Update `IngressDispatcher::query_state` to extract `min_state_version`.
+    - Implement **Strict Horizon Check**: Reject queries for future-dated versions (Mandate 4.3).
+    - Call `raft_handle.await_apply` before fetching inventory if a version is requested.
 - **Acceptance Tests (TDD):**
-  - [ ] Unit test: Query requests block and eventually resolve when the FSM index advances past `min_state_version`.
+  - [x] Unit test: `rejects_query_exceeding_horizon` verifies the strict EOS boundary.
+  - [x] Integration test: `Read-Your-Writes Consistency` smoke test verifies end-to-end synchronization.
 
 ### Step 5: The Halt Mandate & Chaos Testing [IN PROGRESS]
 
 - **Description:** Guarantee safety by implementing the mandatory Poison-then-Panic machinery (ADR 009). This ensures that any node detecting an invariant violation (FSM failure, storage corruption, or recovery divergence) immediately halts to prevent cluster-wide state drift.
 - **Changes:**
   - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol in `LogicalNode`. Catch FSM `apply` errors and transition the node to `LogicalNode::Poisoned` before panicking.
-  - [x] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery (already partially planned in Step 3.3).
+  - [x] **Recovery Guard:** Implement the `Poison-then-Panic` sequence if the FSM index exceeds the Raft commit index during recovery.
   - [ ] **Chaos Engineering:** Expand `smoke_test.py` to aggressively kill nodes during mutation proposals and verify recovery stability.
 - **Acceptance Tests (TDD):**
   - [x] Unit test: Verify that a node transitions to `Poisoned` and then panics when the FSM returns an Invariant error.
@@ -121,5 +131,5 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 
 ## 📈 Completion Status
 
-- **Total Progress:** 84%
-- **Current Focus:** Step 4: Exactly-Once Semantics (EOS) Barrier
+- **Total Progress:** 90%
+- **Current Focus:** Step 5: The Halt Mandate & Chaos Testing
