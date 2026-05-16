@@ -96,13 +96,37 @@ impl ConsensusHandle for LocalRaftHandle {
         }
     }
 
+    async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError> {
+        let mut progress_rx = self.state.subscribe();
+
+        loop {
+            // Check condition first
+            {
+                let progress = progress_rx.borrow();
+                if progress.is_poisoned {
+                    return Err(ConsensusError::Poisoned);
+                }
+                if progress.last_applied >= index {
+                    return Ok(());
+                }
+            }
+
+            // Park until something changes
+            if progress_rx.changed().await.is_err() {
+                return Err(ConsensusError::Terminated);
+            }
+        }
+    }
+
     async fn consensus_status(&self) -> ConsensusStatus {
+        let progress = *self.state.subscribe().borrow();
         let guard = self.state.read().await;
         let is_leader = matches!(&*guard, LogicalNode::Leader(_));
         let (leader_hint, rejection_reason) = self.calculate_redirection(&guard);
 
         ConsensusStatus {
             is_leader,
+            commit_index: progress.commit_index,
             leader_hint,
             rejection_reason,
         }
@@ -277,6 +301,84 @@ mod tests {
             let result = handle.await_commit(index).await;
             assert!(result.is_err());
             assert_eq!(result.unwrap_err(), ConsensusError::NotLeader);
+        }
+    }
+
+    mod await_apply {
+        use std::time::Duration;
+
+        use common::proto::v1::raft::LogEntry;
+        use tokio::time::sleep;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn succeeds_when_index_is_reached() {
+            let (handle, state) = setup();
+            let index = LogIndex::new(5);
+
+            // Simulate FSM apply in background
+            let state_clone = state.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(10)).await;
+                let mut guard = state_clone.write().await;
+
+                // Advance commit_index (which triggers FSM apply and updates last_applied)
+                // LogicalNode::set_commit_index is role-agnostic.
+                // We first need to ensure the log contains the entries we are committing.
+                if let LogicalNode::Follower(node) = &mut *guard {
+                    let mut entries = Vec::new();
+                    for i in 1..=index.value() {
+                        entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
+                    }
+                    node.storage().append_entries(entries).unwrap();
+                }
+
+                guard.set_commit_index(index).await;
+            });
+
+            let result = handle.await_apply(index).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn succeeds_immediately_if_already_applied() {
+            let (handle, state) = setup();
+            let index = LogIndex::new(5);
+
+            {
+                let mut guard = state.write().await;
+                // Prepare log and advance state
+                if let LogicalNode::Follower(node) = &mut *guard {
+                    let mut entries = Vec::new();
+                    for i in 1..=index.value() {
+                        entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
+                    }
+                    node.storage().append_entries(entries).unwrap();
+                }
+                guard.set_commit_index(index).await;
+            }
+
+            let result = handle.await_apply(index).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn fails_if_node_becomes_poisoned() {
+            let (handle, state) = setup();
+
+            // Start waiting for a high index
+            let wait_task =
+                tokio::spawn(async move { handle.await_apply(LogIndex::new(100)).await });
+
+            sleep(Duration::from_millis(10)).await;
+            {
+                let mut guard = state.write().await;
+                *guard = LogicalNode::Poisoned;
+            }
+
+            let result = wait_task.await.unwrap();
+            assert!(matches!(result, Err(ConsensusError::Poisoned)));
         }
     }
 

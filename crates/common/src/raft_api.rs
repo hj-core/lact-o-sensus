@@ -15,6 +15,8 @@ use crate::types::errors::FsmError;
 pub struct ConsensusStatus {
     /// True if this node currently believes itself to be the leader.
     pub is_leader: bool,
+    /// The current cluster-wide consistent horizon.
+    pub commit_index: LogIndex,
     /// The address of the current leader if known, or an empty string.
     pub leader_hint: String,
     /// A human-readable message explaining why mutations might be rejected.
@@ -34,6 +36,11 @@ pub trait ConsensusHandle: Send + Sync + Debug {
 
     /// Waits until the given index has been committed to a quorum.
     async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError>;
+
+    /// Waits until the given index has been applied to the local state machine.
+    ///
+    /// This is used to enforce Read-Your-Writes consistency (ADR 006).
+    async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError>;
 
     /// Returns a consistent snapshot of the node's current consensus status.
     /// This is preferred over individual checks to ensure atomicity in

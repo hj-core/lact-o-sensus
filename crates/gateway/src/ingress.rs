@@ -829,6 +829,10 @@ mod tests {
             }
         }
 
+        async fn await_apply(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+            Ok(())
+        }
+
         async fn consensus_status(&self) -> ConsensusStatus {
             ConsensusStatus {
                 is_leader: self.is_leader,
@@ -1070,6 +1074,10 @@ mod tests {
 
                 async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {
                     self.mock.await_commit(index).await
+                }
+
+                async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError> {
+                    self.mock.await_apply(index).await
                 }
 
                 async fn consensus_status(&self) -> ConsensusStatus {
@@ -1676,6 +1684,10 @@ mod tests {
                 }
 
                 async fn await_commit(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+                    Ok(())
+                }
+
+                async fn await_apply(&self, _index: LogIndex) -> Result<(), ConsensusError> {
                     Ok(())
                 }
 
