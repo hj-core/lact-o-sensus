@@ -28,6 +28,7 @@ use crate::storage::LogStorage;
 pub struct ConsensusProgress {
     pub term: Term,
     pub commit_index: LogIndex,
+    pub last_applied: LogIndex,
     pub is_poisoned: bool,
     /// Volatile counter representing the logical epoch of the node's consistent
     /// state.

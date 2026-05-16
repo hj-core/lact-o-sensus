@@ -96,6 +96,7 @@ impl<'a> Drop for MutationGuard<'a> {
             ConsensusProgress {
                 term: self.before.term,
                 commit_index: self.before.commit_index,
+                last_applied: self.before.last_applied,
                 is_poisoned: true,
                 signal_counter: self.before.signal_counter + 1,
             }
@@ -103,6 +104,7 @@ impl<'a> Drop for MutationGuard<'a> {
             ConsensusProgress {
                 term: self.before.term,
                 commit_index: self.before.commit_index,
+                last_applied: self.before.last_applied,
                 is_poisoned: true,
                 signal_counter: self.before.signal_counter + 1,
             }

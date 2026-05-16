@@ -414,12 +414,14 @@ impl LogicalNode {
             LogicalNode::Poisoned => Ok(ConsensusProgress {
                 term: Term::ZERO,
                 commit_index: LogIndex::ZERO,
+                last_applied: LogIndex::ZERO,
                 is_poisoned: true,
                 signal_counter: 0,
             }),
             _ => Ok(ConsensusProgress {
                 term: self.try_current_term()?,
                 commit_index: self.commit_index(),
+                last_applied: self.last_applied(),
                 is_poisoned: false,
                 signal_counter: self.signal_counter(),
             }),
@@ -446,6 +448,10 @@ impl LogicalNode {
 
     pub fn commit_index(&self) -> LogIndex {
         delegate_to_inner!(self, commit_index)
+    }
+
+    pub fn last_applied(&self) -> LogIndex {
+        delegate_to_inner!(self, last_applied)
     }
 
     pub fn signal_counter(&self) -> u64 {
