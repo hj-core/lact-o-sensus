@@ -19,6 +19,7 @@ use common::types::NodeId;
 use common::types::SequenceId;
 use rand::RngExt;
 use tokio::sync::RwLock;
+use tonic::Code;
 use tonic::Request;
 use tonic::Status;
 use tonic::transport::Channel;
@@ -290,7 +291,7 @@ impl LactoClient {
                 Err(status) => {
                     // ADR 007: Terminal errors should not be retried.
                     match status.code() {
-                        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+                        Code::InvalidArgument | Code::FailedPrecondition => {
                             anyhow::bail!("Mutation rejected by Leader: {}", status.message());
                         }
                         _ => {
@@ -353,10 +354,15 @@ impl LactoClient {
                         return Ok(res);
                     }
                 },
-                Err(_) => {
-                    self.reconcile_routing_failure(None, retry_count).await?;
-                    continue;
-                }
+                Err(status) => match status.code() {
+                    Code::InvalidArgument | Code::FailedPrecondition => {
+                        anyhow::bail!("Query rejected by Leader: {}", status.message());
+                    }
+                    _ => {
+                        self.reconcile_routing_failure(None, retry_count).await?;
+                        continue;
+                    }
+                },
             }
         }
     }

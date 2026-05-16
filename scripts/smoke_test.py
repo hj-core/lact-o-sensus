@@ -455,7 +455,7 @@ def test_ai_veto_egress() -> None:
         )
 
 
-def run_client_command(command: str, seed_port: int) -> str:
+def run_client_command(command: str, seed_port: int, timeout: int = 120) -> str:
     """Helper to run a single command through the client-cli."""
     state_file = ".client_state.json"
     wal_dir = ".client_wal"
@@ -490,11 +490,11 @@ def run_client_command(command: str, seed_port: int) -> str:
             raise RuntimeError("Failed to open stdin for client-cli")
         p.stdin.write(f"{command}\nexit\n")
         p.stdin.flush()
-        stdout, _ = p.communicate(timeout=120)
+        stdout, _ = p.communicate(timeout=timeout)
         return stdout
     except subprocess.TimeoutExpired as exc:
         p.kill()
-        raise RuntimeError("Client CLI timed out.") from exc
+        raise exc
     finally:
         if os.path.exists(state_file):
             os.remove(state_file)
@@ -791,6 +791,49 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     )
 
 
+def test_read_your_writes_consistency() -> None:
+    """Verify that queries block until the requested state version is reached."""
+    leader_id = wait_for_leader()
+    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+
+    # 1. Read-Your-Writes Success Path
+    print("Action: Proposing mutation to get a valid state version...")
+    output = run_client_command(
+        'add "banana" 3 units PrimaryFlora', leader_port
+    )
+    version = extract_version(output)
+    if version == 0:
+        raise RuntimeError(f"Failed to commit mutation for RYW test: {output}")
+
+    print(
+        f"Action: Querying with min_state_version={version} (should succeed)..."
+    )
+    output = run_client_command(f'query "banana" {version}', leader_port)
+    if f"Inventory (version: {version}):" not in output:
+        raise RuntimeError(
+            f"Query with min_version {version} failed or returned wrong version: {output}"
+        )
+    # Use flexible check for normalized item keys (e.g. 'banana_units')
+    if "banana" not in output.lower() or "3 units" not in output:
+        raise RuntimeError(
+            f"Expected item 'banana' missing from RYW query: {output}"
+        )
+
+    # 2. Strict Horizon Rejection Path
+    future_version = version + 1000
+    print(
+        f"Action: Querying with future min_state_version={future_version} (should fail immediately)..."
+    )
+    # This should fail fast because it exceeds the horizon.
+    output = run_client_command(f'query "banana" {future_version}', leader_port)
+    if "Requested version exceeds consistent horizon" not in output:
+        raise RuntimeError(
+            f"Expected horizon rejection for version {future_version}, but got: {output}"
+        )
+
+    print("SUCCESS: Read-Your-Writes consistency and Strict Horizon verified.")
+
+
 # --- Runner Logic ---
 
 
@@ -844,6 +887,11 @@ def main() -> None:
             True,
             # pylint: disable=W0108
             lambda c: test_cold_boot_recovery(c),
+        ),
+        (
+            "Read-Your-Writes Consistency",
+            True,
+            lambda c: test_read_your_writes_consistency(),
         ),
     ]
 

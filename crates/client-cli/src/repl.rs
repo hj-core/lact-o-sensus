@@ -5,6 +5,7 @@ use common::proto::v1::MutationIntent;
 use common::proto::v1::MutationStatus;
 use common::proto::v1::OperationType;
 use common::proto::v1::QueryStatus;
+use common::types::LogIndex;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWrite;
@@ -83,7 +84,10 @@ pub enum Command {
     /// Removal: Removes an item from the inventory.
     Delete { item_key: String },
     /// Linearizable Read: Queries the cluster state, optionally filtered.
-    Query { filter: Option<String> },
+    Query {
+        filter: Option<String>,
+        min_state_version: Option<u64>,
+    },
     /// Graceful Termination: Exits the REPL loop.
     Exit,
 }
@@ -120,14 +124,23 @@ impl Command {
                 })
             }
             "query" | "ls" => {
-                if args.len() > 1 {
+                if args.len() > 2 {
                     anyhow::bail!(
-                        "Too many arguments for 'query'. Expected at most 1, found {}.",
+                        "Too many arguments for 'query'. Expected at most 2, found {}.",
                         args.len()
                     );
                 }
+                let filter = args.first().cloned();
+                let min_state_version = if let Some(v_str) = args.get(1) {
+                    Some(v_str.parse::<u64>().map_err(|e| {
+                        anyhow::anyhow!("Invalid min_state_version '{}': {}", v_str, e)
+                    })?)
+                } else {
+                    None
+                };
                 Ok(Self::Query {
-                    filter: args.first().cloned(),
+                    filter,
+                    min_state_version,
                 })
             }
             "exit" | "quit" | "q" => {
@@ -148,10 +161,16 @@ impl fmt::Display for Command {
             Command::Subtract(args) => write!(f, "SUBTRACT {}", args),
             Command::Set(args) => write!(f, "SET {}", args),
             Command::Delete { item_key } => write!(f, "DELETE {}", item_key),
-            Command::Query { filter } => {
+            Command::Query {
+                filter,
+                min_state_version,
+            } => {
                 write!(f, "QUERY")?;
                 if let Some(filt) = filter {
                     write!(f, " (filter: '{}')", filt)?;
+                }
+                if let Some(v) = min_state_version {
+                    write!(f, " (min_version: {})", v)?;
                 }
                 Ok(())
             }
@@ -238,8 +257,13 @@ async fn execute_command(client: &LactoClient, cmd: Command) -> Result<String> {
             let res = client.propose_mutation(intent).await?;
             format_mutation_response(res)
         }
-        Command::Query { filter } => {
-            let res = client.query_state(filter, None).await?;
+        Command::Query {
+            filter,
+            min_state_version,
+        } => {
+            let res = client
+                .query_state(filter, min_state_version.map(LogIndex::new))
+                .await?;
             format_query_response(res)
         }
         Command::Exit => unreachable!(),
@@ -346,8 +370,29 @@ mod tests {
             assert_eq!(
                 cmd,
                 Command::Query {
-                    filter: Some(".*dairy.*".to_string())
+                    filter: Some(".*dairy.*".to_string()),
+                    min_state_version: None
                 }
+            );
+
+            let cmd = Command::parse("query milk 10").unwrap();
+            assert_eq!(
+                cmd,
+                Command::Query {
+                    filter: Some("milk".to_string()),
+                    min_state_version: Some(10)
+                }
+            );
+        }
+
+        #[test]
+        fn rejects_invalid_min_state_version() {
+            let res = Command::parse("query milk abc");
+            assert!(res.is_err());
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("Invalid min_state_version")
             );
         }
 
