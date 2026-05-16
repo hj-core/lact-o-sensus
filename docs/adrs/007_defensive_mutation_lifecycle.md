@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Mutation Request Lifecycle (Client, Leader, AI-Veto)
 - **Primary Goal:** Transform ambiguous human intent into immutable, deterministic consensus data via a multi-layered defensive pipeline.
-- **Last Updated:** 2026-05-10
+- **Last Updated:** 2026-05-16
 
 ## Context
 
@@ -90,11 +90,14 @@ We will implement a **5-Layer Defensive Pipeline** for all mutation requests. A 
 ### Cons
 
 - **Throughput Latency:** Sequential AI processing limits the system to one concurrent mutation per cluster.
+- **Audit Bloat:** Storing `raw_user_input` and `moral_justification` in every ledger entry increases the storage footprint and snapshot size compared to a traditional "Quantity-Only" ledger.
+- **Linear Context Decay:** Sending the full inventory as context to the AI Oracle creates an O(N) scaling bottleneck. Large inventories will increase network latency and may eventually exceed the AI's context window.
 - **Complexity:** Requires sophisticated state machine logic to handle multi-layered validation and the decoupling of traits.
 - **Lock Contention:** The `MutationLock` limits throughput to the latency of a single AI call.
 
-## Operational Impact
+### Operational Impact
 
 - **Latency:** Mutation throughput is strictly bound by AI inference time due to sequential locking.
+- **Inference Scaling:** Operators must monitor the token count of mutation requests. As the inventory grows, AI inference time will increase, directly reducing the cluster's maximum mutation throughput.
 - **Availability:** Failure of the AI Veto Node halts all mutations; the system remains in a "Read-Only" state for queries.
 - **Observability:** Audit metadata in the log allows operators to definitively diagnose semantic rejections and unit conversion errors.

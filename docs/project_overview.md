@@ -37,14 +37,14 @@ The project is structured as a multi-crate Cargo workspace to enforce strict bou
   - Implements the `StateMachine` trait to interpret the replicated log.
   - Manages the persistent grocery inventory and **Session Table** using **`sled`**.
   - Implements the `SessionProvider` and `InventoryReader` traits to provide authoritative, linearizable query results.
-  - **Physical Truth:** Enforces SI stabilization and the "Dimensional Fence" for all inventory updates.
+  - **Physical Truth:** Enforces SI stabilization and clinical time monotonicity for all inventory updates.
 
 ### 4. `gateway` (The Delivery Layer)
 
 - **Role:** External application interface and policy enforcement.
 - **Responsibility:**
   - Implements the gRPC `IngressService` for client communication.
-  - **The Defensive Onion (ADR 007):** Orchestrates the 5-layer pipeline from user intent to consensus proposal.
+  - **The Defensive Onion (ADR 007):** Orchestrates the 5-layer pipeline from user intent to consensus proposal, including the **Dimensional Fence** and the Registry Firewall.
 
 ### 5. `ai-veto` (The Oracle)
 
@@ -59,6 +59,7 @@ The project is structured as a multi-crate Cargo workspace to enforce strict bou
 - **Responsibility:**
   - Manages a local Write-Ahead Log (WAL) for client-side linearizability.
   - Implements resilient retry loops with exponential backoff.
+  - **Topology Awareness:** Implements automatic leader discovery and transparent redirection logic.
 
 ### 7. `node-server` (The Composition Root)
 
@@ -91,3 +92,7 @@ All physical quantities are stabilized to canonical SI base units (grams, millil
 ### 5. Information Opacity (The Fortress Mandate)
 
 To prevent session probing and state disclosure, the Ingress Firewall utilizes **Opaque Clinical Error Messages**. Rejections explicitly identify the protocol violation (e.g., Sequence Continuity Violation) but withhold internal state values, forcing clients to rely on their local persistent WAL for recovery.
+
+### 6. Cluster Identity Isolation (ADR 004)
+
+The system prevents "Cross-Cluster Contamination" by enforcing a strict `(ClusterId, NodeId)` identity tuple. All traffic is guarded by gRPC Middleware that rejects misdirected or unauthorized requests before they reach the application logic.

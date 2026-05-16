@@ -13,7 +13,7 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 - **`lacto-fsm`**: The business logic; implements the `StateMachine` trait and manages `sled` persistence.
 - **`gateway`**: The gRPC delivery layer and defensive "Ingress Firewall."
 - **`ai-veto`**: External Oracle for semantic resolution and moral evaluation.
-- **`client-cli`**: Consumer REPL with local WAL for linearizable retries.
+- **`client-cli`**: Consumer REPL with local WAL for linearizable retries and automatic leader discovery/redirection.
 - **`node-server`**: The composition root that wires all layers via dependency injection.
 
 ## 3. Architectural Decision Records
@@ -31,15 +31,16 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 ## 4. Technical Mandates
 
 - **4.1. Clinical Decoupling:** Prohibit the leak of grocery domain logic into `raft-engine`. All communication between layers must occur via the `common` contract.
-- **4.2. Poison-then-Panic:** Transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
-- **4.3. Information Opacity:** External errors must identify the category of failure (e.g., Sequence Gap) but MUST NOT disclose internal metadata or state values.
-- **4.4. Physical Truth:** Prohibit non-canonical measurements. All mutations must be stabilized to SI base units before being logged.
-- **4.5. Registry Firewall:** All AI-provided metadata must be verified against hardcoded system registries before finalization.
-- **4.6. Error Categorization (`thiserror` vs `anyhow`):** Map all library-returned errors to domain-specific Error enums via `thiserror`. The use of `anyhow` is strictly PROHIBITED in core logic (`crates/common`, `crates/raft-engine`, `crates/gateway`), and is permitted exclusively in top-level `main.rs` binaries.
-- **4.7. Storage Integrity:** Every physical mutation to the Raft core state must be followed by an explicit `flush_async()` before responding to an RPC to prevent log loss after a crash.
+- **4.2. Heartbeat Decoupling:** Prohibit blocking the Raft heartbeat or election timers with external I/O (e.g., AI Veto egress). All external policy resolution must occur in the delivery layer or via asynchronous task delegation to preserve cluster liveness.
+- **4.3. Poison-then-Panic:** Transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
+- **4.4. Storage Integrity:** Every physical mutation to the Raft core state must be followed by an explicit synchronous disk flush (`flush()`) before responding to an RPC to prevent log loss after a crash.
+- **4.5. Physical Truth:** Prohibit non-canonical measurements. All mutations must be stabilized to SI base units using **Banker's Rounding (Half-to-Even)** and transmitted as stringified fixed-point decimals before being logged to ensure cross-architecture determinism.
+- **4.6. Registry Firewall:** All AI-provided metadata must be verified against hardcoded system registries before finalization.
+- **4.7. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (e.g., `NodeId`, `ClusterId`) for all domain identifiers.
 - **4.8. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
-- **4.9. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (e.g., `NodeId`, `ClusterId`) for all domain identifiers.
-- **4.10. Safety Prohibitions:** Never use `unwrap()` or `expect()` in production-level code.
+- **4.9. Safety Prohibitions:** Never use `unwrap()` or `expect()` in production-level code.
+- **4.10. Information Opacity:** External errors must identify the category of failure (e.g., Sequence Gap) but MUST NOT disclose internal metadata or state values.
+- **4.11. Error Categorization (`thiserror` vs `anyhow`):** Map all library-returned errors to domain-specific Error enums via `thiserror`. The use of `anyhow` is strictly PROHIBITED in core logic (`crates/common`, `crates/raft-engine`, `crates/gateway`), and is permitted exclusively in top-level `main.rs` binaries.
 
 ## 5. Workflow
 

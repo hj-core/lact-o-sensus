@@ -64,7 +64,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **Internal Onion Alignment:** Refactor the Raft engine into the tri-layered **Onion Model** (ADR 009).
   - **Clean Architecture Refactor:** Establish the **node-server** composition root and decouple the State Machine into **lacto-fsm**. This inverted the dependency between consensus and delivery layers.
   - **Contract v2:** Update Protobuf and `CommittedMutation` to support resolved slugs and SI units (ADR 005).
-  - **The Onion:** Implement Layer 1-4 logic (Syntactic scrubbing, **Registry Firewall**, Dimensional Fence).
+  - **The Defensive Onion:** Implement Layers 1-4 of the **Defensive Mutation Lifecycle** (ADR 007: Syntactic scrubbing, Registry Firewall, Dimensional Fence).
   - **Real AI Integration:** Integrate local Llama via `ollama-rs` into `crates/ai-veto`.
   - **Moral Heuristics:** Develop the "Moral Advocate" persona.
   - **Robustness:** Implement **Leader-Internal Retries** for transient AI resolution failures.
@@ -74,11 +74,11 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
 
 - **Goal:** Implement Exactly-Once Semantics and transition to high-fidelity persistent disk storage.
 - **Key Actions:**
-  - **Consistent Query Path:** Implement the `SessionProvider` and `InventoryReader` traits and the `query_state` RPC with Quorum Read verification (ADR 007).
+  - **Consistent Query Path:** Implement the `SessionProvider` and `InventoryReader` traits and the `query_state` RPC with Quorum Read verification (ADR 002/005).
   - **Unified Ledger Alignment**: Record all AI evaluation outcomes (Approvals and Vetoes) as first-class consensus events to ensure ledger continuity (ADR 006).
   - **Isolated Persistent Storage:** Transition Raft logs, FSM inventory, and system identity to dedicated `sled` database trees with synchronous `fsync` (ADR 001/009).
   - **Eternal Session Table:** Implement the Session Table as **Permanent Metadata** to prevent the Double-Bootstrap hazard. Deduplicate requests and provide linearizable replays.
-  - **Opaque Clinical Reporting:** Implement the `**Secure Clinical**` error standard to prevent session probing and information disclosure.
+  - **Opaque Clinical Reporting:** Implement the `**Secure Clinical**` error standard (ADR 006) to prevent session probing and information disclosure.
   - **Stateful Temporal Determinism:** Maintain a persistent logical clock (`last_effective_time`) derived from consensus log timestamps to ensure temporal consistency across the cluster.
   - **The Halt Mandate:** Implement the **Poison-then-Panic** sequence (ADR 009) to prevent "Zombie Node" behavior during state machine or session table divergence.
 - **Success Metric:** Idempotent recovery from the log with 100% linearizability and zero internal state disclosure in error responses.

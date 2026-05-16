@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Cluster Initialization and Membership
 - **Primary Goal:** Provide a safe, multi-phase path from static configuration to dynamic node discovery.
-- **Last Updated:** 2026-04-20
+- **Last Updated:** 2026-05-16
 
 ## Context
 
@@ -18,11 +18,11 @@ We will separate logical identity from physical networking and adopt a three-pha
 
 ### 1. Logical Identity Tuple
 
-Every **System Node** (including Raft participants and AI Veto Nodes) is uniquely identified by the tuple `(cluster_id, node_id)`. **Client Actors** are identified by the tuple `(cluster_id, client_id)`. To prevent **primitive obsession**, core domain identifiers must be implemented as distinct **NewTypes** (`ClusterId`, `NodeId`, `ClientId`, `Term`, `LogIndex`) with self-validating constructors.
+Every **System Node** (including Raft participants and AI Veto Nodes) is uniquely identified by the tuple `(cluster_id, node_id)`. **Client Actors** are identified by the tuple `(cluster_id, client_id)`. To prevent **primitive obsession**, core domain identifiers must be implemented as distinct **NewTypes** (`ClusterId`, `NodeId`, `ClientId`) with self-validating constructors.
 
-- **`cluster_id` (`ClusterId`):** A unique namespace for the entire consensus group (e.g., "lacto-prod-01").
-- **`node_id` (`NodeId`):** A unique identifier for a system node (Raft or AI).
-- **`client_id` (`ClientId`):** A unique logical identifier for a client session.
+- **`ClusterId`:** A unique namespace for the entire consensus group (e.g., "lacto-prod-01").
+- **`NodeId`:** A unique identifier for a system node (Raft or AI).
+- **`ClientId`:** A unique logical identifier for a client session.
 - **Mandate (Identity Guard):** Every gRPC request (Raft peer-to-peer, Client-to-Leader, and Leader-to-AI) must include the `cluster_id` and the `target_node_id` (the intended logical recipient).
 - **Enforcement:** Validation MUST be implemented at the **Middleware/Interceptor layer**. Nodes must reject any message where the `cluster_id` or `target_node_id` does not match their local configuration before it reaches the application logic.
 

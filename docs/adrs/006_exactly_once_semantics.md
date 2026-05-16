@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** State Machine Reliability and Linearizability
 - **Primary Goal:** Ensure every mutation is executed exactly once, regardless of network retries or leader elections.
-- **Last Updated:** 2026-05-10
+- **Last Updated:** 2026-05-16
 
 ## Context
 
@@ -39,7 +39,7 @@ Upon applying a command from the Raft log, the state machine must execute the fo
 
 To eliminate the **"Double-Bootstrap" hazard** (where a network replay is mistaken for a new session after a purge), the Session Table is considered **Permanent Metadata**. Client session records MUST NOT be purged from the state machine.
 
-Given the high clinical value of grocery linearizability and the low storage cost (~64 bytes per client), the system prioritizes absolute integrity over storage reclamation.
+Given the high clinical value of grocery linearizability and the low storage cost (~1KB per client including audit metadata), the system prioritizes absolute integrity over storage reclamation.
 
 ### 4. Secure Clinical Reporting (Opaque Errors)
 
@@ -81,10 +81,10 @@ Any detection of session table inconsistency (e.g., during snapshot loading or h
 
 ### Cons
 
-- **Storage Overhead**: Storing a response cache for every client consumes persistent storage and memory.
+- **Storage Overhead**: Storing a complete response cache (including AI justifications) for every client consumes persistent storage and memory. While negligible for thousands of clients, it may scale significantly if the system services millions of unique IDs over its lifetime.
 - **Complexity**: The state machine application logic becomes more sophisticated, requiring a "Deduplication Layer" before the "Business Logic Layer."
 
 ### Operational Impact
 
 - **Client Requirements**: Clients **must** maintain their `client_id` and `sequence_id` across restarts to benefit from EOS.
-- **Snapshot Size**: Including the session table will increase the size of state machine snapshots.
+- **Snapshot Size**: Including the session table will increase the size of state machine snapshots linearly with the number of unique clients, potentially impacting snapshot transmission times and recovery MTTR in high-scale scenarios.
