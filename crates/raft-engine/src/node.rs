@@ -1917,7 +1917,85 @@ mod tests {
         }
     }
 
-    mod candidate {}
+    mod candidate {
+        use super::*;
+
+        mod on_election_restart {
+            use super::*;
+
+            #[test]
+            fn increments_term_and_votes_for_self() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                let node = setup_node_as_candidate(fsm, log_store);
+                let initial_term = node.current_term().unwrap();
+
+                let restarted = node.try_into_restarted_candidate().unwrap();
+
+                assert_eq!(restarted.current_term().unwrap(), initial_term + 1);
+                assert_eq!(restarted.voted_for().unwrap(), Some(restarted.node_id()));
+                assert_eq!(restarted.state().vote_count(), 1);
+            }
+        }
+
+        mod on_election_victory {
+            use super::*;
+
+            #[test]
+            fn initializes_leader_state_with_next_index_at_end_of_log() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                // Append some entries to the log
+                log_store
+                    .append_entries(vec![
+                        LogEntry {
+                            index: 1,
+                            term: 1,
+                            data: vec![],
+                        },
+                        LogEntry {
+                            index: 2,
+                            term: 1,
+                            data: vec![],
+                        },
+                    ])
+                    .unwrap();
+
+                let node = setup_node_as_candidate(fsm, log_store);
+                let peer_ids = vec![NodeId::new(2), NodeId::new(3)];
+
+                let leader = node.try_into_leader(peer_ids.clone()).unwrap();
+
+                assert_eq!(leader.last_log_index().unwrap(), LogIndex::new(2));
+                for peer_id in peer_ids {
+                    assert_eq!(
+                        *leader.state().next_index().get(&peer_id).unwrap(),
+                        LogIndex::new(3)
+                    );
+                    assert_eq!(
+                        *leader.state().match_index().get(&peer_id).unwrap(),
+                        LogIndex::ZERO
+                    );
+                }
+            }
+        }
+
+        mod vote_counting {
+            use super::*;
+
+            #[test]
+            fn add_vote_is_idempotent_per_peer() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                let mut node = setup_node_as_candidate(fsm, log_store);
+
+                node.state_mut().add_vote(NodeId::new(2));
+                node.state_mut().add_vote(NodeId::new(2)); // Duplicate
+
+                assert_eq!(node.state().vote_count(), 2); // Self (from setup) + Node 2
+            }
+        }
+    }
 
     mod leader {
         use super::*;
