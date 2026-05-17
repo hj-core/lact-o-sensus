@@ -179,7 +179,7 @@ impl IngressService for IngressDispatcher {
         if let Some(min_version) = req.min_state_version.filter(|&v| v > 0) {
             let requested_index = LogIndex::new(min_version);
 
-            if requested_index > status.commit_index {
+            if requested_index > status.last_committed {
                 return Err(Status::failed_precondition(
                     "Requested version exceeds consistent horizon",
                 ));
@@ -822,7 +822,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockRaftHandle {
         is_leader: bool,
-        commit_index: LogIndex,
+        last_committed: LogIndex,
         leader_hint: String,
         rejection_reason: String,
         proposals: Mutex<Vec<Vec<u8>>>,
@@ -854,7 +854,7 @@ mod tests {
         async fn consensus_status(&self) -> ConsensusStatus {
             ConsensusStatus {
                 is_leader: self.is_leader,
-                commit_index: self.commit_index,
+                last_committed: self.last_committed,
                 leader_hint: self.leader_hint.clone(),
                 rejection_reason: self.rejection_reason.clone(),
             }
@@ -2743,7 +2743,7 @@ mod tests {
                 async fn consensus_status(&self) -> ConsensusStatus {
                     ConsensusStatus {
                         is_leader: true,
-                        commit_index: LogIndex::new(100),
+                        last_committed: LogIndex::new(100),
                         ..Default::default()
                     }
                 }
@@ -2773,7 +2773,7 @@ mod tests {
         async fn rejects_query_exceeding_horizon() {
             let raft = Arc::new(MockRaftHandle {
                 is_leader: true,
-                commit_index: LogIndex::new(5),
+                last_committed: LogIndex::new(5),
                 ..Default::default()
             });
             let inventory = successful_inventory();

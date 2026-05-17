@@ -77,7 +77,7 @@ impl ConsensusHandle for LocalRaftHandle {
                 let guard = self.state.read().await;
                 match &*guard {
                     LogicalNode::Leader(node) => {
-                        if node.commit_index() >= index {
+                        if node.last_committed() >= index {
                             return Ok(());
                         }
                     }
@@ -127,7 +127,7 @@ impl ConsensusHandle for LocalRaftHandle {
 
         ConsensusStatus {
             is_leader,
-            commit_index: progress.last_committed,
+            last_committed: progress.last_committed,
             leader_hint,
             rejection_reason,
         }
@@ -272,7 +272,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
                 if let LogicalNode::Leader(_) = &mut *guard {
-                    guard.set_commit_index(index).await;
+                    guard.advance_last_committed(index).await;
                 }
             });
 
@@ -324,18 +324,18 @@ mod tests {
                 sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
 
-                // Advance commit_index (which triggers FSM apply and updates last_applied)
-                // LogicalNode::set_commit_index is role-agnostic.
+                // Advance last_committed (which triggers FSM apply and updates last_applied)
+                // LogicalNode::advance_last_committed is role-agnostic.
                 // We first need to ensure the log contains the entries we are committing.
                 if let LogicalNode::Follower(node) = &mut *guard {
                     let mut entries = Vec::new();
                     for i in 1..=index.value() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
                     }
-                    node.storage().append_entries(entries).unwrap();
+                    node.log_store().append_entries(entries).unwrap();
                 }
 
-                guard.set_commit_index(index).await;
+                guard.advance_last_committed(index).await;
             });
 
             let result = handle.await_apply(index).await;
@@ -355,9 +355,9 @@ mod tests {
                     for i in 1..=index.value() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
                     }
-                    node.storage().append_entries(entries).unwrap();
+                    node.log_store().append_entries(entries).unwrap();
                 }
-                guard.set_commit_index(index).await;
+                guard.advance_last_committed(index).await;
             }
 
             let result = handle.await_apply(index).await;

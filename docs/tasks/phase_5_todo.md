@@ -40,10 +40,10 @@ Implement the 5-Layer Defensive Onion (ADR 007) and Semantic Resolution while co
 - **Changes:**
   - [x] Create `crates/raft-engine/src/fsm.rs` defining `StateMachine` trait.
   - [x] Update `RaftNode` to hold `Arc<dyn StateMachine>` and change `log` to store `Vec<u8>` payloads.
-  - [x] Modify `set_commit_index` to iterate and call `state_machine.apply(entry.data)` (via `apply_to_state_machine` orchestrator).
+  - [x] Modify `advance_last_committed` to iterate and call `state_machine.apply(entry.data)` (via `apply_to_state_machine` orchestrator).
   - [x] Create `crates/raft-engine/src/store.rs` defining `LactoStore` (implements `StateMachine`).
 - **Acceptance Tests (TDD):**
-  - [x] Write a unit test in `node.rs` verifying that `apply` is called with the correct bytes when `commit_index` advances. (Verified via integration and existing tests adapted to new fsm).
+  - [x] Write a unit test in `node.rs` verifying that `apply` is called with the correct bytes when `last_committed` advances. (Verified via integration and existing tests adapted to new fsm).
   - [x] `cargo test` passes.
 
 ### Step 4: The Universal Unit Registry (ADR 008) [x]

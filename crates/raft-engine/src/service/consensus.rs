@@ -361,7 +361,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage()
+                    node.log_store()
                         .append_entries(vec![
                             LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
                             LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
@@ -389,7 +389,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage()
+                    node.log_store()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(2), vec![])])
                         .unwrap();
                 }
@@ -414,7 +414,7 @@ mod tests {
             {
                 let mut state = dispatcher.state.write().await;
                 if let LogicalNode::Follower(node) = &mut *state {
-                    node.storage()
+                    node.log_store()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
                         .unwrap();
                 }
@@ -443,7 +443,7 @@ mod tests {
                     for i in 1..=10 {
                         entries.push(LogEntry::new(LogIndex::new(i as u64), Term::new(1), vec![]));
                     }
-                    node.storage().append_entries(entries).unwrap();
+                    node.log_store().append_entries(entries).unwrap();
                 }
             }
 
@@ -514,7 +514,7 @@ mod tests {
             let storage = Arc::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
             let follower = RaftNode::<Follower>::new(id.clone(), fsm, storage);
-            let candidate = follower.into_candidate().unwrap();
+            let candidate = follower.try_into_candidate().unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 
@@ -543,8 +543,8 @@ mod tests {
             let storage = Arc::new(MemoryStorage::new());
             // Start as Leader term 1
             let follower = RaftNode::<Follower>::new(id.clone(), fsm, storage);
-            let candidate = follower.into_candidate().unwrap();
-            let leader = candidate.into_leader(Vec::new()).unwrap();
+            let candidate = follower.try_into_candidate().unwrap();
+            let leader = candidate.try_into_leader(Vec::new()).unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 

@@ -280,15 +280,15 @@ impl LogicalNode {
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
         self.transition(|old| match old {
-            LogicalNode::Follower(n) => match n.into_follower(term, leader_id) {
+            LogicalNode::Follower(n) => match n.try_into_follower(term, leader_id) {
                 Ok(new) => LogicalNode::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Candidate(n) => match n.into_follower(term, leader_id) {
+            LogicalNode::Candidate(n) => match n.try_into_follower(term, leader_id) {
                 Ok(new) => LogicalNode::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Leader(n) => match n.into_follower(term, leader_id) {
+            LogicalNode::Leader(n) => match n.try_into_follower(term, leader_id) {
                 Ok(new) => LogicalNode::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
@@ -299,11 +299,11 @@ impl LogicalNode {
     /// Transitions to Candidate role.
     pub fn into_candidate(&mut self) {
         self.transition(|old| match old {
-            LogicalNode::Follower(n) => match n.into_candidate() {
+            LogicalNode::Follower(n) => match n.try_into_candidate() {
                 Ok(new) => LogicalNode::Candidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Candidate(n) => match n.into_restarted_candidate() {
+            LogicalNode::Candidate(n) => match n.try_into_restarted_candidate() {
                 Ok(new) => LogicalNode::Candidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
@@ -314,7 +314,7 @@ impl LogicalNode {
     /// Transitions to Leader role.
     pub fn into_leader(&mut self, peer_ids: Vec<NodeId>) {
         self.transition(|old| match old {
-            LogicalNode::Candidate(n) => match n.into_leader(peer_ids) {
+            LogicalNode::Candidate(n) => match n.try_into_leader(peer_ids) {
                 Ok(new) => LogicalNode::Leader(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
@@ -339,8 +339,8 @@ impl LogicalNode {
     }
 
     /// Updates the commit index.
-    pub async fn set_commit_index(&mut self, index: LogIndex) {
-        match delegate_async_to_inner!(self, set_commit_index, index) {
+    pub async fn advance_last_committed(&mut self, index: LogIndex) {
+        match delegate_async_to_inner!(self, advance_last_committed, index) {
             Ok(_) => {}
             Err(e) => self.apply_fatal(e),
         }
@@ -440,21 +440,21 @@ impl LogicalNode {
                 term: n.current_term()?,
                 role: NodeRole::Follower,
                 last_log_index: n.last_log_index()?,
-                last_committed: n.commit_index(),
+                last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
             }),
             LogicalNode::Candidate(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Candidate,
                 last_log_index: n.last_log_index()?,
-                last_committed: n.commit_index(),
+                last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
             }),
             LogicalNode::Leader(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Leader,
                 last_log_index: n.last_log_index()?,
-                last_committed: n.commit_index(),
+                last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
             }),
         }
@@ -478,8 +478,8 @@ impl LogicalNode {
         delegate_to_inner!(self, identity)
     }
 
-    pub fn commit_index(&self) -> LogIndex {
-        delegate_to_inner!(self, commit_index)
+    pub fn last_committed(&self) -> LogIndex {
+        delegate_to_inner!(self, last_committed)
     }
 
     pub fn last_applied(&self) -> LogIndex {
@@ -623,7 +623,7 @@ mod tests {
             let mut state = setup_node(1);
             match &mut state {
                 LogicalNode::Follower(n) => {
-                    n.storage()
+                    n.log_store()
                         .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
                         .unwrap();
                 }

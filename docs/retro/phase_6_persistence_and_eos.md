@@ -27,7 +27,7 @@
 ### ❌ Challenges & Mistakes
 
 * **The "Zombie Task" Hazard:** Initially proposed an unbounded wait for `min_state_version`, which could have leaked server-side resources if a client requested a far-future version.
-  * *Correction:* Implemented the **Strict Horizon Check** to reject queries for versions exceeding the current `commit_index` immediately.
+  * *Correction:* Implemented the **Strict Horizon Check** to reject queries for versions exceeding the current `last_committed` immediately.
 * **Semantic Normalization Jitter:** AI item key resolution (e.g., `apple_2`) initially caused false positives in the integrity audit.
   * *Correction:* Hardened the audit suite with flexible substring matching and normalized key comparisons.
 * **Stale Seed Ports:** Realized that the `MutationFlooder` was "blind" during chaos if its initial seed node was killed.

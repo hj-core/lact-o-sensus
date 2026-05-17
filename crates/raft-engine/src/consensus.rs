@@ -270,9 +270,13 @@ async fn replicate_to_peers(
     peer_manager: Arc<PeerManager>,
 ) -> Result<()> {
     // 1. Gather global replication parameters.
-    let (term, node_id, commit_index) = {
+    let (term, node_id, last_committed) = {
         let mut guard = state.write().await;
-        (guard.current_term(), guard.node_id(), guard.commit_index())
+        (
+            guard.current_term(),
+            guard.node_id(),
+            guard.last_committed(),
+        )
     };
 
     // 2. Prepare and send AppendEntries concurrently to all peers.
@@ -282,7 +286,7 @@ async fn replicate_to_peers(
         state.clone(),
         term,
         node_id,
-        commit_index,
+        last_committed,
     );
 
     // 3. Process responses as they arrive (Opportunistic demotion & index updates).
@@ -444,7 +448,7 @@ fn broadcast_append_entries(
     state: Arc<ConsensusShell>,
     term: Term,
     node_id: NodeId,
-    commit_index: LogIndex,
+    last_committed: LogIndex,
 ) -> FuturesUnordered<impl futures::Future<Output = RpcResult<Option<ReplicationOutcome>>>> {
     let peer_ids = peer_manager.peer_ids();
     let rpc_timeout = config.raft.rpc_timeout();
@@ -464,7 +468,7 @@ fn broadcast_append_entries(
                             peer_id,
                             term,
                             node_id,
-                            commit_index,
+                            last_committed,
                         ),
                         _ => return Ok(None),
                     }
@@ -501,7 +505,7 @@ fn build_append_entries_request(
     peer_id: NodeId,
     term: Term,
     node_id: NodeId,
-    commit_index: LogIndex,
+    last_committed: LogIndex,
 ) -> AppendEntriesRequest {
     let next_idx = if let LogicalNode::Leader(n) = node {
         *n.state()
@@ -524,7 +528,7 @@ fn build_append_entries_request(
         prev_log_index,
         prev_log_term,
         entries,
-        commit_index,
+        last_committed,
     )
 }
 
@@ -563,7 +567,7 @@ async fn process_append_entries_response(
 
     // 2. Process replication success/failure if we are still the leader for this
     //    term
-    let mut commit_index_updated = false;
+    let mut last_committed_updated = false;
     if let LogicalNode::Leader(node) = &mut *guard
         && node.current_term().unwrap_or(Term::ZERO) == term
     {
@@ -582,7 +586,7 @@ async fn process_append_entries_response(
                 node.state_mut()
                     .match_index_mut()
                     .insert(peer_id, new_match);
-                commit_index_updated = true;
+                last_committed_updated = true;
             }
         } else {
             let current_next = *node
@@ -607,8 +611,8 @@ async fn process_append_entries_response(
     }
 
     // 3. Opportunistically advance commit index if progress was made
-    if commit_index_updated {
-        update_leader_commit_index(&mut guard).await;
+    if last_committed_updated {
+        update_leader_last_committed(&mut guard).await;
     }
 
     Ok(ReplicationResult::Continue)
@@ -616,7 +620,7 @@ async fn process_append_entries_response(
 
 /// Helper to update the Leader's commit index based on a quorum of peer
 /// match_indices.
-async fn update_leader_commit_index(node: &mut LogicalNode) {
+async fn update_leader_last_committed(node: &mut LogicalNode) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
     let (median_idx, commit_idx) = if let LogicalNode::Leader(n) = node {
@@ -627,14 +631,14 @@ async fn update_leader_commit_index(node: &mut LogicalNode) {
         // The index that is replicated on a majority of nodes.
         // For 3 nodes, index 1 (middle element of sorted [idx1, idx2, idx3]).
         let median = match_indices[(match_indices.len() - 1) / 2];
-        (median, node.commit_index())
+        (median, node.last_committed())
     } else {
         return;
     };
 
     if median_idx > commit_idx && node.get_term_at(median_idx) == current_term {
         info!("Quorum reached for log index {}. Committing.", median_idx);
-        node.set_commit_index(median_idx).await;
+        node.advance_last_committed(median_idx).await;
     }
 }
 
@@ -945,7 +949,7 @@ mod tests {
         }
     }
 
-    mod update_leader_commit_index {
+    mod update_leader_last_committed {
         use super::*;
 
         #[tokio::test]
@@ -968,7 +972,7 @@ mod tests {
                             data: vec![],
                         })
                         .collect();
-                    leader.storage().append_entries(entries).unwrap();
+                    leader.log_store().append_entries(entries).unwrap();
                 }
             }
 
@@ -985,8 +989,8 @@ mod tests {
                         .match_index_mut()
                         .insert(peer_id_3, LogIndex::new(1));
                 }
-                update_leader_commit_index(&mut guard).await;
-                assert_eq!(guard.commit_index().value(), 4);
+                update_leader_last_committed(&mut guard).await;
+                assert_eq!(guard.last_committed().value(), 4);
             }
         }
     }

@@ -16,7 +16,7 @@ pub struct ConsensusStatus {
     /// True if this node currently believes itself to be the leader.
     pub is_leader: bool,
     /// The current cluster-wide consistent horizon.
-    pub commit_index: LogIndex,
+    pub last_committed: LogIndex,
     /// The address of the current leader if known, or an empty string.
     pub leader_hint: String,
     /// A human-readable message explaining why mutations might be rejected.

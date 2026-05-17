@@ -86,7 +86,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
 - **Description:** Synchronize the State Machine with the Consensus Log during startup.
 - **Changes:**
   - [x] Implement `RecoveryManager` in `crates/raft-engine/src/recovery.rs` to decouple replay logic from the composition root.
-  - [x] Implement the replay loop: compare `fsm.last_applied_index()` with `storage.commit_index()` and apply missing entries.
+  - [x] Implement the replay loop: compare `fsm.last_applied_index()` with `storage.last_committed()` and apply missing entries.
   - [x] **Safety Barrier:** Implement the **Poison-then-Panic** protocol if `fsm > storage.commit` (indicates log regression or disk corruption).
   - [x] Integrate recovery into `node-server/src/main.rs` to block gRPC listener start until state convergence is achieved.
 - **Acceptance Tests (TDD):**
@@ -107,7 +107,7 @@ Implement Exactly-Once Semantics (EOS) and transition to persistent disk storage
   - [x] **Handle Extension:**
     - Add `await_apply(index: LogIndex)` to the `ConsensusHandle` trait.
     - Implement `await_apply` in `LocalRaftHandle` using the `ConsensusShell` subscription.
-    - Update `ConsensusStatus` to include `commit_index` for horizon checks.
+    - Update `ConsensusStatus` to include `last_committed` for horizon checks.
   - [x] **Gateway Enforcement:**
     - Update `IngressDispatcher::query_state` to extract `min_state_version`.
     - Implement **Strict Horizon Check**: Reject queries for future-dated versions (Mandate 4.3).

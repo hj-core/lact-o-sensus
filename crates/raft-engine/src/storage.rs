@@ -21,7 +21,7 @@ pub trait LogStorage: Send + Sync + Debug {
     fn last_log_term(&self) -> Result<Term, LogStorageError>;
 
     /// Returns the last committed log index known to this node.
-    fn commit_index(&self) -> Result<LogIndex, LogStorageError>;
+    fn last_committed(&self) -> Result<LogIndex, LogStorageError>;
 
     /// Retrieves a single log entry by its index.
     ///
@@ -45,7 +45,7 @@ pub trait LogStorage: Send + Sync + Debug {
 
     /// Persists the Raft commit index.
     /// MUST perform a synchronous flush to disk.
-    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError>;
+    fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError>;
 
     /// Appends a batch of entries to the log.
     /// MUST perform a synchronous flush to disk.
@@ -74,8 +74,8 @@ pub struct SledStorage {
 }
 
 impl SledStorage {
-    const KEY_COMMIT_INDEX: &'static [u8] = b"commit_index";
     const KEY_HARD_STATE: &'static [u8] = b"hard_state";
+    const KEY_LAST_COMMITTED: &'static [u8] = b"last_committed";
     const TREE_LOG: &'static str = "log";
     const TREE_META: &'static str = "meta";
 
@@ -188,15 +188,15 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))
     }
 
-    fn commit_index(&self) -> Result<LogIndex, LogStorageError> {
+    fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
         self.meta
-            .get(Self::KEY_COMMIT_INDEX)
+            .get(Self::KEY_LAST_COMMITTED)
             .map_err(|e| {
-                LogStorageError::persistence(format!("Failed to read commit_index: {}", e))
+                LogStorageError::persistence(format!("Failed to read last_committed: {}", e))
             })?
             .map(|k| {
                 let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
-                    LogStorageError::deserialization("commit_index byte conversion failed")
+                    LogStorageError::deserialization("last_committed byte conversion failed")
                 })?;
                 Ok(LogIndex::new(u64::from_be_bytes(bytes)))
             })
@@ -266,11 +266,11 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError> {
+    fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
         self.meta
-            .insert(Self::KEY_COMMIT_INDEX, &index.value().to_be_bytes())
+            .insert(Self::KEY_LAST_COMMITTED, &index.value().to_be_bytes())
             .map_err(|e| {
-                LogStorageError::persistence(format!("Failed to persist commit_index: {}", e))
+                LogStorageError::persistence(format!("Failed to persist last_committed: {}", e))
             })?;
         self.db
             .flush()
@@ -325,7 +325,7 @@ pub struct MemoryStorage {
 struct MemoryState {
     current_term: Term,
     voted_for: Option<NodeId>,
-    commit_index: LogIndex,
+    last_committed: LogIndex,
     /// 1-indexed vector of consensus entries.
     ///
     /// Index 0 in the vector corresponds to LogIndex(1).
@@ -366,8 +366,8 @@ impl LogStorage for MemoryStorage {
             .unwrap_or(Term::ZERO))
     }
 
-    fn commit_index(&self) -> Result<LogIndex, LogStorageError> {
-        Ok(self.state.lock().unwrap().commit_index)
+    fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
+        Ok(self.state.lock().unwrap().last_committed)
     }
 
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
@@ -410,9 +410,9 @@ impl LogStorage for MemoryStorage {
         Ok(())
     }
 
-    fn save_commit_index(&self, index: LogIndex) -> Result<(), LogStorageError> {
+    fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
         let mut state = self.state.lock().unwrap();
-        state.commit_index = index;
+        state.last_committed = index;
         Ok(())
     }
 
@@ -475,13 +475,13 @@ mod tests {
         }
 
         #[test]
-        fn persists_commit_index() {
+        fn persists_last_committed() {
             let storage = setup_storage();
             let index = LogIndex::new(42);
 
-            storage.save_commit_index(index).unwrap();
+            storage.save_last_committed(index).unwrap();
 
-            assert_eq!(storage.commit_index().unwrap(), index);
+            assert_eq!(storage.last_committed().unwrap(), index);
         }
 
         #[test]
@@ -602,13 +602,13 @@ mod tests {
         }
 
         #[test]
-        fn persists_commit_index() {
+        fn persists_last_committed() {
             let storage = MemoryStorage::new();
             let index = LogIndex::new(42);
 
-            storage.save_commit_index(index).unwrap();
+            storage.save_last_committed(index).unwrap();
 
-            assert_eq!(storage.commit_index().unwrap(), index);
+            assert_eq!(storage.last_committed().unwrap(), index);
         }
 
         #[test]

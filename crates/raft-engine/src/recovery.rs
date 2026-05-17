@@ -11,12 +11,12 @@ use crate::storage::LogStorage;
 /// Raft Consensus Log on node startup.
 pub struct RecoveryManager {
     fsm: Arc<dyn StateMachine>,
-    storage: Arc<dyn LogStorage>,
+    log_store: Arc<dyn LogStorage>,
 }
 
 impl RecoveryManager {
-    pub fn new(fsm: Arc<dyn StateMachine>, storage: Arc<dyn LogStorage>) -> Self {
-        Self { fsm, storage }
+    pub fn new(fsm: Arc<dyn StateMachine>, log_store: Arc<dyn LogStorage>) -> Self {
+        Self { fsm, log_store }
     }
 
     /// Replays all committed log entries that have not yet been applied to the
@@ -26,26 +26,26 @@ impl RecoveryManager {
     /// index.
     pub async fn recover(&self) -> Result<(), NodeError> {
         let last_applied = self.fsm.last_applied_index().map_err(NodeError::from)?;
-        let commit_index = self.storage.commit_index().map_err(NodeError::from)?;
+        let last_committed = self.log_store.last_committed().map_err(NodeError::from)?;
 
         info!(
             "Recovery: Initial state check [FSM: {}, Log Commit: {}]",
-            last_applied, commit_index
+            last_applied, last_committed
         );
 
-        if last_applied > commit_index {
+        if last_applied > last_committed {
             error!(
-                "HALT MANDATE (ADR 009): FSM index {} is ahead of commit_index {}. This indicates \
-                 log regression or catastrophic storage corruption.",
-                last_applied, commit_index
+                "HALT MANDATE (ADR 009): FSM index {} is ahead of last_committed {}. This \
+                 indicates log regression or catastrophic storage corruption.",
+                last_applied, last_committed
             );
             return Err(NodeError::Logical(format!(
-                "FSM index {} is ahead of commit_index {}. State drift detected.",
-                last_applied, commit_index
+                "FSM index {} is ahead of last_committed {}. State drift detected.",
+                last_applied, last_committed
             )));
         }
 
-        if last_applied == commit_index {
+        if last_applied == last_committed {
             info!(
                 "Recovery: State is already synchronized at index {}. Replay skipped.",
                 last_applied
@@ -56,13 +56,13 @@ impl RecoveryManager {
         info!(
             "Recovery: REPLAY START [Range: {} -> {}]",
             last_applied + 1,
-            commit_index
+            last_committed
         );
 
         let mut current = last_applied;
-        while current < commit_index {
+        while current < last_committed {
             let apply_idx = current + 1;
-            let entry = self.storage.read_entry(apply_idx)?.ok_or_else(|| {
+            let entry = self.log_store.read_entry(apply_idx)?.ok_or_else(|| {
                 error!(
                     "HALT MANDATE (ADR 009): Committed entry {} missing from log during recovery.",
                     apply_idx
@@ -136,7 +136,7 @@ mod tests {
             let fsm = Arc::new(MockFsm::default());
             let storage = MemoryStorage::new();
 
-            // Setup: Log has 3 entries, commit_index is 3, FSM is at 0.
+            // Setup: Log has 3 entries, last_committed is 3, FSM is at 0.
             storage
                 .append_entries(vec![
                     LogEntry::new(LogIndex::new(1), Term::new(1), vec![1]),
@@ -144,7 +144,7 @@ mod tests {
                     LogEntry::new(LogIndex::new(3), Term::new(1), vec![3]),
                 ])
                 .unwrap();
-            storage.save_commit_index(LogIndex::new(3)).unwrap();
+            storage.save_last_committed(LogIndex::new(3)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
             recovery.recover().await.expect("Recovery failed");
@@ -164,7 +164,7 @@ mod tests {
                 *fsm.last_applied.lock().unwrap() = LogIndex::new(3);
             }
             let storage = MemoryStorage::new();
-            storage.save_commit_index(LogIndex::new(3)).unwrap();
+            storage.save_last_committed(LogIndex::new(3)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
             recovery.recover().await.expect("Recovery failed");
@@ -180,7 +180,7 @@ mod tests {
                 *fsm.last_applied.lock().unwrap() = LogIndex::new(5);
             }
             let storage = MemoryStorage::new();
-            storage.save_commit_index(LogIndex::new(3)).unwrap();
+            storage.save_last_committed(LogIndex::new(3)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
             let result = recovery.recover().await;
@@ -190,7 +190,7 @@ mod tests {
                 result
                     .unwrap_err()
                     .to_string()
-                    .contains("ahead of commit_index")
+                    .contains("ahead of last_committed")
             );
         }
 
@@ -198,8 +198,8 @@ mod tests {
         async fn returns_error_when_committed_entry_is_missing() {
             let fsm = Arc::new(MockFsm::default());
             let storage = MemoryStorage::new();
-            // commit_index is 1, but log is empty
-            storage.save_commit_index(LogIndex::new(1)).unwrap();
+            // last_committed is 1, but log is empty
+            storage.save_last_committed(LogIndex::new(1)).unwrap();
 
             let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
             let result = recovery.recover().await;
