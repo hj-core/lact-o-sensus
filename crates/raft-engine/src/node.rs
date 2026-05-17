@@ -281,7 +281,7 @@ impl<S: NodeState> RaftNode<S> {
         Ok(())
     }
 
-    pub fn vote_for(&mut self, candidate_id: NodeId) -> Result<(), NodeError> {
+    pub fn persist_vote(&mut self, candidate_id: NodeId) -> Result<(), NodeError> {
         let term = self.log_store.current_term()?;
         self.log_store
             .save_hard_state(term, Some(candidate_id))
@@ -378,7 +378,7 @@ impl RaftNode<Follower> {
             && (voted_for.is_none() || voted_for == Some(candidate_id))
             && self.is_log_up_to_date(req_last_log_term, req_last_log_index)?
         {
-            self.vote_for(candidate_id)?;
+            self.persist_vote(candidate_id)?;
             return Ok(true);
         }
         Ok(false)
@@ -400,7 +400,7 @@ impl RaftNode<Follower> {
         let new_term = node.current_term()? + 1;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
-        node.vote_for(node_id)?;
+        node.persist_vote(node_id)?;
         node.state_mut().add_vote(node_id);
         Ok(node)
     }
@@ -529,7 +529,7 @@ impl RaftNode<Candidate> {
         let new_term = node.current_term()? + 1;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
-        node.vote_for(node_id)?;
+        node.persist_vote(node_id)?;
         node.state_mut().add_vote(node_id);
         Ok(node)
     }
@@ -1258,7 +1258,7 @@ mod tests {
                     let mut node = setup_node_as_candidate(fsm, log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.vote_for(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::new(2)).unwrap();
                     check_persists_new_term_and_resets_voted_for(node).await;
                 }
 
@@ -1273,7 +1273,7 @@ mod tests {
                     let mut node = setup_node_as_leader(fsm, log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.vote_for(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::new(2)).unwrap();
                     check_persists_new_term_and_resets_voted_for(node).await;
                 }
             }
@@ -1312,7 +1312,7 @@ mod tests {
                     let mut node = setup_node_as_candidate(fsm, log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.vote_for(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::new(2)).unwrap();
                     check_preserves_current_term_and_voting_state(node).await;
                 }
 
@@ -1325,7 +1325,7 @@ mod tests {
                     let mut node = setup_node_as_leader(fsm, log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.vote_for(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::new(2)).unwrap();
                     check_preserves_current_term_and_voting_state(node).await;
                 }
             }
@@ -1484,6 +1484,23 @@ mod tests {
                     };
                     check_propagates_persistence_error_when_storage_fails(node).await;
                 }
+            }
+        }
+
+        mod persist_vote {
+            use super::*;
+
+            #[test]
+            fn persists_vote_to_log_store() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                let mut node = setup_node_as_follower(fsm, log_store.clone());
+                let candidate_id = NodeId::new(2);
+
+                node.persist_vote(candidate_id).unwrap();
+
+                assert_eq!(node.voted_for().unwrap(), Some(candidate_id));
+                assert_eq!(log_store.voted_for().unwrap(), Some(candidate_id));
             }
         }
     }
@@ -1805,7 +1822,7 @@ mod tests {
                     let mut node =
                         RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
                     node.advance_term(Term::new(1)).unwrap();
-                    node.vote_for(NodeId::new(3)).unwrap();
+                    node.persist_vote(NodeId::new(3)).unwrap();
 
                     let granted = node
                         .attempt_grant_vote(
