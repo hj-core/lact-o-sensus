@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Internal Raft Node Structure and Concurrency
 - **Primary Goal:** Define the structural hierarchy of the Raft node to ensure strict isolation between protocol logic, concurrency management, and reactive signaling.
-- **Last Updated:** 2026-05-10
+- **Last Updated:** 2026-05-17
 
 ## Context
 
@@ -47,7 +47,7 @@ We will implement a tri-layered "Onion" architecture for the internal Raft node,
 
 - **Mitigation of Non-Poisoning Locks:** Explicitly poisoning the `LogicalNode` variant provides a manual safety mechanism that the underlying lock primitive lacks.
 - **Decoupled Determinism:** Isolating protocol logic in the Physical layer enables exhaustive unit testing without async overhead.
-- **Reactive Consistency:** The `signal_counter` (Logical Epoch) in the Execution shell ensures that external components are notified of every state change, preventing "lost updates."
+- **Reactive Consistency:** Using a rich `ConsensusProgress` snapshot (containing Term, Role, Log Index, Commit Index, and Applied Index) allows the Execution shell and its observers to detect state changes through structural equality, ensuring that external components are notified of every significant event without relying on a volatile, non-persistent counter.
 
 ## Consequences
 

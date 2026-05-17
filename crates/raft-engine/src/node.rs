@@ -23,30 +23,6 @@ use crate::storage::LogStorage;
 // 1. Public Snapshots & Types
 // =============================================================================
 
-/// Snapshot of the node's consensus progress, used for reactive observation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConsensusProgress {
-    pub term: Term,
-    pub commit_index: LogIndex,
-    pub last_applied: LogIndex,
-    pub is_poisoned: bool,
-    /// Volatile counter representing the logical epoch of the node's consistent
-    /// state.
-    ///
-    /// INCREMENT POLICY: This counter MUST be incremented exactly once upon the
-    /// successful completion of any:
-    /// 1. Physical Mutation: Advancing the Term, appending to the Log, or
-    ///    updating the Commit Index.
-    /// 2. Logical Transition: Changing the node's Role (e.g., Candidate ->
-    ///    Leader), even if Term/Index are unchanged.
-    /// 3. Fatal Transition: Moving to the Poisoned state (handled by the
-    ///    orchestrator).
-    ///
-    /// This ensures that observers on the reactive channel are notified of
-    /// every significant consensus event and never miss a state change.
-    pub signal_counter: u64,
-}
-
 /// The result of a physical log reconciliation operation (§5.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReconciliationResult {
@@ -118,13 +94,6 @@ pub struct RaftNode<S: NodeState> {
     // --- Volatile State ---
     commit_index: LogIndex,
     last_applied: LogIndex,
-    /// Volatile counter representing the logical epoch of the node's consistent
-    /// state.
-    ///
-    /// Following the INCREMENT POLICY, this counter is updated on every
-    /// physical mutation or logical role transition to trigger reactive
-    /// observers.
-    signal_counter: u64,
     state: S,
 }
 
@@ -157,10 +126,6 @@ impl<S: NodeState> RaftNode<S> {
 
     pub fn last_applied(&self) -> LogIndex {
         self.last_applied
-    }
-
-    pub fn signal_counter(&self) -> u64 {
-        self.signal_counter
     }
 
     pub fn state(&self) -> &S {
@@ -219,8 +184,7 @@ impl<S: NodeState> RaftNode<S> {
         term: Term,
         leader_id: Option<NodeId>,
     ) -> Result<RaftNode<Follower>, NodeError> {
-        let (identity, fsm, storage, commit_index, last_applied, signal_counter) =
-            self.into_parts();
+        let (identity, fsm, storage, commit_index, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
             identity,
@@ -228,15 +192,11 @@ impl<S: NodeState> RaftNode<S> {
             storage,
             commit_index,
             last_applied,
-            signal_counter,
             state: Follower::new(leader_id),
         };
 
         // Transition to next term if higher (§5.1)
-        // INCREMENT POLICY: We increment for the term update (via set_term) AND the
-        // role change.
         node.set_term(term)?;
-        node.increment_signal();
         Ok(node)
     }
 
@@ -268,7 +228,6 @@ impl<S: NodeState> RaftNode<S> {
 
             self.commit_index = index;
             self.apply_to_state_machine().await?;
-            self.increment_signal();
         }
         Ok(())
     }
@@ -320,7 +279,6 @@ impl<S: NodeState> RaftNode<S> {
             self.storage
                 .save_hard_state(term, None)
                 .map_err(NodeError::from)?;
-            self.increment_signal();
         }
         Ok(())
     }
@@ -330,12 +288,7 @@ impl<S: NodeState> RaftNode<S> {
         self.storage
             .save_hard_state(term, Some(candidate_id))
             .map_err(NodeError::from)?;
-        self.increment_signal();
         Ok(())
-    }
-
-    pub(crate) fn increment_signal(&mut self) {
-        self.signal_counter += 1;
     }
 
     #[allow(clippy::type_complexity)]
@@ -347,7 +300,6 @@ impl<S: NodeState> RaftNode<S> {
         Arc<dyn LogStorage>,
         LogIndex,
         LogIndex,
-        u64,
     ) {
         (
             self.identity,
@@ -355,7 +307,6 @@ impl<S: NodeState> RaftNode<S> {
             self.storage,
             self.commit_index,
             self.last_applied,
-            self.signal_counter,
         )
     }
 }
@@ -381,7 +332,6 @@ impl RaftNode<Follower> {
             storage,
             commit_index,
             last_applied,
-            signal_counter: 0,
             state: Follower::new(None),
         }
     }
@@ -395,9 +345,6 @@ impl RaftNode<Follower> {
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
     ) -> Result<ReconciliationResult, NodeError> {
-        let old_last_idx = self.last_log_index()?;
-        let old_last_term = self.last_log_term()?;
-
         if !self.verify_log_consistency(prev_log_index, prev_log_term)? {
             return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
         }
@@ -406,18 +353,13 @@ impl RaftNode<Follower> {
             return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
         }
 
-        if self.last_log_index()? != old_last_idx || self.last_log_term()? != old_last_term {
-            self.increment_signal();
-        }
-
         self.advance_commit_index(leader_commit).await?;
         Ok(ReconciliationResult::success(self.last_log_index()?))
     }
 
     /// Follower -> Candidate transition (Triggered by Election Timeout).
     pub fn into_candidate(self) -> Result<RaftNode<Candidate>, NodeError> {
-        let (identity, fsm, storage, commit_index, last_applied, signal_counter) =
-            self.into_parts();
+        let (identity, fsm, storage, commit_index, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
             identity,
@@ -425,17 +367,14 @@ impl RaftNode<Follower> {
             storage,
             commit_index,
             last_applied,
-            signal_counter,
             state: Candidate::new(),
         };
 
-        // INCREMENT POLICY: We increment for the term update AND the role change.
         let new_term = node.current_term()? + 1;
         node.set_term(new_term)?;
         let node_id = node.node_id();
         node.vote_for(node_id)?;
         node.state_mut().add_vote(node_id);
-        node.increment_signal();
         Ok(node)
     }
 
@@ -572,8 +511,7 @@ impl RaftNode<Follower> {
 
 impl RaftNode<Candidate> {
     pub fn into_restarted_candidate(self) -> Result<RaftNode<Candidate>, NodeError> {
-        let (identity, fsm, storage, commit_index, last_applied, signal_counter) =
-            self.into_parts();
+        let (identity, fsm, storage, commit_index, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
             identity,
@@ -581,35 +519,29 @@ impl RaftNode<Candidate> {
             storage,
             commit_index,
             last_applied,
-            signal_counter,
             state: Candidate::new(),
         };
 
-        // INCREMENT POLICY: We increment for the term update AND the role change.
         let new_term = node.current_term()? + 1;
         node.set_term(new_term)?;
         let node_id = node.node_id();
         node.vote_for(node_id)?;
         node.state_mut().add_vote(node_id);
-        node.increment_signal();
         Ok(node)
     }
 
     pub fn into_leader(self, peer_ids: Vec<NodeId>) -> Result<RaftNode<Leader>, NodeError> {
         let last_log_index = self.last_log_index()?;
-        let (identity, fsm, storage, commit_index, last_applied, signal_counter) =
-            self.into_parts();
+        let (identity, fsm, storage, commit_index, last_applied) = self.into_parts();
 
-        let mut node = RaftNode {
+        let node = RaftNode {
             identity,
             fsm,
             storage,
             commit_index,
             last_applied,
-            signal_counter,
             state: Leader::new(peer_ids, last_log_index),
         };
-        node.increment_signal();
         Ok(node)
     }
 }
@@ -627,7 +559,6 @@ impl RaftNode<Leader> {
         self.storage
             .append_entries(vec![entry])
             .map_err(NodeError::from)?;
-        self.increment_signal();
         Ok(index)
     }
 }
@@ -788,9 +719,6 @@ mod tests {
 
         #[tokio::test]
         async fn apply_to_state_machine_detects_fsm_regression() {
-            // Manually advance FSM index beyond commit_index
-            // Note: In real life this would happen due to disk corruption or log loss
-            // We'll mock it by returning a high index from MockFsm.
             #[derive(Debug, Default)]
             struct RegressionFsm;
             #[async_trait]
@@ -854,11 +782,9 @@ mod tests {
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, Arc::new(storage));
             node.set_commit_index(LogIndex::new(1)).await.unwrap();
 
-            let signal_before = node.signal_counter();
             node.set_commit_index(LogIndex::ZERO).await.unwrap();
 
             assert_eq!(node.commit_index(), LogIndex::new(1));
-            assert_eq!(node.signal_counter(), signal_before);
         }
 
         #[tokio::test]
@@ -877,7 +803,6 @@ mod tests {
             let mut node =
                 RaftNode::<Follower>::new(test_identity(1), fsm.clone(), Arc::new(storage));
 
-            // Jump from index 0 to 3
             node.set_commit_index(LogIndex::new(3)).await.unwrap();
 
             let applied = fsm.applied_indices.lock().unwrap();
@@ -893,8 +818,6 @@ mod tests {
             let fsm = Arc::new(MockFsm::default());
             let storage = Arc::new(MemoryStorage::new());
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, storage);
-            // Manually advance commit index beyond log length WITHOUT the set_commit_index
-            // guard
             node.commit_index = LogIndex::new(5);
             let result = node.apply_to_state_machine().await;
             assert!(result.is_err());
@@ -906,7 +829,6 @@ mod tests {
             let fsm = Arc::new(MockFsm::default());
             let storage = Arc::new(MemoryStorage::new());
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, storage);
-            // Log is empty (max index 0), trying to commit 1
             let result = node.set_commit_index(LogIndex::new(1)).await;
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("last_log_index"));
@@ -940,7 +862,6 @@ mod tests {
 
             let result = node.set_commit_index(LogIndex::new(1)).await;
             assert!(result.is_err());
-            // Verify it's a Logical error wrapping the FsmError
             let err = result.unwrap_err();
             assert!(
                 matches!(err, NodeError::Logical(_)),
@@ -963,7 +884,6 @@ mod tests {
         #[tokio::test]
         async fn reconcile_log_rejects_inconsistent_prev_index() {
             let mut node = setup_node();
-            // Node has empty log. Leader claims prev is 1.
             let result = node
                 .reconcile_log(LogIndex::new(1), Term::new(1), vec![], LogIndex::ZERO)
                 .await
@@ -991,7 +911,6 @@ mod tests {
                 .unwrap();
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, Arc::new(storage));
 
-            // Leader sends entry for index 2 with Term 2.
             let new_entry = LogEntry {
                 index: 2,
                 term: 2,
@@ -1027,8 +946,6 @@ mod tests {
             storage.append_entries(entries).unwrap();
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, Arc::new(storage));
 
-            // Leader sends conflict at index 2, but NO entry for index 3.
-            // Result should be: [ (1, T1), (2, T2) ]
             let new_entry = LogEntry {
                 index: 2,
                 term: 2,
@@ -1062,7 +979,6 @@ mod tests {
             storage.append_entries(vec![entry.clone()]).unwrap();
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, Arc::new(storage));
 
-            let signal_before = node.signal_counter();
             let result = node
                 .reconcile_log(LogIndex::ZERO, Term::ZERO, vec![entry], LogIndex::ZERO)
                 .await
@@ -1070,14 +986,11 @@ mod tests {
 
             assert!(result.success);
             assert_eq!(node.last_log_index().unwrap(), LogIndex::new(1));
-            // No physical change -> No signal increment
-            assert_eq!(node.signal_counter(), signal_before);
         }
 
         #[tokio::test]
         async fn reconcile_log_rejects_non_contiguous_append() {
             let mut node = setup_node();
-            // Log empty (index 0). Leader sends entries for 2 and 3.
             let entry2 = LogEntry {
                 index: 2,
                 term: 1,
@@ -1107,14 +1020,13 @@ mod tests {
         fn grant_vote_respects_voting_state() {
             let mut node = setup_node();
             node.set_term(Term::new(1)).unwrap();
-            node.vote_for(NodeId::new(3)).unwrap(); // Already voted for someone else
+            node.vote_for(NodeId::new(3)).unwrap();
 
             let granted = node
                 .attempt_grant_vote(NodeId::new(2), Term::new(1), LogIndex::ZERO, Term::ZERO)
                 .unwrap();
             assert!(!granted);
 
-            // Can still grant to the SAME candidate
             let granted = node
                 .attempt_grant_vote(NodeId::new(3), Term::new(1), LogIndex::ZERO, Term::ZERO)
                 .unwrap();
@@ -1150,7 +1062,6 @@ mod tests {
         #[test]
         fn rejects_stale_last_term() {
             let node = setup_node_with_log(5, 2);
-            // Candidate has Term 1, Node has Term 2
             assert!(
                 !node
                     .is_log_up_to_date(Term::new(1), LogIndex::new(10))
@@ -1161,7 +1072,6 @@ mod tests {
         #[test]
         fn accepts_higher_last_term() {
             let node = setup_node_with_log(5, 2);
-            // Candidate has Term 3, Node has Term 2
             assert!(
                 node.is_log_up_to_date(Term::new(3), LogIndex::new(1))
                     .unwrap()
@@ -1171,18 +1081,15 @@ mod tests {
         #[test]
         fn handles_equal_terms_with_index_check() {
             let node = setup_node_with_log(5, 2);
-            // Same Term (2), but Candidate index 4 < Node index 5
             assert!(
                 !node
                     .is_log_up_to_date(Term::new(2), LogIndex::new(4))
                     .unwrap()
             );
-            // Same Term (2), Candidate index 5 == Node index 5
             assert!(
                 node.is_log_up_to_date(Term::new(2), LogIndex::new(5))
                     .unwrap()
             );
-            // Same Term (2), Candidate index 6 > Node index 5
             assert!(
                 node.is_log_up_to_date(Term::new(2), LogIndex::new(6))
                     .unwrap()
@@ -1203,14 +1110,11 @@ mod tests {
             let initial_time = node.state().last_heartbeat();
             let notify = node.state().heartbeat_signal().clone();
 
-            // Small sleep to ensure Instant changes
             std::thread::sleep(std::time::Duration::from_millis(1));
 
             node.state_mut().reset_heartbeat();
 
             assert!(node.state().last_heartbeat() > initial_time);
-            // In a real test we'd check notification, but it's internal to Notify.
-            // We can check it doesn't block.
             assert!(notify.notified().now_or_never().is_some());
         }
     }
@@ -1223,7 +1127,6 @@ mod tests {
             let fsm = Arc::new(MockFsm::default());
             let dir = tempfile::tempdir().unwrap();
 
-            // 1. Setup persistent state
             {
                 let db = sled::open(dir.path()).unwrap();
                 let storage = crate::storage::SledStorage::new(db).unwrap();
@@ -1232,7 +1135,6 @@ mod tests {
                     .unwrap();
             }
 
-            // 2. Initialize node and verify
             {
                 let db = sled::open(dir.path()).unwrap();
                 let storage = Arc::new(crate::storage::SledStorage::new(db).unwrap());
@@ -1276,11 +1178,9 @@ mod tests {
                 .into_leader(vec![peer_id])
                 .unwrap();
 
-            // Raft §5.3: initialize nextIndex to leader last log index + 1
             let next_idx = leader.state().next_index().get(&peer_id).unwrap();
             assert_eq!(next_idx.value(), 2);
 
-            // Raft §5.3: initialize matchIndex to 0
             let match_idx = leader.state().match_index().get(&peer_id).unwrap();
             assert_eq!(match_idx.value(), 0);
         }
@@ -1314,19 +1214,17 @@ mod tests {
         }
 
         #[test]
-        fn into_restarted_candidate_increments_term_and_signal() {
+        fn into_restarted_candidate_increments_term() {
             let fsm = Arc::new(MockFsm::default());
             let storage = Arc::new(MemoryStorage::new());
             let node = RaftNode::<Follower>::new(test_identity(1), fsm, storage)
                 .into_candidate()
-                .unwrap(); // Term 1
+                .unwrap();
 
-            let signal_before = node.signal_counter();
-            let restarted = node.into_restarted_candidate().unwrap(); // Term 2
+            let restarted = node.into_restarted_candidate().unwrap();
 
             assert_eq!(restarted.current_term().unwrap(), Term::new(2));
             assert_eq!(restarted.voted_for().unwrap(), Some(NodeId::new(1)));
-            assert!(restarted.signal_counter() > signal_before);
         }
     }
 
@@ -1334,7 +1232,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn propose_increases_epoch() {
+        fn propose_appends_to_log() {
             let fsm = Arc::new(MockFsm::default());
             let storage = Arc::new(MemoryStorage::new());
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, storage)
@@ -1343,10 +1241,8 @@ mod tests {
                 .into_leader(vec![])
                 .unwrap();
 
-            let initial_signal = node.signal_counter();
             node.propose(vec![1]).unwrap();
 
-            assert!(node.signal_counter() > initial_signal);
             assert_eq!(node.last_log_index().unwrap(), LogIndex::new(1));
         }
     }

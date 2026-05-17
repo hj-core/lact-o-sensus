@@ -8,6 +8,7 @@ use common::types::NodeId;
 use common::types::errors::ConsensusError;
 
 use crate::engine::LogicalNode;
+use crate::engine::NodeRole;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
@@ -103,7 +104,7 @@ impl ConsensusHandle for LocalRaftHandle {
             // Check condition first
             {
                 let progress = progress_rx.borrow();
-                if progress.is_poisoned {
+                if progress.role == NodeRole::Poisoned {
                     return Err(ConsensusError::Poisoned);
                 }
                 if progress.last_applied >= index {
@@ -126,7 +127,7 @@ impl ConsensusHandle for LocalRaftHandle {
 
         ConsensusStatus {
             is_leader,
-            commit_index: progress.commit_index,
+            commit_index: progress.last_committed,
             leader_hint,
             rejection_reason,
         }

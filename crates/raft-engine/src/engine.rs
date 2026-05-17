@@ -13,10 +13,28 @@ use tracing::error;
 use tracing::info;
 
 pub use crate::node::Candidate;
-pub use crate::node::ConsensusProgress;
 pub use crate::node::Follower;
 pub use crate::node::Leader;
 pub use crate::node::RaftNode;
+
+/// The logical role of a Raft node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRole {
+    Follower,
+    Candidate,
+    Leader,
+    Poisoned,
+}
+
+/// Snapshot of the node's consensus progress, used for reactive observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusProgress {
+    pub term: Term,
+    pub role: NodeRole,
+    pub last_log_index: LogIndex,
+    pub last_committed: LogIndex,
+    pub last_applied: LogIndex,
+}
 
 /// The Dispatcher Enum (Logical State Machine).
 ///
@@ -413,17 +431,31 @@ impl LogicalNode {
         match self {
             LogicalNode::Poisoned => Ok(ConsensusProgress {
                 term: Term::ZERO,
-                commit_index: LogIndex::ZERO,
+                role: NodeRole::Poisoned,
+                last_log_index: LogIndex::ZERO,
+                last_committed: LogIndex::ZERO,
                 last_applied: LogIndex::ZERO,
-                is_poisoned: true,
-                signal_counter: 0,
             }),
-            _ => Ok(ConsensusProgress {
-                term: self.try_current_term()?,
-                commit_index: self.commit_index(),
-                last_applied: self.last_applied(),
-                is_poisoned: false,
-                signal_counter: self.signal_counter(),
+            LogicalNode::Follower(n) => Ok(ConsensusProgress {
+                term: n.current_term()?,
+                role: NodeRole::Follower,
+                last_log_index: n.last_log_index()?,
+                last_committed: n.commit_index(),
+                last_applied: n.last_applied(),
+            }),
+            LogicalNode::Candidate(n) => Ok(ConsensusProgress {
+                term: n.current_term()?,
+                role: NodeRole::Candidate,
+                last_log_index: n.last_log_index()?,
+                last_committed: n.commit_index(),
+                last_applied: n.last_applied(),
+            }),
+            LogicalNode::Leader(n) => Ok(ConsensusProgress {
+                term: n.current_term()?,
+                role: NodeRole::Leader,
+                last_log_index: n.last_log_index()?,
+                last_committed: n.commit_index(),
+                last_applied: n.last_applied(),
             }),
         }
     }
@@ -452,10 +484,6 @@ impl LogicalNode {
 
     pub fn last_applied(&self) -> LogIndex {
         delegate_to_inner!(self, last_applied)
-    }
-
-    pub fn signal_counter(&self) -> u64 {
-        delegate_to_inner!(self, signal_counter)
     }
 }
 

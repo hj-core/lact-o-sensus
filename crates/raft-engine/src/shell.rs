@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use crate::engine::ConsensusProgress;
 use crate::engine::LogicalNode;
+use crate::engine::NodeRole;
 
 /// The Imperative Shell for consensus signaling.
 ///
@@ -95,18 +96,18 @@ impl<'a> Drop for MutationGuard<'a> {
             *self.guard = LogicalNode::Poisoned;
             ConsensusProgress {
                 term: self.before.term,
-                commit_index: self.before.commit_index,
+                role: NodeRole::Poisoned,
+                last_log_index: self.before.last_log_index,
+                last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
-                is_poisoned: true,
-                signal_counter: self.before.signal_counter + 1,
             }
         } else if self.guard.is_poisoned() {
             ConsensusProgress {
                 term: self.before.term,
-                commit_index: self.before.commit_index,
+                role: NodeRole::Poisoned,
+                last_log_index: self.before.last_log_index,
+                last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
-                is_poisoned: true,
-                signal_counter: self.before.signal_counter + 1,
             }
         } else {
             // In the normal case, we extract the progress from the healthy node.
