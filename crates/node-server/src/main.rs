@@ -104,7 +104,9 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Cold-boot recovery failed: {}", e))?;
 
-    let initial_node = RaftNode::<Follower>::new(identity.clone(), fsm.clone(), storage.clone());
+    let initial_node =
+        RaftNode::<Follower>::try_new(identity.clone(), fsm.clone(), storage.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize RaftNode: {}", e))?;
     let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
 
     // 7. Initialize Networking (Outbound Peer Mesh)

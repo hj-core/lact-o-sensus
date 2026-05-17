@@ -521,11 +521,9 @@ mod tests {
     fn setup_node(node_id: u64) -> LogicalNode {
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
-        LogicalNode::Follower(RaftNode::<Follower>::new(
-            test_identity(node_id),
-            fsm,
-            storage,
-        ))
+        LogicalNode::Follower(
+            RaftNode::<Follower>::try_new(test_identity(node_id), fsm, storage).unwrap(),
+        )
     }
 
     mod handle_append_entries {

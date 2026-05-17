@@ -176,7 +176,8 @@ mod tests {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
-        let node = LogicalNode::Follower(RaftNode::<Follower>::new(id.clone(), fsm, storage));
+        let node =
+            LogicalNode::Follower(RaftNode::<Follower>::try_new(id.clone(), fsm, storage).unwrap());
         let state = Arc::new(ConsensusShell::new(node));
         ConsensusDispatcher::new(id, state)
     }
@@ -216,8 +217,9 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Arc::new(MemoryStorage::new());
             // Different NodeId, same ClusterId
-            let node =
-                LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
+            let node = LogicalNode::Follower(
+                RaftNode::<Follower>::try_new(test_identity(99), fsm, storage).unwrap(),
+            );
             let state = Arc::new(ConsensusShell::new(node));
 
             let dispatcher = ConsensusDispatcher::new(id, state);
@@ -243,8 +245,9 @@ mod tests {
                 ClusterId::try_new("wrong-cluster").unwrap(),
                 id.node_id(),
             ));
-            let node =
-                LogicalNode::Follower(RaftNode::<Follower>::new(cluster_mismatch, fsm, storage));
+            let node = LogicalNode::Follower(
+                RaftNode::<Follower>::try_new(cluster_mismatch, fsm, storage).unwrap(),
+            );
             let state = Arc::new(ConsensusShell::new(node));
 
             let dispatcher = ConsensusDispatcher::new(id, state);
@@ -264,8 +267,9 @@ mod tests {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
             let storage = Arc::new(MemoryStorage::new());
-            let node =
-                LogicalNode::Follower(RaftNode::<Follower>::new(test_identity(99), fsm, storage));
+            let node = LogicalNode::Follower(
+                RaftNode::<Follower>::try_new(test_identity(99), fsm, storage).unwrap(),
+            );
             let state = Arc::new(ConsensusShell::new(node));
             let dispatcher = ConsensusDispatcher::new(id, state.clone());
 
@@ -513,7 +517,7 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Arc::new(MemoryStorage::new());
             // Start as Follower term 0, transition to Candidate term 1
-            let follower = RaftNode::<Follower>::new(id.clone(), fsm, storage);
+            let follower = RaftNode::<Follower>::try_new(id.clone(), fsm, storage).unwrap();
             let candidate = follower.try_into_candidate().unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
@@ -542,7 +546,7 @@ mod tests {
             let fsm = Arc::new(MockFsm);
             let storage = Arc::new(MemoryStorage::new());
             // Start as Leader term 1
-            let follower = RaftNode::<Follower>::new(id.clone(), fsm, storage);
+            let follower = RaftNode::<Follower>::try_new(id.clone(), fsm, storage).unwrap();
             let candidate = follower.try_into_candidate().unwrap();
             let leader = candidate.try_into_leader(Vec::new()).unwrap();
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));
