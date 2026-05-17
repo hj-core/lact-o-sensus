@@ -617,7 +617,7 @@ impl Leader {
 
         for peer_id in peer_ids {
             next_index.insert(peer_id, last_log_index + 1);
-            match_index.insert(peer_id, LogIndex::new(0));
+            match_index.insert(peer_id, LogIndex::ZERO);
         }
 
         Self {
@@ -2000,20 +2000,100 @@ mod tests {
     mod leader {
         use super::*;
 
-        #[test]
-        fn propose_appends_to_log() {
-            let fsm = Arc::new(MockFsm::default());
-            let log_store = Arc::new(MemoryStorage::new());
-            let mut node = RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store)
-                .unwrap()
-                .try_into_candidate()
-                .unwrap()
-                .try_into_leader(vec![])
-                .unwrap();
+        mod propose {
+            use super::*;
 
-            node.propose(vec![1]).unwrap();
+            #[test]
+            fn increments_log_length_and_uses_current_term() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                let mut node = setup_node_as_leader(fsm, log_store);
+                let current_term = node.current_term().unwrap();
 
-            assert_eq!(node.last_log_index().unwrap(), LogIndex::new(1));
+                let index = node.propose(vec![42]).unwrap();
+
+                assert_eq!(index, LogIndex::new(1));
+                assert_eq!(node.last_log_index().unwrap(), LogIndex::new(1));
+                let entry = node.read_entries(index, index).unwrap().remove(0);
+                assert_eq!(entry.term, current_term.value());
+                assert_eq!(entry.data, vec![42]);
+            }
+
+            #[test]
+            fn returns_error_when_storage_fails() {
+                use common::types::errors::LogStorageError;
+
+                #[derive(Debug, Default)]
+                struct FailingAppendStorage;
+                impl LogStorage for FailingAppendStorage {
+                    fn current_term(&self) -> Result<Term, LogStorageError> {
+                        Ok(Term::new(1))
+                    }
+
+                    fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
+                        Ok(None)
+                    }
+
+                    fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
+                        Ok(LogIndex::ZERO)
+                    }
+
+                    fn last_log_term(&self) -> Result<Term, LogStorageError> {
+                        Ok(Term::ZERO)
+                    }
+
+                    fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
+                        Ok(LogIndex::ZERO)
+                    }
+
+                    fn read_entry(&self, _: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
+                        Ok(None)
+                    }
+
+                    fn read_entries(
+                        &self,
+                        _: LogIndex,
+                        _: LogIndex,
+                    ) -> Result<Vec<LogEntry>, LogStorageError> {
+                        Ok(vec![])
+                    }
+
+                    fn save_hard_state(
+                        &self,
+                        _: Term,
+                        _: Option<NodeId>,
+                    ) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn save_last_committed(&self, _: LogIndex) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn append_entries(&self, _: Vec<LogEntry>) -> Result<(), LogStorageError> {
+                        Err(LogStorageError::persistence("Simulated Append Failure"))
+                    }
+
+                    fn truncate_log(&self, _: LogIndex) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+                }
+
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(FailingAppendStorage);
+                let mut node = RaftNode {
+                    identity: test_identity(1),
+                    fsm,
+                    log_store,
+                    last_committed: LogIndex::ZERO,
+                    last_applied: LogIndex::ZERO,
+                    state: Leader::new(vec![], LogIndex::ZERO),
+                };
+
+                let result = node.propose(vec![1]);
+                assert!(result.is_err());
+                assert!(result.unwrap_err().to_string().contains("Append Failure"));
+            }
         }
     }
 }
