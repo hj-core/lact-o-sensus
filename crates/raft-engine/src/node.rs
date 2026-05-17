@@ -12,7 +12,6 @@ use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
-use tokio::sync::Notify;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -54,7 +53,6 @@ impl ReconciliationResult {
 pub struct Follower {
     leader_id: Option<NodeId>,
     last_heartbeat: Instant,
-    heartbeat_signal: Arc<Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -572,7 +570,6 @@ impl Follower {
         Self {
             leader_id,
             last_heartbeat: Instant::now(),
-            heartbeat_signal: Arc::new(Notify::new()),
         }
     }
 
@@ -584,17 +581,12 @@ impl Follower {
         self.last_heartbeat
     }
 
-    pub fn heartbeat_signal(&self) -> &Arc<Notify> {
-        &self.heartbeat_signal
-    }
-
     pub fn set_leader_id(&mut self, leader_id: Option<NodeId>) {
         self.leader_id = leader_id;
     }
 
     pub fn reset_heartbeat(&mut self) {
         self.last_heartbeat = Instant::now();
-        self.heartbeat_signal.notify_one();
     }
 }
 
@@ -1098,24 +1090,20 @@ mod tests {
     }
 
     mod heartbeat_invariants {
-        use futures::FutureExt;
-
         use super::*;
 
         #[test]
-        fn reset_heartbeat_updates_timer_and_notifies() {
+        fn reset_heartbeat_updates_timer() {
             let fsm = Arc::new(MockFsm::default());
             let storage = Arc::new(MemoryStorage::new());
             let mut node = RaftNode::<Follower>::new(test_identity(1), fsm, storage);
             let initial_time = node.state().last_heartbeat();
-            let notify = node.state().heartbeat_signal().clone();
 
             std::thread::sleep(std::time::Duration::from_millis(1));
 
             node.state_mut().reset_heartbeat();
 
             assert!(node.state().last_heartbeat() > initial_time);
-            assert!(notify.notified().now_or_never().is_some());
         }
     }
 

@@ -23,7 +23,7 @@ We will implement a tri-layered "Onion" architecture for the internal Raft node,
 - **Nature:** Pure Data Mutator.
 - **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
 - **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application).
-- **Constraint:** This layer must be synchronous and deterministic. It uses dedicated `sled` database handles (`log`, `fsm`, `system`) to ensure component isolation. It is the "Silent State Machine."
+- **Constraint:** This layer must be synchronous and deterministic. It is the "Silent State Machine," containing only the logical state and transitions necessary for protocol correctness, independent of any specific concurrency or signaling primitives. It uses dedicated `sled` database handles (`log`, `fsm`, `system`) to ensure component isolation.
 
 ### 2. Layer 2: The Logical Orchestrator (Safety Barrier)
 

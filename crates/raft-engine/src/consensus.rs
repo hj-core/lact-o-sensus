@@ -85,47 +85,27 @@ pub fn spawn_election_timer(
 ) {
     tokio::spawn(async move {
         loop {
-            // 1. Generate randomized timeout and identify signal.
+            // 1. Generate randomized timeout.
             let timeout = calculate_election_timeout(&config);
 
-            let heartbeat_signal = {
-                let guard = state.read().await;
-                match &*guard {
-                    LogicalNode::Follower(node) => Some(node.state().heartbeat_signal().clone()),
-                    LogicalNode::Candidate(_) | LogicalNode::Leader(_) => None,
-                    LogicalNode::Poisoned => {
-                        error!("Node is poisoned. Election timer stopping (ADR 009).");
-                        return;
-                    }
-                }
-            };
+            // 2. Sleep for the full timeout duration.
+            sleep(timeout).await;
 
-            // 2. Wait: Race timeout vs. heartbeat signal (if Follower).
-            let action = if let Some(signal) = heartbeat_signal {
-                tokio::select! {
-                    _ = sleep(timeout) => {
-                        let guard = state.read().await;
-                        handle_follower_tick(&guard, timeout)
-                    }
-                    _ = signal.notified() => {
-                        TimerAction::Restart
-                    }
-                }
-            } else {
-                sleep(timeout).await;
+            // 3. Evaluation: Check state and evaluate if election is needed.
+            let action = {
                 let guard = state.read().await;
                 match &*guard {
+                    LogicalNode::Follower(_) => handle_follower_tick(&guard, timeout),
                     LogicalNode::Candidate(_) => handle_candidate_tick(&guard),
                     LogicalNode::Leader(_) => handle_leader_tick(&guard),
                     LogicalNode::Poisoned => {
                         error!("Node is poisoned. Election timer stopping (ADR 009).");
                         return;
                     }
-                    _ => TimerAction::Restart,
                 }
             };
 
-            // 3. Execution: If evaluation triggered an election, transition and campaign.
+            // 4. Execution: If evaluation triggered an election, transition and campaign.
             if action == TimerAction::StartElection {
                 initiate_transition_to_candidate(
                     config.clone(),
