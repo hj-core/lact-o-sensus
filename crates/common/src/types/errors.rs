@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::types::LogIndex;
+use crate::types::NodeId;
 
 // =============================================================================
 // 1. Clinical Orchestration (NodeError)
@@ -9,26 +10,33 @@ use crate::types::LogIndex;
 /// Categorical system errors that trigger the Halt Mandate (ADR 009).
 #[derive(Debug, Error)]
 pub enum NodeError {
-    #[error("Physical Integrity Violation: {0}")]
+    #[error("Physical Storage Failure (Retriable): {0}")]
     Physical(String),
 
-    #[error("Logical Integrity Violation: {0}")]
-    Logical(String),
+    #[error("Routing Mismatch: I am not the leader (Redirection Hint: {leader_hint:?})")]
+    NotLeader { leader_hint: Option<NodeId> },
 
-    #[error("Semantic Integrity Violation: {0}")]
-    Semantic(String),
+    #[error("Protocol Invariant Violation (Fatal): {0}")]
+    Protocol(String),
 
-    #[error("Identity Integrity Violation: {0}")]
-    Identity(String),
+    #[error("Data Integrity Violation (Fatal): {0}")]
+    Integrity(String),
+}
+
+impl NodeError {
+    /// Returns true if this error triggers the Halt Mandate (ADR 009).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::Protocol(_) | Self::Integrity(_))
+    }
 }
 
 impl From<LogStorageError> for NodeError {
     fn from(err: LogStorageError) -> Self {
         match err {
             LogStorageError::Persistence(msg) => NodeError::Physical(msg),
-            LogStorageError::Serialization(msg) => NodeError::Semantic(msg),
-            LogStorageError::Deserialization(msg) => NodeError::Semantic(msg),
-            LogStorageError::Invariant(msg) => NodeError::Logical(msg),
+            LogStorageError::Serialization(msg) => NodeError::Integrity(msg),
+            LogStorageError::Deserialization(msg) => NodeError::Integrity(msg),
+            LogStorageError::Invariant(msg) => NodeError::Protocol(msg),
         }
     }
 }
@@ -37,9 +45,9 @@ impl From<FsmError> for NodeError {
     fn from(err: FsmError) -> Self {
         match err {
             FsmError::Persistence(msg) => NodeError::Physical(msg),
-            FsmError::Serialization(msg) => NodeError::Semantic(msg),
-            FsmError::Deserialization(msg) => NodeError::Semantic(msg),
-            FsmError::Invariant(msg) => NodeError::Logical(msg),
+            FsmError::Serialization(msg) => NodeError::Integrity(msg),
+            FsmError::Deserialization(msg) => NodeError::Integrity(msg),
+            FsmError::Invariant(msg) => NodeError::Protocol(msg),
         }
     }
 }

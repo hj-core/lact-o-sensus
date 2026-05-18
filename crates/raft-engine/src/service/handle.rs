@@ -6,6 +6,7 @@ use common::raft_api::ConsensusStatus;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::ConsensusError;
+use common::types::errors::NodeError;
 
 use crate::engine::LogicalNode;
 use crate::engine::NodeRole;
@@ -65,7 +66,10 @@ impl LocalRaftHandle {
 impl ConsensusHandle for LocalRaftHandle {
     async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
         let mut guard = self.state.write().await;
-        guard.propose(data)
+        guard.propose(data).map_err(|e| match e {
+            NodeError::NotLeader { .. } => ConsensusError::NotLeader,
+            _ => ConsensusError::Internal(e.to_string()),
+        })
     }
 
     async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {

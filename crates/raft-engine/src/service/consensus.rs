@@ -45,7 +45,7 @@ impl ConsensusDispatcher {
                 self.identity, engine_id
             );
             // ADR 009: Poison the node via apply_fatal before panicking.
-            node.apply_fatal(NodeError::Identity(msg));
+            node.apply_fatal(NodeError::Integrity(msg));
         }
     }
 
@@ -211,7 +211,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[should_panic(expected = "Identity Integrity Violation: Identity divergence detected")]
+        #[should_panic(expected = "Data Integrity Violation (Fatal): Identity divergence detected")]
         async fn panics_on_node_id_mismatch() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);
@@ -235,7 +235,7 @@ mod tests {
         }
 
         #[tokio::test]
-        #[should_panic(expected = "Identity Integrity Violation: Identity divergence detected")]
+        #[should_panic(expected = "Data Integrity Violation (Fatal): Identity divergence detected")]
         async fn panics_on_cluster_id_mismatch() {
             let id = mock_identity();
             let fsm = Arc::new(MockFsm);

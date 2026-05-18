@@ -6,7 +6,6 @@ use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
-use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
 use tracing::debug;
 use tracing::error;
@@ -178,7 +177,7 @@ impl LogicalNode {
                          node.",
                         leader_id, req_term
                     );
-                    self.apply_fatal(NodeError::Logical(msg));
+                    self.apply_fatal(NodeError::Protocol(msg));
                 }
                 LogicalNode::Follower(node) => {
                     node.state_mut().set_leader_id(Some(leader_id));
@@ -212,7 +211,12 @@ impl LogicalNode {
                             )
                         }
                     }
-                    Err(e) => self.apply_fatal(e),
+                    Err(e) => {
+                        // TODO: Refinement - Implement capped retries for non-fatal errors
+                        // (e.g. NodeError::Physical) in the Execution Shell before triggering
+                        // Halt Mandate here.
+                        self.apply_fatal(e);
+                    }
                 }
             }
             _ => AppendEntriesResult::inconsistent(self.current_term(), LogIndex::ZERO),
@@ -247,7 +251,10 @@ impl LogicalNode {
                 req_last_log_term,
             ) {
                 Ok(granted) => granted,
-                Err(e) => self.apply_fatal(e),
+                Err(e) => {
+                    // TODO: Refinement - Implement retry/backoff for non-fatal errors.
+                    self.apply_fatal(e);
+                }
             },
             _ => false,
         };
@@ -265,14 +272,20 @@ impl LogicalNode {
 
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
-    pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, ConsensusError> {
+    pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
         match self {
             LogicalNode::Leader(node) => match node.propose(command) {
                 Ok(idx) => Ok(idx),
-                Err(e) => self.apply_fatal(e),
+                Err(e) => {
+                    // TODO: Refinement - Consider if certain Leader-Physical errors
+                    // should trigger a step-down or retry instead of immediate Halt.
+                    self.apply_fatal(e);
+                }
             },
             LogicalNode::Poisoned => panic!("Halt Mandate: Node is poisoned"),
-            _ => Err(ConsensusError::NotLeader),
+            _ => Err(NodeError::NotLeader {
+                leader_hint: self.voted_for(),
+            }),
         }
     }
 
@@ -673,7 +686,7 @@ mod tests {
         fn fails_when_not_leader() {
             let mut state = setup_node(1);
             let result = state.propose(vec![42]);
-            assert!(matches!(result, Err(ConsensusError::NotLeader)));
+            assert!(matches!(result, Err(NodeError::NotLeader { .. })));
         }
     }
 

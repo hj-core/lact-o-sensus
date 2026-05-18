@@ -39,7 +39,7 @@ impl RecoveryManager {
                  indicates log regression or catastrophic storage corruption.",
                 last_applied, last_committed
             );
-            return Err(NodeError::Logical(format!(
+            return Err(NodeError::Protocol(format!(
                 "FSM index {} is ahead of last_committed {}. State drift detected.",
                 last_applied, last_committed
             )));
@@ -67,7 +67,7 @@ impl RecoveryManager {
                     "HALT MANDATE (ADR 009): Committed entry {} missing from log during recovery.",
                     apply_idx
                 );
-                NodeError::Logical(format!(
+                NodeError::Protocol(format!(
                     "Committed entry {} missing from log during recovery",
                     apply_idx
                 ))

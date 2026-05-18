@@ -211,7 +211,7 @@ impl<S: NodeState> RaftNode<S> {
 
         let last_idx = self.last_log_index()?;
         if index > last_idx {
-            return Err(NodeError::Logical(format!(
+            return Err(NodeError::Protocol(format!(
                 "Attempted to commit index {} but last_log_index is {}",
                 index, last_idx
             )));
@@ -236,7 +236,7 @@ impl<S: NodeState> RaftNode<S> {
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
         let fsm_last = self.fsm.last_applied_index().map_err(NodeError::from)?;
         if fsm_last > self.last_committed {
-            return Err(NodeError::Logical(format!(
+            return Err(NodeError::Protocol(format!(
                 "FSM index {} is ahead of last_committed {}. Possible log regression.",
                 fsm_last, self.last_committed
             )));
@@ -245,7 +245,7 @@ impl<S: NodeState> RaftNode<S> {
         while self.last_applied < self.last_committed {
             let apply_idx = self.last_applied + 1;
             let entry = self.log_store.read_entry(apply_idx)?.ok_or_else(|| {
-                NodeError::Logical(format!(
+                NodeError::Protocol(format!(
                     "Committed entry {} missing from log during apply",
                     apply_idx
                 ))
@@ -268,7 +268,7 @@ impl<S: NodeState> RaftNode<S> {
     pub(crate) fn advance_term(&mut self, term: Term) -> Result<(), NodeError> {
         let current = self.log_store.current_term()?;
         if term < current {
-            return Err(NodeError::Logical(format!(
+            return Err(NodeError::Protocol(format!(
                 "Term regression detected! current={} new={}",
                 current, term
             )));
@@ -323,7 +323,7 @@ impl RaftNode<Follower> {
         let last_committed = log_store.last_committed().map_err(NodeError::from)?;
 
         if last_applied > last_committed {
-            return Err(NodeError::Logical(format!(
+            return Err(NodeError::Protocol(format!(
                 "Causal invariant violation: FSM applied index {} is ahead of LogStore committed \
                  index {}",
                 last_applied, last_committed
@@ -1038,8 +1038,8 @@ mod tests {
                     assert!(result.is_err());
                     let err = result.unwrap_err();
                     assert!(
-                        matches!(err, NodeError::Logical(_)),
-                        "Expected NodeError::Logical, got {:?}",
+                        matches!(err, NodeError::Protocol(_)),
+                        "Expected NodeError::Protocol, got {:?}",
                         err
                     );
                     assert!(err.to_string().contains("Simulated FSM failure"));
