@@ -27,20 +27,22 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 - **3.7. Defensive Mutation Lifecycle (ADR 007):** A 5-layer "Defense Onion" pipeline: Structural Intent -> Syntactic Fortress -> Semantic Oracle -> Registry Firewall -> Consensus Commit.
 - **3.8. Universal Unit Registry (ADR 008):** Internal SI stabilization using `rust_decimal`. All physical state is normalized to `g` or `ml` using Banker's Rounding.
 - **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Implements **Poison-then-Panic** to handle invariant violations.
+- **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with mandatory PII redaction (Client ID truncation, TRACE-only justifications) to enable deterministic reconstruction of distributed events.
 
 ## 4. Technical Mandates
 
-- **4.1. Clinical Decoupling:** Prohibit the leak of grocery domain logic into `raft-engine`. All communication between layers must occur via the `common` contract.
-- **4.2. Heartbeat Decoupling:** Prohibit blocking the Raft heartbeat or election timers with external I/O (e.g., AI Veto egress). All external policy resolution must occur in the delivery layer or via asynchronous task delegation to preserve cluster liveness.
-- **4.3. Poison-then-Panic:** Transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
-- **4.4. Storage Integrity:** Every physical mutation to the Raft core state must be followed by an explicit synchronous disk flush (`flush()`) before responding to an RPC to prevent log loss after a crash.
-- **4.5. Physical Truth:** Prohibit non-canonical measurements. All mutations must be stabilized to SI base units using **Banker's Rounding (Half-to-Even)** and transmitted as stringified fixed-point decimals before being logged to ensure cross-architecture determinism.
-- **4.6. Registry Firewall:** All AI-provided metadata must be verified against hardcoded system registries before finalization.
-- **4.7. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (e.g., `NodeId`, `ClusterId`) for all domain identifiers.
-- **4.8. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
-- **4.9. Safety Prohibitions:** Never use `unwrap()` or `expect()` in production-level code.
-- **4.10. Information Opacity:** External errors must identify the category of failure (e.g., Sequence Gap) but MUST NOT disclose internal metadata or state values.
-- **4.11. Error Categorization (`thiserror` vs `anyhow`):** Map all library-returned errors to domain-specific Error enums via `thiserror`. The use of `anyhow` is strictly PROHIBITED in core logic (`crates/common`, `crates/raft-engine`, `crates/gateway`), and is permitted exclusively in top-level `main.rs` binaries.
+- **4.1. Poison-then-Panic:** Transition logical state to `Poisoned` immediately before any invariant-violation `panic!`.
+- **4.2. Safety Prohibitions:** Never use `unwrap()` or `expect()` in production-level code.
+- **4.3. NewType Enforcement:** Zero-tolerance for primitive obsession. Use self-validating NewTypes (e.g., `NodeId`, `ClusterId`) for all domain identifiers.
+- **4.4. Error Categorization (`thiserror` vs `anyhow`):** Map all library-returned errors to domain-specific Error enums via `thiserror`. The use of `anyhow` is strictly PROHIBITED in core logic (`crates/common`, `crates/raft-engine`, `crates/gateway`), and is permitted exclusively in top-level `main.rs` binaries.
+- **4.5. Clinical Decoupling:** Prohibit the leak of grocery domain logic into `raft-engine`. All communication between layers must occur via the `common` contract.
+- **4.6. Heartbeat Decoupling:** Prohibit blocking the Raft heartbeat or election timers with external I/O (e.g., AI Veto egress). All external policy resolution must occur in the delivery layer or via asynchronous task delegation to preserve cluster liveness.
+- **4.7. Factory-Only Egress:** Prohibit manual gRPC message construction. Use NewType-aware factories (`new`) in `common/src/proto.rs` to ensure safe boundary transitions.
+- **4.8. Storage Integrity:** Every physical mutation to the Raft core state must be followed by an explicit synchronous disk flush (`flush()`) before responding to an RPC to prevent log loss after a crash.
+- **4.9. Physical Truth:** Prohibit non-canonical measurements. All mutations must be stabilized to SI base units using **Banker's Rounding (Half-to-Even)** and transmitted as stringified fixed-point decimals before being logged to ensure cross-architecture determinism.
+- **4.10. Registry Firewall:** All AI-provided metadata must be verified against hardcoded system registries before finalization.
+- **4.11. Structured Observability:** Prohibit unstructured logging for clinical events. All protocol transitions, physical mutations, and lifecycle spans must use structured `tracing` events with standardized fields (`trace_id`, `term`, `index`, `client_id`) and respect the mandatory redaction boundaries defined in ADR 010.
+- **4.12. Information Opacity:** External errors must identify the category of failure (e.g., Sequence Gap) but MUST NOT disclose internal metadata or state values.
 
 ## 5. Workflow
 
