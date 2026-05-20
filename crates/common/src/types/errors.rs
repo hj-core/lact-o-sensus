@@ -174,4 +174,7 @@ pub enum IdentityError {
 
     #[error("Invalid ClientId format: {0}")]
     InvalidClientId(String),
+
+    #[error("Invalid TraceId format: {0}")]
+    InvalidTraceId(String),
 }
