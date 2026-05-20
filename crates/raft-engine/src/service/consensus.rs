@@ -5,11 +5,13 @@ use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
+use common::rpc::TraceInterceptor;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
+use common::types::trace::ClinicalTarget;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -17,6 +19,68 @@ use tracing::info_span;
 
 use crate::engine::LogicalNode;
 use crate::shell::ConsensusShell;
+
+// =============================================================================
+// I. Semantic Vocabulary (DTOs)
+// =============================================================================
+
+/// Encapsulates the fully validated and parsed parameters for a RequestVote
+/// RPC.
+struct VoteParams {
+    candidate_id: NodeId,
+    term: Term,
+    last_log_index: LogIndex,
+    last_log_term: Term,
+}
+
+impl VoteParams {
+    /// Translates raw Protobuf types into strict domain NewTypes.
+    fn try_from_proto(req: RequestVoteRequest) -> Result<Self, Status> {
+        let candidate_id = req.candidate_id.parse::<NodeId>().map_err(|_| {
+            Status::invalid_argument(format!("Invalid NodeId: '{}'", req.candidate_id))
+        })?;
+
+        Ok(Self {
+            candidate_id,
+            term: Term::new(req.term),
+            last_log_index: LogIndex::new(req.last_log_index),
+            last_log_term: Term::new(req.last_log_term),
+        })
+    }
+}
+
+/// Encapsulates the fully validated and parsed parameters for an
+/// AppendEntries RPC.
+struct AppendParams {
+    leader_id: NodeId,
+    term: Term,
+    prev_log_index: LogIndex,
+    prev_log_term: Term,
+    entries: Vec<common::proto::v1::raft::LogEntry>,
+    leader_commit: LogIndex,
+}
+
+impl AppendParams {
+    /// Translates raw Protobuf types into strict domain NewTypes.
+    fn try_from_proto(req: AppendEntriesRequest) -> Result<Self, Status> {
+        let leader_id = req.leader_id.parse::<NodeId>().map_err(|_| {
+            Status::invalid_argument(format!("Invalid NodeId: '{}'", req.leader_id))
+        })?;
+
+        Ok(Self {
+            leader_id,
+            term: Term::new(req.term),
+            prev_log_index: LogIndex::new(req.prev_log_index),
+            prev_log_term: Term::new(req.prev_log_term),
+            entries: req.entries,
+            leader_commit: LogIndex::new(req.leader_commit),
+        })
+    }
+}
+
+// =============================================================================
+// II. Public Orchestrators (ConsensusDispatcher)
+// =============================================================================
 
 /// Implementation of the internal Raft consensus RPCs.
 ///
@@ -40,6 +104,14 @@ impl ConsensusDispatcher {
         if Arc::ptr_eq(&engine_id, &self.identity) {
             Ok(())
         } else {
+            // ADR 010: Structured Integrity Event
+            tracing::error!(
+                target: ClinicalTarget::ClinicalTelemetry.as_str(),
+                service_id = ?&self.identity,
+                engine_id = ?engine_id,
+                "Identity divergence detected! Halting node."
+            );
+
             let msg = format!(
                 "Identity divergence detected! ServiceIdentity='{:?}' EngineIdentity='{:?}'",
                 self.identity, engine_id
@@ -49,9 +121,40 @@ impl ConsensusDispatcher {
         }
     }
 
-    /// Returns a standard gRPC InvalidArgument status for invalid Node IDs.
-    fn invalid_node_id_status(&self, input: &str) -> Status {
-        Status::invalid_argument(format!("Invalid NodeId format: '{}'", input))
+    /// Executes the core logic for a RequestVote RPC.
+    async fn execute_vote_logic(
+        &self,
+        params: &VoteParams,
+    ) -> Result<crate::engine::RequestVoteResult, Status> {
+        let mut guard = self.state.write().await;
+        self.verify_node_integrity(&mut guard)?;
+
+        Ok(guard.handle_request_vote(
+            params.candidate_id,
+            params.term,
+            params.last_log_index,
+            params.last_log_term,
+        ))
+    }
+
+    /// Executes the core logic for an AppendEntries RPC.
+    async fn execute_append_logic(
+        &self,
+        params: AppendParams,
+    ) -> Result<crate::engine::AppendEntriesResult, Status> {
+        let mut guard = self.state.write().await;
+        self.verify_node_integrity(&mut guard)?;
+
+        Ok(guard
+            .handle_append_entries(
+                params.leader_id,
+                params.term,
+                params.prev_log_index,
+                params.prev_log_term,
+                params.entries,
+                params.leader_commit,
+            )
+            .await)
     }
 }
 
@@ -61,78 +164,65 @@ impl ConsensusService for ConsensusDispatcher {
         &self,
         request: Request<RequestVoteRequest>,
     ) -> Result<Response<RequestVoteResponse>, Status> {
-        let req = request.into_inner();
+        // 1. Extraction: Enforce TraceId presence and parse domain parameters.
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+        let params = VoteParams::try_from_proto(request.into_inner())?;
 
-        let candidate_id = req
-            .candidate_id
-            .parse::<NodeId>()
-            .map_err(|_| self.invalid_node_id_status(&req.candidate_id))?;
-
-        let req_term = Term::new(req.term);
-        let req_last_log_index = LogIndex::new(req.last_log_index);
-        let req_last_log_term = Term::new(req.last_log_term);
-
-        let span = info_span!("request_vote", term = %req_term, candidate = %candidate_id);
+        // 2. Instrumentation: Establish the clinical boundary.
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "request_vote",
+            cluster_id = %self.identity.cluster_id(),
+            node_id = %self.identity.node_id(),
+            trace_id = %trace_id,
+            term = %params.term,
+            sender_id = %params.candidate_id
+        );
         let _enter = span.enter();
 
-        let result = {
-            let mut guard = self.state.write().await;
-            self.verify_node_integrity(&mut guard)?;
+        // 3. Execution: Delegate to the internal logic shell.
+        let result = self.execute_vote_logic(&params).await?;
 
-            guard.handle_request_vote(
-                candidate_id,
-                req_term,
-                req_last_log_index,
-                req_last_log_term,
-            )
-        };
+        // 4. Construction: Build the response and inject telemetry feedback.
+        let mut response =
+            Response::new(RequestVoteResponse::new(result.term, result.vote_granted));
+        TraceInterceptor::inject_response(&mut response, trace_id)?;
 
-        Ok(Response::new(RequestVoteResponse::new(
-            result.term,
-            result.vote_granted,
-        )))
+        Ok(response)
     }
 
     async fn append_entries(
         &self,
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesResponse>, Status> {
-        let req = request.into_inner();
+        // 1. Extraction: Enforce TraceId presence and parse domain parameters.
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+        let params = AppendParams::try_from_proto(request.into_inner())?;
 
-        let leader_id = req
-            .leader_id
-            .parse::<NodeId>()
-            .map_err(|_| self.invalid_node_id_status(&req.leader_id))?;
-
-        let req_term = Term::new(req.term);
-        let req_prev_log_index = LogIndex::new(req.prev_log_index);
-        let req_prev_log_term = Term::new(req.prev_log_term);
-        let req_leader_commit = LogIndex::new(req.leader_commit);
-
-        let span = info_span!("append_entries", term = %req_term, leader = %leader_id);
+        // 2. Instrumentation: Establish the clinical boundary.
+        let span = info_span!(
+            target: ClinicalTarget::RaftReplication.as_str(),
+            "append_entries",
+            cluster_id = %self.identity.cluster_id(),
+            node_id = %self.identity.node_id(),
+            trace_id = %trace_id,
+            term = %params.term,
+            sender_id = %params.leader_id
+        );
         let _enter = span.enter();
 
-        let result = {
-            let mut guard = self.state.write().await;
-            self.verify_node_integrity(&mut guard)?;
+        // 3. Execution: Delegate to the internal logic shell.
+        let result = self.execute_append_logic(params).await?;
 
-            guard
-                .handle_append_entries(
-                    leader_id,
-                    req_term,
-                    req_prev_log_index,
-                    req_prev_log_term,
-                    req.entries,
-                    req_leader_commit,
-                )
-                .await
-        };
-
-        Ok(Response::new(AppendEntriesResponse::new(
+        // 4. Construction: Build the response and inject telemetry feedback.
+        let mut response = Response::new(AppendEntriesResponse::new(
             result.term,
             result.success,
             result.conflict_index,
-        )))
+        ));
+        TraceInterceptor::inject_response(&mut response, trace_id)?;
+
+        Ok(response)
     }
 }
 
@@ -142,6 +232,7 @@ mod tests {
     use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
 
     use super::*;
     use crate::engine::Follower;
@@ -182,6 +273,33 @@ mod tests {
         ConsensusDispatcher::new(id, state)
     }
 
+    /// Helper to create a Request with a mandatory TraceId extension for
+    /// telemetry-guarded handlers.
+    fn make_request<T>(payload: T) -> Request<T> {
+        let mut req = Request::new(payload);
+        req.extensions_mut().insert(TraceId::generate());
+        req
+    }
+
+    mod tracing_integrity {
+        use super::*;
+
+        #[tokio::test]
+        async fn rejects_request_missing_trace_id() {
+            let dispatcher = mock_dispatcher();
+            let req = Request::new(RequestVoteRequest {
+                term: 1,
+                candidate_id: "2".to_string(),
+                last_log_index: 0,
+                last_log_term: 0,
+            });
+
+            let result = dispatcher.request_vote(req).await;
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        }
+    }
+
     mod integrity_check {
         use std::panic::AssertUnwindSafe;
 
@@ -200,7 +318,7 @@ mod tests {
                 *guard = LogicalNode::Poisoned;
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -224,7 +342,7 @@ mod tests {
 
             let dispatcher = ConsensusDispatcher::new(id, state);
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -252,7 +370,7 @@ mod tests {
 
             let dispatcher = ConsensusDispatcher::new(id, state);
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -273,7 +391,7 @@ mod tests {
             let state = Arc::new(ConsensusShell::new(node));
             let dispatcher = ConsensusDispatcher::new(id, state.clone());
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -302,7 +420,7 @@ mod tests {
         async fn grants_vote_when_term_is_higher_and_not_voted() {
             let dispatcher = mock_dispatcher();
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1, // Follower starts at term 0, so 1 is higher
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -323,7 +441,7 @@ mod tests {
                 state.into_follower(Term::new(1), None);
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1, // Same as current term
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -345,7 +463,7 @@ mod tests {
                 state.into_follower(Term::new(2), None);
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1, // Older term
                 candidate_id: "2".to_string(),
                 last_log_index: 0,
@@ -374,7 +492,7 @@ mod tests {
                 }
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 1, // Shorter than local (2)
@@ -399,7 +517,7 @@ mod tests {
                 }
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 2,
                 candidate_id: "2".to_string(),
                 last_log_index: 10, // Longer, but...
@@ -424,7 +542,7 @@ mod tests {
                 }
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 1,
                 candidate_id: "2".to_string(),
                 last_log_index: 2, // Longer than local (1)
@@ -451,7 +569,7 @@ mod tests {
                 }
             }
 
-            let req = Request::new(RequestVoteRequest {
+            let req = make_request(RequestVoteRequest {
                 term: 2,
                 candidate_id: "2".to_string(),
                 last_log_index: 1, // Shorter, but...
@@ -460,6 +578,25 @@ mod tests {
 
             let response = dispatcher.request_vote(req).await.unwrap().into_inner();
             assert!(response.vote_granted);
+        }
+
+        #[tokio::test]
+        async fn grants_vote_and_injects_trace_response() {
+            let dispatcher = mock_dispatcher();
+            let req = RequestVoteRequest {
+                term: 2,
+                candidate_id: "2".to_string(),
+                last_log_index: 1,
+                last_log_term: 2,
+            };
+
+            let trace_id = TraceId::generate();
+            let mut r = Request::new(req);
+            r.extensions_mut().insert(trace_id);
+
+            let resp = dispatcher.request_vote(r).await.unwrap();
+            assert!(resp.get_ref().vote_granted);
+            assert_eq!(TraceInterceptor::extract_response(&resp).unwrap(), trace_id);
         }
     }
 
@@ -473,7 +610,7 @@ mod tests {
         async fn returns_success_when_term_is_current() {
             let dispatcher = mock_dispatcher();
 
-            let req = Request::new(AppendEntriesRequest {
+            let req = make_request(AppendEntriesRequest {
                 term: 0,
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -497,7 +634,7 @@ mod tests {
                 state.into_follower(Term::new(2), None);
             }
 
-            let req = Request::new(AppendEntriesRequest {
+            let req = make_request(AppendEntriesRequest {
                 term: 1, // Older
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -522,7 +659,7 @@ mod tests {
             let state = Arc::new(ConsensusShell::new(LogicalNode::Candidate(candidate)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 
-            let req = Request::new(AppendEntriesRequest {
+            let req = make_request(AppendEntriesRequest {
                 term: 1, // Equal to candidate term
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -552,7 +689,7 @@ mod tests {
             let state = Arc::new(ConsensusShell::new(LogicalNode::Leader(leader)));
             let dispatcher = ConsensusDispatcher::new(id, state);
 
-            let req = Request::new(AppendEntriesRequest {
+            let req = make_request(AppendEntriesRequest {
                 term: 1, // Rival leader for same term
                 leader_id: "2".to_string(),
                 prev_log_index: 0,
@@ -582,7 +719,7 @@ mod tests {
             // Small sleep to ensure time moves forward
             tokio::time::sleep(Duration::from_millis(5)).await;
 
-            let req = Request::new(AppendEntriesRequest {
+            let req = make_request(AppendEntriesRequest {
                 term: 0,
                 leader_id: "2".to_string(),
                 prev_log_index: 0,

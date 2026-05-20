@@ -12,9 +12,12 @@ use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
+use common::types::trace::ClinicalTarget;
+use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::info_span;
 
 use crate::storage::LogStorage;
 
@@ -195,6 +198,13 @@ impl<S: NodeState> RaftNode<S> {
 
         // Transition to next term if higher (§5.1)
         node.advance_term(term)?;
+
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            leader_id = ?leader_id,
+            "Role Transition: -> Follower"
+        );
+
         Ok(node)
     }
 
@@ -203,6 +213,7 @@ impl<S: NodeState> RaftNode<S> {
     pub async fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
         if index < self.last_committed {
             debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
                 "Ignoring stale last_committed update: {} < current {}",
                 index, self.last_committed
             );
@@ -225,7 +236,20 @@ impl<S: NodeState> RaftNode<S> {
                 .map_err(NodeError::from)?;
 
             self.last_committed = index;
-            self.apply_to_state_machine().await?;
+
+            info!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                index = %index,
+                "Commit Index Advanced"
+            );
+
+            let fsm_span = info_span!(
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                "fsm_application",
+                last_committed = %self.last_committed
+            );
+
+            self.apply_to_state_machine().instrument(fsm_span).await?;
         }
         Ok(())
     }
@@ -253,11 +277,19 @@ impl<S: NodeState> RaftNode<S> {
 
             if let Err(e) = self.fsm.apply(apply_idx, &entry.data).await {
                 error!(
-                    "State machine failed to apply index {}: {}. Triggering Halt Mandate.",
-                    apply_idx, e
+                    target: ClinicalTarget::ClinicalFsm.as_str(),
+                    index = %apply_idx,
+                    error = %e,
+                    "State machine failed to apply index. Triggering Halt Mandate."
                 );
                 return Err(NodeError::from(e));
             }
+
+            debug!(
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                index = %apply_idx,
+                "Physical Mutation Resolved"
+            );
 
             self.last_applied = apply_idx;
         }
@@ -277,6 +309,13 @@ impl<S: NodeState> RaftNode<S> {
             self.log_store
                 .save_hard_state(term, None)
                 .map_err(NodeError::from)?;
+
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                current_term = %current,
+                new_term = %term,
+                "Term Advanced"
+            );
         }
         Ok(())
     }
@@ -349,16 +388,27 @@ impl RaftNode<Follower> {
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
     ) -> Result<ReconciliationResult, NodeError> {
-        if !self.verify_log_consistency(prev_log_index, prev_log_term)? {
-            return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
-        }
+        let span = info_span!(
+            target: ClinicalTarget::RaftReplication.as_str(),
+            "log_reconciliation",
+            prev_index = %prev_log_index,
+            entry_count = entries.len()
+        );
 
-        if !self.append_entries_with_reconciliation(entries)? {
-            return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
-        }
+        async {
+            if !self.verify_log_consistency(prev_log_index, prev_log_term)? {
+                return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
+            }
 
-        self.reconcile_last_committed(leader_commit).await?;
-        Ok(ReconciliationResult::success(self.last_log_index()?))
+            if !self.append_entries_with_reconciliation(entries)? {
+                return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
+            }
+
+            self.reconcile_last_committed(leader_commit).await?;
+            Ok(ReconciliationResult::success(self.last_log_index()?))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Evaluates if a vote can be granted to a candidate for the given term.
@@ -402,6 +452,13 @@ impl RaftNode<Follower> {
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
         node.state_mut().add_vote(node_id);
+
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            term = %new_term,
+            "Role Transition: -> Candidate"
+        );
+
         Ok(node)
     }
 
@@ -531,11 +588,19 @@ impl RaftNode<Candidate> {
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
         node.state_mut().add_vote(node_id);
+
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            term = %new_term,
+            "Role Transition: -> Candidate (Restarted)"
+        );
+
         Ok(node)
     }
 
     pub fn try_into_leader(self, peer_ids: Vec<NodeId>) -> Result<RaftNode<Leader>, NodeError> {
         let last_log_index = self.last_log_index()?;
+        let term = self.current_term()?;
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let node = RaftNode {
@@ -546,6 +611,13 @@ impl RaftNode<Candidate> {
             last_applied,
             state: Leader::new(peer_ids, last_log_index),
         };
+
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            term = %term,
+            "Role Transition: -> Leader"
+        );
+
         Ok(node)
     }
 }
@@ -558,6 +630,10 @@ impl RaftNode<Leader> {
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
+        let span =
+            info_span!(target: ClinicalTarget::RaftReplication.as_str(), "proposal_ingestion");
+        let _enter = span.enter();
+
         let index = self.last_log_index()? + 1;
         let entry = LogEntry::new(index, self.current_term()?, command);
         self.log_store

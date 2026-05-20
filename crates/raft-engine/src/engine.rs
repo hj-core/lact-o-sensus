@@ -7,6 +7,7 @@ use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
+use common::types::trace::ClinicalTarget;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -149,8 +150,11 @@ impl LogicalNode {
         // 1. Term check (§5.1)
         if req_term < current_term {
             debug!(
-                "Rejecting AppendEntries from {}: term {} is older than currentTerm {}",
-                leader_id, req_term, current_term
+                target: "raft::replication",
+                remote_leader = %leader_id,
+                req_term = %req_term,
+                local_term = %current_term,
+                "Rejecting AppendEntries: Stale Term"
             );
             return AppendEntriesResult::stale_term(current_term);
         }
@@ -158,16 +162,21 @@ impl LogicalNode {
         // 2. High-level state transitions and demotions (§5.1, §5.2)
         if req_term > current_term {
             info!(
-                "Received higher term ({}) from leader {}. Demoting to Follower.",
-                req_term, leader_id
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                old_term = %current_term,
+                new_term = %req_term,
+                remote_leader = %leader_id,
+                "Role Transition: -> Follower (Term Discovery)"
             );
             self.into_follower(req_term, Some(leader_id));
         } else if req_term == current_term {
             match self {
                 LogicalNode::Candidate(_) => {
                     info!(
-                        "Candidate recognizing leader {} for term {}. Returning to Follower.",
-                        leader_id, req_term
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        remote_leader = %leader_id,
+                        "Role Transition: -> Follower (Leader Recognized)"
                     );
                     self.into_follower(req_term, Some(leader_id));
                 }
@@ -236,8 +245,11 @@ impl LogicalNode {
         // 1. High-level term update (§5.1)
         if req_term > current_term {
             info!(
-                "Received higher term ({}) from candidate {}. Transitioning to Follower.",
-                req_term, candidate_id
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                old_term = %current_term,
+                new_term = %req_term,
+                candidate = %candidate_id,
+                "Role Transition: -> Follower (Term Discovery via Vote)"
             );
             self.into_follower(req_term, None);
         }
@@ -261,8 +273,10 @@ impl LogicalNode {
 
         if vote_granted {
             info!(
-                "Granting vote to candidate {} for term {}",
-                candidate_id, req_term
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                term = %req_term,
+                candidate = %candidate_id,
+                "Vote Granted"
             );
             RequestVoteResult::granted(self.current_term())
         } else {
@@ -275,7 +289,16 @@ impl LogicalNode {
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
         match self {
             LogicalNode::Leader(node) => match node.propose(command) {
-                Ok(idx) => Ok(idx),
+                Ok(idx) => {
+                    let term = self.current_term();
+                    debug!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        %term,
+                        index = %idx,
+                        "Proposal Ingested"
+                    );
+                    Ok(idx)
+                }
                 Err(e) => {
                     // TODO: Refinement - Consider if certain Leader-Physical errors
                     // should trigger a step-down or retry instead of immediate Halt.
@@ -415,14 +438,22 @@ impl LogicalNode {
     /// Transitions state to Poisoned and panics with a standardized clinical
     /// prefix.
     pub(crate) fn apply_fatal(&mut self, err: NodeError) -> ! {
-        error!("FATAL: {}", err);
+        error!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            error = %err,
+            "FATAL: Halt Mandate Executed"
+        );
         *self = LogicalNode::Poisoned;
         panic!("Halt Mandate: {}", err);
     }
 
     /// Static variant for use within ownership-consuming closures.
     pub(crate) fn apply_fatal_static(err: NodeError) -> ! {
-        error!("FATAL: {}", err);
+        error!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            error = %err,
+            "FATAL: Halt Mandate Executed (Static)"
+        );
         panic!("Halt Mandate: {}", err);
     }
 
@@ -542,156 +573,229 @@ mod tests {
     mod handle_append_entries {
         use super::*;
 
-        #[tokio::test]
-        async fn demotes_candidate_on_equal_term() {
-            let mut state = setup_node(1);
-            state.into_candidate();
+        mod term_safety {
+            use super::*;
 
-            // AppendEntries from leader of same term
-            let result = state
-                .handle_append_entries(
-                    NodeId::new(2),
-                    Term::new(1),
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                    vec![],
-                    LogIndex::ZERO,
-                )
-                .await;
+            #[tokio::test]
+            async fn demotes_candidate_on_equal_term() {
+                let mut state = setup_node(1);
+                state.into_candidate();
 
-            assert!(result.success);
-            assert_eq!(result.term, Term::new(1));
-            assert!(matches!(state, LogicalNode::Follower(_)));
+                // AppendEntries from leader of same term
+                let result = state
+                    .handle_append_entries(
+                        NodeId::new(2),
+                        Term::new(1),
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    )
+                    .await;
+
+                assert!(result.success);
+                assert_eq!(result.term, Term::new(1));
+                assert!(matches!(state, LogicalNode::Follower(_)));
+            }
+
+            #[tokio::test]
+            async fn demotes_any_role_on_higher_term() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                state.into_leader(vec![]);
+
+                let result = state
+                    .handle_append_entries(
+                        NodeId::new(2),
+                        Term::new(10), // Higher term
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    )
+                    .await;
+
+                assert!(result.success);
+                assert_eq!(result.term, Term::new(10));
+                assert!(matches!(state, LogicalNode::Follower(_)));
+            }
+
+            #[tokio::test]
+            async fn rejects_stale_term() {
+                let mut state = setup_node(1);
+                state.into_follower(Term::new(5), None);
+
+                let result = state
+                    .handle_append_entries(
+                        NodeId::new(2),
+                        Term::new(1), // Stale term
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    )
+                    .await;
+
+                assert!(!result.success);
+                assert_eq!(result.term, Term::new(5));
+            }
         }
 
-        #[tokio::test]
-        async fn demotes_any_role_on_higher_term() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            state.into_leader(vec![]);
+        mod rival_leader_protection {
+            use super::*;
 
-            let result = state
-                .handle_append_entries(
-                    NodeId::new(2),
-                    Term::new(10), // Higher term
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                    vec![],
-                    LogIndex::ZERO,
-                )
-                .await;
+            #[tokio::test]
+            #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+            async fn halts_on_rival_leader_same_term() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                state.into_leader(vec![]);
 
-            assert!(result.success);
-            assert_eq!(result.term, Term::new(10));
-            assert!(matches!(state, LogicalNode::Follower(_)));
-        }
-
-        #[tokio::test]
-        async fn rejects_stale_term() {
-            let mut state = setup_node(1);
-            state.into_follower(Term::new(5), None);
-
-            let result = state
-                .handle_append_entries(
-                    NodeId::new(2),
-                    Term::new(1), // Stale term
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                    vec![],
-                    LogIndex::ZERO,
-                )
-                .await;
-
-            assert!(!result.success);
-            assert_eq!(result.term, Term::new(5));
-        }
-
-        #[tokio::test]
-        #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
-        async fn halts_on_rival_leader_same_term() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            state.into_leader(vec![]);
-
-            state
-                .handle_append_entries(
-                    NodeId::new(2),
-                    Term::new(1), // Same term as local leader
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                    vec![],
-                    LogIndex::ZERO,
-                )
-                .await;
+                state
+                    .handle_append_entries(
+                        NodeId::new(2),
+                        Term::new(1), // Same term as local leader
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    )
+                    .await;
+            }
         }
     }
 
     mod handle_request_vote {
         use super::*;
 
-        #[test]
-        fn demotes_on_higher_term_even_if_vote_rejected() {
-            let mut state = setup_node(1);
-            match &mut state {
-                LogicalNode::Follower(n) => {
-                    n.log_store()
-                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
-                        .unwrap();
+        mod term_safety {
+            use super::*;
+
+            #[test]
+            fn demotes_on_higher_term_even_if_vote_rejected() {
+                let mut state = setup_node(1);
+                match &mut state {
+                    LogicalNode::Follower(n) => {
+                        n.log_store()
+                            .append_entries(vec![LogEntry::new(
+                                LogIndex::new(1),
+                                Term::new(1),
+                                vec![],
+                            )])
+                            .unwrap();
+                    }
+                    _ => panic!("Setup failed"),
                 }
-                _ => panic!("Setup failed"),
+                state.into_candidate();
+
+                // Request from higher term, but with stale candidate log
+                let result = state.handle_request_vote(
+                    NodeId::new(2),
+                    Term::new(5),
+                    LogIndex::ZERO, // Stale index
+                    Term::ZERO,
+                );
+
+                assert!(!result.vote_granted);
+                assert_eq!(result.term, Term::new(5));
+                assert!(matches!(state, LogicalNode::Follower(_)));
             }
-            state.into_candidate();
-
-            // Request from higher term, but with stale candidate log
-            let result = state.handle_request_vote(
-                NodeId::new(2),
-                Term::new(5),
-                LogIndex::ZERO, // Stale index
-                Term::ZERO,
-            );
-
-            assert!(!result.vote_granted);
-            assert_eq!(result.term, Term::new(5));
-            assert!(matches!(state, LogicalNode::Follower(_)));
         }
 
-        #[test]
-        fn grants_vote_on_same_term_if_eligible() {
-            let mut state = setup_node(1);
-            state.into_follower(Term::new(1), None);
+        mod vote_granting {
+            use super::*;
 
-            let result =
-                state.handle_request_vote(NodeId::new(2), Term::new(1), LogIndex::ZERO, Term::ZERO);
+            #[test]
+            fn grants_vote_on_same_term_if_eligible() {
+                let mut state = setup_node(1);
+                state.into_follower(Term::new(1), None);
 
-            assert!(result.vote_granted);
-            assert_eq!(state.voted_for(), Some(NodeId::new(2)));
+                let result = state.handle_request_vote(
+                    NodeId::new(2),
+                    Term::new(1),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                );
+
+                assert!(result.vote_granted);
+                assert_eq!(state.voted_for(), Some(NodeId::new(2)));
+            }
         }
     }
 
     mod propose {
         use super::*;
 
-        #[test]
-        fn succeeds_when_leader() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            state.into_leader(vec![]);
+        mod role_restrictions {
+            use super::*;
 
-            let result = state.propose(vec![42]);
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), LogIndex::new(1));
+            #[test]
+            fn succeeds_when_leader() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                state.into_leader(vec![]);
+
+                let result = state.propose(vec![42]);
+                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), LogIndex::new(1));
+            }
+
+            #[test]
+            fn fails_when_not_leader() {
+                let mut state = setup_node(1);
+                let result = state.propose(vec![42]);
+                assert!(matches!(result, Err(NodeError::NotLeader { .. })));
+            }
+        }
+    }
+
+    mod consensus_progress {
+        use super::*;
+
+        #[test]
+        fn reports_follower_state_accurately() {
+            let mut state = setup_node(1);
+            let progress = state.consensus_progress();
+            assert_eq!(progress.role, NodeRole::Follower);
+            assert_eq!(progress.term, Term::ZERO);
         }
 
         #[test]
-        fn fails_when_not_leader() {
+        fn reports_candidate_state_accurately() {
             let mut state = setup_node(1);
-            let result = state.propose(vec![42]);
-            assert!(matches!(result, Err(NodeError::NotLeader { .. })));
+            state.into_candidate();
+            let progress = state.consensus_progress();
+            assert_eq!(progress.role, NodeRole::Candidate);
+            assert_eq!(progress.term, Term::new(1));
+        }
+
+        #[test]
+        fn reports_leader_state_accurately() {
+            let mut state = setup_node(1);
+            state.into_candidate();
+            state.into_leader(vec![]);
+            let progress = state.consensus_progress();
+            assert_eq!(progress.role, NodeRole::Leader);
+            assert_eq!(progress.term, Term::new(1));
+        }
+
+        #[test]
+        fn reports_poisoned_state_accurately() {
+            let mut state = LogicalNode::Poisoned;
+            let progress = state.consensus_progress();
+            assert_eq!(progress.role, NodeRole::Poisoned);
         }
     }
 
     mod transition_safety {
         use super::*;
+
+        #[test]
+        #[should_panic(expected = "Halt Mandate: Node is poisoned")]
+        fn panics_on_propose_when_poisoned() {
+            let mut state = LogicalNode::Poisoned;
+            let _ = state.propose(vec![42]);
+        }
 
         #[test]
         #[should_panic(expected = "Halt Mandate: Node is poisoned")]

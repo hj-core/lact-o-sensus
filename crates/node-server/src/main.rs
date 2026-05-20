@@ -6,6 +6,8 @@ use clap::Parser;
 use common::proto::v1::app::ingress_service_server::IngressServiceServer;
 use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
 use common::rpc::IdentityInterceptor;
+use common::rpc::TraceInterceptor;
+use common::types::trace::ClinicalTarget;
 use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use lacto_fsm::LactoStore;
@@ -22,6 +24,7 @@ use raft_engine::service::consensus::ConsensusDispatcher;
 use raft_engine::service::handle::LocalRaftHandle;
 use raft_engine::shell::ConsensusShell;
 use raft_engine::storage::SledStorage;
+use tonic::service::Interceptor;
 use tonic::transport::Server;
 use tracing::Instrument;
 use tracing::error;
@@ -52,149 +55,254 @@ async fn main() -> Result<()> {
         .with_thread_ids(true)
         .init();
 
-    info!("Lact-O-Sensus Node Initializing...");
+    info!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
+        "Lact-O-Sensus Node Initializing..."
+    );
 
     // 3. Load Configuration
-    let config = match Config::load(&args.config) {
-        Ok(cfg) => Arc::new(cfg),
-        Err(e) => {
-            error!("Failed to load configuration from {:?}: {}", args.config, e);
-            return Err(e.into());
+    let config = {
+        let _span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "configuration_loading"
+        )
+        .entered();
+
+        match Config::load(&args.config) {
+            Ok(cfg) => Arc::new(cfg),
+            Err(e) => {
+                error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    error = %e,
+                    "Failed to load configuration from {:?}",
+                    args.config
+                );
+                return Err(e.into());
+            }
         }
     };
 
     // 4. Initialize Isolated Persistence (sled) (ADR 001/009)
     // Establishing split databases for strict component isolation.
-    let system_path = config.data_dir.join("system");
-    let log_path = config.data_dir.join("log");
-    let fsm_path = config.data_dir.join("fsm");
+    let (system_db, log_db, fsm_db) = {
+        let _span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "persistence_initialization"
+        )
+        .entered();
 
-    info!("Opening system database at: {}", system_path.display());
-    let system_db = sled::open(&system_path).map_err(anyhow::Error::from)?;
+        let system_path = config.data_dir.join("system");
+        let log_path = config.data_dir.join("log");
+        let fsm_path = config.data_dir.join("fsm");
 
-    info!("Opening log database at: {}", log_path.display());
-    let log_db = sled::open(&log_path).map_err(anyhow::Error::from)?;
+        info!(path = %system_path.display(), "Opening system database");
+        let system_db = sled::open(&system_path).map_err(anyhow::Error::from)?;
 
-    info!("Opening FSM database at: {}", fsm_path.display());
-    let fsm_db = sled::open(&fsm_path).map_err(anyhow::Error::from)?;
+        info!(path = %log_path.display(), "Opening log database");
+        let log_db = sled::open(&log_path).map_err(anyhow::Error::from)?;
+
+        info!(path = %fsm_path.display(), "Opening FSM database");
+        let fsm_db = sled::open(&fsm_path).map_err(anyhow::Error::from)?;
+
+        (system_db, log_db, fsm_db)
+    };
 
     // 5. Verify or Initialize Identity (ADR 004)
-    let identity = match initialize_node_identity(&system_db, &config) {
-        Ok(id) => Arc::new(id),
-        Err(e) => {
-            error!("Fatal Error during identity verification: {}", e);
-            return Err(e.into());
+    let identity = {
+        let _span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "identity_initialization"
+        )
+        .entered();
+
+        match initialize_node_identity(&system_db, &config) {
+            Ok(id) => Arc::new(id),
+            Err(e) => {
+                error!(error = %e, "Fatal Error during identity verification");
+                return Err(e.into());
+            }
         }
     };
 
-    // 6. Initialize the Shared Node State (Atomic Shell)
-    let fsm_store = LactoStore::new(fsm_db.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to initialize LactoStore: {}", e))?;
-    let fsm = Arc::new(fsm_store);
-    let storage = Arc::new(
-        SledStorage::new(log_db.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
-    );
-
-    // 6.1 Cold-Boot Recovery (ADR 001/009)
-    // Synchronize FSM with Consensus Log before accepting any network events.
-    let recovery = RecoveryManager::new(fsm.clone(), storage.clone());
-    recovery
-        .recover()
-        .await
-        .map_err(|e| anyhow::anyhow!("Cold-boot recovery failed: {}", e))?;
-
-    let initial_node =
-        RaftNode::<Follower>::try_new(identity.clone(), fsm.clone(), storage.clone())
-            .map_err(|e| anyhow::anyhow!("Failed to initialize RaftNode: {}", e))?;
-    let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
-
-    // 7. Initialize Networking (Outbound Peer Mesh)
-    let peer_manager = Arc::new(match PeerManager::new(identity.clone(), &config.peers) {
-        Ok(m) => m,
-        Err(e) => {
-            error!("Fatal Error during Peer Manager initialization: {}", e);
-            return Err(e.into());
-        }
-    });
-
-    // 8. Initialize RPC Service Dispatchers
-    let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
-
-    // Initialize the Raft Handle for the Gateway (ADR 005/007)
-    let raft_handle = Arc::new(LocalRaftHandle::new(
-        shared_state.clone(),
-        peer_manager.clone(),
-    ));
-
-    // Initialize the AI Veto Relay (Egress Bridge)
-    let veto_channel = config
-        .policy
-        .veto_endpoint()
-        .map_err(|e| anyhow::anyhow!("Failed to parse AI Veto address: {}", e))?
-        .connect_lazy();
-    let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
-
-    let ingress_dispatcher = IngressDispatcher::new(
-        raft_handle,
-        fsm.clone(),
-        fsm.clone(),
-        veto_relay,
-        config.policy.veto_timeout(),
-        config.policy.veto_max_retries,
-        config.policy.max_justification_len,
-    );
-
-    // 9. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
-    spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
-    spawn_heartbeat_task(config.clone(), shared_state.clone(), peer_manager.clone());
-
-    // 10. Create the Root Node Span
+    // 6. Create the Root Node Span (Established once identity is verified)
     let root_span = info_span!(
         "node",
-        cluster = %identity.cluster_id(),
-        id = %identity.node_id()
+        cluster_id = %identity.cluster_id(),
+        node_id = %identity.node_id()
     );
 
-    let interceptor = IdentityInterceptor::new(identity.clone());
+    // 7. Initialize the Shared Node State & Recovery (Phase 3)
+    let (fsm, shared_state) = {
+        let _span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            parent: &root_span,
+            "state_initialization"
+        )
+        .entered();
+
+        let fsm_store = LactoStore::new(fsm_db.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to initialize LactoStore: {}", e))?;
+        let fsm = Arc::new(fsm_store);
+        let storage = Arc::new(
+            SledStorage::new(log_db.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to initialize SledStorage: {}", e))?,
+        );
+
+        // 7.1 Cold-Boot Recovery (ADR 001/009)
+        // Synchronize FSM with Consensus Log before accepting any network events.
+        let recovery_span = info_span!(
+            target: ClinicalTarget::ClinicalRecovery.as_str(),
+            parent: &root_span,
+            "cold_boot_recovery"
+        );
+        let recovery = RecoveryManager::new(fsm.clone(), storage.clone());
+        info!(
+            target: ClinicalTarget::ClinicalRecovery.as_str(),
+            "Commencing cold-boot recovery..."
+        );
+        recovery
+            .recover()
+            .instrument(recovery_span)
+            .await
+            .map_err(|e| anyhow::anyhow!("Cold-boot recovery failed: {}", e))?;
+
+        let initial_node =
+            RaftNode::<Follower>::try_new(identity.clone(), fsm.clone(), storage.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to initialize RaftNode: {}", e))?;
+        let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
+
+        (fsm, shared_state)
+    };
+
+    // 8. Initialize Networking & Service Dispatchers (Phase 4)
+    let (peer_manager, consensus_dispatcher, ingress_dispatcher) = {
+        let _span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            parent: &root_span,
+            "service_initialization"
+        )
+        .entered();
+
+        let peer_manager = Arc::new(match PeerManager::new(identity.clone(), &config.peers) {
+            Ok(m) => m,
+            Err(e) => {
+                error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    error = %e,
+                    "Fatal Error during Peer Manager initialization"
+                );
+                return Err(e.into());
+            }
+        });
+
+        let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
+
+        let raft_handle = Arc::new(LocalRaftHandle::new(
+            shared_state.clone(),
+            peer_manager.clone(),
+        ));
+
+        let veto_channel = config
+            .policy
+            .veto_endpoint()
+            .map_err(|e| anyhow::anyhow!("Failed to parse AI Veto address: {}", e))?
+            .connect_lazy();
+        let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
+
+        let ingress_dispatcher = IngressDispatcher::new(
+            raft_handle,
+            fsm.clone(),
+            fsm.clone(),
+            veto_relay,
+            config.policy.veto_timeout(),
+            config.policy.veto_max_retries,
+            config.policy.max_justification_len,
+        );
+
+        (peer_manager, consensus_dispatcher, ingress_dispatcher)
+    };
+
+    let identity_interceptor = IdentityInterceptor::new(identity.clone());
+    let ingress_trace_interceptor = TraceInterceptor::authoritative();
+    let consensus_trace_interceptor = TraceInterceptor::propagative();
 
     async move {
-        info!("Identity verified. Transport layer starting...");
+        // 10. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
+        // Spawning inside this block ensures they are child tasks of the root node
+        // span.
+        spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
+        spawn_heartbeat_task(config.clone(), shared_state.clone(), peer_manager.clone());
+
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "Identity verified. Transport layer starting..."
+        );
 
         let addr = config.listen_addr;
-        info!("Starting gRPC server on {}", addr);
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            address = %addr,
+            "Starting gRPC server"
+        );
 
         // Define the graceful shutdown signal
         let shutdown = async {
             if let Err(e) = tokio::signal::ctrl_c().await {
-                error!("Failed to install CTRL+C handler: {}", e);
+                error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    error = %e,
+                    "Failed to install CTRL+C handler"
+                );
             } else {
-                info!("Shutdown signal received. Commencing graceful exit...");
+                info!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    "Shutdown signal received. Commencing graceful exit..."
+                );
             }
         };
 
-        // 11. Start the gRPC Server
+        // 11. Start the gRPC Server with combined interceptors
         Server::builder()
             .add_service(ConsensusServiceServer::with_interceptor(
                 consensus_dispatcher,
-                interceptor.clone(),
+                {
+                    let mut identity = identity_interceptor.clone();
+                    let mut trace = consensus_trace_interceptor;
+                    move |req| identity.call(req).and_then(|req| trace.call(req))
+                },
             ))
             .add_service(IngressServiceServer::with_interceptor(
                 ingress_dispatcher,
-                interceptor,
+                {
+                    let mut identity = identity_interceptor;
+                    let mut trace = ingress_trace_interceptor;
+                    move |req| identity.call(req).and_then(|req| trace.call(req))
+                },
             ))
             .serve_with_shutdown(addr, shutdown)
             .await
             .map_err(anyhow::Error::from)?;
 
         // 12. Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
-        info!("gRPC server stopped. Flushing databases to disk...");
-        system_db.flush_async().await.map_err(anyhow::Error::from)?;
-        log_db.flush_async().await.map_err(anyhow::Error::from)?;
-        fsm_db.flush_async().await.map_err(anyhow::Error::from)?;
-        info!("Databases synchronized successfully.");
+        let shutdown_span = info_span!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "persistence_shutdown"
+        );
+        async {
+            info!("gRPC server stopped. Flushing databases to disk...");
+            system_db.flush_async().await.map_err(anyhow::Error::from)?;
+            log_db.flush_async().await.map_err(anyhow::Error::from)?;
+            fsm_db.flush_async().await.map_err(anyhow::Error::from)?;
+            info!("Databases synchronized successfully.");
+            Ok::<(), anyhow::Error>(())
+        }
+        .instrument(shutdown_span)
+        .await?;
 
-        info!("Node lifecycle finished successfully. Goodbye.");
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "Node lifecycle finished successfully. Goodbye."
+        );
         Ok(())
     }
     .instrument(root_span)
