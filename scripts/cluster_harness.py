@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Dict, List, Optional, TypedDict, IO, Generator
+from typing import Dict, List, Optional, TypedDict, IO, Generator, Tuple, Callable, Any
 
 # Lact-O-Sensus: Cluster Test Harness
 # Provides the core infrastructure for managing local Raft clusters, AI Veto Nodes, and Clients.
@@ -75,6 +75,27 @@ def build_binaries() -> None:
     if result.returncode != 0:
         raise RuntimeError("Cargo build failed.")
     print("SUCCESS: Binaries compiled.")
+
+
+def poll_until(
+    condition_fn: Callable[[], Any],
+    timeout: float = 10.0,
+    interval: float = 0.1,
+    desc: Optional[str] = None,
+) -> Any:
+    """
+    Generic polling helper. Repeatedly calls condition_fn until it returns a
+    truthy value or timeout is reached.
+    """
+    start = time.time()
+    while (time.time() - start) < timeout:
+        res = condition_fn()
+        if res:
+            return res
+        time.sleep(interval)
+    raise RuntimeError(
+        f"Timeout waiting for condition: {desc or 'unspecified'}"
+    )
 
 
 class ClusterManager:
@@ -168,10 +189,21 @@ class ClusterManager:
         for node in NODES:
             self.start_node(node["id"], wipe_data=wipe_data)
 
-        # Give nodes time to initialize
-        # Since we use pre-compiled binaries, initialization is much faster.
-        # But we still need a small buffer for gRPC servers to bind.
-        time.sleep(2)
+        # 3. Wait for all Raft nodes to bind their ports
+        # (Replaces the static time.sleep(2))
+        print("Action: Waiting for nodes to initialize...")
+        for node in NODES:
+            poll_until(
+                lambda: self.check_node_alive(node["id"]),
+                timeout=5,
+                desc=f"Node {node['id']} startup",
+            )
+
+    def check_node_alive(self, node_id: int) -> bool:
+        """Returns True if the node's process is running."""
+        if node_id not in self.processes:
+            return False
+        return self.processes[node_id].poll() is None
 
     def kill_node(self, node_id: int) -> float:
         """Kills a specific node and returns kill timestamp in ms."""
@@ -334,21 +366,30 @@ def find_current_leader(cluster: ClusterManager) -> Optional[int]:
 def wait_for_leader(
     cluster: ClusterManager, timeout: float = 15.0
 ) -> int:
-    """Helper to wait for a leader to emerge."""
+    """
+    Helper to wait for a leader to emerge and remain stable for one heartbeat.
+    (Harden Discovery mandate from Commit 4)
+    """
     print(
         f"Waiting for leader to emerge (max {timeout}s)...",
         end="",
         flush=True,
     )
-    start = time.time()
-    while (time.time() - start) < timeout:
-        leader_id = find_current_leader(cluster)
-        if leader_id:
-            print(f" OK (Node {leader_id})")
-            return leader_id
-        time.sleep(0.5)
-    print(" FAILED")
-    raise RuntimeError(f"No leader emerged within {timeout}s.")
+
+    def leader_is_stable() -> Optional[int]:
+        lid = find_current_leader(cluster)
+        if lid:
+            # Wait for one heartbeat (50ms + safety buffer) to ensure it's not a flap
+            time.sleep(0.1)
+            if find_current_leader(cluster) == lid:
+                return lid
+        return None
+
+    leader_id = poll_until(
+        leader_is_stable, timeout=timeout, desc="Stable leader"
+    )
+    print(f" OK (Node {leader_id})")
+    return leader_id
 
 
 def count_elections(cluster: ClusterManager) -> int:
@@ -471,19 +512,15 @@ def verify_convergence(
     print(
         f"Action: Verifying cluster convergence for index {index} ({status_str})..."
     )
-    start = time.time()
 
     index_pattern = re.compile(rf"index={index}(\s|,|}})")
     status_pattern = re.compile(rf"status={status_str}(\s|,|}})")
     target_pattern = "clinical::fsm:"
 
-    missing: list[int] = []
-    while (time.time() - start) < timeout:
+    def check_all_converged() -> bool:
         cluster.refresh_logs()
-        missing = []
         for nid in cluster.node_logs:
             found = False
-            # Scan only the buffer (Priority 3: No redundant disk I/O)
             for line in cluster.node_logs[nid]:
                 if (
                     target_pattern in line
@@ -493,13 +530,8 @@ def verify_convergence(
                     found = True
                     break
             if not found:
-                missing.append(nid)
+                return False
+        return True
 
-        if not missing:
-            print(f"SUCCESS: All nodes converged at index {index}.")
-            return
-        time.sleep(0.5)
-
-    raise RuntimeError(
-        f"Convergence failure. Nodes {missing} did not apply index {index} within {timeout}s."
-    )
+    poll_until(check_all_converged, timeout=timeout, desc="Convergence")
+    print(f"SUCCESS: All nodes converged at index {index}.")

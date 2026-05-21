@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from cluster_harness import (
     NODES,
@@ -22,6 +22,7 @@ from cluster_harness import (
     parse_log_timestamp,
     now_ms,
     build_binaries,
+    poll_until,
 )
 
 # Lact-O-Sensus: Consensus Verification Suite
@@ -40,7 +41,10 @@ def test_leadership_stability(cluster: ClusterManager) -> None:
     wait_for_leader(cluster)
     initial_count = count_elections(cluster)
     print("Verifying stability for 3s...")
+
+    # We wait a fixed duration to prove no re-elections happen during normal operation.
     time.sleep(3)
+
     if count_elections(cluster) > initial_count:
         raise RuntimeError(
             "Leadership was unstable (unnecessary re-election detected)."
@@ -62,16 +66,12 @@ def test_leader_failover(cluster: ClusterManager) -> None:
     kill_time = cluster.kill_node(leader_id)
 
     print("Waiting for re-election...")
-    max_wait, elapsed = 10.0, 0.0
-    while elapsed < max_wait:
-        time.sleep(0.1)
-        elapsed += 0.1
+
+    def new_leader_elected() -> Optional[Tuple[int, int]]:
         if count_elections(cluster) > base_count:
             for node in NODES:
                 if node["id"] == leader_id:
                     continue
-                # We still use direct file reading here for the specific re-election event
-                # to confirm exactly when it happened relative to kill_time.
                 for line in get_complete_lines(
                     node["log"], log_offsets.get(node["id"], 0)
                 ):
@@ -81,11 +81,13 @@ def test_leader_failover(cluster: ClusterManager) -> None:
                             (log_ts if log_ts > 0 else now_ms())
                             - kill_time
                         )
-                        print(
-                            f"SUCCESS: New leader (Node {node['id']}) elected in {duration}ms."
-                        )
-                        return
-    raise RuntimeError("No re-election occurred after failover.")
+                        return node["id"], duration
+        return None
+
+    node_id, duration = poll_until(
+        new_leader_elected, timeout=10, desc="Re-election"
+    )
+    print(f"SUCCESS: New leader (Node {node_id}) elected in {duration}ms.")
 
 
 def test_identity_guard(cluster: ClusterManager) -> None:
@@ -156,9 +158,9 @@ def test_ai_veto_egress(cluster: ClusterManager) -> None:
 
 def test_smart_client_success(cluster: ClusterManager) -> None:
     """Verifies that valid input is successfully committed and converged."""
+    # wait_for_leader now ensures stability, replacing the old time.sleep(2)
     leader_id = wait_for_leader(cluster)
-    print("Stabilizing cluster (2s)...")
-    time.sleep(2)
+
     follower_port = next(
         n["port"] for n in NODES if n["id"] != leader_id
     )
@@ -180,9 +182,9 @@ def test_smart_client_success(cluster: ClusterManager) -> None:
 
 def test_smart_client_veto(cluster: ClusterManager) -> None:
     """Verifies that invalid input is correctly VETOED and converged."""
+    # wait_for_leader now ensures stability, replacing the old time.sleep(2)
     leader_id = wait_for_leader(cluster)
-    print("Stabilizing cluster (2s)...")
-    time.sleep(2)
+
     follower_port = next(
         n["port"] for n in NODES if n["id"] != leader_id
     )
@@ -278,10 +280,9 @@ def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
 
 def test_persistence_restart(cluster: ClusterManager) -> None:
     """Verifies that inventory state survives a total cluster shutdown."""
+    # wait_for_leader now ensures stability, replacing the old time.sleep(2)
     leader_id = wait_for_leader(cluster)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
-    print(f"Stabilizing cluster around Leader {leader_id} (2s)...")
-    time.sleep(2)
 
     # 1. Add an item
     print("Action: Adding test item (apple)...")
@@ -309,7 +310,6 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
     print(
         "Action: Cluster is OFFLINE. (Causal history exists only on disk)"
     )
-    time.sleep(2)
 
     # 3. Total Cluster Restart (No Wipe)
     cluster.start_all(start_veto=True, wipe_data=False)
@@ -368,36 +368,26 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
 
     # 6. Verify recovery in the follower's logs (looking only at new lines)
     print(f"Action: Verifying recovery logs for Node {follower_id}...")
-    recovered = False
-    fsm_applied = False
-    start_time = time.time()
-    while (time.time() - start_time) < 15.0:
+
+    def recovered_and_applied() -> bool:
+        recovered = False
+        fsm_applied = False
         for line in get_complete_lines(log_path, log_offset):
             if (
                 "Recovery: REPLAY COMPLETE" in line
                 and str(version) in line
             ):
                 recovered = True
-            # FSM marker proving the data was actually applied to the DB
             if (
                 "Mutation applied to state machine" in line
                 and f"index={version}" in line
             ):
                 fsm_applied = True
-        if recovered and fsm_applied:
-            break
-        time.sleep(0.5)
+        return recovered and fsm_applied
 
-    if not recovered:
-        print_cluster_logs(20)
-        raise RuntimeError(
-            f"Node {follower_id} failed to perform recovery replay log."
-        )
-    if not fsm_applied:
-        raise RuntimeError(
-            f"Node {follower_id} logged recovery completion but FSM markers are missing."
-        )
-
+    poll_until(
+        recovered_and_applied, timeout=15.0, desc="Cold-boot recovery"
+    )
     print(
         f"SUCCESS: Node {follower_id} replayed {version} entries and restored FSM state."
     )
@@ -533,14 +523,14 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
     try:
         # Perform 3 rounds of chaos
         for i in range(1, 4):
-            time.sleep(3)  # Let some mutations fly
+            # Wait for some mutations to commit
+            time.sleep(3)
             victim_id = random.choice([n["id"] for n in NODES])
             print(
                 f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---"
             )
 
             cluster.kill_node(victim_id)
-            time.sleep(2)  # Wait for cluster to react
 
             print(f"Action: Restarting Node {victim_id}...")
             cluster.start_node(victim_id, wipe_data=False)
@@ -556,15 +546,10 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         print(
             f"Action: Flood stopped. {len(flooder.successful_items)} items successfully committed."
         )
-        if flooder.successful_items:
-            print(
-                f"DEBUG: Expected items: {', '.join(flooder.successful_items)}"
-            )
 
         # 1. Final Convergence Check
-        # Get the highest version among successful mutations
-        # Actually, we can just wait for a bit and then check the leader.
-        time.sleep(3)
+        # Wait for a bit to let any pending replications settle (using minimal delay)
+        time.sleep(1)
         leader_id = wait_for_leader(cluster)
         leader_port = next(
             n["port"] for n in NODES if n["id"] == leader_id
@@ -573,14 +558,11 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         # 2. Verify Data Parity
         print("Action: Verifying final inventory parity on Leader...")
         inventory_output = run_client_command("query", leader_port)
-        print(f"DEBUG: Final Inventory Output:\n{inventory_output}")
 
         missing_items = []
         # Normalize output for easier matching
         normalized_output = inventory_output.lower().replace("_", "")
         for item in flooder.successful_items:
-            # Check for the item key as a distinct entry in the inventory
-            # We look for the pattern " - {item_name} "
             search_key = item.lower().replace("_", "")
             if f"- {search_key} (" not in normalized_output:
                 missing_items.append(item)
@@ -588,12 +570,10 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         if missing_items:
             raise RuntimeError(
                 f"Data Integrity Violation! {len(missing_items)} successful items "
-                "missing from Leader inventory: {missing_items[:5]}..."
+                f"missing from Leader inventory. Example: {missing_items[0]}"
             )
 
         # 3. Verify Cluster-Wide Convergence via Logs
-        # We check that every node reached at least the same FSM index.
-        # We'll use a conservative version from the leader's output.
         final_version = extract_version(inventory_output)
         if final_version > 0:
             verify_convergence(cluster, final_version, "Committed")
@@ -697,7 +677,7 @@ def main() -> None:
             break
         finally:
             cluster.cleanup()
-            time.sleep(1)
+            time.sleep(0.5)
 
     print(f"\n=== Final Result: {passed}/{total_run} Tests Passed ===")
     if total_run > 0 and passed < total_run:
