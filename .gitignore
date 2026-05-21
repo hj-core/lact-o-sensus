@@ -3,3 +3,4 @@ data/
 *.log
 .client_wal
 .tmp/
+__pycache__
