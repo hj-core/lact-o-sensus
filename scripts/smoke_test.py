@@ -21,6 +21,7 @@ from cluster_harness import (
     get_complete_lines,
     parse_log_timestamp,
     now_ms,
+    build_binaries,
 )
 
 # Lact-O-Sensus: Consensus Verification Suite
@@ -611,6 +612,9 @@ def main() -> None:
 
     # Allow filtering tests by name via command line
     filter_arg = sys.argv[1] if len(sys.argv) > 1 else None
+
+    # Step 0: Build binaries once per suite run
+    build_binaries()
 
     tests = [
         ("Leader Election", False, lambda c: test_leader_election()),

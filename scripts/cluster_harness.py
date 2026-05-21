@@ -44,10 +44,37 @@ VETO_LOG = "ai_veto.log"
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
+# Binary Paths (relative to project root)
+# Using release profile for better timing stability and performance.
+TARGET_DIR = "target/release"
+NODE_SERVER_BIN = os.path.join(TARGET_DIR, "raft-node")
+AI_VETO_BIN = os.path.join(TARGET_DIR, "ai-veto")
+CLIENT_CLI_BIN = os.path.join(TARGET_DIR, "client-cli")
+
 
 def now_ms() -> float:
     """Returns current wall-clock time in milliseconds."""
     return time.time() * 1000
+
+
+def build_binaries() -> None:
+    """Compiles all required binaries exactly once using the release profile."""
+    print("--- Compiling Lact-O-Sensus Binaries (Release) ---")
+    cmd = [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "node-server",
+        "-p",
+        "ai-veto",
+        "-p",
+        "client-cli",
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode != 0:
+        raise RuntimeError("Cargo build failed.")
+    print("SUCCESS: Binaries compiled.")
 
 
 class ClusterManager:
@@ -65,7 +92,7 @@ class ClusterManager:
         self.veto_log = None
 
     def start_node(self, node_id: int, wipe_data: bool = False) -> None:
-        """Starts or restarts a specific node."""
+        """Starts or restarts a specific node using pre-compiled binary."""
         node = next(n for n in NODES if n["id"] == node_id)
 
         if wipe_data:
@@ -86,12 +113,9 @@ class ClusterManager:
         log_file: IO = open(node["log"], mode, encoding="utf-8")
         self.log_files[node["id"]] = log_file
 
+        # Execute compiled binary directly
         cmd = [
-            "cargo",
-            "run",
-            "-p",
-            "node-server",
-            "--",
+            NODE_SERVER_BIN,
             "--config",
             node["config"],
         ]
@@ -121,11 +145,7 @@ class ClusterManager:
             self.veto_log = open(VETO_LOG, "w", encoding="utf-8")
             self.veto_process = subprocess.Popen(
                 [
-                    "cargo",
-                    "run",
-                    "-p",
-                    "ai-veto",
-                    "--",
+                    AI_VETO_BIN,
                     "--port",
                     str(VETO_PORT),
                     "--model",
@@ -140,8 +160,10 @@ class ClusterManager:
         for node in NODES:
             self.start_node(node["id"], wipe_data=wipe_data)
 
-        # Give nodes time to initialize and Cargo to finish building if necessary
-        time.sleep(5)
+        # Give nodes time to initialize
+        # Since we use pre-compiled binaries, initialization is much faster.
+        # But we still need a small buffer for gRPC servers to bind.
+        time.sleep(2)
 
     def kill_node(self, node_id: int) -> float:
         """Kills a specific node and returns kill timestamp in ms."""
@@ -362,7 +384,7 @@ def check_connectivity(
 def run_client_command(
     command: str, seed_port: int, timeout: int = 120
 ) -> str:
-    """Helper to run a single command through the client-cli."""
+    """Helper to run a single command through the client-cli using pre-compiled binary."""
     state_file = ".client_state.json"
     wal_dir = ".client_wal"
     if os.path.exists(state_file):
@@ -371,12 +393,7 @@ def run_client_command(
         shutil.rmtree(wal_dir)
 
     cmd = [
-        "cargo",
-        "run",
-        "-q",
-        "-p",
-        "client-cli",
-        "--",
+        CLIENT_CLI_BIN,
         "--cluster-id",
         "lacto-dev-01",
         "--seed",
