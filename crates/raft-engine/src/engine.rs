@@ -16,6 +16,7 @@ pub use crate::node::Candidate;
 pub use crate::node::Follower;
 pub use crate::node::Leader;
 pub use crate::node::RaftNode;
+pub use crate::node::TickAction;
 
 /// The logical role of a Raft node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,3 +8,8 @@ pub mod recovery;
 pub mod service;
 pub mod shell;
 pub mod storage;
+pub mod tick;
+
+pub use crate::tick::Tick;
+pub use crate::tick::TickDuration;
+pub use crate::tick::TickThresholds;

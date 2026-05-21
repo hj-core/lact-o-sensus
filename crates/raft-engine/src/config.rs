@@ -12,6 +12,9 @@ use serde::Serialize;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::tick::TickDuration;
+use crate::tick::TickThresholds;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("Failed to read configuration file: {0}")]
@@ -35,6 +38,11 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RaftConfig {
+    /// The fixed interval at which the deterministic Tick Loop executes
+    /// (in milliseconds). All protocol timers are expressed as multiples
+    /// of this value.
+    pub tick_interval_ms: u64,
+
     /// Interval between heartbeats sent by the leader (in milliseconds).
     pub heartbeat_interval_ms: u64,
 
@@ -51,6 +59,7 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
+            tick_interval_ms: 10,
             heartbeat_interval_ms: 50,
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
@@ -68,11 +77,35 @@ impl RaftConfig {
         Duration::from_millis(self.rpc_timeout_ms)
     }
 
+    /// Translates wall-clock millisecond configurations into sterile, unitless
+    /// tick thresholds for the logical engine.
+    pub fn calculate_thresholds(&self) -> TickThresholds {
+        let to_ticks = |ms: u64| TickDuration::new(ms.div_ceil(self.tick_interval_ms));
+
+        TickThresholds {
+            heartbeat_interval: to_ticks(self.heartbeat_interval_ms),
+            min_election: to_ticks(self.election_timeout_min_ms),
+            max_election: to_ticks(self.election_timeout_max_ms),
+        }
+    }
+
     /// Validates Raft-specific timing invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.tick_interval_ms == 0 {
+            return Err(ConfigError::TimingInvariant(
+                "tick_interval_ms must be greater than 0".to_string(),
+            ));
+        }
+
         if self.heartbeat_interval_ms == 0 {
             return Err(ConfigError::TimingInvariant(
                 "heartbeat_interval_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.tick_interval_ms > self.heartbeat_interval_ms {
+            return Err(ConfigError::TimingInvariant(
+                "tick_interval_ms must be less than or equal to heartbeat_interval_ms".to_string(),
             ));
         }
 
@@ -307,6 +340,47 @@ mod tests {
         }
 
         #[test]
+        fn reject_config_when_tick_interval_is_zero() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            tick_interval_ms = 0
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms") && msg.contains("greater than 0")
+            ));
+        }
+
+        #[test]
+        fn reject_config_when_tick_interval_exceeds_heartbeat_interval() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            tick_interval_ms = 100
+            heartbeat_interval_ms = 50
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms") && msg.contains("less than or equal to heartbeat")
+            ));
+        }
+
+        #[test]
         fn reject_config_when_rpc_timeout_exceeds_heartbeat_interval() {
             let toml_str = r#"
             cluster_id = "test-cluster"
@@ -454,6 +528,44 @@ mod tests {
             let config: Config = toml::from_str(toml_str).unwrap();
             let result = config.validate();
             assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
+        }
+    }
+
+    mod calculate_thresholds {
+        use super::*;
+
+        #[test]
+        fn translate_milliseconds_to_ticks_accurately() {
+            let config = RaftConfig {
+                tick_interval_ms: 10,
+                heartbeat_interval_ms: 50,
+                election_timeout_min_ms: 150,
+                election_timeout_max_ms: 300,
+                rpc_timeout_ms: 40,
+            };
+
+            let thresholds = config.calculate_thresholds();
+
+            assert_eq!(thresholds.heartbeat_interval, TickDuration::new(5));
+            assert_eq!(thresholds.min_election, TickDuration::new(15));
+            assert_eq!(thresholds.max_election, TickDuration::new(30));
+        }
+
+        #[test]
+        fn handle_non_multiple_intervals_with_ceiling_logic() {
+            let config = RaftConfig {
+                tick_interval_ms: 10,
+                heartbeat_interval_ms: 55,
+                election_timeout_min_ms: 155,
+                election_timeout_max_ms: 305,
+                rpc_timeout_ms: 40,
+            };
+
+            let thresholds = config.calculate_thresholds();
+
+            assert_eq!(thresholds.heartbeat_interval, TickDuration::new(6));
+            assert_eq!(thresholds.min_election, TickDuration::new(16));
+            assert_eq!(thresholds.max_election, TickDuration::new(31));
         }
     }
 }

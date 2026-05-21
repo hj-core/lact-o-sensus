@@ -48,6 +48,22 @@ impl ReconciliationResult {
     }
 }
 
+/// Semantic instructions for the deterministic Tick Loop.
+///
+/// Instructs the execution shell on whether to trigger an election,
+/// send a heartbeat, or halt due to a safety violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickAction {
+    /// No significant event; continue ticking.
+    None,
+    /// Election timeout reached; transition to Candidate and campaign.
+    StartElection,
+    /// Heartbeat interval reached; send AppendEntries to all peers.
+    SendHeartbeat,
+    /// Terminal state reached; stop the tick loop (ADR 009).
+    Stop,
+}
+
 // =============================================================================
 // 2. Role Markers (Type-State Engine)
 // =============================================================================
