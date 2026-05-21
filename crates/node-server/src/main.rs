@@ -8,6 +8,7 @@ use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
 use common::rpc::IdentityInterceptor;
 use common::rpc::TraceInterceptor;
 use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use lacto_fsm::LactoStore;
@@ -150,14 +151,17 @@ async fn main() -> Result<()> {
 
         // 7.1 Cold-Boot Recovery (ADR 001/009)
         // Synchronize FSM with Consensus Log before accepting any network events.
+        let trace_id = TraceId::generate();
         let recovery_span = info_span!(
             target: ClinicalTarget::ClinicalRecovery.as_str(),
             parent: &root_span,
-            "cold_boot_recovery"
+            "cold_boot_recovery",
+            trace_id = %trace_id
         );
-        let recovery = RecoveryManager::new(fsm.clone(), storage.clone());
+        let recovery = RecoveryManager::new(identity.clone(), fsm.clone(), storage.clone());
         info!(
             target: ClinicalTarget::ClinicalRecovery.as_str(),
+            %trace_id,
             "Commencing cold-boot recovery..."
         );
         recovery

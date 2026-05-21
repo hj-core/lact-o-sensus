@@ -17,11 +17,14 @@ use common::raft_api::ConsensusHandle;
 use common::raft_api::ConsensusStatus;
 use common::raft_api::InventoryReader;
 use common::raft_api::SessionProvider;
+use common::rpc::TraceInterceptor;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
 use common::types::errors::ConsensusError;
+use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
 use prost::Message;
@@ -30,6 +33,7 @@ use tokio::sync::Mutex;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::Instrument;
 use tracing::error;
 use tracing::info;
 use tracing::info_span;
@@ -74,150 +78,7 @@ pub struct IngressDispatcher {
     mutation_lock: Mutex<()>,
 }
 
-#[tonic::async_trait]
-impl IngressService for IngressDispatcher {
-    /// High-level orchestrator for user mutations.
-    /// Implements the Defensive Onion pipeline (ADR 007).
-    async fn propose_mutation(
-        &self,
-        request: Request<ProposeMutationRequest>,
-    ) -> Result<Response<ProposeMutationResponse>, Status> {
-        let req = request.into_inner();
-
-        let sequence_id = SequenceId::new(req.sequence_id);
-        let client_id = req
-            .client_id
-            .parse::<ClientId>()
-            .map_err(|e| self.invalid_argument(format!("Invalid client_id: {}", e)))?;
-
-        let span = info_span!("propose_mutation", client = %client_id, seq = %sequence_id);
-        let _enter = span.enter();
-
-        // 1. Verifies that this node is the authorized leader.
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
-            return Ok(self.rejection_response_with_status(status));
-        }
-
-        // 2. Enforces linearizability via the sequence firewall.
-        if let Some(cached_response) = self
-            .enforce_sequence_firewall(&client_id, sequence_id)
-            .await?
-        {
-            return Ok(cached_response);
-        }
-
-        // 3. Guards against concurrent mutation attempts.
-        let _lock = self.mutation_lock.lock().await;
-
-        // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
-        let mut intent = req.intent.clone().ok_or_else(|| {
-            self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
-        })?;
-        let raw_user_input = self.format_raw_input(&intent);
-        self.normalize_intent(&mut intent)?;
-
-        // 5. Resolves semantic metadata and stabilizes physical quantities via the AI
-        //    resolution loop.
-        let (final_status, stabilized) = self
-            .resolve_semantic_mutation(req.client_id.clone(), &intent)
-            .await?;
-
-        // 6. Proposes the finalized intent to the cluster for consensus.
-        let proposal_index = self
-            .commit_to_consensus(
-                &client_id,
-                sequence_id,
-                intent,
-                stabilized.clone(),
-                raw_user_input,
-                final_status,
-                &status,
-            )
-            .await?;
-
-        info!(
-            "Mutation index {} committed with status {:?}.",
-            proposal_index, final_status
-        );
-
-        // 7. Constructs the final response reflecting the committed lifecycle status.
-        Ok(self.build_mutation_response(
-            proposal_index,
-            final_status,
-            stabilized.moral_justification,
-        ))
-    }
-
-    /// High-level orchestrator for state queries.
-    async fn query_state(
-        &self,
-        request: Request<QueryStateRequest>,
-    ) -> Result<Response<QueryStateResponse>, Status> {
-        let req = request.into_inner();
-
-        let span = info_span!("query_state");
-        let _enter = span.enter();
-
-        // 1. Leadership Authority (Quorum Read Verification)
-        if let Err(err) = self.raft_handle.verify_leadership().await {
-            let status = self.raft_handle.consensus_status().await;
-            let grpc_status = self.map_consensus_error(err, &status);
-            return Ok(Response::new(QueryStateResponse {
-                items: Vec::new(),
-                current_state_version: 0,
-                status: QueryStatus::Rejected as i32,
-                leader_hint: status.leader_hint,
-                error_message: grpc_status.message().to_string(),
-            }));
-        }
-
-        // 2. Consistent Horizon Check (Strict EOS)
-        // Ensure the client isn't querying for a version that hasn't reached
-        // cluster-wide agreement yet (ADR 006).
-        let status = self.raft_handle.consensus_status().await;
-        if let Some(min_version) = req.min_state_version.filter(|&v| v > 0) {
-            let requested_index = LogIndex::new(min_version);
-
-            if requested_index > status.last_committed {
-                return Err(Status::failed_precondition(
-                    "Requested version exceeds consistent horizon",
-                ));
-            }
-
-            // 3. State Machine Convergence (Wait for apply)
-            if let Err(err) = self.raft_handle.await_apply(requested_index).await {
-                return Err(self.map_consensus_error(err, &status));
-            }
-        }
-
-        // 4. Fetch inventory from the authoritative state machine
-        let all_items = self.inventory_reader.get_inventory().await;
-        let state_version = self.inventory_reader.current_version().await;
-
-        // 5. Apply semantic filters
-        let filtered_items = if let Some(filter) = req.query_filter {
-            let filter = filter.to_lowercase();
-            all_items
-                .into_iter()
-                .filter(|item| item.item_key.to_lowercase().contains(&filter))
-                .collect()
-        } else {
-            all_items
-        };
-
-        Ok(Response::new(QueryStateResponse {
-            items: filtered_items,
-            current_state_version: state_version.value(),
-            status: QueryStatus::Success as i32,
-            leader_hint: String::new(),
-            error_message: String::new(),
-        }))
-    }
-}
-
 impl IngressDispatcher {
-    /// Creates a new IngressDispatcher with configured AI policy parameters.
     pub fn new(
         raft_handle: Arc<dyn ConsensusHandle>,
         session_provider: Arc<dyn SessionProvider>,
@@ -238,9 +99,223 @@ impl IngressDispatcher {
             mutation_lock: Mutex::new(()),
         }
     }
+}
 
-    // --- High-Level Orchestration Helpers (Top-Down Call Order) ---
+#[tonic::async_trait]
+impl IngressService for IngressDispatcher {
+    /// High-level orchestrator for user mutations.
+    /// Implements the Defensive Onion pipeline (ADR 007).
+    async fn propose_mutation(
+        &self,
+        request: Request<ProposeMutationRequest>,
+    ) -> Result<Response<ProposeMutationResponse>, Status> {
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
 
+        let mut result = self.handle_propose_mutation(request, trace_id).await;
+
+        if let Ok(ref mut response) = result {
+            TraceInterceptor::inject_response(response, trace_id)?;
+        }
+        result
+    }
+
+    /// Queries the current linearizable grocery state.
+    async fn query_state(
+        &self,
+        request: Request<QueryStateRequest>,
+    ) -> Result<Response<QueryStateResponse>, Status> {
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+
+        let mut result = self.handle_query_state(request, trace_id).await;
+
+        if let Ok(ref mut response) = result {
+            TraceInterceptor::inject_response(response, trace_id)?;
+        }
+        result
+    }
+}
+
+impl IngressDispatcher {
+    /// Internal handler for mutations, executed within the TraceId scope.
+    async fn handle_propose_mutation(
+        &self,
+        request: Request<ProposeMutationRequest>,
+        trace_id: TraceId,
+    ) -> Result<Response<ProposeMutationResponse>, Status> {
+        let req = request.into_inner();
+
+        let sequence_id = SequenceId::new(req.sequence_id);
+        let client_id = req
+            .client_id
+            .parse::<ClientId>()
+            .map_err(|e| self.invalid_argument(format!("Invalid client_id: {}", e)))?;
+
+        let span = info_span!(
+            "propose_mutation",
+            trace_id = %trace_id,
+            client = %client_id.truncated(),
+            seq = %sequence_id
+        );
+        let _enter = span.enter();
+
+        // 1. Verifies that this node is the authorized leader.
+        let status = self.raft_handle.consensus_status().await;
+        if !status.is_leader {
+            return Ok(self.rejection_response_with_status(status));
+        }
+
+        // 2. Enforces linearizability via the sequence firewall.
+        if let Some(cached_response) = self
+            .enforce_sequence_firewall(&client_id, sequence_id)
+            .await?
+        {
+            return Ok(cached_response);
+        }
+
+        // 3. Guards against concurrent mutation attempts and instruments the critical
+        //    section.
+        let sequencing_span = info_span!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            "mutation_sequencing",
+            %trace_id,
+            client = %client_id.truncated()
+        );
+
+        async {
+            let _lock = self.mutation_lock.lock().await;
+
+            // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
+            let mut intent = req.intent.clone().ok_or_else(|| {
+                self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
+            })?;
+            let raw_user_input = self.format_raw_input(&intent);
+
+            tracing::trace!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                raw_input = %raw_user_input,
+                "Raw User Input (PII)"
+            );
+
+            self.normalize_intent(&mut intent)?;
+
+            // 5. Resolves semantic metadata and stabilizes physical quantities via the AI
+            //    resolution loop.
+            let (final_status, stabilized) = self
+                .resolve_semantic_mutation(client_id.clone(), &intent, trace_id)
+                .await?;
+
+            // 6. Proposes the finalized intent to the cluster for consensus.
+            let proposal_index = self
+                .commit_to_consensus(
+                    &client_id,
+                    sequence_id,
+                    intent,
+                    stabilized.clone(),
+                    raw_user_input,
+                    final_status,
+                    &status,
+                )
+                .await?;
+
+            info!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                index = %proposal_index,
+                status = ?final_status,
+                category_slug = %stabilized.category,
+                item_slug = %stabilized.resolved_item_key,
+                "Mutation committed to consensus."
+            );
+
+            // 7. Constructs the final response reflecting the committed lifecycle status.
+            Ok(self.build_mutation_response(
+                proposal_index,
+                final_status,
+                stabilized.moral_justification,
+            ))
+        }
+        .instrument(sequencing_span)
+        .await
+    }
+
+    /// Internal handler for queries, executed within the TraceId scope.
+    async fn handle_query_state(
+        &self,
+        request: Request<QueryStateRequest>,
+        trace_id: TraceId,
+    ) -> Result<Response<QueryStateResponse>, Status> {
+        let req = request.into_inner();
+
+        let span = info_span!("query_state", trace_id = %trace_id);
+        let _enter = span.enter();
+
+        // 1. Verifies that this node is the authorized leader.
+        let status = self.raft_handle.consensus_status().await;
+        if !status.is_leader {
+            return Ok(Response::new(QueryStateResponse {
+                status: QueryStatus::Rejected as i32,
+                leader_hint: status.leader_hint,
+                ..Default::default()
+            }));
+        }
+
+        // 2. Linearizable Quorum Read (Verification of leadership continuity).
+        if let Err(e) = self.raft_handle.verify_leadership().await {
+            match e {
+                ConsensusError::NotLeader => {
+                    return Ok(Response::new(QueryStateResponse {
+                        status: QueryStatus::Rejected as i32,
+                        leader_hint: status.leader_hint,
+                        ..Default::default()
+                    }));
+                }
+                _ => return Err(Status::internal(format!("Linearizable read failed: {}", e))),
+            }
+        }
+
+        // 3. Linearizable Consistency Fence (ADR 006).
+        // If a minimum state version is requested, we ensure the local state
+        // machine has caught up to that version before responding.
+        if let Some(version) = req.min_state_version {
+            if version > status.last_committed.value() {
+                return Err(Status::failed_precondition(format!(
+                    "Requested version {} exceeds consistent horizon {}.",
+                    version,
+                    status.last_committed.value()
+                )));
+            }
+
+            self.raft_handle
+                .await_apply(LogIndex::new(version))
+                .await
+                .map_err(|e| self.map_consensus_error(e, &status))?;
+        }
+
+        // 4. Fetches the consolidated inventory from the State Machine.
+        let items = self.inventory_reader.get_inventory().await;
+
+        let version = self.inventory_reader.current_version().await;
+
+        // 5. Redacts or filters results if a query filter was provided.
+        let filtered_items = if let Some(ref filter) = req.query_filter {
+            let filter_lower = filter.to_lowercase();
+            items
+                .into_iter()
+                .filter(|item| item.item_key.to_lowercase().contains(&filter_lower))
+                .collect()
+        } else {
+            items
+        };
+
+        Ok(Response::new(QueryStateResponse {
+            items: filtered_items,
+            current_state_version: version.value(),
+            status: QueryStatus::Success as i32,
+            ..Default::default()
+        }))
+    }
+}
+
+impl IngressDispatcher {
     /// Enforces Exactly-Once Semantics by validating request sequences against
     /// the authoritative session table.
     ///
@@ -269,8 +344,10 @@ impl IngressDispatcher {
         if let Some(record) = last_session {
             if sequence_id.value() == record.last_sequence_id {
                 info!(
-                    "Deduplicating request for client {} (seq {}). Returning cached outcome.",
-                    client_id, sequence_id
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    client_id = %client_id.truncated(),
+                    seq = %sequence_id,
+                    "Deduplicating request. Returning cached outcome."
                 );
                 return Ok(Some(Response::new(ProposeMutationResponse {
                     status: record.status,
@@ -286,8 +363,11 @@ impl IngressDispatcher {
 
             if sequence_id.value() < record.last_sequence_id {
                 warn!(
-                    "Rejecting stale request for client {} (got {}, cluster at {}).",
-                    client_id, sequence_id, record.last_sequence_id
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    client_id = %client_id.truncated(),
+                    seq = %sequence_id,
+                    cluster_seq = %record.last_sequence_id,
+                    "Rejecting stale request."
                 );
                 return Ok(Some(Response::new(ProposeMutationResponse {
                     status: MutationStatus::Rejected as i32,
@@ -299,10 +379,11 @@ impl IngressDispatcher {
 
             if sequence_id.value() > record.last_sequence_id + 1 {
                 warn!(
-                    "Rejecting sequence gap for client {}: expected {}, got {}.",
-                    client_id,
-                    record.last_sequence_id + 1,
-                    sequence_id
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    client_id = %client_id.truncated(),
+                    seq = %sequence_id,
+                    expected_seq = %(record.last_sequence_id + 1),
+                    "Rejecting sequence gap."
                 );
                 return Ok(Some(Response::new(ProposeMutationResponse {
                     status: MutationStatus::Rejected as i32,
@@ -314,8 +395,11 @@ impl IngressDispatcher {
         } else if sequence_id.value() != 1 {
             // New client must start with sequence 1
             warn!(
-                "Rejecting session bootstrap gap for client {}: expected 1, got {}.",
-                client_id, sequence_id
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                client_id = %client_id.truncated(),
+                seq = %sequence_id,
+                expected_seq = 1,
+                "Rejecting session bootstrap gap."
             );
             return Ok(Some(Response::new(ProposeMutationResponse {
                 status: MutationStatus::Rejected as i32,
@@ -383,8 +467,9 @@ impl IngressDispatcher {
     /// and SI stabilization retries.
     async fn resolve_semantic_mutation(
         &self,
-        client_id: String,
+        client_id: ClientId,
         intent: &MutationIntent,
+        trace_id: TraceId,
     ) -> Result<(MutationStatus, StabilizedMutation), Status> {
         let mut stabilized_mutation = None;
         let mut final_status = MutationStatus::Committed;
@@ -392,19 +477,24 @@ impl IngressDispatcher {
         for attempt in 0..=self.veto_max_retries {
             if attempt > 0 {
                 info!(
-                    "Retrying AI resolution (attempt {}/{})...",
-                    attempt + 1,
-                    self.veto_max_retries + 1
+                    target: ClinicalTarget::ClinicalOracle.as_str(),
+                    attempt = attempt + 1,
+                    max_retries = self.veto_max_retries + 1,
+                    "Retrying AI resolution..."
                 );
             }
 
-            let veto = match self.evaluate_policy(client_id.clone(), intent).await {
+            let veto = match self
+                .evaluate_policy(client_id.clone(), intent, trace_id)
+                .await
+            {
                 Ok(v) => v,
                 Err(e) if attempt < self.veto_max_retries => {
                     warn!(
-                        "Transient AI failure on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        e
+                        target: ClinicalTarget::ClinicalOracle.as_str(),
+                        attempt = attempt + 1,
+                        error = %e,
+                        "Transient AI failure. Retrying..."
                     );
                     continue;
                 }
@@ -432,16 +522,18 @@ impl IngressDispatcher {
                 }
                 Err(status) if attempt < self.veto_max_retries => {
                     warn!(
-                        "AI response failed physical validation on attempt {}: {}. Retrying...",
-                        attempt + 1,
-                        status.message()
+                        target: ClinicalTarget::ClinicalOracle.as_str(),
+                        attempt = attempt + 1,
+                        error = %status.message(),
+                        "AI response failed physical validation. Retrying..."
                     );
                     continue;
                 }
                 Err(status) => {
                     warn!(
-                        "AI resolution exhausted retries and failed validation: {}",
-                        status.message()
+                        target: ClinicalTarget::ClinicalOracle.as_str(),
+                        error = %status.message(),
+                        "AI resolution exhausted retries and failed validation."
                     );
                     final_status = MutationStatus::Vetoed;
                     stabilized_mutation = Some(StabilizedMutation {
@@ -719,10 +811,22 @@ impl IngressDispatcher {
     /// Executes the AI policy evaluation with timeout and error handling.
     async fn evaluate_policy(
         &self,
-        client_id: String,
+        client_id: ClientId,
         intent: &MutationIntent,
+        trace_id: TraceId,
     ) -> Result<VetoOutcome, Status> {
-        info!("Triggering AI Veto evaluation for normalized intent...");
+        let span = info_span!(
+            target: ClinicalTarget::ClinicalOracle.as_str(),
+            "veto_evaluation",
+            %trace_id,
+            timeout = ?self.veto_timeout
+        );
+
+        info!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            "Triggering AI Veto evaluation for normalized intent..."
+        );
+
         let outcome = self
             .veto_relay
             .evaluate(
@@ -731,24 +835,51 @@ impl IngressDispatcher {
                 &[], // Inventory store implemented in Phase 5
                 self.veto_timeout,
                 self.max_justification_len,
+                trace_id,
             )
+            .instrument(span)
             .await;
 
         match outcome {
             Ok(v) => {
                 if !v.is_approved {
-                    info!("Mutation VETOED by AI: {}", v.moral_justification);
+                    info!(
+                        target: ClinicalTarget::ClinicalIngress.as_str(),
+                        resolution = "Vetoed",
+                        "Mutation VETOED by AI"
+                    );
+                    tracing::trace!(
+                        target: ClinicalTarget::ClinicalIngress.as_str(),
+                        moral_justification = %v.moral_justification,
+                        "AI Moral Justification (PII)"
+                    );
                 }
                 Ok(v)
             }
+            Err(VetoError::CausalIntegrityViolation) => {
+                // Byzantine Resilience: Explicitly detected trace grafting.
+                error!(
+                    target: ClinicalTarget::ClinicalTelemetry.as_str(),
+                    "Causal Integrity Violation: AI Veto Node returned mismatched TraceId"
+                );
+                Err(Status::failed_precondition("Causal Integrity Violation"))
+            }
             Err(VetoError::Timeout(d)) => {
-                warn!("AI Veto evaluation timed out after {:?}", d);
+                warn!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    timeout = ?d,
+                    "AI Veto evaluation timed out"
+                );
                 Err(Status::deadline_exceeded(
                     "AI evaluation timed out. Please retry shortly.",
                 ))
             }
             Err(e) => {
-                error!("AI Veto infrastructure failure: {}", e);
+                error!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    error = %e,
+                    "AI Veto infrastructure failure"
+                );
                 Err(self.internal_error("Internal policy engine failure"))
             }
         }
@@ -768,11 +899,18 @@ impl IngressDispatcher {
                 Status::deadline_exceeded(format!("Proposal at index {} timed out", idx))
             }
             ConsensusError::Poisoned => {
-                error!("CRITICAL: Node is in a poisoned state due to fatal safety violation.");
+                error!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    "CRITICAL: Node is in a poisoned state due to fatal safety violation."
+                );
                 Status::aborted("Node is in a fatal state and cannot process requests.")
             }
             ConsensusError::Internal(msg) => {
-                error!("Consensus Internal Error: {}", msg);
+                error!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    error = %msg,
+                    "Consensus Internal Error"
+                );
                 Status::internal("Internal Consensus Failure")
             }
             ConsensusError::Terminated => Status::unavailable("Consensus engine is shutting down"),
@@ -814,6 +952,7 @@ mod tests {
     use common::types::SequenceId;
     use common::types::errors::ConsensusError;
     use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
     use prost::Message;
     use tonic::Request;
 
@@ -879,11 +1018,12 @@ mod tests {
     impl VetoRelay for MockVetoRelay {
         async fn evaluate(
             &self,
-            _client_id: String,
+            _client_id: ClientId,
             _intent: &MutationIntent,
             _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
+            _trace_id: TraceId,
         ) -> Result<VetoOutcome, VetoError> {
             if let Some(err) = &self.error {
                 return Err(err.clone());
@@ -903,11 +1043,12 @@ mod tests {
     impl VetoRelay for FlakyVetoRelay {
         async fn evaluate(
             &self,
-            _client_id: String,
+            _client_id: ClientId,
             _intent: &MutationIntent,
             _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
+            _trace_id: TraceId,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.fail_count.lock().unwrap();
             if *count < self.max_fails {
@@ -933,11 +1074,12 @@ mod tests {
     impl VetoRelay for HallucinatingVetoRelay {
         async fn evaluate(
             &self,
-            _client_id: String,
+            _client_id: ClientId,
             _intent: &MutationIntent,
             _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
+            _trace_id: TraceId,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.call_count.lock().unwrap();
             if *count == 0 {
@@ -958,11 +1100,12 @@ mod tests {
     impl VetoRelay for MixedFailureVetoRelay {
         async fn evaluate(
             &self,
-            _client_id: String,
+            _client_id: ClientId,
             _intent: &MutationIntent,
             _current_inventory: &[GroceryItem],
             _timeout: Duration,
             _max_justification_len: usize,
+            _trace_id: TraceId,
         ) -> Result<VetoOutcome, VetoError> {
             let mut count = self.call_count.lock().unwrap();
             let current = *count;
@@ -1050,6 +1193,14 @@ mod tests {
         })
     }
 
+    /// Helper to create a Request with a mandatory TraceId extension for
+    /// telemetry-guarded handlers.
+    fn make_request<T>(payload: T) -> Request<T> {
+        let mut req = Request::new(payload);
+        req.extensions_mut().insert(TraceId::generate());
+        req
+    }
+
     mod propose_mutation {
         use super::*;
 
@@ -1065,7 +1216,7 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: None,
@@ -1147,7 +1298,7 @@ mod tests {
             let inventory = Arc::new(DuplicateSource { committed_index });
 
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1186,7 +1337,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1226,7 +1377,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1267,7 +1418,7 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1303,7 +1454,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1335,7 +1486,7 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1362,7 +1513,7 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1392,7 +1543,7 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1428,11 +1579,12 @@ mod tests {
             impl VetoRelay for SlowVetoRelay {
                 async fn evaluate(
                     &self,
-                    _client_id: String,
+                    _client_id: ClientId,
                     _intent: &MutationIntent,
                     _current_inventory: &[common::proto::v1::app::GroceryItem],
                     _timeout: Duration,
                     _max_justification_len: usize,
+                    _trace_id: TraceId,
                 ) -> Result<VetoOutcome, VetoError> {
                     let current = self.active_calls.fetch_add(1, Ordering::SeqCst) + 1;
 
@@ -1472,7 +1624,7 @@ mod tests {
 
             let d1 = dispatcher.clone();
             let h1 = tokio::spawn(async move {
-                let req = Request::new(ProposeMutationRequest {
+                let req = make_request(ProposeMutationRequest {
                     client_id: ClientId::generate().as_str().to_string(),
                     sequence_id: 1,
                     intent: Some(MutationIntent {
@@ -1487,7 +1639,7 @@ mod tests {
 
             let d2 = dispatcher.clone();
             let h2 = tokio::spawn(async move {
-                let req = Request::new(ProposeMutationRequest {
+                let req = make_request(ProposeMutationRequest {
                     client_id: ClientId::generate().as_str().to_string(),
                     sequence_id: 2,
                     intent: Some(MutationIntent {
@@ -1527,7 +1679,7 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1557,7 +1709,7 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft.clone(), inventory.clone(), inventory, veto);
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1594,7 +1746,7 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1632,7 +1784,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1672,7 +1824,7 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1729,7 +1881,7 @@ mod tests {
                 inventory,
                 successful_veto(),
             );
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1764,7 +1916,7 @@ mod tests {
                 512,
             );
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1816,7 +1968,7 @@ mod tests {
                 512,
             );
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1858,7 +2010,7 @@ mod tests {
                 512,
             );
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1906,7 +2058,7 @@ mod tests {
                 512,
             );
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1944,11 +2096,12 @@ mod tests {
             impl VetoRelay for CountingVetoRelay {
                 async fn evaluate(
                     &self,
-                    _client_id: String,
+                    _client_id: ClientId,
                     _intent: &MutationIntent,
                     _current_inventory: &[common::proto::v1::app::GroceryItem],
                     _timeout: Duration,
                     _max_justification_len: usize,
+                    _trace_id: TraceId,
                 ) -> Result<VetoOutcome, VetoError> {
                     self.call_count.fetch_add(1, Ordering::SeqCst);
                     Ok(VetoOutcome {
@@ -1975,7 +2128,7 @@ mod tests {
                 512,
             );
 
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1,
                 intent: Some(MutationIntent {
@@ -1988,6 +2141,55 @@ mod tests {
 
             let _ = dispatcher.propose_mutation(req).await.unwrap();
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn rejects_when_ai_veto_violates_causal_integrity() {
+            #[derive(Debug)]
+            struct ByzantineVetoRelay;
+            #[async_trait]
+            impl VetoRelay for ByzantineVetoRelay {
+                async fn evaluate(
+                    &self,
+                    _client_id: ClientId,
+                    _intent: &MutationIntent,
+                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _timeout: Duration,
+                    _max_justification_len: usize,
+                    _trace_id: TraceId,
+                ) -> Result<VetoOutcome, VetoError> {
+                    // Simulate the bridge detecting a TraceId mismatch or missing ID
+                    Err(VetoError::CausalIntegrityViolation)
+                }
+            }
+
+            let raft = successful_raft();
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    raft,
+                    inventory.clone(),
+                    inventory,
+                    Arc::new(ByzantineVetoRelay),
+                )
+            };
+
+            let req = make_request(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: Some(MutationIntent {
+                    item_key: "milk".to_string(),
+                    quantity: Some("1".to_string()),
+                    operation: OperationType::Add as i32,
+                    ..Default::default()
+                }),
+            });
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+            assert!(status.message().contains("Causal Integrity Violation"));
         }
     }
 
@@ -2258,7 +2460,7 @@ mod tests {
             });
 
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: sid.value(),
                 intent: Some(MutationIntent::default()),
@@ -2311,7 +2513,7 @@ mod tests {
             });
 
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: sid.value(),
                 intent: Some(MutationIntent::default()),
@@ -2358,7 +2560,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 5, // Stale: cluster is at 10
                 intent: Some(MutationIntent::default()),
@@ -2410,7 +2612,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 3, // Gap: expecting 2
                 intent: Some(MutationIntent::default()),
@@ -2455,7 +2657,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 5, // Should be 1
                 intent: Some(MutationIntent {
@@ -2504,7 +2706,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 1, // Correct start
                 intent: Some(MutationIntent {
@@ -2555,7 +2757,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 2, // Valid: 1 + 1
                 intent: Some(MutationIntent {
@@ -2598,7 +2800,7 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = Request::new(ProposeMutationRequest {
+            let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
                 sequence_id: 0, // Forbidden by protocol
                 intent: Some(MutationIntent::default()),
@@ -2627,7 +2829,7 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = Request::new(QueryStateRequest {
+            let req = make_request(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
             });
@@ -2664,7 +2866,7 @@ mod tests {
             });
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = Request::new(QueryStateRequest {
+            let req = make_request(QueryStateRequest {
                 query_filter: None,
                 min_state_version: None,
             });
@@ -2706,7 +2908,7 @@ mod tests {
             });
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = Request::new(QueryStateRequest {
+            let req = make_request(QueryStateRequest {
                 query_filter: Some("milk".to_string()),
                 min_state_version: None,
             });
@@ -2757,7 +2959,7 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = Request::new(QueryStateRequest {
+            let req = make_request(QueryStateRequest {
                 query_filter: None,
                 min_state_version: Some(10),
             });
@@ -2779,7 +2981,7 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = Request::new(QueryStateRequest {
+            let req = make_request(QueryStateRequest {
                 query_filter: None,
                 min_state_version: Some(10), // Exceeds horizon (5)
             });

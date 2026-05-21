@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::proto::v1::raft::consensus_service_client::ConsensusServiceClient;
-use common::rpc::HEADER_CLUSTER_ID;
-use common::rpc::HEADER_TARGET_NODE_ID;
+use common::rpc::IdentityInterceptor;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use thiserror::Error;
@@ -97,20 +96,10 @@ impl PeerManager {
         let cluster_id = self.identity.cluster_id().clone();
         let target_node_id = node_id;
 
-        // Interceptor to inject identity headers for cluster isolation.
+        // Interceptor to inject identity headers.
         let interceptor = move |mut req: Request<()>| {
-            req.metadata_mut().insert(
-                HEADER_CLUSTER_ID,
-                cluster_id.as_str().parse().map_err(|_| {
-                    Status::internal("Failed to parse cluster_id for outbound header")
-                })?,
-            );
-            req.metadata_mut().insert(
-                HEADER_TARGET_NODE_ID,
-                target_node_id.to_string().parse().map_err(|_| {
-                    Status::internal("Failed to parse target_node_id for outbound header")
-                })?,
-            );
+            IdentityInterceptor::inject_request(&mut req, &cluster_id, target_node_id)?;
+
             Ok(req)
         };
 

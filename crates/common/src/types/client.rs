@@ -33,6 +33,13 @@ impl ClientId {
     pub fn as_str(&self) -> &str {
         &self.cached_str
     }
+
+    /// Returns a correlation-safe truncation (first 8 characters) for clinical
+    /// logging (ADR 010).
+    pub fn truncated(&self) -> &str {
+        let s = self.as_str();
+        if s.len() <= 8 { s } else { &s[..8] }
+    }
 }
 
 impl FromStr for ClientId {
@@ -51,14 +58,16 @@ impl FromStr for ClientId {
 impl fmt::Debug for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Redacted for security (correlation-safe truncation)
-        write!(f, "ClientId({}...) ", &self.as_str()[..8])
+        write!(f, "ClientId({}...) ", self.truncated())
     }
 }
 
 impl fmt::Display for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Redacted for security (correlation-safe truncation)
-        write!(f, "{}...", &self.as_str()[..8])
+        // We omit the ellipses to strictly follow the 8-character mandate for
+        // structured logs.
+        write!(f, "{}", self.truncated())
     }
 }
 

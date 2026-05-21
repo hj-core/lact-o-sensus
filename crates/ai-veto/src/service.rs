@@ -4,7 +4,10 @@ use common::proto::v1::app::EvaluateProposalRequest;
 use common::proto::v1::app::EvaluateProposalResponse;
 use common::proto::v1::app::OperationType;
 use common::proto::v1::app::policy_service_server::PolicyService;
+use common::rpc::TraceInterceptor;
 use common::taxonomy::GroceryCategory;
+use common::types::ClientId;
+use common::types::trace::ClinicalTarget;
 use common::units::UnitRegistry;
 use ollama_rs::Ollama;
 use ollama_rs::generation::chat::ChatMessage;
@@ -18,8 +21,11 @@ use ollama_rs::models::ModelOptions;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::Instrument;
 use tracing::error;
 use tracing::info;
+use tracing::info_span;
+use tracing::trace;
 use tracing::warn;
 
 use crate::args::Args;
@@ -33,8 +39,13 @@ pub struct RealPolicyService {
 impl RealPolicyService {
     pub fn new(args: Args) -> Self {
         info!(
-            "Moral Advocate initializing. Model={}, Host={}:{}, Think={}, MaxTokens={}",
-            args.model, args.ollama_host, args.ollama_port, args.think, args.max_tokens
+            target: ClinicalTarget::ClinicalOracle.as_str(),
+            model = %args.model,
+            host = %args.ollama_host,
+            port = %args.ollama_port,
+            think = %args.think,
+            max_tokens = %args.max_tokens,
+            "Moral Advocate initializing."
         );
         Self {
             ollama: Ollama::new(args.ollama_host.clone(), args.ollama_port),
@@ -173,13 +184,21 @@ Constraint: Do NOT invent units or categories. Use exactly the strings provided 
     /// Performs a No-Op request to pin the model in VRAM and ensure Ollama is
     /// reachable.
     pub async fn warm_up(&self) -> anyhow::Result<()> {
-        info!("Performing VRAM warm-up for model '{}'...", self.args.model);
+        info!(
+            target: ClinicalTarget::ClinicalOracle.as_str(),
+            model = %self.args.model,
+            "Performing VRAM warm-up..."
+        );
         let messages = vec![ChatMessage::new(MessageRole::User, "ping".to_string())];
         let req =
             ChatMessageRequest::new(self.args.model.clone(), messages).think(ThinkType::False);
 
         self.ollama.send_chat_messages(req).await?;
-        info!("Warm-up complete. Model is pinned in VRAM.");
+        info!(
+            target: ClinicalTarget::ClinicalOracle.as_str(),
+            model = %self.args.model,
+            "Warm-up complete. Model is pinned in VRAM."
+        );
         Ok(())
     }
 
@@ -189,19 +208,30 @@ Constraint: Do NOT invent units or categories. Use exactly the strings provided 
     fn validate_semantic_integrity(&self, res: &LlmResponse) -> Result<(), Status> {
         // 1. Validate Category
         if GroceryCategory::from_str(&res.category_assignment).is_err() {
-            warn!("AI Hallucinated category: '{}'", res.category_assignment);
+            warn!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                category = %res.category_assignment,
+                "AI Hallucinated category."
+            );
             return Err(Status::internal("AI Hallucination: Invalid Category"));
         }
 
         // 2. Validate Unit Symbol
         if UnitRegistry::resolve_symbol(&res.resolved_unit).is_err() {
-            warn!("AI Hallucinated unit: '{}'", res.resolved_unit);
+            warn!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                unit = %res.resolved_unit,
+                "AI Hallucinated unit."
+            );
             return Err(Status::internal("AI Hallucination: Invalid Unit"));
         }
 
         // 3. Prevent empty keys
         if res.resolved_item_key.trim().is_empty() {
-            warn!("AI returned empty item key.");
+            warn!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                "AI returned empty item key."
+            );
             return Err(Status::internal("AI Hallucination: Empty Item Key"));
         }
 
@@ -215,83 +245,130 @@ impl PolicyService for RealPolicyService {
         &self,
         request: Request<EvaluateProposalRequest>,
     ) -> Result<Response<EvaluateProposalResponse>, Status> {
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+
         let req = request.into_inner();
-        let chat_req = self.build_chat_request(&req)?;
 
-        info!(
-            "Evaluating proposal from client={} for item_key='{}'",
-            req.client_id,
-            req.intent
-                .as_ref()
-                .map(|i| i.item_key.as_str())
-                .unwrap_or("none")
-        );
-
-        let start = std::time::Instant::now();
-        let res = self
-            .ollama
-            .send_chat_messages(chat_req)
-            .await
-            .map_err(|e| {
-                error!("Ollama chat failed after {:?}: {}", start.elapsed(), e);
-                Status::internal(format!("LLM Error: {}", e))
-            })?;
-
-        let duration = start.elapsed();
-        info!("LLM responded in {:?}", duration);
-
-        let message_content = res.message.content.trim();
-
-        // Scrub markdown backticks if present
-        let clean_json = if message_content.starts_with("```") {
-            message_content
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-        } else {
-            message_content
-        };
-
-        if clean_json.is_empty() {
-            error!("AI returned empty response content.");
-            return Err(Status::internal("AI Hallucination: Empty response"));
-        }
-
-        let llm_res: LlmResponse = serde_json::from_str(clean_json).map_err(|e| {
-            error!(
-                "Failed to parse LLM JSON: {}. Raw: {}",
-                e, res.message.content
-            );
-            Status::internal("AI Hallucination: Malformed response format")
+        let cid = req.client_id.parse::<ClientId>().map_err(|_| {
+            Status::invalid_argument(format!("Malformed Client ID: {}", req.client_id))
         })?;
 
-        // Semantic Integrity Guard
-        self.validate_semantic_integrity(&llm_res)?;
+        let item_key = req
+            .intent
+            .as_ref()
+            .map(|i| i.item_key.as_str())
+            .unwrap_or("none");
 
-        info!(
-            "Evaluation complete. Approved: {}, Resolved Key: '{}', Category: '{}'",
-            llm_res.is_approved, llm_res.resolved_item_key, llm_res.category_assignment
+        let span = info_span!(
+            target: ClinicalTarget::ClinicalOracle.as_str(),
+            "evaluate_proposal",
+            %trace_id,
+            client_id = %cid.truncated(),
+            item = %item_key
         );
 
-        // Resolve stabilization multiplier (ADR 008)
-        let multiplier = if let Some(ref custom) = llm_res.custom_multiplier {
-            custom.clone()
-        } else {
-            UnitRegistry::resolve_symbol(&llm_res.resolved_unit)
-                .map(|e| e.multiplier.to_string())
-                .unwrap_or_else(|_| "1.0".to_string())
-        };
+        async {
+            let chat_req = self.build_chat_request(&req)?;
 
-        Ok(Response::new(EvaluateProposalResponse {
-            is_approved: llm_res.is_approved,
-            category_assignment: llm_res.category_assignment,
-            moral_justification: llm_res.moral_justification,
-            resolved_item_key: llm_res.resolved_item_key,
-            suggested_display_name: llm_res.suggested_display_name,
-            resolved_unit: llm_res.resolved_unit,
-            conversion_multiplier_to_base: multiplier,
-        }))
+            info!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                "Evaluating semantic proposal"
+            );
+
+            let start = std::time::Instant::now();
+            let res = self
+                .ollama
+                .send_chat_messages(chat_req)
+                .await
+                .map_err(|e| {
+                    error!(
+                        target: ClinicalTarget::ClinicalOracle.as_str(),
+                        duration_ms = start.elapsed().as_millis(),
+                        error = %e,
+                        "Ollama chat failed"
+                    );
+                    Status::internal(format!("LLM Error: {}", e))
+                })?;
+
+            let duration = start.elapsed();
+            info!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                duration_ms = duration.as_millis(),
+                "LLM evaluation completed"
+            );
+
+            let message_content = res.message.content.trim();
+
+            // Scrub markdown backticks if present
+            let clean_json = if message_content.starts_with("```") {
+                message_content
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+            } else {
+                message_content
+            };
+
+            if clean_json.is_empty() {
+                error!(
+                    target: ClinicalTarget::ClinicalOracle.as_str(),
+                    "AI returned empty response content."
+                );
+                return Err(Status::internal("AI Hallucination: Empty response"));
+            }
+
+            let llm_res: LlmResponse = serde_json::from_str(clean_json).map_err(|e| {
+                error!(
+                    target: ClinicalTarget::ClinicalOracle.as_str(),
+                    error = %e,
+                    "Failed to parse LLM JSON. AI Hallucination."
+                );
+                trace!(
+                    target: ClinicalTarget::ClinicalOracle.as_str(),
+                    raw_response = %res.message.content,
+                    "Raw LLM Response"
+                );
+                Status::internal("AI Hallucination: Malformed response format")
+            })?;
+
+            // Semantic Integrity Guard
+            self.validate_semantic_integrity(&llm_res)?;
+
+            info!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                resolution = if llm_res.is_approved { "Approved" } else { "Vetoed" },
+                resolved_key = %llm_res.resolved_item_key,
+                category = %llm_res.category_assignment,
+                "Semantic Integrity Validated"
+            );
+
+            // Resolve stabilization multiplier (ADR 008)
+            let multiplier = if let Some(ref custom) = llm_res.custom_multiplier {
+                custom.clone()
+            } else {
+                UnitRegistry::resolve_symbol(&llm_res.resolved_unit)
+                    .map(|e| e.multiplier.to_string())
+                    .unwrap_or_else(|_| "1.0".to_string())
+            };
+
+            let mut response = Response::new(EvaluateProposalResponse {
+                is_approved: llm_res.is_approved,
+                category_assignment: llm_res.category_assignment,
+                moral_justification: llm_res.moral_justification,
+                resolved_item_key: llm_res.resolved_item_key,
+                suggested_display_name: llm_res.suggested_display_name,
+                resolved_unit: llm_res.resolved_unit,
+                conversion_multiplier_to_base: multiplier,
+            });
+
+            // Strict Causal Injection
+            TraceInterceptor::inject_response(&mut response, trace_id)?;
+
+            Ok(response)
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -484,6 +561,117 @@ mod tests {
             let status = service.validate_semantic_integrity(&res).unwrap_err();
             assert_eq!(status.code(), tonic::Code::Internal);
             assert!(status.message().contains("Invalid Unit"));
+        }
+    }
+
+    mod causal_integrity {
+        use common::types::trace::TraceId;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn injects_trace_id_into_response() {
+            let _service = RealPolicyService::new(test_args(false));
+
+            // We mock evaluate_proposal manually to verify trace injection
+            // since RealPolicyService::evaluate_proposal calls Ollama.
+            // But we can verify the TraceInterceptor::inject_response logic here.
+            let trace_id = TraceId::generate();
+            let mut response = Response::new(EvaluateProposalResponse::default());
+
+            TraceInterceptor::inject_response(&mut response, trace_id).unwrap();
+
+            let extracted = TraceInterceptor::extract_response(&response).unwrap();
+            assert_eq!(extracted, trace_id);
+        }
+    }
+
+    mod json_scrubbing {
+        use super::*;
+        use crate::model::LlmResponse;
+
+        // A helper to expose the scrubbing logic for testing without calling the LLM
+        fn scrub_and_parse(message_content: &str) -> Result<LlmResponse, Status> {
+            let clean_json = if message_content.starts_with("```") {
+                message_content
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+            } else {
+                message_content
+            };
+
+            if clean_json.is_empty() {
+                return Err(Status::internal("AI Hallucination: Empty response"));
+            }
+
+            serde_json::from_str(clean_json)
+                .map_err(|_| Status::internal("AI Hallucination: Malformed response format"))
+        }
+
+        #[test]
+        fn successfully_parses_raw_json() {
+            let raw = r#"{
+                "is_approved": true,
+                "category_assignment": "Primary Flora",
+                "moral_justification": "Healthy.",
+                "resolved_item_key": "apple",
+                "suggested_display_name": "Apple",
+                "resolved_unit": "units",
+                "custom_multiplier": null
+            }"#;
+
+            let res = scrub_and_parse(raw).unwrap();
+            assert!(res.is_approved);
+            assert_eq!(res.resolved_item_key, "apple");
+        }
+
+        #[test]
+        fn strips_markdown_json_blocks_before_parsing() {
+            let markdown = r#"```json
+            {
+                "is_approved": false,
+                "category_assignment": "Anomalous Inputs",
+                "moral_justification": "Vetoed.",
+                "resolved_item_key": "brick",
+                "suggested_display_name": "Brick",
+                "resolved_unit": "misc",
+                "custom_multiplier": null
+            }
+            ```"#;
+
+            let res = scrub_and_parse(markdown).unwrap();
+            assert!(!res.is_approved);
+            assert_eq!(res.resolved_item_key, "brick");
+        }
+
+        #[test]
+        fn strips_generic_markdown_blocks_before_parsing() {
+            let markdown = r#"```
+            {
+                "is_approved": true,
+                "category_assignment": "Liquefied Hydration",
+                "moral_justification": "Water is essential.",
+                "resolved_item_key": "water",
+                "suggested_display_name": "Water",
+                "resolved_unit": "ml",
+                "custom_multiplier": "1000"
+            }
+            ```"#;
+
+            let res = scrub_and_parse(markdown).unwrap();
+            assert!(res.is_approved);
+            assert_eq!(res.resolved_item_key, "water");
+            assert_eq!(res.custom_multiplier.unwrap(), "1000");
+        }
+
+        #[test]
+        fn returns_error_on_empty_code_block() {
+            let empty = "```json\n\n```";
+            let err = scrub_and_parse(empty).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Internal);
+            assert!(err.message().contains("Empty response"));
         }
     }
 }

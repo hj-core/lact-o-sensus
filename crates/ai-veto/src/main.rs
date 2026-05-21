@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use common::proto::v1::app::policy_service_server::PolicyServiceServer;
+use common::rpc::TraceInterceptor;
+use common::types::trace::ClinicalTarget;
 use tonic::transport::Server;
 use tracing::Instrument;
 use tracing::error;
@@ -30,16 +32,30 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
 
-    let root_span = info_span!("ai_veto", port = args.port, model = %args.model);
+    let root_span = info_span!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
+        "ai_veto",
+        port = args.port,
+        model = %args.model
+    );
 
     async move {
-        info!("AI Moral Advocate (ADR 008 Compliant) starting on {}", addr);
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "AI Moral Advocate (ADR 008 Compliant) starting on {}", addr
+        );
 
         let shutdown = async {
             if let Err(e) = tokio::signal::ctrl_c().await {
-                error!("Failed to install CTRL+C handler: {}", e);
+                error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    "Failed to install CTRL+C handler: {}", e
+                );
             } else {
-                info!("Shutdown signal received. Commencing graceful exit...");
+                info!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    "Shutdown signal received. Commencing graceful exit..."
+                );
             }
         };
 
@@ -48,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         // Proactive VRAM Warm-up (Task 2)
         if let Err(e) = service.warm_up().await {
             error!(
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
                 "Fatal Error during model warm-up: {}. Verify Ollama is running and model is \
                  pulled.",
                 e
@@ -55,14 +72,23 @@ async fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Warm-up failed"));
         }
 
-        info!("Service initialized, starting gRPC server...");
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "Service initialized, starting gRPC server..."
+        );
+
+        let service =
+            PolicyServiceServer::with_interceptor(service, TraceInterceptor::propagative());
 
         Server::builder()
-            .add_service(PolicyServiceServer::new(service))
+            .add_service(service)
             .serve_with_shutdown(addr, shutdown)
             .await?;
 
-        info!("AI Moral Advocate lifecycle finished. Goodbye.");
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "AI Moral Advocate lifecycle finished. Goodbye."
+        );
         Ok(())
     }
     .instrument(root_span)
