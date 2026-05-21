@@ -49,6 +49,8 @@ VETO_LOG = "ai_veto.log"
 
 # --- Helper Library ---
 
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def now_ms() -> float:
     """Returns current wall-clock time in milliseconds."""
@@ -221,7 +223,7 @@ def get_complete_lines(
             line = f.readline()
             if not line or not line.endswith("\n"):
                 break
-            yield line
+            yield ANSI_ESCAPE.sub("", line)
             offset = f.tell()
     return offset
 
@@ -261,13 +263,15 @@ def find_current_leader() -> Optional[int]:
     leader_id = best_leader[2]
 
     # Now verify this leader hasn't demoted in a later log entry
-    for line in get_complete_lines(next(n["log"] for n in NODES if n["id"] == leader_id), 0):
-        if "Demoting to Follower" in line:
+    for line in get_complete_lines(
+        next(n["log"] for n in NODES if n["id"] == leader_id), 0
+    ):
+        if "Role Transition: -> Follower" in line:
             ts = parse_log_timestamp(line)
             # Try to extract term from demotion if available
             term_match = re.search(r"term[= ](\d+)", line)
             demoted_term = int(term_match.group(1)) if term_match else 0
-            
+
             # If demoted in the same or higher term, or if timestamp is newer
             if ts >= latest_ts and demoted_term >= leader_term:
                 return None
@@ -297,7 +301,7 @@ def count_elections() -> int:
         1
         for node in NODES
         for line in get_complete_lines(node["log"], 0)
-        if "Transitioning to Leader" in line
+        if "Role Transition: -> Leader" in line
     )
 
 
@@ -397,7 +401,7 @@ def test_leader_failover(cluster: ClusterManager) -> None:
                 for line in get_complete_lines(
                     node["log"], log_offsets.get(node["id"], 0)
                 ):
-                    if "Transitioning to Leader" in line:
+                    if "Role Transition: -> Leader" in line:
                         log_ts = parse_log_timestamp(line)
                         duration = int(
                             (log_ts if log_ts > 0 else now_ms())
@@ -476,7 +480,9 @@ def test_ai_veto_egress() -> None:
         )
 
 
-def run_client_command(command: str, seed_port: int, timeout: int = 120) -> str:
+def run_client_command(
+    command: str, seed_port: int, timeout: int = 120
+) -> str:
     """Helper to run a single command through the client-cli."""
     state_file = ".client_state.json"
     wal_dir = ".client_wal"
@@ -537,17 +543,23 @@ def verify_convergence(
         f"Action: Verifying cluster convergence for index {index} ({status_str})..."
     )
     start = time.time()
-    missing: list[int] = []
+    missing = [node["id"] for node in NODES]
     while (time.time() - start) < timeout:
         missing = []
         for node in NODES:
             found = False
-            # FSM log marker from store.rs
-            pattern = f"FSM[{index}]:"
-            marker = f"status {status_str}"
+            # Robust regex for structured clinical::fsm events.
+            # Handles coordinates in either the span context or message body.
+            index_pattern = re.compile(rf"index={index}(\s|,|}})")
+            status_pattern = re.compile(rf"status={status_str}(\s|,|}})")
+            target_pattern = "clinical::fsm:"
 
             for line in get_complete_lines(node["log"], 0):
-                if pattern in line and marker in line:
+                if (
+                    target_pattern in line
+                    and index_pattern.search(line)
+                    and status_pattern.search(line)
+                ):
                     found = True
                     break
             if not found:
@@ -662,11 +674,13 @@ def test_linearizable_query_rejection() -> None:
         if status == "QUERY_STATUS_REJECTED":
             if leader_hint == expected_hint:
                 print(
-                    f"SUCCESS: Follower correctly rejected query_state with accurate hint: {leader_hint}"
+                    "SUCCESS: Follower correctly rejected query_state "
+                    f"with accurate hint: {leader_hint}"
                 )
             else:
                 print(
-                    f"FAILURE: Follower provided incorrect leader hint. Expected {expected_hint}, got {leader_hint}"
+                    "FAILURE: Follower provided incorrect leader hint. "
+                    f"Expected {expected_hint}, got {leader_hint}"
                 )
                 raise RuntimeError(
                     "Incorrect leader hint in query rejection."
@@ -791,7 +805,10 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
             ):
                 recovered = True
             # FSM marker proving the data was actually applied to the DB
-            if f"FSM[{version}]:" in line:
+            if (
+                "Mutation applied to state machine" in line
+                and f"index={version}" in line
+            ):
                 fsm_applied = True
         if recovered and fsm_applied:
             break
@@ -824,12 +841,16 @@ def test_read_your_writes_consistency() -> None:
     )
     version = extract_version(output)
     if version == 0:
-        raise RuntimeError(f"Failed to commit mutation for RYW test: {output}")
+        raise RuntimeError(
+            f"Failed to commit mutation for RYW test: {output}"
+        )
 
     print(
         f"Action: Querying with min_state_version={version} (should succeed)..."
     )
-    output = run_client_command(f'query "banana" {version}', leader_port)
+    output = run_client_command(
+        f'query "banana" {version}', leader_port
+    )
     if f"Inventory (version: {version}):" not in output:
         raise RuntimeError(
             f"Query with min_version {version} failed or returned wrong version: {output}"
@@ -843,22 +864,34 @@ def test_read_your_writes_consistency() -> None:
     # 2. Strict Horizon Rejection Path
     future_version = version + 1000
     print(
-        f"Action: Querying with future min_state_version={future_version} (should fail immediately)..."
+        f"Action: Querying with future min_state_version={future_version} "
+        "(should fail immediately)..."
     )
     # This should fail fast because it exceeds the horizon.
-    output = run_client_command(f'query "banana" {future_version}', leader_port)
-    if "Requested version exceeds consistent horizon" not in output:
+    output = run_client_command(
+        f'query "banana" {future_version}', leader_port
+    )
+    if "exceeds consistent horizon" not in output:
         raise RuntimeError(
             f"Expected horizon rejection for version {future_version}, but got: {output}"
         )
 
-    print("SUCCESS: Read-Your-Writes consistency and Strict Horizon verified.")
+    print(
+        "SUCCESS: Read-Your-Writes consistency and Strict Horizon verified."
+    )
 
 
 class MutationFlooder(threading.Thread):
     """Continuously spams mutations to the cluster in a background thread."""
 
-    GROCERY_LEXICON = ["milk", "bread", "apple", "cheese", "water", "carrot"]
+    GROCERY_LEXICON = [
+        "milk",
+        "bread",
+        "apple",
+        "cheese",
+        "water",
+        "carrot",
+    ]
 
     def __init__(self, cluster: ClusterManager) -> None:
         super().__init__(daemon=True)
@@ -900,11 +933,12 @@ class MutationFlooder(threading.Thread):
                         self.successful_items.append(item_name)
                     else:
                         # Log failure for visibility
-                        first_line = output.split("\n")[0]
-                        print(f"DEBUG: Flooder failed '{item_name}': {first_line}")
+                        first_line = output.split("\n", maxsplit=1)[0]
+                        print(
+                            f"DEBUG: Flooder failed '{item_name}': {first_line}"
+                        )
                 except (subprocess.TimeoutExpired, RuntimeError) as e:
                     print(f"DEBUG: Flooder error '{item_name}': {e}")
-                    pass
                 time.sleep(0.1)
         except Exception as e:  # pylint: disable=broad-except
             self.exception = e
@@ -927,7 +961,9 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         for i in range(1, 4):
             time.sleep(3)  # Let some mutations fly
             victim_id = random.choice([n["id"] for n in NODES])
-            print(f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---")
+            print(
+                f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---"
+            )
 
             cluster.kill_node(victim_id)
             time.sleep(2)  # Wait for cluster to react
@@ -947,14 +983,18 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
             f"Action: Flood stopped. {len(flooder.successful_items)} items successfully committed."
         )
         if flooder.successful_items:
-            print(f"DEBUG: Expected items: {', '.join(flooder.successful_items)}")
+            print(
+                f"DEBUG: Expected items: {', '.join(flooder.successful_items)}"
+            )
 
         # 1. Final Convergence Check
         # Get the highest version among successful mutations
         # Actually, we can just wait for a bit and then check the leader.
         time.sleep(3)
         leader_id = wait_for_leader()
-        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+        leader_port = next(
+            n["port"] for n in NODES if n["id"] == leader_id
+        )
 
         # 2. Verify Data Parity
         print("Action: Verifying final inventory parity on Leader...")
@@ -973,7 +1013,8 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
 
         if missing_items:
             raise RuntimeError(
-                f"Data Integrity Violation! {len(missing_items)} successful items missing from Leader inventory: {missing_items[:5]}..."
+                f"Data Integrity Violation! {len(missing_items)} successful items "
+                "missing from Leader inventory: {missing_items[:5]}..."
             )
 
         # 3. Verify Cluster-Wide Convergence via Logs
@@ -983,7 +1024,9 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         if final_version > 0:
             verify_convergence(final_version, "Committed")
 
-        print("SUCCESS: 100% Data Integrity and Parity achieved after Chaos.")
+        print(
+            "SUCCESS: 100% Data Integrity and Parity achieved after Chaos."
+        )
 
     finally:
         flooder.stop()
@@ -1051,6 +1094,7 @@ def main() -> None:
         (
             "Replication Chaos Audit",
             True,
+            # pylint: disable=W0108
             lambda c: test_replication_chaos(c),
         ),
     ]

@@ -12,11 +12,13 @@ use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
 use common::types::errors::FsmError;
+use common::types::trace::ClinicalTarget;
 use prost::Message;
 use sled::Transactional;
 use sled::transaction::TransactionResult;
 use tracing::error;
 use tracing::info;
+use tracing::trace;
 use tracing::warn;
 
 /// Persistent implementation of the Lact-O-Sensus state machine using `sled`.
@@ -201,6 +203,15 @@ impl StateMachine for LactoStore {
             .map(|opt| opt.unwrap_or(LogIndex::ZERO))
     }
 
+    #[tracing::instrument(
+        target = "clinical::fsm",
+        skip(self, data),
+        fields(
+            index = %index,
+            client_id = tracing::field::Empty,
+            seq = tracing::field::Empty,
+        )
+    )]
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
             FsmError::deserialization(format!(
@@ -221,6 +232,17 @@ impl StateMachine for LactoStore {
         let client_id = mutation.client_id.clone();
         let seq = mutation.sequence_id;
 
+        let client_id_obj = ClientId::from_str(&client_id).map_err(|e| {
+            FsmError::invariant(format!(
+                "Invalid client_id '{}' in ledger at index {}. Identity metadata is corrupted: {}",
+                client_id, index, e
+            ))
+        })?;
+
+        // Record truncated client_id in the span context
+        tracing::Span::current().record("client_id", client_id_obj.truncated());
+        tracing::Span::current().record("seq", seq);
+
         // 2. Client Sequence Validation (ADR 006)
         let last_seen = self
             .get_session_record(&client_id)?
@@ -229,8 +251,9 @@ impl StateMachine for LactoStore {
 
         if seq <= last_seen {
             warn!(
-                "FSM[{}]: Deduplicating stale/retry sequence {} for client {} (last_seen: {})",
-                index, seq, client_id, last_seen
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                last_seen = %last_seen,
+                "Deduplicating stale/retry sequence. State advancement only."
             );
             // Even for duplicates, we must advance last_applied to ensure
             // the Raft engine stays in sync with the log.
@@ -248,11 +271,9 @@ impl StateMachine for LactoStore {
         if seq > last_seen + 1 {
             // ADR 006: Invariant Enforcement
             error!(
-                "FSM[{}]: SEQUENCE GAP DETECTED for client {}. Expected {}, got {}.",
-                index,
-                client_id,
-                last_seen + 1,
-                seq
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                expected_seq = %(last_seen + 1),
+                "HALT MANDATE (ADR 006): Sequence gap detected. Causal history broken."
             );
             return Err(FsmError::invariant(format!(
                 "Sequence gap for client {}: expected {}, got {}",
@@ -289,12 +310,15 @@ impl StateMachine for LactoStore {
         let current_effective = self.last_effective_time()?;
         let next_effective = Self::max_timestamp(event_time, current_effective);
 
-        let client_id_obj = ClientId::from_str(&client_id).map_err(|e| {
-            FsmError::invariant(format!(
-                "Invalid client_id '{}' in ledger at index {}. Identity metadata is corrupted: {}",
-                client_id, index, e
-            ))
-        })?;
+        // PII Trace: Log full AI output and raw intent at TRACE level only (ADR 010).
+        trace!(
+            target: ClinicalTarget::ClinicalFsm.as_str(),
+            raw_client_id = %client_id,
+            item_key = %mutation.resolved_item_key,
+            justification = %moral_justification,
+            raw_input = %mutation.raw_user_input,
+            "Physical Mutation PII Trace"
+        );
 
         let res: TransactionResult<(), ()> = (&inventory_tree, &sessions_tree, &meta_tree)
             .transaction(|(inventory, sessions, meta)| {
@@ -340,8 +364,10 @@ impl StateMachine for LactoStore {
         })?;
 
         info!(
-            "FSM[{}]: Applied sequence {} with status {:?} (Clinical Time: {}.{:09}s)",
-            index, seq, status, next_effective.seconds, next_effective.nanos
+            target: ClinicalTarget::ClinicalFsm.as_str(),
+            status = ?status,
+            clinical_time = %format!("{}.{:09}s", next_effective.seconds, next_effective.nanos),
+            "Mutation applied to state machine."
         );
 
         Ok(())

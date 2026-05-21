@@ -91,10 +91,11 @@ async fn recover_pending_intents(client: &LactoClient) -> Result<()> {
     for (seq, req) in pending {
         info!("Recovering intent sequence {}...", seq);
         match client.repropose_mutation(seq, req).await {
-            Ok(res) => {
+            Ok((res, tid)) => {
+                let trace_info = tid.map(|t| format!(" [Trace: {}]", t)).unwrap_or_default();
                 info!(
-                    "Successfully recovered intent {}. Status: {:?}",
-                    seq, res.status
+                    "Successfully recovered intent {}. Status: {:?}{}",
+                    seq, res.status, trace_info
                 );
             }
             Err(e) => {

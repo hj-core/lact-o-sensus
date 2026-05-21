@@ -138,6 +138,19 @@ impl ClientState {
         self.record_success(&leader_addr)
     }
 
+    /// Rotates the known nodes list, moving the current primary to the back.
+    ///
+    /// This is used when a node is unreachable or consistently fails to provide
+    /// a valid leader hint.
+    pub fn rotate_nodes(&mut self) -> Result<()> {
+        if self.known_nodes.len() > 1 {
+            let current = self.known_nodes.remove(0);
+            self.known_nodes.push(current);
+            self.save()?;
+        }
+        Ok(())
+    }
+
     // --- Getters ---
 
     pub fn cluster_id(&self) -> &ClusterId {

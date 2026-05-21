@@ -6,6 +6,7 @@ use common::proto::v1::MutationStatus;
 use common::proto::v1::OperationType;
 use common::proto::v1::QueryStatus;
 use common::types::LogIndex;
+use common::types::trace::TraceId;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWrite;
@@ -229,22 +230,22 @@ where
 async fn execute_command(client: &LactoClient, cmd: Command) -> Result<String> {
     match cmd {
         Command::Add(args) => {
-            let res = client
+            let (res, tid) = client
                 .propose_mutation(args.into_intent(OperationType::Add))
                 .await?;
-            format_mutation_response(res)
+            format_mutation_response(res, tid)
         }
         Command::Subtract(args) => {
-            let res = client
+            let (res, tid) = client
                 .propose_mutation(args.into_intent(OperationType::Subtract))
                 .await?;
-            format_mutation_response(res)
+            format_mutation_response(res, tid)
         }
         Command::Set(args) => {
-            let res = client
+            let (res, tid) = client
                 .propose_mutation(args.into_intent(OperationType::Set))
                 .await?;
-            format_mutation_response(res)
+            format_mutation_response(res, tid)
         }
         Command::Delete { item_key } => {
             let intent = MutationIntent {
@@ -254,39 +255,51 @@ async fn execute_command(client: &LactoClient, cmd: Command) -> Result<String> {
                 category: None,
                 operation: OperationType::Delete as i32,
             };
-            let res = client.propose_mutation(intent).await?;
-            format_mutation_response(res)
+            let (res, tid) = client.propose_mutation(intent).await?;
+            format_mutation_response(res, tid)
         }
         Command::Query {
             filter,
             min_state_version,
         } => {
-            let res = client
+            let (res, tid) = client
                 .query_state(filter, min_state_version.map(LogIndex::new))
                 .await?;
-            format_query_response(res)
+            format_query_response(res, tid)
         }
         Command::Exit => unreachable!(),
     }
 }
 
-fn format_mutation_response(res: common::proto::v1::ProposeMutationResponse) -> Result<String> {
+fn format_mutation_response(
+    res: common::proto::v1::ProposeMutationResponse,
+    tid: Option<TraceId>,
+) -> Result<String> {
+    let trace_suffix = tid.map(|t| format!(" [Trace: {}]", t)).unwrap_or_default();
+
     match MutationStatus::try_from(res.status) {
         Ok(MutationStatus::Committed) => Ok(format!(
-            "SUCCESS: Committed at version {}",
-            res.state_version
+            "SUCCESS: Committed at version {}{}",
+            res.state_version, trace_suffix
         )),
-        Ok(MutationStatus::Vetoed) => Ok(format!("VETOED: {}", res.error_message)),
-        Ok(MutationStatus::Rejected) => Ok(format!("REJECTED: {}", res.error_message)),
-        _ => Ok(format!("UNKNOWN STATUS: {}", res.status)),
+        Ok(MutationStatus::Vetoed) => Ok(format!("VETOED: {}{}", res.error_message, trace_suffix)),
+        Ok(MutationStatus::Rejected) => {
+            Ok(format!("REJECTED: {}{}", res.error_message, trace_suffix))
+        }
+        _ => Ok(format!("UNKNOWN STATUS: {}{}", res.status, trace_suffix)),
     }
 }
 
-fn format_query_response(res: common::proto::v1::QueryStateResponse) -> Result<String> {
+fn format_query_response(
+    res: common::proto::v1::QueryStateResponse,
+    tid: Option<TraceId>,
+) -> Result<String> {
+    let trace_suffix = tid.map(|t| format!(" [Trace: {}]", t)).unwrap_or_default();
+
     match QueryStatus::try_from(res.status) {
         Ok(QueryStatus::Success) => {
             if res.items.is_empty() {
-                return Ok("Inventory is empty.".to_string());
+                return Ok(format!("Inventory is empty.{}", trace_suffix));
             }
             let mut output = format!("Inventory (version: {}):\n", res.current_state_version);
             for item in res.items {
@@ -295,10 +308,11 @@ fn format_query_response(res: common::proto::v1::QueryStateResponse) -> Result<S
                     item.item_key, item.quantity, item.unit
                 ));
             }
+            output.push_str(&trace_suffix);
             Ok(output.trim_end().to_string())
         }
-        Ok(QueryStatus::Rejected) => Ok(format!("REJECTED: {}", res.error_message)),
-        _ => Ok(format!("ERROR: {}", res.error_message)),
+        Ok(QueryStatus::Rejected) => Ok(format!("REJECTED: {}{}", res.error_message, trace_suffix)),
+        _ => Ok(format!("ERROR: {}{}", res.error_message, trace_suffix)),
     }
 }
 
