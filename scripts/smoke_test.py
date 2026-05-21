@@ -30,18 +30,18 @@ from cluster_harness import (
 # --- Test Cases ---
 
 
-def test_leader_election() -> None:
+def test_leader_election(cluster: ClusterManager) -> None:
     """Explicitly tests that a leader can be elected."""
-    wait_for_leader()
+    wait_for_leader(cluster)
 
 
-def test_leadership_stability() -> None:
+def test_leadership_stability(cluster: ClusterManager) -> None:
     """Verifies that heartbeats maintain a stable leader without re-elections."""
-    wait_for_leader()
-    initial_count = count_elections()
+    wait_for_leader(cluster)
+    initial_count = count_elections(cluster)
     print("Verifying stability for 3s...")
     time.sleep(3)
-    if count_elections() > initial_count:
+    if count_elections(cluster) > initial_count:
         raise RuntimeError(
             "Leadership was unstable (unnecessary re-election detected)."
         )
@@ -50,8 +50,8 @@ def test_leadership_stability() -> None:
 
 def test_leader_failover(cluster: ClusterManager) -> None:
     """Verifies that killing the leader triggers a successful re-election."""
-    leader_id = wait_for_leader()
-    base_count = count_elections()
+    leader_id = wait_for_leader(cluster)
+    base_count = count_elections(cluster)
 
     log_offsets = {
         n["id"]: (
@@ -66,10 +66,12 @@ def test_leader_failover(cluster: ClusterManager) -> None:
     while elapsed < max_wait:
         time.sleep(0.1)
         elapsed += 0.1
-        if count_elections() > base_count:
+        if count_elections(cluster) > base_count:
             for node in NODES:
                 if node["id"] == leader_id:
                     continue
+                # We still use direct file reading here for the specific re-election event
+                # to confirm exactly when it happened relative to kill_time.
                 for line in get_complete_lines(
                     node["log"], log_offsets.get(node["id"], 0)
                 ):
@@ -86,9 +88,9 @@ def test_leader_failover(cluster: ClusterManager) -> None:
     raise RuntimeError("No re-election occurred after failover.")
 
 
-def test_identity_guard() -> None:
+def test_identity_guard(cluster: ClusterManager) -> None:
     """Verifies that the Identity Guard (ADR 004) rejects unauthorized cluster IDs."""
-    wait_for_leader()
+    wait_for_leader(cluster)
     if check_connectivity(1, 50051, cluster_id="wrong-cluster"):
         print(
             "SUCCESS: Identity Guard correctly rejected unauthorized request."
@@ -99,9 +101,9 @@ def test_identity_guard() -> None:
         )
 
 
-def test_ai_veto_egress() -> None:
+def test_ai_veto_egress(cluster: ClusterManager) -> None:
     """Verifies that the Leader can successfully call out to the AI Veto Node."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     print(
@@ -152,9 +154,9 @@ def test_ai_veto_egress() -> None:
         )
 
 
-def test_smart_client_success() -> None:
+def test_smart_client_success(cluster: ClusterManager) -> None:
     """Verifies that valid input is successfully committed and converged."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
     follower_port = next(
@@ -170,15 +172,15 @@ def test_smart_client_success() -> None:
         print("SUCCESS: Moral Advocate approved valid mutation.")
         version = extract_version(output)
         if version > 0:
-            verify_convergence(version, "Committed")
+            verify_convergence(cluster, version, "Committed")
     else:
         print(f"FAILURE: AI rejected valid mutation:\n{output}")
         raise RuntimeError("Valid mutation was unexpectedly rejected.")
 
 
-def test_smart_client_veto() -> None:
+def test_smart_client_veto(cluster: ClusterManager) -> None:
     """Verifies that invalid input is correctly VETOED and converged."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     print("Stabilizing cluster (2s)...")
     time.sleep(2)
     follower_port = next(
@@ -197,7 +199,7 @@ def test_smart_client_veto() -> None:
         )
         version = extract_version(output)
         if version > 0:
-            verify_convergence(version, "Vetoed")
+            verify_convergence(cluster, version, "Vetoed")
     else:
         print(
             f"FAILURE: AI failed to veto unethical mutation:\n{output}"
@@ -207,9 +209,9 @@ def test_smart_client_veto() -> None:
         )
 
 
-def test_linearizable_query_rejection() -> None:
+def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
     """Verifies that a non-leader node rejects query_state directly."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
     follower_port = next(
         n["port"] for n in NODES if n["id"] == follower_id
@@ -276,7 +278,7 @@ def test_linearizable_query_rejection() -> None:
 
 def test_persistence_restart(cluster: ClusterManager) -> None:
     """Verifies that inventory state survives a total cluster shutdown."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
     print(f"Stabilizing cluster around Leader {leader_id} (2s)...")
     time.sleep(2)
@@ -295,7 +297,7 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
         print(
             f"Confirmed commitment at version {version}. Verifying cluster-wide convergence..."
         )
-        verify_convergence(version, "Committed")
+        verify_convergence(cluster, version, "Committed")
     else:
         print(f"DEBUG: Client Output: {output}")
         raise RuntimeError(
@@ -312,7 +314,7 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
     # 3. Total Cluster Restart (No Wipe)
     cluster.start_all(start_veto=True, wipe_data=False)
     print("Waiting for cluster recovery...")
-    new_leader_id = wait_for_leader()
+    new_leader_id = wait_for_leader(cluster)
     new_leader_port = next(
         n["port"] for n in NODES if n["id"] == new_leader_id
     )
@@ -333,7 +335,7 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
 
 def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     """Verifies that a node can recover FSM state from log when FSM data is lost."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     # 1. Identify a follower dynamically
     follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
@@ -348,7 +350,7 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     if version == 0:
         raise RuntimeError("Failed to commit items for recovery test.")
 
-    verify_convergence(version, "Committed")
+    verify_convergence(cluster, version, "Committed")
 
     # 3. Kill the node FIRST, then record log offset
     cluster.kill_node(follower_id)
@@ -401,9 +403,9 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     )
 
 
-def test_read_your_writes_consistency() -> None:
+def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
     """Verify that queries block until the requested state version is reached."""
-    leader_id = wait_for_leader()
+    leader_id = wait_for_leader(cluster)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     # 1. Read-Your-Writes Success Path
@@ -522,7 +524,7 @@ class MutationFlooder(threading.Thread):
 
 def test_replication_chaos(cluster: ClusterManager) -> None:
     """Verify data integrity after multiple SIGKILLs during active replication."""
-    wait_for_leader()
+    wait_for_leader(cluster)
 
     flooder = MutationFlooder(cluster)
     print("Action: Starting background mutation flood...")
@@ -544,7 +546,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
             cluster.start_node(victim_id, wipe_data=False)
 
             # Wait for cluster to re-stabilize and elect a leader
-            wait_for_leader(timeout=20)
+            wait_for_leader(cluster, timeout=20)
 
         print("\nAction: Chaos phase complete. Stopping flood...")
         flooder.stop()
@@ -563,7 +565,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         # Get the highest version among successful mutations
         # Actually, we can just wait for a bit and then check the leader.
         time.sleep(3)
-        leader_id = wait_for_leader()
+        leader_id = wait_for_leader(cluster)
         leader_port = next(
             n["port"] for n in NODES if n["id"] == leader_id
         )
@@ -594,7 +596,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         # We'll use a conservative version from the leader's output.
         final_version = extract_version(inventory_output)
         if final_version > 0:
-            verify_convergence(final_version, "Committed")
+            verify_convergence(cluster, final_version, "Committed")
 
         print(
             "SUCCESS: 100% Data Integrity and Parity achieved after Chaos."
@@ -617,60 +619,61 @@ def main() -> None:
     build_binaries()
 
     tests = [
-        ("Leader Election", False, lambda c: test_leader_election()),
+        (
+            "Leader Election",
+            False,
+            test_leader_election,
+        ),
         (
             "Leadership Stability",
             False,
-            lambda c: test_leadership_stability(),
+            test_leadership_stability,
         ),
         (
             "Chaos Failover",
             False,
-            lambda c: test_leader_failover(c),  # pylint: disable=W0108
+            test_leader_failover,
         ),
         (
             "Identity Guard (ADR 004)",
             False,
-            lambda c: test_identity_guard(),
+            test_identity_guard,
         ),
         (
             "Linearizable Query Rejection",
             False,
-            lambda c: test_linearizable_query_rejection(),
+            test_linearizable_query_rejection,
         ),
-        ("AI Veto Egress", True, lambda c: test_ai_veto_egress()),
+        ("AI Veto Egress", True, test_ai_veto_egress),
         (
             "Smart Client (Success Path)",
             True,
-            lambda c: test_smart_client_success(),
+            test_smart_client_success,
         ),
         (
             "Smart Client (Veto Path)",
             True,
-            lambda c: test_smart_client_veto(),
+            test_smart_client_veto,
         ),
         (
             "Inventory Durability (Restart Recovery)",
             True,
-            # pylint: disable=W0108
-            lambda c: test_persistence_restart(c),
+            test_persistence_restart,
         ),
         (
             "Cold-Boot Recovery (Log Replay)",
             True,
-            # pylint: disable=W0108
-            lambda c: test_cold_boot_recovery(c),
+            test_cold_boot_recovery,
         ),
         (
             "Read-Your-Writes Consistency",
             True,
-            lambda c: test_read_your_writes_consistency(),
+            test_read_your_writes_consistency,
         ),
         (
             "Replication Chaos Audit",
             True,
-            # pylint: disable=W0108
-            lambda c: test_replication_chaos(c),
+            test_replication_chaos,
         ),
     ]
 

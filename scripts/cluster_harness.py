@@ -85,11 +85,17 @@ class ClusterManager:
     veto_process: Optional[subprocess.Popen]
     veto_log: Optional[IO]
 
+    # Stateful Log Buffers
+    node_logs: Dict[int, List[str]]
+    node_offsets: Dict[int, int]
+
     def __init__(self) -> None:
         self.processes = {}
         self.log_files = {}
         self.veto_process = None
         self.veto_log = None
+        self.node_logs = {n["id"]: [] for n in NODES}
+        self.node_offsets = {n["id"]: 0 for n in NODES}
 
     def start_node(self, node_id: int, wipe_data: bool = False) -> None:
         """Starts or restarts a specific node using pre-compiled binary."""
@@ -99,6 +105,8 @@ class ClusterManager:
             # 1. Wipe diagnostic logs
             if os.path.exists(node["log"]):
                 os.remove(node["log"])
+            self.node_logs[node_id] = []
+            self.node_offsets[node_id] = 0
 
             # 2. Wipe physical persistence directory (ADR 001/009)
             data_dir = f"data/node_{node_id}"
@@ -236,11 +244,33 @@ class ClusterManager:
                 f"FSM path {fsm_path} not found for wiping."
             )
 
+    def refresh_logs(self) -> None:
+        """Reads new lines from all node logs and appends to in-memory buffers."""
+        for node in NODES:
+            nid = node["id"]
+            path = node["log"]
+            if not os.path.exists(path):
+                continue
+
+            with open(path, "r", encoding="utf-8") as f:
+                f.seek(self.node_offsets[nid])
+                while True:
+                    line = f.readline()
+                    if not line or not line.endswith("\n"):
+                        break
+                    self.node_logs[nid].append(
+                        ANSI_ESCAPE.sub("", line)
+                    )
+                    self.node_offsets[nid] = f.tell()
+
 
 def get_complete_lines(
     log_path: str, offset: int = 0
 ) -> Generator[str, None, int]:
-    """Yields only complete lines from a log file."""
+    """
+    Yields only complete lines from a log file.
+    NOTE: Returns the new offset via StopIteration.value.
+    """
     if not os.path.exists(log_path):
         return offset
     with open(log_path, "r", encoding="utf-8") as f:
@@ -265,14 +295,14 @@ def parse_log_timestamp(line: str) -> float:
         return 0.0
 
 
-def find_current_leader() -> Optional[int]:
-    """Robust leader discovery using most recent election event and term sovereignty."""
+def find_current_leader(cluster: ClusterManager) -> Optional[int]:
+    """Robust leader discovery using in-memory log buffers."""
+    cluster.refresh_logs()
     leaders = []  # List of (term, timestamp, node_id)
     for node in NODES:
-        for line in get_complete_lines(node["log"], 0):
+        for line in cluster.node_logs[node["id"]]:
             if "Transitioning to Leader" in line:
                 ts = parse_log_timestamp(line)
-                # Try to extract term: "term=4" or "term 4"
                 term_match = re.search(r"term[= ](\d+)", line)
                 term = int(term_match.group(1)) if term_match else 0
                 leaders.append((term, ts, node["id"]))
@@ -288,13 +318,10 @@ def find_current_leader() -> Optional[int]:
     latest_ts = best_leader[1]
     leader_id = best_leader[2]
 
-    # Now verify this leader hasn't demoted in a later log entry
-    for line in get_complete_lines(
-        next(n["log"] for n in NODES if n["id"] == leader_id), 0
-    ):
+    # Verify this leader hasn't demoted in a later log entry
+    for line in cluster.node_logs[leader_id]:
         if "Role Transition: -> Follower" in line:
             ts = parse_log_timestamp(line)
-            # Try to extract term from demotion if available
             term_match = re.search(r"term[= ](\d+)", line)
             demoted_term = int(term_match.group(1)) if term_match else 0
 
@@ -304,7 +331,9 @@ def find_current_leader() -> Optional[int]:
     return leader_id
 
 
-def wait_for_leader(timeout: float = 15.0) -> int:
+def wait_for_leader(
+    cluster: ClusterManager, timeout: float = 15.0
+) -> int:
     """Helper to wait for a leader to emerge."""
     print(
         f"Waiting for leader to emerge (max {timeout}s)...",
@@ -313,7 +342,7 @@ def wait_for_leader(timeout: float = 15.0) -> int:
     )
     start = time.time()
     while (time.time() - start) < timeout:
-        leader_id = find_current_leader()
+        leader_id = find_current_leader(cluster)
         if leader_id:
             print(f" OK (Node {leader_id})")
             return leader_id
@@ -322,11 +351,12 @@ def wait_for_leader(timeout: float = 15.0) -> int:
     raise RuntimeError(f"No leader emerged within {timeout}s.")
 
 
-def count_elections() -> int:
+def count_elections(cluster: ClusterManager) -> int:
+    cluster.refresh_logs()
     return sum(
         1
-        for node in NODES
-        for line in get_complete_lines(node["log"], 0)
+        for nid in cluster.node_logs
+        for line in cluster.node_logs[nid]
         if "Role Transition: -> Leader" in line
     )
 
@@ -432,27 +462,29 @@ def extract_version(output: str) -> int:
 
 
 def verify_convergence(
-    index: int, status_str: str, timeout: float = 5.0
+    cluster: ClusterManager,
+    index: int,
+    status_str: str,
+    timeout: float = 5.0,
 ) -> None:
-    """Verifies that ALL nodes applied the mutation at the given index."""
+    """Verifies that ALL nodes applied the mutation at the given index using log buffers."""
     print(
         f"Action: Verifying cluster convergence for index {index} ({status_str})..."
     )
     start = time.time()
-    missing = [node["id"] for node in NODES]
-    while (time.time() - start) < timeout:
-        missing = []
-        for node in NODES:
-            found = False
-            # Robust regex for structured clinical::fsm events.
-            # Handles coordinates in either the span context or message body.
-            index_pattern = re.compile(rf"index={index}(\s|,|}})")
-            status_pattern = re.compile(
-                rf"status={status_str}(\s|,|}})"
-            )
-            target_pattern = "clinical::fsm:"
 
-            for line in get_complete_lines(node["log"], 0):
+    index_pattern = re.compile(rf"index={index}(\s|,|}})")
+    status_pattern = re.compile(rf"status={status_str}(\s|,|}})")
+    target_pattern = "clinical::fsm:"
+
+    missing: list[int] = []
+    while (time.time() - start) < timeout:
+        cluster.refresh_logs()
+        missing = []
+        for nid in cluster.node_logs:
+            found = False
+            # Scan only the buffer (Priority 3: No redundant disk I/O)
+            for line in cluster.node_logs[nid]:
                 if (
                     target_pattern in line
                     and index_pattern.search(line)
@@ -461,7 +493,7 @@ def verify_convergence(
                     found = True
                     break
             if not found:
-                missing.append(node["id"])
+                missing.append(nid)
 
         if not missing:
             print(f"SUCCESS: All nodes converged at index {index}.")
