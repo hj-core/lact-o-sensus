@@ -23,6 +23,7 @@ from cluster_harness import (
     now_ms,
     build_binaries,
     poll_until,
+    Registry,
 )
 
 # Lact-O-Sensus: Consensus Verification Suite
@@ -58,9 +59,7 @@ def test_leader_failover(cluster: ClusterManager) -> None:
     base_count = count_elections(cluster)
 
     log_offsets = {
-        n["id"]: (
-            os.path.getsize(n["log"]) if os.path.exists(n["log"]) else 0
-        )
+        n["id"]: (os.path.getsize(n["log"]) if os.path.exists(n["log"]) else 0)
         for n in NODES
     }
     kill_time = cluster.kill_node(leader_id)
@@ -77,16 +76,11 @@ def test_leader_failover(cluster: ClusterManager) -> None:
                 ):
                     if "Role Transition: -> Leader" in line:
                         log_ts = parse_log_timestamp(line)
-                        duration = int(
-                            (log_ts if log_ts > 0 else now_ms())
-                            - kill_time
-                        )
+                        duration = int((log_ts if log_ts > 0 else now_ms()) - kill_time)
                         return node["id"], duration
         return None
 
-    node_id, duration = poll_until(
-        new_leader_elected, timeout=10, desc="Re-election"
-    )
+    node_id, duration = poll_until(new_leader_elected, timeout=10, desc="Re-election")
     print(f"SUCCESS: New leader (Node {node_id}) elected in {duration}ms.")
 
 
@@ -94,13 +88,9 @@ def test_identity_guard(cluster: ClusterManager) -> None:
     """Verifies that the Identity Guard (ADR 004) rejects unauthorized cluster IDs."""
     wait_for_leader(cluster)
     if check_connectivity(1, 50051, cluster_id="wrong-cluster"):
-        print(
-            "SUCCESS: Identity Guard correctly rejected unauthorized request."
-        )
+        print("SUCCESS: Identity Guard correctly rejected unauthorized request.")
     else:
-        raise RuntimeError(
-            "Identity Guard failed to reject unauthorized request."
-        )
+        raise RuntimeError("Identity Guard failed to reject unauthorized request.")
 
 
 def test_ai_veto_egress(cluster: ClusterManager) -> None:
@@ -108,6 +98,7 @@ def test_ai_veto_egress(cluster: ClusterManager) -> None:
     leader_id = wait_for_leader(cluster)
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
+    item = Registry.TEST_ITEMS["MILK"]
     print(
         f"Action: Sending mutation to Leader (Node {leader_id}) on port {leader_port}..."
     )
@@ -128,10 +119,10 @@ def test_ai_veto_egress(cluster: ClusterManager) -> None:
                 "client_id": "550e8400-e29b-41d4-a716-446655440000",
                 "sequence_id": 1,
                 "intent": {
-                    "item_key": "oat_milk",
+                    "item_key": item["key"],
                     "quantity": "2",
-                    "unit": "l",
-                    "category": "LiquefiedHydration",
+                    "unit": item["unit"],
+                    "category": item["category"],
                     "operation": 1,
                 },
             }
@@ -139,21 +130,15 @@ def test_ai_veto_egress(cluster: ClusterManager) -> None:
         f"127.0.0.1:{leader_port}",
         "lacto_sensus.v1.IngressService/ProposeMutation",
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     if "MUTATION_STATUS_COMMITTED" in result.stdout:
         print(
             "SUCCESS: Leader successfully called out to AI Veto Node and committed the entry."
         )
     else:
-        print(
-            f"FAILURE: Unexpected response from leader: {result.stdout} {result.stderr}"
-        )
-        raise RuntimeError(
-            "Leader failed to trigger AI evaluation or received error."
-        )
+        print(f"FAILURE: Unexpected response from leader: {result.stdout} {result.stderr}")
+        raise RuntimeError("Leader failed to trigger AI evaluation or received error.")
 
 
 def test_smart_client_success(cluster: ClusterManager) -> None:
@@ -161,13 +146,12 @@ def test_smart_client_success(cluster: ClusterManager) -> None:
     # wait_for_leader now ensures stability, replacing the old time.sleep(2)
     leader_id = wait_for_leader(cluster)
 
-    follower_port = next(
-        n["port"] for n in NODES if n["id"] != leader_id
-    )
+    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
 
-    print("Action: Sending VALID mutation (Water)...")
+    item = Registry.TEST_ITEMS["WATER"]
+    print(f"Action: Sending VALID mutation ({item['key']})...")
     output = run_client_command(
-        'add "water" 5 l LiquefiedHydration', follower_port
+        f'add "{item["key"]}" 5 {item["unit"]} {item["category"]}', follower_port
     )
 
     if "SUCCESS: Committed at version" in output:
@@ -185,43 +169,32 @@ def test_smart_client_veto(cluster: ClusterManager) -> None:
     # wait_for_leader now ensures stability, replacing the old time.sleep(2)
     leader_id = wait_for_leader(cluster)
 
-    follower_port = next(
-        n["port"] for n in NODES if n["id"] != leader_id
-    )
+    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
 
-    print("Action: Sending INVALID mutation (Cigarettes)...")
+    item = Registry.TEST_ITEMS["CIGARETTES"]
+    print(f"Action: Sending INVALID mutation ({item['key']})...")
     output = run_client_command(
-        'add "cigarettes" 2 pack NutrientSparseCommodities',
+        f'add "{item["key"]}" 2 {item["unit"]} {item["category"]}',
         follower_port,
     )
 
     if "VETOED:" in output:
-        print(
-            "SUCCESS: Moral Advocate correctly blocked unethical mutation."
-        )
+        print("SUCCESS: Moral Advocate correctly blocked unethical mutation.")
         version = extract_version(output)
         if version > 0:
             verify_convergence(cluster, version, "Vetoed")
     else:
-        print(
-            f"FAILURE: AI failed to veto unethical mutation:\n{output}"
-        )
-        raise RuntimeError(
-            "Unethical mutation was unexpectedly committed."
-        )
+        print(f"FAILURE: AI failed to veto unethical mutation:\n{output}")
+        raise RuntimeError("Unethical mutation was unexpectedly committed.")
 
 
 def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
     """Verifies that a non-leader node rejects query_state directly."""
     leader_id = wait_for_leader(cluster)
     follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
-    follower_port = next(
-        n["port"] for n in NODES if n["id"] == follower_id
-    )
+    follower_port = next(n["port"] for n in NODES if n["id"] == follower_id)
 
-    print(
-        f"Action: Probing FOLLOWER (Node {follower_id}) for query_state..."
-    )
+    print(f"Action: Probing FOLLOWER (Node {follower_id}) for query_state...")
     cmd = [
         "grpcurl",
         "-plaintext",
@@ -238,18 +211,14 @@ def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
         f"127.0.0.1:{follower_port}",
         "lacto_sensus.v1.IngressService/QueryState",
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     try:
         response = json.loads(result.stdout)
         status = response.get("status")
         leader_hint = response.get("leaderHint")
 
-        leader_port = next(
-            n["port"] for n in NODES if n["id"] == leader_id
-        )
+        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
         expected_hint = f"http://127.0.0.1:{leader_port}"
 
         if status == "QUERY_STATUS_REJECTED":
@@ -263,16 +232,10 @@ def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
                     "FAILURE: Follower provided incorrect leader hint. "
                     f"Expected {expected_hint}, got {leader_hint}"
                 )
-                raise RuntimeError(
-                    "Incorrect leader hint in query rejection."
-                )
+                raise RuntimeError("Incorrect leader hint in query rejection.")
         else:
-            print(
-                f"FAILURE: Follower did not reject query_state: {result.stdout}"
-            )
-            raise RuntimeError(
-                "Follower failed to reject linearizable query."
-            )
+            print(f"FAILURE: Follower did not reject query_state: {result.stdout}")
+            raise RuntimeError("Follower failed to reject linearizable query.")
     except json.JSONDecodeError as exc:
         print(f"FAILURE: Malformed JSON response: {result.stdout}")
         raise RuntimeError("Malformed response from follower.") from exc
@@ -285,9 +248,10 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     # 1. Add an item
-    print("Action: Adding test item (apple)...")
+    item = Registry.TEST_ITEMS["APPLE"]
+    print(f"Action: Adding test item ({item['key']})...")
     output = run_client_command(
-        'add "apple" 1 units PrimaryFlora', leader_port
+        f'add "{item["key"]}" 1 {item["unit"]} {item["category"]}', leader_port
     )
     if "SUCCESS" not in output:
         raise RuntimeError(f"Failed to add item: {output}")
@@ -301,32 +265,26 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
         verify_convergence(cluster, version, "Committed")
     else:
         print(f"DEBUG: Client Output: {output}")
-        raise RuntimeError(
-            "Failed to extract version from client output."
-        )
+        raise RuntimeError("Failed to extract version from client output.")
 
     # 2. Total Cluster Shutdown
     cluster.cleanup()
-    print(
-        "Action: Cluster is OFFLINE. (Causal history exists only on disk)"
-    )
+    print("Action: Cluster is OFFLINE. (Causal history exists only on disk)")
 
     # 3. Total Cluster Restart (No Wipe)
     cluster.start_all(start_veto=True, wipe_data=False)
     print("Waiting for cluster recovery...")
     new_leader_id = wait_for_leader(cluster)
-    new_leader_port = next(
-        n["port"] for n in NODES if n["id"] == new_leader_id
-    )
+    new_leader_port = next(n["port"] for n in NODES if n["id"] == new_leader_id)
 
     # 4. Verify item existence via the new leader
     print(
         f"Action: Verifying item survival via authoritative Leader {new_leader_id}..."
     )
 
-    output = run_client_command("query apple", new_leader_port)
+    output = run_client_command(f"query {item['key']}", new_leader_port)
 
-    if "apple" in output.lower() and "1 units" in output:
+    if item["key"] in output.lower() and f"1 {item['unit']}" in output:
         print("SUCCESS: Inventory survived total cluster restart.")
     else:
         print(f"FAILURE: Item not found after restart:\n{output}")
@@ -341,10 +299,14 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     # 2. Add test items to ensure non-zero log index
-    print("Action: Adding test items (milk, apple)...")
-    run_client_command('add "milk" 1 l LiquefiedHydration', leader_port)
+    item1 = Registry.TEST_ITEMS["MILK"]
+    item2 = Registry.TEST_ITEMS["APPLE"]
+    print(f"Action: Adding test items ({item1['key']}, {item2['key']})...")
+    run_client_command(
+        f'add "{item1["key"]}" 1 {item1["unit"]} {item1["category"]}', leader_port
+    )
     output = run_client_command(
-        'add "apple" 1 units PrimaryFlora', leader_port
+        f'add "{item2["key"]}" 1 {item2["unit"]} {item2["category"]}', leader_port
     )
     version = extract_version(output)
     if version == 0:
@@ -355,9 +317,7 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     # 3. Kill the node FIRST, then record log offset
     cluster.kill_node(follower_id)
     log_path = next(n["log"] for n in NODES if n["id"] == follower_id)
-    log_offset = (
-        os.path.getsize(log_path) if os.path.exists(log_path) else 0
-    )
+    log_offset = (os.path.getsize(log_path) if os.path.exists(log_path) else 0)
 
     # 4. Surgical Wipe: Delete ONLY the FSM database of the follower
     cluster.wipe_node_fsm(follower_id)
@@ -373,21 +333,13 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
         recovered = False
         fsm_applied = False
         for line in get_complete_lines(log_path, log_offset):
-            if (
-                "Recovery: REPLAY COMPLETE" in line
-                and str(version) in line
-            ):
+            if "Recovery: REPLAY COMPLETE" in line and str(version) in line:
                 recovered = True
-            if (
-                "Mutation applied to state machine" in line
-                and f"index={version}" in line
-            ):
+            if "Mutation applied to state machine" in line and f"index={version}" in line:
                 fsm_applied = True
         return recovered and fsm_applied
 
-    poll_until(
-        recovered_and_applied, timeout=15.0, desc="Cold-boot recovery"
-    )
+    poll_until(recovered_and_applied, timeout=15.0, desc="Cold-boot recovery")
     print(
         f"SUCCESS: Node {follower_id} replayed {version} entries and restored FSM state."
     )
@@ -399,31 +351,26 @@ def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
     leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
     # 1. Read-Your-Writes Success Path
+    item = Registry.TEST_ITEMS["BANANA"]
     print("Action: Proposing mutation to get a valid state version...")
     output = run_client_command(
-        'add "banana" 3 units PrimaryFlora', leader_port
+        f'add "{item["key"]}" 3 {item["unit"]} {item["category"]}', leader_port
     )
     version = extract_version(output)
     if version == 0:
-        raise RuntimeError(
-            f"Failed to commit mutation for RYW test: {output}"
-        )
+        raise RuntimeError(f"Failed to commit mutation for RYW test: {output}")
 
-    print(
-        f"Action: Querying with min_state_version={version} (should succeed)..."
-    )
-    output = run_client_command(
-        f'query "banana" {version}', leader_port
-    )
+    print(f"Action: Querying with min_state_version={version} (should succeed)...")
+    output = run_client_command(f'query "{item["key"]}" {version}', leader_port)
     if f"Inventory (version: {version}):" not in output:
         raise RuntimeError(
             f"Query with min_version {version} failed or returned wrong version: {output}"
         )
     # Use flexible check for normalized item keys (e.g. 'banana_units')
-    if "banana" not in output.lower() or "3 units" not in output:
-        raise RuntimeError(
-            f"Expected item 'banana' missing from RYW query: {output}"
-        )
+    if item["key"] in output.lower() and f"3 {item['unit']}" in output:
+        pass
+    else:
+        raise RuntimeError(f"Expected item '{item['key']}' missing from RYW query: {output}")
 
     # 2. Strict Horizon Rejection Path
     future_version = version + 1000
@@ -432,30 +379,17 @@ def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
         "(should fail immediately)..."
     )
     # This should fail fast because it exceeds the horizon.
-    output = run_client_command(
-        f'query "banana" {future_version}', leader_port
-    )
+    output = run_client_command(f'query "{item["key"]}" {future_version}', leader_port)
     if "exceeds consistent horizon" not in output:
         raise RuntimeError(
             f"Expected horizon rejection for version {future_version}, but got: {output}"
         )
 
-    print(
-        "SUCCESS: Read-Your-Writes consistency and Strict Horizon verified."
-    )
+    print("SUCCESS: Read-Your-Writes consistency and Strict Horizon verified.")
 
 
 class MutationFlooder(threading.Thread):
     """Continuously spams mutations to the cluster in a background thread."""
-
-    GROCERY_LEXICON = [
-        "milk",
-        "bread",
-        "apple",
-        "cheese",
-        "water",
-        "carrot",
-    ]
 
     def __init__(self, cluster: ClusterManager) -> None:
         super().__init__(daemon=True)
@@ -469,16 +403,13 @@ class MutationFlooder(threading.Thread):
         try:
             while not self.stop_event.is_set():
                 self.counter += 1
-                base_name = self.GROCERY_LEXICON[
-                    self.counter % len(self.GROCERY_LEXICON)
-                ]
+                lexicon = [item["key"] for item in Registry.TEST_ITEMS.values()]
+                base_name = lexicon[self.counter % len(lexicon)]
                 item_name = f"{base_name}_{self.counter}"
 
                 # Dynamic Seed Selection: Pick a living node to avoid stale seeds
                 living_ports = [
-                    n["port"]
-                    for n in NODES
-                    if n["id"] in self.cluster.processes
+                    n["port"] for n in NODES if n["id"] in self.cluster.processes
                 ]
                 if not living_ports:
                     time.sleep(0.5)
@@ -486,9 +417,12 @@ class MutationFlooder(threading.Thread):
 
                 seed_port = random.choice(living_ports)
 
+                # Use a valid category for all flood items
+                category = Registry.CATEGORIES[0]
+
                 try:
                     output = run_client_command(
-                        f'add "{item_name}" 1 units PrimaryFlora',
+                        f'add "{item_name}" 1 units {category}',
                         seed_port,
                         timeout=15,
                     )
@@ -498,9 +432,7 @@ class MutationFlooder(threading.Thread):
                     else:
                         # Log failure for visibility
                         first_line = output.split("\n", maxsplit=1)[0]
-                        print(
-                            f"DEBUG: Flooder failed '{item_name}': {first_line}"
-                        )
+                        print(f"DEBUG: Flooder failed '{item_name}': {first_line}")
                 except (subprocess.TimeoutExpired, RuntimeError) as e:
                     print(f"DEBUG: Flooder error '{item_name}': {e}")
                 time.sleep(0.1)
@@ -526,9 +458,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
             # Wait for some mutations to commit
             time.sleep(3)
             victim_id = random.choice([n["id"] for n in NODES])
-            print(
-                f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---"
-            )
+            print(f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---")
 
             cluster.kill_node(victim_id)
 
@@ -551,9 +481,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         # Wait for a bit to let any pending replications settle (using minimal delay)
         time.sleep(1)
         leader_id = wait_for_leader(cluster)
-        leader_port = next(
-            n["port"] for n in NODES if n["id"] == leader_id
-        )
+        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
 
         # 2. Verify Data Parity
         print("Action: Verifying final inventory parity on Leader...")
@@ -578,9 +506,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         if final_version > 0:
             verify_convergence(cluster, final_version, "Committed")
 
-        print(
-            "SUCCESS: 100% Data Integrity and Parity achieved after Chaos."
-        )
+        print("SUCCESS: 100% Data Integrity and Parity achieved after Chaos.")
 
     finally:
         flooder.stop()

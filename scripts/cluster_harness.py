@@ -5,7 +5,17 @@ import re
 import shutil
 import subprocess
 import time
-from typing import Dict, List, Optional, TypedDict, IO, Generator, Tuple, Callable, Any
+from typing import (
+    Dict,
+    List,
+    Optional,
+    TypedDict,
+    IO,
+    Generator,
+    Tuple,
+    Callable,
+    Any,
+)
 
 # Lact-O-Sensus: Cluster Test Harness
 # Provides the core infrastructure for managing local Raft clusters, AI Veto Nodes, and Clients.
@@ -52,6 +62,52 @@ AI_VETO_BIN = os.path.join(TARGET_DIR, "ai-veto")
 CLIENT_CLI_BIN = os.path.join(TARGET_DIR, "client-cli")
 
 
+class Registry:
+    """
+    Physical Truth Registry (ADR 4.10).
+    Synchronizes test data with the internal Rust FSM hardcoded registries.
+    """
+
+    CATEGORIES = [
+        "PrimaryFlora",
+        "AnimalSecretions",
+        "FleshAndMarrow",
+        "ShelfStableCarbohydrates",
+        "CulturedDoughs",
+        "LiquefiedHydration",
+        "CondimentsAndCatalysts",
+        "NutrientSparseCommodities",
+        "EthanolSolutions",
+        "BiomedicalMaintenance",
+        "SanitizationAndUtility",
+        "AnomalousInputs",
+    ]
+
+    UNITS = {
+        "Mass": ["g", "kg", "lb", "lbs", "oz"],
+        "Volume": ["ml", "l", "gal", "fl_oz"],
+        "Count": ["units", "unit", "pc", "pcs", "dozens", "dozen", "packs", "pack"],
+        "Anomalous": ["misc", "handful", "bunch"],
+    }
+
+    # Standard items used across multiple smoke tests
+    TEST_ITEMS = {
+        "WATER": {"key": "water", "category": "LiquefiedHydration", "unit": "l"},
+        "APPLE": {"key": "apple", "category": "PrimaryFlora", "unit": "units"},
+        "MILK": {
+            "key": "milk",
+            "category": "LiquefiedHydration",
+            "unit": "l",
+        },  # Could also be AnimalSecretions
+        "BANANA": {"key": "banana", "category": "PrimaryFlora", "unit": "units"},
+        "CIGARETTES": {
+            "key": "cigarettes",
+            "category": "NutrientSparseCommodities",
+            "unit": "pack",
+        },
+    }
+
+
 def now_ms() -> float:
     """Returns current wall-clock time in milliseconds."""
     return time.time() * 1000
@@ -93,9 +149,7 @@ def poll_until(
         if res:
             return res
         time.sleep(interval)
-    raise RuntimeError(
-        f"Timeout waiting for condition: {desc or 'unspecified'}"
-    )
+    raise RuntimeError(f"Timeout waiting for condition: {desc or 'unspecified'}")
 
 
 class ClusterManager:
@@ -156,13 +210,9 @@ class ClusterManager:
         )
         self.processes[node["id"]] = p
 
-    def start_all(
-        self, start_veto: bool = False, wipe_data: bool = True
-    ) -> None:
+    def start_all(self, start_veto: bool = False, wipe_data: bool = True) -> None:
         """Starts all nodes defined in NODES and optionally the AI Veto Node."""
-        print(
-            f"--- Starting cluster (AI Veto: {start_veto}, Wipe: {wipe_data}) ---"
-        )
+        print(f"--- Starting cluster (AI Veto: {start_veto}, Wipe: {wipe_data}) ---")
 
         # 1. Start AI Veto Node if requested
         if start_veto:
@@ -272,9 +322,7 @@ class ClusterManager:
         if os.path.exists(fsm_path):
             shutil.rmtree(fsm_path)
         else:
-            raise RuntimeError(
-                f"FSM path {fsm_path} not found for wiping."
-            )
+            raise RuntimeError(f"FSM path {fsm_path} not found for wiping.")
 
     def refresh_logs(self) -> None:
         """Reads new lines from all node logs and appends to in-memory buffers."""
@@ -290,15 +338,11 @@ class ClusterManager:
                     line = f.readline()
                     if not line or not line.endswith("\n"):
                         break
-                    self.node_logs[nid].append(
-                        ANSI_ESCAPE.sub("", line)
-                    )
+                    self.node_logs[nid].append(ANSI_ESCAPE.sub("", line))
                     self.node_offsets[nid] = f.tell()
 
 
-def get_complete_lines(
-    log_path: str, offset: int = 0
-) -> Generator[str, None, int]:
+def get_complete_lines(log_path: str, offset: int = 0) -> Generator[str, None, int]:
     """
     Yields only complete lines from a log file.
     NOTE: Returns the new offset via StopIteration.value.
@@ -319,9 +363,7 @@ def get_complete_lines(
 def parse_log_timestamp(line: str) -> float:
     try:
         ts_str = line.split(" ")[0]
-        ts = datetime.datetime.fromisoformat(
-            ts_str.replace("Z", "+00:00")
-        )
+        ts = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         return ts.timestamp() * 1000
     except (ValueError, IndexError):
         return 0.0
@@ -363,9 +405,7 @@ def find_current_leader(cluster: ClusterManager) -> Optional[int]:
     return leader_id
 
 
-def wait_for_leader(
-    cluster: ClusterManager, timeout: float = 15.0
-) -> int:
+def wait_for_leader(cluster: ClusterManager, timeout: float = 15.0) -> int:
     """
     Helper to wait for a leader to emerge and remain stable for one heartbeat.
     (Harden Discovery mandate from Commit 4)
@@ -385,9 +425,7 @@ def wait_for_leader(
                 return lid
         return None
 
-    leader_id = poll_until(
-        leader_is_stable, timeout=timeout, desc="Stable leader"
-    )
+    leader_id = poll_until(leader_is_stable, timeout=timeout, desc="Stable leader")
     print(f" OK (Node {leader_id})")
     return leader_id
 
@@ -407,9 +445,7 @@ def print_cluster_logs(lines: int = 5) -> None:
     for node in NODES:
         if os.path.exists(node["log"]):
             print(f"\n--- Node {node['id']} ---")
-            subprocess.run(
-                ["tail", "-n", str(lines), node["log"]], check=False
-            )
+            subprocess.run(["tail", "-n", str(lines), node["log"]], check=False)
 
 
 def check_connectivity(
@@ -417,7 +453,10 @@ def check_connectivity(
     port: int,
     cluster_id: str = "probe-unauthorized",
 ) -> bool:
-    """Side-effect free probe via Identity Guard."""
+    """
+    Side-effect free probe via Identity Guard.
+    Harden Protocol mandate: Uses gRPC status evaluation (ADR 006).
+    """
     peer_id = 2 if target_node_id == 1 else 1
     cmd = [
         "grpcurl",
@@ -440,21 +479,15 @@ def check_connectivity(
         f"127.0.0.1:{port}",
         "raft.v1.ConsensusService/RequestVote",
     ]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if cluster_id == "lacto-dev-01":
         return result.returncode == 0
     else:
-        return (
-            "Cluster identity mismatch" in result.stderr
-            or "Unauthenticated" in result.stderr
-        )
+        # Standard grpcurl error output format for Unauthenticated status
+        return "Code: Unauthenticated" in result.stderr
 
 
-def run_client_command(
-    command: str, seed_port: int, timeout: int = 120
-) -> str:
+def run_client_command(command: str, seed_port: int, timeout: int = 120) -> str:
     """Helper to run a single command through the client-cli using pre-compiled binary."""
     state_file = ".client_state.json"
     wal_dir = ".client_wal"
@@ -509,8 +542,7 @@ def verify_convergence(
     timeout: float = 5.0,
 ) -> None:
     """Verifies that ALL nodes applied the mutation at the given index using log buffers."""
-    print(
-        f"Action: Verifying cluster convergence for index {index} ({status_str})..."
+    print(f"Action: Verifying cluster convergence for index {index} ({status_str})..."
     )
 
     index_pattern = re.compile(rf"index={index}(\s|,|}})")
