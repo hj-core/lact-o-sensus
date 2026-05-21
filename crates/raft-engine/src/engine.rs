@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use common::proto::v1::raft::LogEntry;
+use common::raft_api::StateMachine;
 use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -8,6 +9,7 @@ use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
+use rand::rngs::StdRng;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -17,6 +19,9 @@ pub use crate::node::Follower;
 pub use crate::node::Leader;
 pub use crate::node::RaftNode;
 pub use crate::node::TickAction;
+use crate::storage::LogStorage;
+use crate::tick::Tick;
+use crate::tick::TickThresholds;
 
 /// The logical role of a Raft node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,31 +47,41 @@ pub struct ConsensusProgress {
 /// This is the primary entry point for all consensus operations, managing
 /// the transitions between Raft roles (ADR 002).
 #[derive(Debug)]
-pub enum LogicalNode {
+pub enum RoleState {
     Follower(RaftNode<Follower>),
     Candidate(RaftNode<Candidate>),
     Leader(RaftNode<Leader>),
     Poisoned, // ADR 001: Safety barrier during transition failures
 }
 
+/// The logical orchestrator of a Raft node, managing its role state,
+/// deterministic clock, and randomized timeouts.
+#[derive(Debug)]
+pub struct LogicalNode {
+    state: RoleState,
+    current_tick: Tick,
+    thresholds: TickThresholds,
+    rng: StdRng,
+}
+
 macro_rules! delegate_to_inner {
     ($self:ident, $method:ident $(, $args:expr)*) => {
-        match $self {
-            LogicalNode::Follower(n) => n.$method($($args),*),
-            LogicalNode::Candidate(n) => n.$method($($args),*),
-            LogicalNode::Leader(n) => n.$method($($args),*),
-            LogicalNode::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+        match &$self.state {
+            RoleState::Follower(n) => n.$method($($args),*),
+            RoleState::Candidate(n) => n.$method($($args),*),
+            RoleState::Leader(n) => n.$method($($args),*),
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
         }
     };
 }
 
 macro_rules! delegate_async_to_inner {
     ($self:ident, $method:ident $(, $args:expr)*) => {
-        match $self {
-            LogicalNode::Follower(n) => n.$method($($args),*).await,
-            LogicalNode::Candidate(n) => n.$method($($args),*).await,
-            LogicalNode::Leader(n) => n.$method($($args),*).await,
-            LogicalNode::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+        match &mut $self.state {
+            RoleState::Follower(n) => n.$method($($args),*).await,
+            RoleState::Candidate(n) => n.$method($($args),*).await,
+            RoleState::Leader(n) => n.$method($($args),*).await,
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
         }
     };
 }
@@ -136,6 +151,53 @@ impl RequestVoteResult {
 // =============================================================================
 
 impl LogicalNode {
+    /// Creates a new LogicalNode in the Follower role.
+    pub fn try_new(
+        identity: Arc<NodeIdentity>,
+        fsm: Arc<dyn StateMachine>,
+        log_store: Arc<dyn LogStorage>,
+        thresholds: TickThresholds,
+        mut rng: StdRng,
+    ) -> Result<Self, NodeError> {
+        let current_tick = Tick::ZERO;
+        let timeout = thresholds.generate_election_timeout(&mut rng);
+
+        let node = RaftNode::<Follower>::try_new(identity, fsm, log_store, current_tick, timeout)?;
+
+        Ok(Self {
+            state: RoleState::Follower(node),
+            current_tick,
+            thresholds,
+            rng,
+        })
+    }
+
+    pub fn state(&self) -> &RoleState {
+        &self.state
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower>> {
+        match &mut self.state {
+            RoleState::Follower(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_candidate_mut(&mut self) -> Option<&mut RaftNode<Candidate>> {
+        match &mut self.state {
+            RoleState::Candidate(node) => Some(node),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader>> {
+        match &mut self.state {
+            RoleState::Leader(node) => Some(node),
+            _ => None,
+        }
+    }
+
     /// Processes an AppendEntries RPC.
     pub async fn handle_append_entries(
         &mut self,
@@ -171,8 +233,8 @@ impl LogicalNode {
             );
             self.into_follower(req_term, Some(leader_id));
         } else if req_term == current_term {
-            match self {
-                LogicalNode::Candidate(_) => {
+            match &mut self.state {
+                RoleState::Candidate(_) => {
                     info!(
                         target: ClinicalTarget::RaftFoundation.as_str(),
                         term = %req_term,
@@ -181,7 +243,7 @@ impl LogicalNode {
                     );
                     self.into_follower(req_term, Some(leader_id));
                 }
-                LogicalNode::Leader(_) => {
+                RoleState::Leader(_) => {
                     let msg = format!(
                         "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
                          node.",
@@ -189,7 +251,7 @@ impl LogicalNode {
                     );
                     self.apply_fatal(NodeError::Protocol(msg));
                 }
-                LogicalNode::Follower(node) => {
+                RoleState::Follower(node) => {
                     node.state_mut().set_leader_id(Some(leader_id));
                 }
                 _ => {}
@@ -199,8 +261,8 @@ impl LogicalNode {
         // 3. Delegation to physical reconciliation (§5.3)
         self.reset_heartbeat();
 
-        match self {
-            LogicalNode::Follower(node) => {
+        match &mut self.state {
+            RoleState::Follower(node) => {
                 let res = node
                     .reconcile_log(
                         req_prev_log_index,
@@ -222,9 +284,6 @@ impl LogicalNode {
                         }
                     }
                     Err(e) => {
-                        // TODO: Refinement - Implement capped retries for non-fatal errors
-                        // (e.g. NodeError::Physical) in the Execution Shell before triggering
-                        // Halt Mandate here.
                         self.apply_fatal(e);
                     }
                 }
@@ -256,8 +315,8 @@ impl LogicalNode {
         }
 
         // 2. Delegate vote granting logic to physical foundation (§5.2, §5.4)
-        let vote_granted = match self {
-            LogicalNode::Follower(node) => match node.attempt_grant_vote(
+        let vote_granted = match &mut self.state {
+            RoleState::Follower(node) => match node.attempt_grant_vote(
                 candidate_id,
                 req_term,
                 req_last_log_index,
@@ -265,7 +324,6 @@ impl LogicalNode {
             ) {
                 Ok(granted) => granted,
                 Err(e) => {
-                    // TODO: Refinement - Implement retry/backoff for non-fatal errors.
                     self.apply_fatal(e);
                 }
             },
@@ -288,8 +346,8 @@ impl LogicalNode {
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
-        match self {
-            LogicalNode::Leader(node) => match node.propose(command) {
+        match &mut self.state {
+            RoleState::Leader(node) => match node.propose(command) {
                 Ok(idx) => {
                     let term = self.current_term();
                     debug!(
@@ -301,12 +359,10 @@ impl LogicalNode {
                     Ok(idx)
                 }
                 Err(e) => {
-                    // TODO: Refinement - Consider if certain Leader-Physical errors
-                    // should trigger a step-down or retry instead of immediate Halt.
                     self.apply_fatal(e);
                 }
             },
-            LogicalNode::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
             _ => Err(NodeError::NotLeader {
                 leader_hint: self.voted_for(),
             }),
@@ -316,32 +372,38 @@ impl LogicalNode {
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
     pub fn into_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
-        self.transition(|old| match old {
-            LogicalNode::Follower(n) => match n.try_into_follower(term, leader_id) {
-                Ok(new) => LogicalNode::Follower(new),
+        let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
+        let tick = self.current_tick;
+
+        self.transition(|old_role| match old_role {
+            RoleState::Follower(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
+                Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Candidate(n) => match n.try_into_follower(term, leader_id) {
-                Ok(new) => LogicalNode::Follower(new),
+            RoleState::Candidate(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
+                Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Leader(n) => match n.try_into_follower(term, leader_id) {
-                Ok(new) => LogicalNode::Follower(new),
+            RoleState::Leader(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
+                Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
         });
     }
 
     /// Transitions to Candidate role.
     pub fn into_candidate(&mut self) {
-        self.transition(|old| match old {
-            LogicalNode::Follower(n) => match n.try_into_candidate() {
-                Ok(new) => LogicalNode::Candidate(new),
+        let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
+        let tick = self.current_tick;
+
+        self.transition(|old_role| match old_role {
+            RoleState::Follower(n) => match n.try_into_candidate(tick, timeout) {
+                Ok(new) => RoleState::Candidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            LogicalNode::Candidate(n) => match n.try_into_restarted_candidate() {
-                Ok(new) => LogicalNode::Candidate(new),
+            RoleState::Candidate(n) => match n.try_into_restarted_candidate(tick, timeout) {
+                Ok(new) => RoleState::Candidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
             other => other,
@@ -350,9 +412,11 @@ impl LogicalNode {
 
     /// Transitions to Leader role.
     pub fn into_leader(&mut self, peer_ids: Vec<NodeId>) {
-        self.transition(|old| match old {
-            LogicalNode::Candidate(n) => match n.try_into_leader(peer_ids) {
-                Ok(new) => LogicalNode::Leader(new),
+        let tick = self.current_tick;
+
+        self.transition(|old_role| match old_role {
+            RoleState::Candidate(n) => match n.try_into_leader(peer_ids, tick) {
+                Ok(new) => RoleState::Leader(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
             other => other,
@@ -362,16 +426,17 @@ impl LogicalNode {
     /// Safely transitions the node state using an ownership-consuming closure.
     pub fn transition<F>(&mut self, f: F)
     where
-        F: FnOnce(LogicalNode) -> LogicalNode,
+        F: FnOnce(RoleState) -> RoleState,
     {
-        let old_state = std::mem::replace(self, LogicalNode::Poisoned);
-        *self = f(old_state);
+        let old_state = std::mem::replace(&mut self.state, RoleState::Poisoned);
+        self.state = f(old_state);
     }
 
     /// Resets the election timer if the node is a Follower.
     pub fn reset_heartbeat(&mut self) {
-        if let LogicalNode::Follower(node) = self {
-            node.state_mut().reset_heartbeat();
+        let tick = self.current_tick;
+        if let RoleState::Follower(node) = &mut self.state {
+            node.state_mut().reset_heartbeat(tick);
         }
     }
 
@@ -434,6 +499,11 @@ impl LogicalNode {
         }
     }
 
+    /// Forces the node into a poisoned state.
+    pub fn poison(&mut self) {
+        self.state = RoleState::Poisoned;
+    }
+
     // --- Technical Helpers for Halt Mandate ---
 
     /// Transitions state to Poisoned and panics with a standardized clinical
@@ -444,7 +514,7 @@ impl LogicalNode {
             error = %err,
             "FATAL: Halt Mandate Executed"
         );
-        *self = LogicalNode::Poisoned;
+        self.state = RoleState::Poisoned;
         panic!("Halt Mandate: {}", err);
     }
 
@@ -473,29 +543,29 @@ impl LogicalNode {
     }
 
     pub fn try_consensus_progress(&self) -> Result<ConsensusProgress, NodeError> {
-        match self {
-            LogicalNode::Poisoned => Ok(ConsensusProgress {
+        match &self.state {
+            RoleState::Poisoned => Ok(ConsensusProgress {
                 term: Term::ZERO,
                 role: NodeRole::Poisoned,
                 last_log_index: LogIndex::ZERO,
                 last_committed: LogIndex::ZERO,
                 last_applied: LogIndex::ZERO,
             }),
-            LogicalNode::Follower(n) => Ok(ConsensusProgress {
+            RoleState::Follower(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Follower,
                 last_log_index: n.last_log_index()?,
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
             }),
-            LogicalNode::Candidate(n) => Ok(ConsensusProgress {
+            RoleState::Candidate(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Candidate,
                 last_log_index: n.last_log_index()?,
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
             }),
-            LogicalNode::Leader(n) => Ok(ConsensusProgress {
+            RoleState::Leader(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Leader,
                 last_log_index: n.last_log_index()?,
@@ -508,7 +578,7 @@ impl LogicalNode {
     // --- Infallible In-Memory Accessors ---
 
     pub fn is_poisoned(&self) -> bool {
-        matches!(self, LogicalNode::Poisoned)
+        matches!(self.state, RoleState::Poisoned)
     }
 
     pub fn cluster_id(&self) -> &ClusterId {
@@ -539,9 +609,11 @@ mod tests {
     use async_trait::async_trait;
     use common::raft_api::StateMachine;
     use common::types::errors::FsmError;
+    use rand::SeedableRng;
 
     use super::*;
     use crate::storage::MemoryStorage;
+    use crate::tick::TickDuration;
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -566,9 +638,13 @@ mod tests {
     fn setup_node(node_id: u64) -> LogicalNode {
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
-        LogicalNode::Follower(
-            RaftNode::<Follower>::try_new(test_identity(node_id), fsm, storage).unwrap(),
-        )
+        let thresholds = TickThresholds {
+            heartbeat_interval: TickDuration::new(10),
+            min_election: TickDuration::new(15),
+            max_election: TickDuration::new(30),
+        };
+        let rng = StdRng::seed_from_u64(node_id);
+        LogicalNode::try_new(test_identity(node_id), fsm, storage, thresholds, rng).unwrap()
     }
 
     mod handle_append_entries {
@@ -596,7 +672,7 @@ mod tests {
 
                 assert!(result.success);
                 assert_eq!(result.term, Term::new(1));
-                assert!(matches!(state, LogicalNode::Follower(_)));
+                assert!(matches!(state.state, RoleState::Follower(_)));
             }
 
             #[tokio::test]
@@ -618,7 +694,7 @@ mod tests {
 
                 assert!(result.success);
                 assert_eq!(result.term, Term::new(10));
-                assert!(matches!(state, LogicalNode::Follower(_)));
+                assert!(matches!(state.state, RoleState::Follower(_)));
             }
 
             #[tokio::test]
@@ -675,8 +751,8 @@ mod tests {
             #[test]
             fn demotes_on_higher_term_even_if_vote_rejected() {
                 let mut state = setup_node(1);
-                match &mut state {
-                    LogicalNode::Follower(n) => {
+                match &mut state.state {
+                    RoleState::Follower(n) => {
                         n.log_store()
                             .append_entries(vec![LogEntry::new(
                                 LogIndex::new(1),
@@ -699,7 +775,7 @@ mod tests {
 
                 assert!(!result.vote_granted);
                 assert_eq!(result.term, Term::new(5));
-                assert!(matches!(state, LogicalNode::Follower(_)));
+                assert!(matches!(state.state, RoleState::Follower(_)));
             }
         }
 
@@ -782,7 +858,17 @@ mod tests {
 
         #[test]
         fn reports_poisoned_state_accurately() {
-            let mut state = LogicalNode::Poisoned;
+            let fsm = Arc::new(MockFsm);
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let mut state =
+                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+            state.state = RoleState::Poisoned;
             let progress = state.consensus_progress();
             assert_eq!(progress.role, NodeRole::Poisoned);
         }
@@ -794,14 +880,34 @@ mod tests {
         #[test]
         #[should_panic(expected = "Halt Mandate: Node is poisoned")]
         fn panics_on_propose_when_poisoned() {
-            let mut state = LogicalNode::Poisoned;
+            let fsm = Arc::new(MockFsm);
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let mut state =
+                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+            state.state = RoleState::Poisoned;
             let _ = state.propose(vec![42]);
         }
 
         #[test]
         #[should_panic(expected = "Halt Mandate: Node is poisoned")]
         fn panics_on_accessing_poisoned_node() {
-            let state = LogicalNode::Poisoned;
+            let fsm = Arc::new(MockFsm);
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let mut state =
+                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+            state.state = RoleState::Poisoned;
             let _ = state.node_id();
         }
 

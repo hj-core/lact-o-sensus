@@ -15,16 +15,16 @@ use lacto_fsm::LactoStore;
 use raft_engine::config::Config;
 use raft_engine::consensus::spawn_election_timer;
 use raft_engine::consensus::spawn_heartbeat_task;
-use raft_engine::engine::Follower;
 use raft_engine::engine::LogicalNode;
 use raft_engine::identity::initialize_node_identity;
-use raft_engine::node::RaftNode;
 use raft_engine::peer::PeerManager;
 use raft_engine::recovery::RecoveryManager;
 use raft_engine::service::consensus::ConsensusDispatcher;
 use raft_engine::service::handle::LocalRaftHandle;
 use raft_engine::shell::ConsensusShell;
 use raft_engine::storage::SledStorage;
+use rand::RngExt;
+use rand::SeedableRng;
 use tonic::service::Interceptor;
 use tonic::transport::Server;
 use tracing::Instrument;
@@ -170,10 +170,20 @@ async fn main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("Cold-boot recovery failed: {}", e))?;
 
-        let initial_node =
-            RaftNode::<Follower>::try_new(identity.clone(), fsm.clone(), storage.clone())
-                .map_err(|e| anyhow::anyhow!("Failed to initialize RaftNode: {}", e))?;
-        let shared_state = Arc::new(ConsensusShell::new(LogicalNode::Follower(initial_node)));
+        let thresholds = config.raft.calculate_thresholds();
+
+        let rng = create_deterministic_rng(identity.node_id());
+
+        let logical_node = LogicalNode::try_new(
+            identity.clone(),
+            fsm.clone(),
+            storage.clone(),
+            thresholds,
+            rng,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to initialize LogicalNode: {}", e))?;
+
+        let shared_state = Arc::new(ConsensusShell::new(logical_node));
 
         (fsm, shared_state)
     };
@@ -311,4 +321,21 @@ async fn main() -> Result<()> {
     }
     .instrument(root_span)
     .await
+}
+
+/// Creates a deterministically seeded PRNG for the Raft engine.
+///
+/// Combines the NodeId (to ensure cluster-wide uniqueness) with OS-level
+/// entropy (to ensure cross-restart uniqueness) to prevent split-vote storms
+/// (ADR 003).
+fn create_deterministic_rng(node_id: common::types::NodeId) -> rand::rngs::StdRng {
+    let mut seed = [0u8; 32];
+    // Mix in the NodeId to guarantee uniqueness between nodes
+    let node_id_bytes = node_id.value().to_be_bytes();
+    seed[0..8].copy_from_slice(&node_id_bytes);
+
+    // Mix in OS entropy for cross-restart uniqueness
+    rand::rng().fill(&mut seed[8..]);
+
+    rand::rngs::StdRng::from_seed(seed)
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Instant;
 
 use common::proto::v1::raft::LogEntry;
 use common::raft_api::StateMachine;
@@ -20,6 +19,8 @@ use tracing::info;
 use tracing::info_span;
 
 use crate::storage::LogStorage;
+use crate::tick::Tick;
+use crate::tick::TickDuration;
 
 // =============================================================================
 // 1. Public Snapshots & Types
@@ -71,18 +72,22 @@ pub enum TickAction {
 #[derive(Debug)]
 pub struct Follower {
     leader_id: Option<NodeId>,
-    last_heartbeat: Instant,
+    last_heartbeat: Tick,
+    timeout: TickDuration,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Candidate {
     votes_received: HashSet<NodeId>,
+    election_start: Tick,
+    timeout: TickDuration,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Leader {
     next_index: HashMap<NodeId, LogIndex>,
     match_index: HashMap<NodeId, LogIndex>,
+    last_heartbeat: Tick,
 }
 
 pub trait NodeState: Debug {}
@@ -200,6 +205,8 @@ impl<S: NodeState> RaftNode<S> {
         self,
         term: Term,
         leader_id: Option<NodeId>,
+        last_heartbeat: Tick,
+        timeout: TickDuration,
     ) -> Result<RaftNode<Follower>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
@@ -209,7 +216,7 @@ impl<S: NodeState> RaftNode<S> {
             log_store,
             last_committed,
             last_applied,
-            state: Follower::new(leader_id),
+            state: Follower::new(leader_id, last_heartbeat, timeout),
         };
 
         // Transition to next term if higher (§5.1)
@@ -373,6 +380,8 @@ impl RaftNode<Follower> {
         identity: Arc<NodeIdentity>,
         fsm: Arc<dyn StateMachine>,
         log_store: Arc<dyn LogStorage>,
+        last_heartbeat: Tick,
+        timeout: TickDuration,
     ) -> Result<Self, NodeError> {
         let last_applied = fsm.last_applied_index().map_err(NodeError::from)?;
         let last_committed = log_store.last_committed().map_err(NodeError::from)?;
@@ -391,7 +400,7 @@ impl RaftNode<Follower> {
             log_store,
             last_committed,
             last_applied,
-            state: Follower::new(None),
+            state: Follower::new(None, last_heartbeat, timeout),
         })
     }
 
@@ -451,7 +460,11 @@ impl RaftNode<Follower> {
     }
 
     /// Follower -> Candidate transition (Triggered by Election Timeout).
-    pub fn try_into_candidate(self) -> Result<RaftNode<Candidate>, NodeError> {
+    pub fn try_into_candidate(
+        self,
+        election_start: Tick,
+        timeout: TickDuration,
+    ) -> Result<RaftNode<Candidate>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
@@ -460,7 +473,7 @@ impl RaftNode<Follower> {
             log_store,
             last_committed,
             last_applied,
-            state: Candidate::new(),
+            state: Candidate::new(election_start, timeout),
         };
 
         let new_term = node.current_term()? + 1;
@@ -587,7 +600,11 @@ impl RaftNode<Follower> {
 // =============================================================================
 
 impl RaftNode<Candidate> {
-    pub fn try_into_restarted_candidate(self) -> Result<RaftNode<Candidate>, NodeError> {
+    pub fn try_into_restarted_candidate(
+        self,
+        election_start: Tick,
+        timeout: TickDuration,
+    ) -> Result<RaftNode<Candidate>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
@@ -596,7 +613,7 @@ impl RaftNode<Candidate> {
             log_store,
             last_committed,
             last_applied,
-            state: Candidate::new(),
+            state: Candidate::new(election_start, timeout),
         };
 
         let new_term = node.current_term()? + 1;
@@ -614,7 +631,11 @@ impl RaftNode<Candidate> {
         Ok(node)
     }
 
-    pub fn try_into_leader(self, peer_ids: Vec<NodeId>) -> Result<RaftNode<Leader>, NodeError> {
+    pub fn try_into_leader(
+        self,
+        peer_ids: Vec<NodeId>,
+        last_heartbeat: Tick,
+    ) -> Result<RaftNode<Leader>, NodeError> {
         let last_log_index = self.last_log_index()?;
         let term = self.current_term()?;
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
@@ -625,7 +646,7 @@ impl RaftNode<Candidate> {
             log_store,
             last_committed,
             last_applied,
-            state: Leader::new(peer_ids, last_log_index),
+            state: Leader::new(peer_ids, last_log_index, last_heartbeat),
         };
 
         info!(
@@ -664,10 +685,11 @@ impl RaftNode<Leader> {
 // =============================================================================
 
 impl Follower {
-    pub fn new(leader_id: Option<NodeId>) -> Self {
+    pub fn new(leader_id: Option<NodeId>, last_heartbeat: Tick, timeout: TickDuration) -> Self {
         Self {
             leader_id,
-            last_heartbeat: Instant::now(),
+            last_heartbeat,
+            timeout,
         }
     }
 
@@ -675,22 +697,38 @@ impl Follower {
         self.leader_id
     }
 
-    pub fn last_heartbeat(&self) -> Instant {
+    pub fn last_heartbeat(&self) -> Tick {
         self.last_heartbeat
+    }
+
+    pub fn timeout(&self) -> TickDuration {
+        self.timeout
     }
 
     pub fn set_leader_id(&mut self, leader_id: Option<NodeId>) {
         self.leader_id = leader_id;
     }
 
-    pub fn reset_heartbeat(&mut self) {
-        self.last_heartbeat = Instant::now();
+    pub fn reset_heartbeat(&mut self, current_tick: Tick) {
+        self.last_heartbeat = current_tick;
     }
 }
 
 impl Candidate {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(election_start: Tick, timeout: TickDuration) -> Self {
+        Self {
+            votes_received: HashSet::new(),
+            election_start,
+            timeout,
+        }
+    }
+
+    pub fn election_start(&self) -> Tick {
+        self.election_start
+    }
+
+    pub fn timeout(&self) -> TickDuration {
+        self.timeout
     }
 
     pub fn add_vote(&mut self, peer_id: NodeId) {
@@ -703,7 +741,7 @@ impl Candidate {
 }
 
 impl Leader {
-    pub fn new(peer_ids: Vec<NodeId>, last_log_index: LogIndex) -> Self {
+    pub fn new(peer_ids: Vec<NodeId>, last_log_index: LogIndex, last_heartbeat: Tick) -> Self {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
 
@@ -715,7 +753,16 @@ impl Leader {
         Self {
             next_index,
             match_index,
+            last_heartbeat,
         }
+    }
+
+    pub fn last_heartbeat(&self) -> Tick {
+        self.last_heartbeat
+    }
+
+    pub fn reset_heartbeat(&mut self, current_tick: Tick) {
+        self.last_heartbeat = current_tick;
     }
 
     pub fn next_index(&self) -> &HashMap<NodeId, LogIndex> {
@@ -779,7 +826,14 @@ mod tests {
         fsm: Arc<MockFsm>,
         log_store: Arc<MemoryStorage>,
     ) -> RaftNode<Follower> {
-        RaftNode::try_new(test_identity(1), fsm, log_store).unwrap()
+        RaftNode::try_new(
+            test_identity(1),
+            fsm,
+            log_store,
+            Tick::new(0),
+            TickDuration::new(100),
+        )
+        .unwrap()
     }
 
     fn setup_node_as_candidate(
@@ -787,13 +841,13 @@ mod tests {
         log_store: Arc<MemoryStorage>,
     ) -> RaftNode<Candidate> {
         setup_node_as_follower(fsm, log_store)
-            .try_into_candidate()
+            .try_into_candidate(Tick::new(0), TickDuration::new(150))
             .unwrap()
     }
 
     fn setup_node_as_leader(fsm: Arc<MockFsm>, log_store: Arc<MemoryStorage>) -> RaftNode<Leader> {
         setup_node_as_candidate(fsm, log_store)
-            .try_into_leader(vec![])
+            .try_into_leader(vec![], Tick::new(0))
             .unwrap()
     }
 
@@ -810,14 +864,19 @@ mod tests {
                 fn reset_heartbeat_updates_timer() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
                     let initial_time = node.state().last_heartbeat();
 
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    node.state_mut().reset_heartbeat(Tick::new(10));
 
-                    node.state_mut().reset_heartbeat();
-
+                    assert_eq!(node.state().last_heartbeat(), Tick::new(10));
                     assert!(node.state().last_heartbeat() > initial_time);
                 }
             }
@@ -836,11 +895,18 @@ mod tests {
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::new(1)))
                         .unwrap();
-                    let node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
-                    let demoted = node.try_into_follower(Term::new(2), None).unwrap();
+                    let demoted = node
+                        .try_into_follower(Term::new(2), None, Tick::new(0), TickDuration::new(100))
+                        .unwrap();
 
                     assert_eq!(demoted.current_term().unwrap(), Term::new(2));
                     assert_eq!(demoted.voted_for().unwrap(), None);
@@ -853,11 +919,18 @@ mod tests {
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::new(3)))
                         .unwrap();
-                    let node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
-                    let demoted = node.try_into_follower(Term::new(1), None).unwrap();
+                    let demoted = node
+                        .try_into_follower(Term::new(1), None, Tick::new(0), TickDuration::new(100))
+                        .unwrap();
                     assert_eq!(demoted.voted_for().unwrap(), Some(NodeId::new(3)));
                 }
             }
@@ -1144,6 +1217,8 @@ mod tests {
                         test_identity(1),
                         Arc::new(PoisonFsm),
                         log_store.clone(),
+                        Tick::new(0),
+                        TickDuration::new(100),
                     )
                     .unwrap();
                     check_returns_error_when_state_machine_apply_fails(node, log_store).await;
@@ -1159,7 +1234,7 @@ mod tests {
                         log_store: log_store.clone(),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Candidate::new(),
+                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
                     };
                     check_returns_error_when_state_machine_apply_fails(node, log_store).await;
                 }
@@ -1174,7 +1249,7 @@ mod tests {
                         log_store: log_store.clone(),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
                     };
                     check_returns_error_when_state_machine_apply_fails(node, log_store).await;
                 }
@@ -1223,7 +1298,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::new(100),
-                        state: Follower::new(None),
+                        state: Follower::new(None, Tick::new(0), TickDuration::new(100)),
                     };
                     check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
                 }
@@ -1236,7 +1311,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Candidate::new(),
+                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
                     };
                     check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
                 }
@@ -1249,7 +1324,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
                     };
                     check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
                 }
@@ -1276,6 +1351,8 @@ mod tests {
                         test_identity(1),
                         Arc::new(MockFsm::default()),
                         Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
                     )
                     .unwrap();
                     check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
@@ -1290,7 +1367,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Candidate::new(),
+                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
                     };
                     check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
                 }
@@ -1303,7 +1380,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
                     };
                     check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
                 }
@@ -1544,8 +1621,14 @@ mod tests {
                 async fn propagates_persistence_error_when_storage_fails_as_follower() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(FailingStorage);
-                    let node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
                     check_propagates_persistence_error_when_storage_fails(node).await;
                 }
 
@@ -1558,7 +1641,7 @@ mod tests {
                         log_store: Arc::new(FailingStorage),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Candidate::new(),
+                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
                     };
                     check_propagates_persistence_error_when_storage_fails(_node).await;
                 }
@@ -1572,7 +1655,7 @@ mod tests {
                         log_store: Arc::new(FailingStorage),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
                     };
                     check_propagates_persistence_error_when_storage_fails(node).await;
                 }
@@ -1623,8 +1706,14 @@ mod tests {
                     {
                         let db = sled::open(dir.path()).unwrap();
                         let log_store = Arc::new(SledStorage::new(db).unwrap());
-                        let node = RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store)
-                            .unwrap();
+                        let node = RaftNode::<Follower>::try_new(
+                            test_identity(1),
+                            fsm,
+                            log_store,
+                            Tick::new(0),
+                            TickDuration::new(100),
+                        )
+                        .unwrap();
 
                         assert_eq!(node.current_term().unwrap(), Term::new(7));
                         assert_eq!(node.voted_for().unwrap(), Some(NodeId::new(2)));
@@ -1653,7 +1742,13 @@ mod tests {
                     let fsm = Arc::new(AheadFsm);
                     let log_store = Arc::new(MemoryStorage::new());
 
-                    let result = RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store);
+                    let result = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    );
 
                     assert!(result.is_err());
                     assert!(
@@ -1676,8 +1771,14 @@ mod tests {
                 async fn rejects_inconsistent_prev_index() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
                     let result = node
                         .reconcile_log(LogIndex::new(1), Term::new(1), vec![], LogIndex::ZERO)
                         .await
@@ -1707,9 +1808,14 @@ mod tests {
                             },
                         ])
                         .unwrap();
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
                     let new_entry = LogEntry {
                         index: 2,
@@ -1744,9 +1850,14 @@ mod tests {
                         });
                     }
                     log_store.append_entries(entries).unwrap();
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
                     let new_entry = LogEntry {
                         index: 2,
@@ -1783,9 +1894,14 @@ mod tests {
                     };
                     let log_store = MemoryStorage::new();
                     log_store.append_entries(vec![entry.clone()]).unwrap();
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
                     let result = node
                         .reconcile_log(LogIndex::ZERO, Term::ZERO, vec![entry], LogIndex::ZERO)
@@ -1804,8 +1920,14 @@ mod tests {
                 async fn rejects_non_contiguous_append() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
                     let entry2 = LogEntry {
                         index: 2,
                         term: 1,
@@ -1842,9 +1964,14 @@ mod tests {
                             data: vec![],
                         }])
                         .unwrap();
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
                     let entry3 = LogEntry {
                         index: 3,
@@ -1875,9 +2002,14 @@ mod tests {
                             data: vec![],
                         }])
                         .unwrap();
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                            .unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
                     // Scenario: Leader has commit_index 10, but our log only reaches 2 after
                     // append.
@@ -1911,8 +2043,14 @@ mod tests {
                 fn grant_vote_respects_voting_state() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
                     node.advance_term(Term::new(1)).unwrap();
                     node.persist_vote(NodeId::new(3)).unwrap();
 
@@ -1960,8 +2098,14 @@ mod tests {
                         });
                     }
                     log_store.append_entries(entries).unwrap();
-                    RaftNode::<Follower>::try_new(test_identity(1), fsm, Arc::new(log_store))
-                        .unwrap()
+                    RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        Arc::new(log_store),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap()
                 }
 
                 #[test]
@@ -2013,10 +2157,18 @@ mod tests {
                 fn promotion_preserves_invariants() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let node =
-                        RaftNode::<Follower>::try_new(test_identity(1), fsm, log_store).unwrap();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        fsm,
+                        log_store,
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
 
-                    let candidate = node.try_into_candidate().unwrap();
+                    let candidate = node
+                        .try_into_candidate(Tick::new(0), TickDuration::new(150))
+                        .unwrap();
 
                     assert_eq!(candidate.current_term().unwrap(), Term::new(1));
                     assert_eq!(candidate.voted_for().unwrap(), Some(NodeId::new(1)));
@@ -2039,7 +2191,9 @@ mod tests {
                 let node = setup_node_as_candidate(fsm, log_store);
                 let initial_term = node.current_term().unwrap();
 
-                let restarted = node.try_into_restarted_candidate().unwrap();
+                let restarted = node
+                    .try_into_restarted_candidate(Tick::new(0), TickDuration::new(150))
+                    .unwrap();
 
                 assert_eq!(restarted.current_term().unwrap(), initial_term + 1);
                 assert_eq!(restarted.voted_for().unwrap(), Some(restarted.node_id()));
@@ -2073,7 +2227,9 @@ mod tests {
                 let node = setup_node_as_candidate(fsm, log_store);
                 let peer_ids = vec![NodeId::new(2), NodeId::new(3)];
 
-                let leader = node.try_into_leader(peer_ids.clone()).unwrap();
+                let leader = node
+                    .try_into_leader(peer_ids.clone(), Tick::new(0))
+                    .unwrap();
 
                 assert_eq!(leader.last_log_index().unwrap(), LogIndex::new(2));
                 for peer_id in peer_ids {
@@ -2124,7 +2280,7 @@ mod tests {
                 assert_eq!(index, LogIndex::new(1));
                 assert_eq!(node.last_log_index().unwrap(), LogIndex::new(1));
                 let entry = node.read_entries(index, index).unwrap().remove(0);
-                assert_eq!(entry.term, current_term.value());
+                assert_eq!(Term::new(entry.term), current_term);
                 assert_eq!(entry.data, vec![42]);
             }
 
@@ -2196,7 +2352,7 @@ mod tests {
                     log_store,
                     last_committed: LogIndex::ZERO,
                     last_applied: LogIndex::ZERO,
-                    state: Leader::new(vec![], LogIndex::ZERO),
+                    state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
                 };
 
                 let result = node.propose(vec![1]);

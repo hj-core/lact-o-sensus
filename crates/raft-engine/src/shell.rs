@@ -93,7 +93,7 @@ impl<'a> Drop for MutationGuard<'a> {
         // we MUST transition the node to Poisoned and broadcast a terminal
         // signal to halt other tasks (ADR 009).
         let after = if std::thread::panicking() {
-            *self.guard = LogicalNode::Poisoned;
+            self.guard.poison();
             ConsensusProgress {
                 term: self.before.term,
                 role: NodeRole::Poisoned,

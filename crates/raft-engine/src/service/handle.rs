@@ -10,6 +10,7 @@ use common::types::errors::NodeError;
 
 use crate::engine::LogicalNode;
 use crate::engine::NodeRole;
+use crate::engine::RoleState;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
@@ -30,14 +31,14 @@ impl LocalRaftHandle {
     /// Determines the leader address and status message based on the current
     /// role.
     fn calculate_redirection(&self, node_state: &LogicalNode) -> (String, String) {
-        match node_state {
-            LogicalNode::Follower(node) => self.follower_redirection(node.state().leader_id()),
-            LogicalNode::Candidate(_) => (
+        match node_state.state() {
+            RoleState::Follower(node) => self.follower_redirection(node.state().leader_id()),
+            RoleState::Candidate(_) => (
                 String::new(),
                 "Election in progress. No leader established.".to_string(),
             ),
-            LogicalNode::Leader(_) => (String::new(), String::new()),
-            LogicalNode::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
+            RoleState::Leader(_) => (String::new(), String::new()),
+            RoleState::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
         }
     }
 
@@ -79,13 +80,13 @@ impl ConsensusHandle for LocalRaftHandle {
             // Check condition first (prevents missing updates before subscription)
             {
                 let guard = self.state.read().await;
-                match &*guard {
-                    LogicalNode::Leader(node) => {
+                match guard.state() {
+                    RoleState::Leader(node) => {
                         if node.last_committed() >= index {
                             return Ok(());
                         }
                     }
-                    LogicalNode::Poisoned => {
+                    RoleState::Poisoned => {
                         return Err(ConsensusError::Poisoned);
                     }
                     _ => {
@@ -126,7 +127,7 @@ impl ConsensusHandle for LocalRaftHandle {
     async fn consensus_status(&self) -> ConsensusStatus {
         let progress = *self.state.subscribe().borrow();
         let guard = self.state.read().await;
-        let is_leader = matches!(&*guard, LogicalNode::Leader(_));
+        let is_leader = matches!(guard.state(), RoleState::Leader(_));
         let (leader_hint, rejection_reason) = self.calculate_redirection(&guard);
 
         ConsensusStatus {
@@ -139,14 +140,14 @@ impl ConsensusHandle for LocalRaftHandle {
 
     async fn verify_leadership(&self) -> Result<(), ConsensusError> {
         let guard = self.state.read().await;
-        match &*guard {
-            LogicalNode::Leader(_) => {
+        match guard.state() {
+            RoleState::Leader(_) => {
                 // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability.
                 // Currently, this only performs a local authority check which is
                 // vulnerable to stale reads in partitioned scenarios.
                 Ok(())
             }
-            LogicalNode::Poisoned => Err(ConsensusError::Poisoned),
+            RoleState::Poisoned => Err(ConsensusError::Poisoned),
             _ => Err(ConsensusError::NotLeader),
         }
     }
@@ -162,10 +163,10 @@ mod tests {
     use common::types::errors::FsmError;
 
     use super::*;
-    use crate::engine::Follower;
     use crate::engine::LogicalNode;
-    use crate::node::RaftNode;
     use crate::storage::MemoryStorage;
+    use crate::tick::TickDuration;
+    use crate::tick::TickThresholds;
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -191,8 +192,13 @@ mod tests {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
-        let node =
-            LogicalNode::Follower(RaftNode::<Follower>::try_new(id.clone(), fsm, storage).unwrap());
+        let thresholds = TickThresholds {
+            heartbeat_interval: TickDuration::new(10),
+            min_election: TickDuration::new(15),
+            max_election: TickDuration::new(30),
+        };
+        let rng = rand::SeedableRng::seed_from_u64(1);
+        let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager =
             Arc::new(PeerManager::new(id, &std::collections::HashMap::new()).unwrap());
@@ -251,7 +257,7 @@ mod tests {
 
             let result = handle.propose(vec![1, 2, 3]).await;
             assert!(result.is_ok());
-            assert_eq!(result.unwrap().value(), 1);
+            assert_eq!(result.unwrap(), LogIndex::new(1));
         }
     }
 
@@ -276,7 +282,7 @@ mod tests {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
-                if let LogicalNode::Leader(_) = &mut *guard {
+                if guard.as_leader_mut().is_some() {
                     guard.advance_last_committed(index).await;
                 }
             });
@@ -332,7 +338,7 @@ mod tests {
                 // Advance last_committed (which triggers FSM apply and updates last_applied)
                 // LogicalNode::advance_last_committed is role-agnostic.
                 // We first need to ensure the log contains the entries we are committing.
-                if let LogicalNode::Follower(node) = &mut *guard {
+                if let Some(node) = guard.as_follower_mut() {
                     let mut entries = Vec::new();
                     for i in 1..=index.value() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
@@ -355,7 +361,7 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 // Prepare log and advance state
-                if let LogicalNode::Follower(node) = &mut *guard {
+                if let Some(node) = guard.as_follower_mut() {
                     let mut entries = Vec::new();
                     for i in 1..=index.value() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
@@ -380,7 +386,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
             {
                 let mut guard = state.write().await;
-                *guard = LogicalNode::Poisoned;
+                guard.poison();
             }
 
             let result = wait_task.await.unwrap();
@@ -397,7 +403,7 @@ mod tests {
             {
                 // Manually transition to poisoned state
                 let mut guard = state.write().await;
-                *guard = LogicalNode::Poisoned;
+                guard.poison();
             }
 
             let status = handle.consensus_status().await;
@@ -410,7 +416,7 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                *guard = LogicalNode::Poisoned;
+                guard.poison();
             }
 
             let result = handle.verify_leadership().await;
@@ -422,7 +428,7 @@ mod tests {
             let (handle, state) = setup();
             {
                 let mut guard = state.write().await;
-                *guard = LogicalNode::Poisoned;
+                guard.poison();
             }
 
             let result = handle.await_commit(LogIndex::new(1)).await;
@@ -446,7 +452,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             {
                 let mut guard = state.write().await;
-                *guard = LogicalNode::Poisoned;
+                guard.poison();
                 // MutationGuard drop triggers the watch channel update
             }
 
