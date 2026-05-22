@@ -1,3 +1,14 @@
+//! Universal SI unit registry and stabilization for the Lact-O-Sensus cluster.
+//!
+//! This module implements the physical quantity normalization mandated by ADR
+//! 008. It ensures that all grocery state values (mass, volume, count) are
+//! converted to a stable, deterministic internal representation (g, ml, units)
+//! using Banker's Rounding (Midpoint-Nearest-Even) to prevent cumulative
+//! statistical bias.
+//!
+//! The "Dimensional Fence" enforces that arithmetic operations are only
+//! permitted between quantities of the same physical dimension.
+
 use std::ops::Add;
 use std::ops::Sub;
 use std::str::FromStr;
@@ -8,17 +19,22 @@ use strum::Display;
 use strum::EnumString;
 use thiserror::Error;
 
+/// Errors associated with physical quantity parsing and stabilization.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum UnitError {
+    /// The provided unit symbol is not recognized by the registry.
     #[error("Invalid unit symbol: {0}")]
     InvalidSymbol(String),
 
+    /// An arithmetic operation was attempted between mismatched dimensions.
     #[error("Dimensional mismatch: operation not permitted across dimensions")]
     DimensionalMismatch,
 
+    /// The provided quantity string could not be parsed as a decimal.
     #[error("Invalid quantity format: {0}")]
     InvalidQuantity(String),
 
+    /// An arithmetic operation resulted in an overflow or underflow.
     #[error("Arithmetic overflow or underflow")]
     ArithmeticError,
 }
@@ -27,9 +43,13 @@ pub enum UnitError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum Dimension {
+    /// Quantities of matter (Base: grams).
     Mass,
+    /// Quantities of space (Base: milliliters).
     Volume,
+    /// Discrete items (Base: units).
     Count,
+    /// Unstructured or non-standard measurements.
     Anomalous,
 }
 
@@ -47,27 +67,37 @@ impl Dimension {
 
 // --- NewType Enforcement for Physical Domains ---
 
+/// A physical quantity representing Mass, stored in grams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mass(pub Decimal);
 
+/// A physical quantity representing Volume, stored in milliliters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Volume(pub Decimal);
 
+/// A physical quantity representing Count, stored in discrete units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Count(pub Decimal);
 
+/// A physical quantity representing unstructured measurements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Anomalous(pub Decimal);
 
+/// A self-validating wrapper for authorized physical quantities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalQuantity {
+    /// Mass dimension (g).
     Mass(Mass),
+    /// Volume dimension (ml).
     Volume(Volume),
+    /// Count dimension (units).
     Count(Count),
+    /// Anomalous dimension (misc).
     Anomalous(Anomalous),
 }
 
 impl PhysicalQuantity {
+    /// Returns the underlying decimal value.
     pub fn value(&self) -> Decimal {
         match self {
             Self::Mass(m) => m.0,
@@ -77,6 +107,7 @@ impl PhysicalQuantity {
         }
     }
 
+    /// Returns the dimension of this quantity.
     pub fn dimension(&self) -> Dimension {
         match self {
             Self::Mass(_) => Dimension::Mass,
@@ -92,6 +123,7 @@ impl PhysicalQuantity {
 impl Add for PhysicalQuantity {
     type Output = Result<PhysicalQuantity, UnitError>;
 
+    /// Performs dimension-aware addition. Returns an error on mismatch.
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Self::Mass(a), Self::Mass(b)) => {
@@ -118,6 +150,7 @@ impl Add for PhysicalQuantity {
 impl Sub for PhysicalQuantity {
     type Output = Result<PhysicalQuantity, UnitError>;
 
+    /// Performs dimension-aware subtraction. Returns an error on mismatch.
     fn sub(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
             (Self::Mass(a), Self::Mass(b)) => {
@@ -143,26 +176,28 @@ impl Sub for PhysicalQuantity {
 
 // --- Unit Registry ---
 
+/// Metadata for a unit symbol supported by the registry.
 #[derive(Debug, Clone)]
 pub struct UnitRegistryEntry {
+    /// The canonical symbol for the unit.
     pub symbol: &'static str,
+    /// The dimension this unit belongs to.
     pub dimension: Dimension,
+    /// The conversion factor to reach the SI base unit.
     pub multiplier: Decimal,
-    /// If true, the multiplier depends on the specific item context (e.g.,
-    /// 'pack'). If false, the multiplier is a universal physical constant
-    /// (e.g., 'kg').
+    /// Whether the multiplier is item-contextual rather than physical.
     pub is_contextual: bool,
 }
 
+/// A centralized registry for physical unit definitions and conversions.
 pub struct UnitRegistry;
 
 // --- Physical Conversion Constants (ADR 008) ---
-// Defined via Decimal::from_parts(lo, mid, hi, negative, scale) to enable const
-// construction.
-const MULTIPLIER_LB: Decimal = Decimal::from_parts(45359237, 0, 0, false, 5); // 453.59237
-const MULTIPLIER_OZ: Decimal = Decimal::from_parts(2834952, 0, 0, false, 5); // 28.34952
-const MULTIPLIER_GAL: Decimal = Decimal::from_parts(378541178, 0, 0, false, 5); // 3785.41178
-const MULTIPLIER_FL_OZ: Decimal = Decimal::from_parts(2957353, 0, 0, false, 5); // 29.57353
+// Raw conversion values sourced from NIST/International Standards.
+const MULTIPLIER_LB: Decimal = Decimal::from_parts(45359237, 0, 0, false, 5); // 453.59237 (lb -> g)
+const MULTIPLIER_OZ: Decimal = Decimal::from_parts(2834952, 0, 0, false, 5); // 28.34952 (oz -> g)
+const MULTIPLIER_GAL: Decimal = Decimal::from_parts(378541178, 0, 0, false, 5); // 3785.41178 (gal -> ml)
+const MULTIPLIER_FL_OZ: Decimal = Decimal::from_parts(2957353, 0, 0, false, 5); // 29.57353 (fl_oz -> ml)
 
 impl UnitRegistry {
     /// High-level Orchestrator: Parses a quantity and unit symbol into a
@@ -186,7 +221,7 @@ impl UnitRegistry {
         Ok(Self::construct_quantity(entry.dimension, base_val))
     }
 
-    /// Resolves a unit symbol to its metadata.
+    /// Resolves a unit symbol to its metadata. Returns an error if unknown.
     pub fn resolve_symbol(symbol: &str) -> Result<UnitRegistryEntry, UnitError> {
         let normalized = symbol.trim().to_lowercase();
 
@@ -306,118 +341,149 @@ mod tests {
     mod parse_and_convert {
         use super::*;
 
-        #[test]
-        fn converts_lb_to_g_with_bankers_rounding() {
-            let res = UnitRegistry::parse_and_convert("2.0", "lb").unwrap();
-            assert_eq!(res.dimension(), Dimension::Mass);
-            // 2 * 453.59237 = 907.18474 -> rounded to 4dp = 907.1847
-            assert_eq!(res.value().to_string(), "907.1847");
+        mod with_si_base_units {
+            use super::*;
+            #[test]
+            fn returns_stabilized_quantity_when_unit_is_mass() {
+                let res = UnitRegistry::parse_and_convert("2.0", "lb").unwrap();
+                assert_eq!(res.dimension(), Dimension::Mass);
+                // 2 * 453.59237 = 907.18474 -> rounded to 4dp = 907.1847
+                assert_eq!(res.value().to_string(), "907.1847");
+            }
+
+            #[test]
+            fn returns_stabilized_quantity_when_unit_is_volume() {
+                let res = UnitRegistry::parse_and_convert("1.0", "gal").unwrap();
+                assert_eq!(res.dimension(), Dimension::Volume);
+                assert_eq!(res.value().to_string(), "3785.4118"); // 3785.41178 rounded to 4dp
+            }
         }
 
-        #[test]
-        fn prevents_cumulative_bias_on_midpoint_values() {
-            // MidpointNearestEven means 1.5 -> 2.0 and 2.5 -> 2.0 (rounding to 0 dp)
-            let val = Decimal::from_str("1.5").unwrap();
-            let rounded = val.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
-            assert_eq!(rounded.to_string(), "2");
+        mod with_bankers_rounding {
+            use super::*;
+            #[test]
+            fn rounds_to_nearest_even_on_midpoint_values() {
+                // MidpointNearestEven means 1.5 -> 2.0 and 2.5 -> 2.0 (rounding to 0 dp)
+                let val = Decimal::from_str("1.5").unwrap();
+                let rounded = val.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
+                assert_eq!(rounded.to_string(), "2");
 
-            let val2 = Decimal::from_str("2.5").unwrap();
-            let rounded2 = val2.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
-            assert_eq!(rounded2.to_string(), "2");
-        }
-
-        #[test]
-        fn converts_gal_to_ml() {
-            let res = UnitRegistry::parse_and_convert("1.0", "gal").unwrap();
-            assert_eq!(res.dimension(), Dimension::Volume);
-            assert_eq!(res.value().to_string(), "3785.4118"); // 3785.41178 rounded to 4dp
+                let val2 = Decimal::from_str("2.5").unwrap();
+                let rounded2 =
+                    val2.round_dp_with_strategy(0, RoundingStrategy::MidpointNearestEven);
+                assert_eq!(rounded2.to_string(), "2");
+            }
         }
     }
 
     mod parse_and_convert_with_multiplier {
         use super::*;
 
-        #[test]
-        fn applies_custom_multiplier_and_resolves_dimension() {
-            // A "pack" of 6 units
-            let res =
-                UnitRegistry::parse_and_convert_with_multiplier("2", "pack", Decimal::from(6))
-                    .unwrap();
+        mod with_contextual_multiplier {
+            use super::*;
+            #[test]
+            fn returns_count_when_resolving_pack_size() {
+                // A "pack" of 6 units
+                let res =
+                    UnitRegistry::parse_and_convert_with_multiplier("2", "pack", Decimal::from(6))
+                        .unwrap();
 
-            assert_eq!(res.dimension(), Dimension::Count);
-            // 2 packs * 6 multiplier = 12 units
-            assert_eq!(res.value().to_string(), "12");
+                assert_eq!(res.dimension(), Dimension::Count);
+                // 2 packs * 6 multiplier = 12 units
+                assert_eq!(res.value().to_string(), "12");
+            }
         }
 
-        #[test]
-        fn applies_bankers_rounding_to_stabilized_result() {
-            // Testing 1.23456 * 10 = 12.3456
-            let res = UnitRegistry::parse_and_convert_with_multiplier(
-                "1.23456",
-                "units",
-                Decimal::from(10),
-            )
-            .unwrap();
+        mod with_fractional_input {
+            use super::*;
+            #[test]
+            fn applies_rounding_to_stabilized_result() {
+                // Testing 1.23456 * 10 = 12.3456
+                let res = UnitRegistry::parse_and_convert_with_multiplier(
+                    "1.23456",
+                    "units",
+                    Decimal::from(10),
+                )
+                .unwrap();
 
-            // Banker's Rounding to 4dp: 12.3456
-            assert_eq!(res.value().to_string(), "12.3456");
+                // Banker's Rounding to 4dp: 12.3456
+                assert_eq!(res.value().to_string(), "12.3456");
+            }
         }
 
-        #[test]
-        fn fails_on_invalid_unit_symbol() {
-            let res =
-                UnitRegistry::parse_and_convert_with_multiplier("1", "unknown_unit", Decimal::ONE);
-            assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
+        mod with_invalid_input {
+            use super::*;
+            #[test]
+            fn returns_error_when_symbol_is_unknown() {
+                let res = UnitRegistry::parse_and_convert_with_multiplier(
+                    "1",
+                    "unknown_unit",
+                    Decimal::ONE,
+                );
+                assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
+            }
         }
     }
 
     mod resolve_symbol {
         use super::*;
 
-        #[test]
-        fn parses_valid_mass_symbols() {
-            let kg = UnitRegistry::resolve_symbol("kg").unwrap();
-            assert_eq!(kg.dimension, Dimension::Mass);
-            assert_eq!(kg.multiplier, Decimal::from(1000));
+        mod with_valid_symbols {
+            use super::*;
+            #[test]
+            fn returns_metadata_when_symbol_is_mass() {
+                let kg = UnitRegistry::resolve_symbol("kg").unwrap();
+                assert_eq!(kg.dimension, Dimension::Mass);
+                assert_eq!(kg.multiplier, Decimal::from(1000));
+            }
         }
 
-        #[test]
-        fn rejects_invalid_unit_symbols() {
-            let res = UnitRegistry::resolve_symbol("invalid_unit");
-            assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
+        mod with_invalid_symbols {
+            use super::*;
+            #[test]
+            fn returns_error_when_symbol_is_malformed() {
+                let res = UnitRegistry::resolve_symbol("invalid_unit");
+                assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
+            }
         }
     }
 
     mod dimensional_fence {
         use super::*;
 
-        #[test]
-        fn allows_adding_same_dimension() {
-            let q1 = UnitRegistry::parse_and_convert("1", "kg").unwrap(); // 1000g
-            let q2 = UnitRegistry::parse_and_convert("500", "g").unwrap(); // 500g
+        mod addition {
+            use super::*;
+            #[test]
+            fn returns_success_when_dimensions_match() {
+                let q1 = UnitRegistry::parse_and_convert("1", "kg").unwrap(); // 1000g
+                let q2 = UnitRegistry::parse_and_convert("500", "g").unwrap(); // 500g
 
-            let sum = (q1 + q2).unwrap();
-            assert_eq!(sum.dimension(), Dimension::Mass);
-            assert_eq!(sum.value(), Decimal::from(1500));
+                let sum = (q1 + q2).unwrap();
+                assert_eq!(sum.dimension(), Dimension::Mass);
+                assert_eq!(sum.value(), Decimal::from(1500));
+            }
+
+            #[test]
+            fn returns_error_when_dimensions_mismatch() {
+                let q1 = UnitRegistry::parse_and_convert("1", "kg").unwrap(); // Mass
+                let q2 = UnitRegistry::parse_and_convert("1", "L").unwrap(); // Volume
+
+                let res = q1 + q2;
+                assert!(matches!(res, Err(UnitError::DimensionalMismatch)));
+            }
         }
 
-        #[test]
-        fn rejects_adding_mass_and_volume() {
-            let q1 = UnitRegistry::parse_and_convert("1", "kg").unwrap(); // Mass
-            let q2 = UnitRegistry::parse_and_convert("1", "L").unwrap(); // Volume
+        mod subtraction {
+            use super::*;
+            #[test]
+            fn returns_success_when_dimensions_match() {
+                let q1 = UnitRegistry::parse_and_convert("2", "L").unwrap(); // 2000ml
+                let q2 = UnitRegistry::parse_and_convert("500", "ml").unwrap(); // 500ml
 
-            let res = q1 + q2;
-            assert!(matches!(res, Err(UnitError::DimensionalMismatch)));
-        }
-
-        #[test]
-        fn allows_subtracting_same_dimension() {
-            let q1 = UnitRegistry::parse_and_convert("2", "L").unwrap(); // 2000ml
-            let q2 = UnitRegistry::parse_and_convert("500", "ml").unwrap(); // 500ml
-
-            let diff = (q1 - q2).unwrap();
-            assert_eq!(diff.dimension(), Dimension::Volume);
-            assert_eq!(diff.value(), Decimal::from(1500));
+                let diff = (q1 - q2).unwrap();
+                assert_eq!(diff.dimension(), Dimension::Volume);
+                assert_eq!(diff.value(), Decimal::from(1500));
+            }
         }
     }
 }
