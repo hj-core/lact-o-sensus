@@ -363,7 +363,7 @@ impl PolicyService for RealPolicyService {
             });
 
             // Strict Causal Injection
-            TraceInterceptor::inject_response(&mut response, trace_id)?;
+            TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
             Ok(response)
         }
@@ -574,9 +574,9 @@ mod tests {
             let trace_id = TraceId::generate();
             let mut response = Response::new(EvaluateProposalResponse::default());
 
-            TraceInterceptor::inject_response(&mut response, trace_id).unwrap();
+            TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id).unwrap();
 
-            let extracted = TraceInterceptor::extract_response(&response).unwrap();
+            let extracted = TraceInterceptor::extract_trace_id_from_response(&response).unwrap();
             assert_eq!(extracted, trace_id);
         }
     }

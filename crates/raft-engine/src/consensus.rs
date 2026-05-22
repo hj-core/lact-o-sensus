@@ -644,7 +644,7 @@ async fn request_vote_from_peer(
     request.set_timeout(params.rpc_timeout);
 
     // Explicit Outbound Propagation
-    TraceInterceptor::inject_request(&mut request, params.trace_id)
+    TraceInterceptor::inject_trace_id_into_request(&mut request, params.trace_id)
         .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
 
     let response = client.request_vote(request).await?;
@@ -739,7 +739,7 @@ async fn replicate_to_peer(
     req.set_timeout(rpc_timeout);
 
     // Explicit Outbound Propagation
-    TraceInterceptor::inject_request(&mut req, trace_id)
+    TraceInterceptor::inject_trace_id_into_request(&mut req, trace_id)
         .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
 
     let response = client.append_entries(req).await?;
@@ -844,7 +844,7 @@ fn verify_trace_integrity<T>(
     expected_id: TraceId,
     peer_id: NodeId,
 ) -> RpcResult<()> {
-    match TraceInterceptor::extract_response(response) {
+    match TraceInterceptor::extract_trace_id_from_response(response) {
         Some(returned_id) if returned_id == expected_id => Ok(()),
         Some(returned_id) => {
             warn!(
@@ -1099,7 +1099,7 @@ mod tests {
         fn should_pass_matching_trace_id() {
             let trace_id = TraceId::generate();
             let mut response = Response::new(());
-            TraceInterceptor::inject_response(&mut response, trace_id)
+            TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)
                 .expect("Should inject trace ID");
             assert!(
                 verify_trace_integrity(&response, trace_id, NodeId::try_new(2).unwrap()).is_ok()
@@ -1111,7 +1111,8 @@ mod tests {
             let expected = TraceId::generate();
             let got = TraceId::generate();
             let mut response = Response::new(());
-            TraceInterceptor::inject_response(&mut response, got).expect("Should inject trace ID");
+            TraceInterceptor::inject_trace_id_into_response(&mut response, got)
+                .expect("Should inject trace ID");
             let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
             assert!(res.is_err());
             assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);

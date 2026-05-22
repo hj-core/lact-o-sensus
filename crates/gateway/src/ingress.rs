@@ -114,7 +114,7 @@ impl IngressService for IngressDispatcher {
         let mut result = self.handle_propose_mutation(request, trace_id).await;
 
         if let Ok(ref mut response) = result {
-            TraceInterceptor::inject_response(response, trace_id)?;
+            TraceInterceptor::inject_trace_id_into_response(response, trace_id)?;
         }
         result
     }
@@ -129,7 +129,7 @@ impl IngressService for IngressDispatcher {
         let mut result = self.handle_query_state(request, trace_id).await;
 
         if let Ok(ref mut response) = result {
-            TraceInterceptor::inject_response(response, trace_id)?;
+            TraceInterceptor::inject_trace_id_into_response(response, trace_id)?;
         }
         result
     }

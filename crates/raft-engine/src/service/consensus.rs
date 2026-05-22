@@ -186,7 +186,7 @@ impl ConsensusService for ConsensusDispatcher {
         // 4. Construction: Build the response and inject telemetry feedback.
         let mut response =
             Response::new(RequestVoteResponse::new(result.term, result.vote_granted));
-        TraceInterceptor::inject_response(&mut response, trace_id)?;
+        TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
         Ok(response)
     }
@@ -220,7 +220,7 @@ impl ConsensusService for ConsensusDispatcher {
             result.success,
             result.conflict_index,
         ));
-        TraceInterceptor::inject_response(&mut response, trace_id)?;
+        TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
         Ok(response)
     }
@@ -612,7 +612,10 @@ mod tests {
 
             let resp = dispatcher.request_vote(r).await.unwrap();
             assert!(resp.get_ref().vote_granted);
-            assert_eq!(TraceInterceptor::extract_response(&resp).unwrap(), trace_id);
+            assert_eq!(
+                TraceInterceptor::extract_trace_id_from_response(&resp).unwrap(),
+                trace_id
+            );
         }
     }
 

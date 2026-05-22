@@ -98,7 +98,11 @@ impl PeerManager {
 
         // Interceptor to inject identity headers.
         let interceptor = move |mut req: Request<()>| {
-            IdentityInterceptor::inject_request(&mut req, &cluster_id, target_node_id)?;
+            IdentityInterceptor::inject_identity_into_request(
+                &mut req,
+                &cluster_id,
+                target_node_id,
+            )?;
 
             Ok(req)
         };

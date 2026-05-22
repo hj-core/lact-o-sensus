@@ -1,3 +1,10 @@
+//! gRPC interceptors and utilities for the Lact-O-Sensus cluster.
+//!
+//! This module provides the centralized middleware for identity verification
+//! (ADR 004) and distributed trace propagation (ADR 010). These interceptors
+//! ensure that every RPC crossing the cluster boundary is authenticated
+//! and traceable, maintaining the "Fortress" security model.
+
 use std::sync::Arc;
 
 use tonic::Request;
@@ -29,12 +36,28 @@ pub struct IdentityInterceptor {
 }
 
 impl IdentityInterceptor {
+    /// Constructs a new IdentityInterceptor with the local node's identity.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
         Self { identity }
     }
+}
 
+impl Interceptor for IdentityInterceptor {
+    /// High-level orchestrator for RPC identity verification.
+    ///
+    /// Delegates to specialized sub-functions to verify the cluster boundary
+    /// and the target node routing.
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        self.verify_cluster_id(&request)?;
+        self.verify_target_node_id(&request)?;
+
+        Ok(request)
+    }
+}
+
+impl IdentityInterceptor {
     /// Injects identity headers into an outbound request for cluster isolation.
-    pub fn inject_request<T>(
+    pub fn inject_identity_into_request<T>(
         request: &mut Request<T>,
         cluster_id: &crate::types::ClusterId,
         target_node_id: crate::types::NodeId,
@@ -56,21 +79,7 @@ impl IdentityInterceptor {
             .insert(HEADER_TARGET_NODE_ID, node_val);
         Ok(())
     }
-}
 
-impl Interceptor for IdentityInterceptor {
-    /// High-level orchestrator for RPC identity verification.
-    /// Delegates to specialized sub-functions to maintain Information
-    /// Hierarchy.
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        self.verify_cluster_id(&request)?;
-        self.verify_target_node_id(&request)?;
-
-        Ok(request)
-    }
-}
-
-impl IdentityInterceptor {
     /// Mandatory Boundary Check: Ensures the request belongs to this logical
     /// cluster.
     fn verify_cluster_id(&self, request: &Request<()>) -> Result<(), Status> {
@@ -158,62 +167,13 @@ impl TraceInterceptor {
             authoritative: false,
         }
     }
-
-    /// Extracts a TraceId from a Request's extensions if present.
-    fn extract_request<T>(request: &Request<T>) -> Option<TraceId> {
-        request.extensions().get::<TraceId>().copied()
-    }
-
-    /// Mandates the presence of a TraceId in a Request's extensions.
-    ///
-    /// Returns the TraceId or a pre-configured gRPC Status if missing.
-    /// Used by internal services to enforce clinical correlation (ADR 010).
-    pub fn require_trace_id<T>(request: &Request<T>) -> Result<TraceId, Status> {
-        Self::extract_request(request).ok_or_else(|| {
-            Status::failed_precondition("Missing TraceId for distributed correlation")
-        })
-    }
-
-    /// Extracts a TraceId from a Response's metadata (ADR 010).
-    pub fn extract_response<T>(response: &Response<T>) -> Option<TraceId> {
-        if let Some(trace_val) = response.metadata().get(HEADER_TRACE_ID)
-            && let Ok(trace_str) = trace_val.to_str()
-            && let Ok(trace_id) = trace_str.parse::<TraceId>()
-        {
-            return Some(trace_id);
-        }
-        None
-    }
-
-    /// Injects a TraceId into a Request's metadata for outbound propagation.
-    pub fn inject_request<T>(request: &mut Request<T>, trace_id: TraceId) -> Result<(), Status> {
-        let trace_val = trace_id
-            .to_string()
-            .parse()
-            .map_err(|_| Status::internal("Failed to parse TraceId for outbound header"))?;
-        request.metadata_mut().insert(HEADER_TRACE_ID, trace_val);
-        Ok(())
-    }
-
-    /// Injects a TraceId into a Response's metadata for client feedback (ADR
-    /// 010).
-    pub fn inject_response<T>(response: &mut Response<T>, trace_id: TraceId) -> Result<(), Status> {
-        let trace_val = trace_id
-            .to_string()
-            .parse()
-            .map_err(|_| Status::internal("Failed to parse TraceId for outbound header"))?;
-        response.metadata_mut().insert(HEADER_TRACE_ID, trace_val);
-        Ok(())
-    }
-}
-
-impl Default for TraceInterceptor {
-    fn default() -> Self {
-        Self::propagative()
-    }
 }
 
 impl Interceptor for TraceInterceptor {
+    /// High-level orchestrator for distributed trace propagation.
+    ///
+    /// Depending on the mode, it either generates a new trace ID or extracts
+    /// it from the incoming request metadata.
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         if self.authoritative {
             // Gateway Authority: Always generate a new "Clinical Birth" ID.
@@ -239,6 +199,67 @@ impl Interceptor for TraceInterceptor {
             request.extensions_mut().insert(trace_id);
             Ok(request)
         }
+    }
+}
+
+impl TraceInterceptor {
+    /// Mandates the presence of a TraceId in a Request's extensions.
+    ///
+    /// Returns the TraceId or a pre-configured gRPC Status if missing.
+    /// Used by internal services to enforce clinical correlation (ADR 010).
+    pub fn require_trace_id<T>(request: &Request<T>) -> Result<TraceId, Status> {
+        Self::extract_trace_id_from_request(request).ok_or_else(|| {
+            Status::failed_precondition("Missing TraceId for distributed correlation")
+        })
+    }
+
+    /// Extracts a TraceId from a Response's metadata (ADR 010).
+    pub fn extract_trace_id_from_response<T>(response: &Response<T>) -> Option<TraceId> {
+        if let Some(trace_val) = response.metadata().get(HEADER_TRACE_ID)
+            && let Ok(trace_str) = trace_val.to_str()
+            && let Ok(trace_id) = trace_str.parse::<TraceId>()
+        {
+            return Some(trace_id);
+        }
+        None
+    }
+
+    /// Injects a TraceId into a Request's metadata for outbound propagation.
+    pub fn inject_trace_id_into_request<T>(
+        request: &mut Request<T>,
+        trace_id: TraceId,
+    ) -> Result<(), Status> {
+        let trace_val = trace_id
+            .to_string()
+            .parse()
+            .map_err(|_| Status::internal("Failed to parse TraceId for outbound header"))?;
+        request.metadata_mut().insert(HEADER_TRACE_ID, trace_val);
+        Ok(())
+    }
+
+    /// Injects a TraceId into a Response's metadata for client feedback (ADR
+    /// 010).
+    pub fn inject_trace_id_into_response<T>(
+        response: &mut Response<T>,
+        trace_id: TraceId,
+    ) -> Result<(), Status> {
+        let trace_val = trace_id
+            .to_string()
+            .parse()
+            .map_err(|_| Status::internal("Failed to parse TraceId for outbound header"))?;
+        response.metadata_mut().insert(HEADER_TRACE_ID, trace_val);
+        Ok(())
+    }
+
+    /// Extracts a TraceId from a Request's extensions if present.
+    fn extract_trace_id_from_request<T>(request: &Request<T>) -> Option<TraceId> {
+        request.extensions().get::<TraceId>().copied()
+    }
+}
+
+impl Default for TraceInterceptor {
+    fn default() -> Self {
+        Self::propagative()
     }
 }
 
@@ -271,7 +292,7 @@ mod tests {
             use super::*;
 
             #[test]
-            fn accepts_valid_identity_headers() {
+            fn returns_success_when_identity_headers_match() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let request = authenticated_request("test-cluster", 1);
 
@@ -280,7 +301,7 @@ mod tests {
             }
 
             #[test]
-            fn rejects_missing_cluster_id() {
+            fn returns_unauthenticated_when_cluster_id_is_missing() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let mut request = authenticated_request("test-cluster", 1);
                 request.metadata_mut().remove(HEADER_CLUSTER_ID);
@@ -291,7 +312,7 @@ mod tests {
             }
 
             #[test]
-            fn rejects_cluster_id_mismatch() {
+            fn returns_unauthenticated_when_cluster_id_mismatches() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let request = authenticated_request("WRONG-cluster", 1);
 
@@ -301,7 +322,7 @@ mod tests {
             }
 
             #[test]
-            fn rejects_missing_node_id() {
+            fn returns_unauthenticated_when_node_id_is_missing() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let mut request = authenticated_request("test-cluster", 1);
                 request.metadata_mut().remove(HEADER_TARGET_NODE_ID);
@@ -312,7 +333,7 @@ mod tests {
             }
 
             #[test]
-            fn rejects_node_id_mismatch() {
+            fn returns_unauthenticated_when_node_id_mismatches() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let request = authenticated_request("test-cluster", 2);
 
@@ -322,7 +343,7 @@ mod tests {
             }
 
             #[test]
-            fn rejects_malformed_node_id() {
+            fn returns_unauthenticated_when_node_id_is_malformed() {
                 let mut interceptor = IdentityInterceptor::new(mock_identity("test-cluster", 1));
                 let mut request = authenticated_request("test-cluster", 1);
                 request
@@ -335,16 +356,21 @@ mod tests {
             }
         }
 
-        mod inject_request {
+        mod inject_identity_into_request {
             use super::*;
 
             #[test]
-            fn inserts_identity_headers_correctly() {
+            fn inserts_identity_headers_when_parameters_are_valid() {
                 let mut request = Request::new(());
                 let cluster_id = ClusterId::try_new("test-cluster").unwrap();
                 let node_id = NodeId::try_new(42).unwrap();
 
-                IdentityInterceptor::inject_request(&mut request, &cluster_id, node_id).unwrap();
+                IdentityInterceptor::inject_identity_into_request(
+                    &mut request,
+                    &cluster_id,
+                    node_id,
+                )
+                .unwrap();
 
                 assert_eq!(
                     request
@@ -371,110 +397,16 @@ mod tests {
     mod trace_interceptor {
         use super::*;
 
-        mod helpers {
-            use super::*;
-
-            mod extract_request {
-                use super::*;
-
-                #[test]
-                fn returns_some_when_extension_exists() {
-                    let mut request = Request::new(());
-                    let trace_id = TraceId::generate();
-                    request.extensions_mut().insert(trace_id);
-
-                    let result = TraceInterceptor::extract_request(&request).unwrap();
-                    assert_eq!(result, trace_id);
-                }
-
-                #[test]
-                fn returns_none_when_extension_missing() {
-                    let request = Request::new(());
-                    assert!(TraceInterceptor::extract_request(&request).is_none());
-                }
-            }
-
-            mod require_trace_id {
-                use super::*;
-
-                #[test]
-                fn should_return_trace_id_when_extension_exists() {
-                    let mut request = Request::new(());
-                    let trace_id = TraceId::generate();
-                    request.extensions_mut().insert(trace_id);
-
-                    let result = TraceInterceptor::require_trace_id(&request);
-                    assert!(result.is_ok());
-                    assert_eq!(result.unwrap(), trace_id);
-                }
-
-                #[test]
-                fn should_return_failed_precondition_when_extension_missing() {
-                    let request = Request::new(());
-                    let result = TraceInterceptor::require_trace_id(&request);
-                    assert!(result.is_err());
-                    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
-                }
-            }
-
-            mod extract_response {
-                use super::*;
-
-                #[test]
-                fn returns_some_when_metadata_exists() {
-                    let mut response = Response::new(());
-                    let trace_id = TraceId::generate();
-                    let _ = TraceInterceptor::inject_response(&mut response, trace_id);
-
-                    let result = TraceInterceptor::extract_response(&response).unwrap();
-                    assert_eq!(result, trace_id);
-                }
-
-                #[test]
-                fn returns_none_when_metadata_missing() {
-                    let response = Response::new(());
-                    assert!(TraceInterceptor::extract_response(&response).is_none());
-                }
-            }
-
-            mod inject_request {
-                use super::*;
-
-                #[test]
-                fn inserts_header_when_valid_id_provided() {
-                    let mut request = Request::new(());
-                    let trace_id = TraceId::generate();
-                    let _ = TraceInterceptor::inject_request(&mut request, trace_id);
-
-                    let header_val = request.metadata().get(HEADER_TRACE_ID).unwrap();
-                    assert_eq!(header_val.to_str().unwrap(), trace_id.to_string());
-                }
-            }
-
-            mod inject_response {
-                use super::*;
-
-                #[test]
-                fn inserts_header_when_valid_id_provided() {
-                    let mut response = Response::new(());
-                    let trace_id = TraceId::generate();
-                    let _ = TraceInterceptor::inject_response(&mut response, trace_id);
-
-                    let header_val = response.metadata().get(HEADER_TRACE_ID).unwrap();
-                    assert_eq!(header_val.to_str().unwrap(), trace_id.to_string());
-                }
-            }
-        }
-
         mod call {
             use super::*;
 
             #[test]
-            fn extracts_trace_id_in_propagative_mode() {
+            fn extracts_and_inserts_trace_id_when_mode_is_propagative() {
                 let mut interceptor = TraceInterceptor::propagative();
                 let mut request = Request::new(());
                 let expected_trace = TraceId::generate();
-                let _ = TraceInterceptor::inject_request(&mut request, expected_trace);
+                let _ =
+                    TraceInterceptor::inject_trace_id_into_request(&mut request, expected_trace);
 
                 let result = interceptor.call(request).unwrap();
                 let extracted = TraceInterceptor::require_trace_id(&result).unwrap();
@@ -482,7 +414,7 @@ mod tests {
             }
 
             #[test]
-            fn generates_new_trace_id_in_authoritative_mode() {
+            fn generates_new_trace_id_when_mode_is_authoritative() {
                 let mut interceptor = TraceInterceptor::authoritative();
                 let request = Request::new(());
 
@@ -491,11 +423,11 @@ mod tests {
             }
 
             #[test]
-            fn authoritative_mode_ignores_client_provided_trace_id() {
+            fn ignores_client_provided_trace_id_when_mode_is_authoritative() {
                 let mut interceptor = TraceInterceptor::authoritative();
                 let mut request = Request::new(());
                 let client_trace = TraceId::generate();
-                let _ = TraceInterceptor::inject_request(&mut request, client_trace);
+                let _ = TraceInterceptor::inject_trace_id_into_request(&mut request, client_trace);
 
                 let result = interceptor.call(request).unwrap();
                 let assigned = TraceInterceptor::require_trace_id(&result).unwrap();
@@ -503,7 +435,7 @@ mod tests {
             }
 
             #[test]
-            fn returns_error_when_header_is_missing_in_propagative_mode() {
+            fn returns_failed_precondition_when_header_is_missing_in_propagative_mode() {
                 let mut interceptor = TraceInterceptor::propagative();
                 let request = Request::new(());
 
@@ -513,7 +445,7 @@ mod tests {
             }
 
             #[test]
-            fn returns_error_when_header_is_malformed_in_propagative_mode() {
+            fn returns_failed_precondition_when_header_is_malformed_in_propagative_mode() {
                 let mut interceptor = TraceInterceptor::propagative();
                 let mut request = Request::new(());
                 request
@@ -524,29 +456,105 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
             }
+        }
+
+        mod require_trace_id {
+            use super::*;
 
             #[test]
-            fn extract_response_is_strict() {
+            fn returns_trace_id_when_extension_is_present() {
+                let mut request = Request::new(());
                 let trace_id = TraceId::generate();
+                request.extensions_mut().insert(trace_id);
+
+                let result = TraceInterceptor::require_trace_id(&request);
+                assert!(result.is_ok());
+                assert_eq!(result.unwrap(), trace_id);
+            }
+
+            #[test]
+            fn returns_failed_precondition_when_extension_is_missing() {
+                let request = Request::new(());
+                let result = TraceInterceptor::require_trace_id(&request);
+                assert!(result.is_err());
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+        }
+
+        mod extract_trace_id_from_response {
+            use super::*;
+
+            #[test]
+            fn returns_some_when_trace_metadata_is_present() {
                 let mut response = Response::new(());
+                let trace_id = TraceId::generate();
+                let _ = TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id);
 
-                // 1. Success: Matching ID present
-                let _ = TraceInterceptor::inject_response(&mut response, trace_id);
-                assert_eq!(
-                    TraceInterceptor::extract_response(&response).unwrap(),
-                    trace_id
-                );
+                let result = TraceInterceptor::extract_trace_id_from_response(&response).unwrap();
+                assert_eq!(result, trace_id);
+            }
 
-                // 2. Failure: Metadata missing
-                let empty_resp = Response::new(());
-                assert!(TraceInterceptor::extract_response(&empty_resp).is_none());
+            #[test]
+            fn returns_none_when_trace_metadata_is_missing() {
+                let response = Response::new(());
+                assert!(TraceInterceptor::extract_trace_id_from_response(&response).is_none());
+            }
 
-                // 3. Failure: Malformed metadata
+            #[test]
+            fn returns_none_when_trace_metadata_is_malformed() {
                 let mut malformed = Response::new(());
                 malformed
                     .metadata_mut()
                     .insert(HEADER_TRACE_ID, "not-a-uuid".parse().unwrap());
-                assert!(TraceInterceptor::extract_response(&malformed).is_none());
+                assert!(TraceInterceptor::extract_trace_id_from_response(&malformed).is_none());
+            }
+        }
+
+        mod inject_trace_id_into_request {
+            use super::*;
+
+            #[test]
+            fn inserts_header_when_valid_id_is_provided() {
+                let mut request = Request::new(());
+                let trace_id = TraceId::generate();
+                let _ = TraceInterceptor::inject_trace_id_into_request(&mut request, trace_id);
+
+                let header_val = request.metadata().get(HEADER_TRACE_ID).unwrap();
+                assert_eq!(header_val.to_str().unwrap(), trace_id.to_string());
+            }
+        }
+
+        mod inject_trace_id_into_response {
+            use super::*;
+
+            #[test]
+            fn inserts_header_when_valid_id_is_provided() {
+                let mut response = Response::new(());
+                let trace_id = TraceId::generate();
+                let _ = TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id);
+
+                let header_val = response.metadata().get(HEADER_TRACE_ID).unwrap();
+                assert_eq!(header_val.to_str().unwrap(), trace_id.to_string());
+            }
+        }
+
+        mod extract_trace_id_from_request {
+            use super::*;
+
+            #[test]
+            fn returns_some_when_extension_is_present() {
+                let mut request = Request::new(());
+                let trace_id = TraceId::generate();
+                request.extensions_mut().insert(trace_id);
+
+                let result = TraceInterceptor::extract_trace_id_from_request(&request).unwrap();
+                assert_eq!(result, trace_id);
+            }
+
+            #[test]
+            fn returns_none_when_extension_is_missing() {
+                let request = Request::new(());
+                assert!(TraceInterceptor::extract_trace_id_from_request(&request).is_none());
             }
         }
     }

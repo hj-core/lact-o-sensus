@@ -113,7 +113,7 @@ impl VetoRelay for GrpcVetoRelay {
         request.set_timeout(timeout);
 
         // Explicit Outbound Propagation (ADR 010)
-        TraceInterceptor::inject_request(&mut request, trace_id)
+        TraceInterceptor::inject_trace_id_into_request(&mut request, trace_id)
             .map_err(|e| VetoError::RpcFailure(format!("Telemetry injection failed: {}", e)))?;
 
         let span = info_span!(
@@ -135,7 +135,7 @@ impl VetoRelay for GrpcVetoRelay {
 
             // Byzantine Resilience: Verify returned trace_id matches the one we sent.
             // If the AI Veto Node (untrusted) returns a different ID or strips it, reject.
-            match TraceInterceptor::extract_response(&response) {
+            match TraceInterceptor::extract_trace_id_from_response(&response) {
                 Some(returned_id) if returned_id == trace_id => {}
                 _ => {
                     warn!(
@@ -232,7 +232,7 @@ mod tests {
                 // If we have a trace_id to return, inject it.
                 // Otherwise, the response won't have one (simulating a strip/miss).
                 if let Some(tid) = *self.trace_id_to_return.lock().unwrap() {
-                    TraceInterceptor::inject_response(&mut res, tid)
+                    TraceInterceptor::inject_trace_id_into_response(&mut res, tid)
                         .map_err(|e| Status::internal(e.to_string()))?;
                 }
 

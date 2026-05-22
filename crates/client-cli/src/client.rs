@@ -260,14 +260,18 @@ impl LactoClient {
 
             // Inject identity headers (ADR 004/005).
             if let Some(target_node_id) = self.current_node_id().await {
-                IdentityInterceptor::inject_request(&mut request, &self.cluster_id, target_node_id)
-                    .map_err(|e| anyhow::anyhow!("Failed to inject identity headers: {}", e))?;
+                IdentityInterceptor::inject_identity_into_request(
+                    &mut request,
+                    &self.cluster_id,
+                    target_node_id,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to inject identity headers: {}", e))?;
             }
 
             let r = rpc_fn(client, request).await;
 
             let trace_id = if let Ok(ref response) = r {
-                TraceInterceptor::extract_response(response)
+                TraceInterceptor::extract_trace_id_from_response(response)
             } else {
                 None
             };
@@ -541,7 +545,7 @@ mod tests {
             let res = queue.remove(0)?;
             let mut response = Response::new(res);
             if let Some(ref tid) = *self.trace_id_to_return.lock().unwrap() {
-                let _ = TraceInterceptor::inject_response(&mut response, *tid);
+                let _ = TraceInterceptor::inject_trace_id_into_response(&mut response, *tid);
             }
             Ok(response)
         }
@@ -558,7 +562,7 @@ mod tests {
             let res = queue.remove(0)?;
             let mut response = Response::new(res);
             if let Some(ref tid) = *self.trace_id_to_return.lock().unwrap() {
-                let _ = TraceInterceptor::inject_response(&mut response, *tid);
+                let _ = TraceInterceptor::inject_trace_id_into_response(&mut response, *tid);
             }
             Ok(response)
         }
