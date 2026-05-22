@@ -98,7 +98,7 @@ impl SledStorage {
         match vote {
             Some(node_id) => {
                 data.push(1);
-                data.extend_from_slice(&node_id.value().to_be_bytes());
+                data.extend_from_slice(&node_id.as_u64().to_be_bytes());
             }
             None => {
                 data.push(0);

@@ -31,7 +31,7 @@ impl NodeId {
         Self::try_new(id).expect("NodeId cannot be 0")
     }
 
-    pub fn value(&self) -> u64 {
+    pub fn as_u64(&self) -> u64 {
         self.0
     }
 }
@@ -167,7 +167,7 @@ mod tests {
             fn accepts_valid_id() {
                 let id = NodeId::try_new(1);
                 assert!(id.is_ok());
-                assert_eq!(id.unwrap().value(), 1);
+                assert_eq!(id.unwrap().as_u64(), 1);
             }
 
             #[test]
@@ -182,7 +182,7 @@ mod tests {
             #[test]
             fn parses_valid_string() {
                 let id: NodeId = "42".parse().unwrap();
-                assert_eq!(id.value(), 42);
+                assert_eq!(id.as_u64(), 42);
             }
 
             #[test]

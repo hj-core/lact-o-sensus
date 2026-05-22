@@ -328,7 +328,7 @@ async fn main() -> Result<()> {
 fn create_deterministic_rng(node_id: common::types::NodeId) -> rand::rngs::StdRng {
     let mut seed = [0u8; 32];
     // Mix in the NodeId to guarantee uniqueness between nodes
-    let node_id_bytes = node_id.value().to_be_bytes();
+    let node_id_bytes = node_id.as_u64().to_be_bytes();
     seed[0..8].copy_from_slice(&node_id_bytes);
 
     // Mix in OS entropy for cross-restart uniqueness
