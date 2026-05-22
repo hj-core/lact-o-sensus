@@ -156,6 +156,14 @@ pub struct UnitRegistryEntry {
 
 pub struct UnitRegistry;
 
+// --- Physical Conversion Constants (ADR 008) ---
+// Defined via Decimal::from_parts(lo, mid, hi, negative, scale) to enable const
+// construction.
+const MULTIPLIER_LB: Decimal = Decimal::from_parts(45359237, 0, 0, false, 5); // 453.59237
+const MULTIPLIER_OZ: Decimal = Decimal::from_parts(2834952, 0, 0, false, 5); // 28.34952
+const MULTIPLIER_GAL: Decimal = Decimal::from_parts(378541178, 0, 0, false, 5); // 3785.41178
+const MULTIPLIER_FL_OZ: Decimal = Decimal::from_parts(2957353, 0, 0, false, 5); // 29.57353
+
 impl UnitRegistry {
     /// High-level Orchestrator: Parses a quantity and unit symbol into a
     /// validated, stabilized `PhysicalQuantity`.
@@ -199,13 +207,13 @@ impl UnitRegistry {
             "lb" | "lbs" => Ok(UnitRegistryEntry {
                 symbol: "lb",
                 dimension: Dimension::Mass,
-                multiplier: Decimal::from_str("453.59237").unwrap(),
+                multiplier: MULTIPLIER_LB,
                 is_contextual: false,
             }),
             "oz" => Ok(UnitRegistryEntry {
                 symbol: "oz",
                 dimension: Dimension::Mass,
-                multiplier: Decimal::from_str("28.34952").unwrap(),
+                multiplier: MULTIPLIER_OZ,
                 is_contextual: false,
             }),
 
@@ -225,13 +233,13 @@ impl UnitRegistry {
             "gal" => Ok(UnitRegistryEntry {
                 symbol: "gal",
                 dimension: Dimension::Volume,
-                multiplier: Decimal::from_str("3785.41178").unwrap(),
+                multiplier: MULTIPLIER_GAL,
                 is_contextual: false,
             }),
             "fl_oz" => Ok(UnitRegistryEntry {
                 symbol: "fl_oz",
                 dimension: Dimension::Volume,
-                multiplier: Decimal::from_str("29.57353").unwrap(),
+                multiplier: MULTIPLIER_FL_OZ,
                 is_contextual: false,
             }),
 
