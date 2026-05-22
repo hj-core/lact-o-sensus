@@ -14,7 +14,6 @@ use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use rand::RngExt;
 use tokio::time::sleep;
 use tonic::Request;
 use tonic::Status;
@@ -28,6 +27,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::engine::LogicalNode;
 use crate::engine::RoleState;
+use crate::engine::TickAction;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
@@ -42,20 +42,6 @@ use crate::shell::ConsensusShell;
 type RpcResult<T> = std::result::Result<T, Status>;
 
 // --- 1. The Election Cycle ---
-
-/// Semantic instructions for the Randomized Election Timer loop.
-///
-/// Governs the transition from Follower or Candidate based on the
-/// physical passage of time (ADR 003).
-#[derive(Debug, PartialEq)]
-enum TimerAction {
-    /// No significant event; restart the loop with a new timeout.
-    Restart,
-    /// Transition to Candidate and initiate a new election.
-    StartElection,
-    /// Terminate the task immediately (Node poisoned) (ADR 009).
-    Stop,
-}
 
 /// Consolidated parameters for a RequestVote RPC.
 ///
@@ -87,20 +73,6 @@ enum VoteAction {
 
 // --- 2. The Replication Cycle ---
 
-/// Semantic instructions for the Leader's heartbeat and replication cadence.
-///
-/// Ensures the active Leader maintains its authority or transitions to
-/// a dormant state upon poisoning.
-#[derive(Debug, PartialEq)]
-enum HeartbeatAction {
-    /// No replication needed; maintain current cadence.
-    None,
-    /// Trigger a new replication round (Heartbeat or Log synchronization).
-    SendReplication,
-    /// Terminate the task (Node poisoned) (ADR 009).
-    Stop,
-}
-
 /// Forensic snapshot of a replication attempt.
 ///
 /// Encapsulates the peer's response along with the metadata of the intent sent,
@@ -129,128 +101,75 @@ enum ReplicationAction {
 // II. Public Background Task Orchestrators
 // =============================================================================
 
-/// Spawns the node's Randomized Election Evaluation loop.
+/// Spawns the unified deterministic Tick Loop.
 ///
-/// This task represents the "Passive" state of the node, continuously
-/// monitoring the heartbeat interval and triggering a transition to
-/// Candidate if the cluster authority is lost (ADR 003).
-///
-/// It is responsible for initializing and maintaining the long-lived
-/// 'role_session' telemetry spans (ADR 010).
-pub fn spawn_election_timer(
+/// This is the system's "Heartbeat" (ADR 003). It pulses at a fixed interval,
+/// driving the logical engine's absolute clock and dispatching consensus
+/// actions (Elections, Heartbeats) based on deterministic tick boundaries.
+pub fn spawn_tick_loop(
     config: Arc<Config>,
     state: Arc<ConsensusShell>,
     peer_manager: Arc<PeerManager>,
 ) {
+    let interval = config.raft.tick_interval();
     let span = tracing::Span::current();
+
     tokio::spawn(
         async move {
-            let mut role_span: Option<(tracing::Span, String)> = None;
+            let mut current_session: Option<(tracing::Span, String, Term)> = None;
 
             loop {
-                // 1. Generate randomized timeout.
-                let timeout = calculate_election_timeout(&config);
+                // 1. Fixed-interval pulse
+                sleep(interval).await;
 
-                // 2. Sleep for the full timeout duration.
-                sleep(timeout).await;
-
-                // 3. Evaluation: Check state and evaluate if election is needed.
-                // Snapshot identity and action under a single read lock.
+                // 2. Drive the logical engine and capture the required action
                 let (action, role_name, term) = {
-                    let guard = state.read().await;
+                    let mut guard = state.write().await;
+                    let action = guard.tick();
                     let role = determine_node_role_name(&guard);
-                    let action = evaluate_timer_action(&guard, timeout);
-                    (
-                        action,
-                        role.to_string(),
-                        guard.try_current_term().unwrap_or(Term::ZERO),
-                    )
+                    let term = guard.try_current_term().unwrap_or(Term::ZERO);
+                    (action, role.to_string(), term)
                 };
 
-                if action == TimerAction::Stop {
-                    error!(
-                        target: ClinicalTarget::ClinicalFoundation.as_str(),
-                        "Node is poisoned. Election timer stopping (ADR 009)."
-                    );
-                    return;
-                }
+                // 3. Telemetry: Manage Role Session Spans (ADR 010)
+                // We re-create the span if either the Role or the Term changes
+                // to ensure causal accuracy and avoid "Causal Ghosting".
+                let identity_changed = current_session
+                    .as_ref()
+                    .map(|(_, r, t)| r != &role_name || t != &term)
+                    .unwrap_or(true);
 
-                // Manage Role Spans (ADR 010)
-                if role_span.as_ref().map(|(_, name)| name) != Some(&role_name) {
+                if identity_changed {
                     let span = info_span!(
                         target: ClinicalTarget::RaftFoundation.as_str(),
                         "role_session",
                         role = %role_name,
                         term = %term
                     );
-                    role_span = Some((span, role_name.clone()));
+                    current_session = Some((span, role_name.clone(), term));
                 }
 
-                let _enter = role_span.as_ref().map(|(s, _)| s.enter());
+                let _enter = current_session.as_ref().map(|(s, _, _)| s.enter());
 
-                // 4. Execution: If evaluation triggered an election, transition and campaign.
-                if action == TimerAction::StartElection {
-                    let trace_id = TraceId::generate();
-                    initiate_transition_to_candidate(
-                        config.clone(),
-                        state.clone(),
-                        peer_manager.clone(),
-                        trace_id,
-                    )
-                    .await;
-                }
-            }
-        }
-        .instrument(span),
-    );
-}
-
-/// Spawns the Leader's periodic Heartbeat and Replication loop.
-///
-/// This task represents the "Active" state of the node. It maintains
-/// leadership authority by orchestrating periodic log synchronization
-/// rounds to all known peers.
-///
-/// It manages the 'leader_session' telemetry span and ensures replication
-/// stops immediately if the node is poisoned (ADR 009).
-pub fn spawn_heartbeat_task(
-    config: Arc<Config>,
-    state: Arc<ConsensusShell>,
-    peer_manager: Arc<PeerManager>,
-) {
-    let interval = config.raft.heartbeat_interval();
-    let span = tracing::Span::current();
-    tokio::spawn(
-        async move {
-            let mut leader_span: Option<tracing::Span> = None;
-
-            loop {
-                sleep(interval).await;
-
-                let (action, term) = {
-                    let guard = state.read().await;
-                    let action = match guard.state() {
-                        RoleState::Leader(_) => HeartbeatAction::SendReplication,
-                        RoleState::Poisoned => HeartbeatAction::Stop,
-                        _ => HeartbeatAction::None,
-                    };
-                    (action, guard.try_current_term().unwrap_or(Term::ZERO))
-                };
-
+                // 4. Dispatch deterministic actions
                 match action {
-                    HeartbeatAction::SendReplication => {
-                        // Start or maintain the Leader Role Span (ADR 010)
-                        if leader_span.is_none() {
-                            let span = info_span!(
-                                target: ClinicalTarget::RaftFoundation.as_str(),
-                                "leader_session",
-                                term = %term
-                            );
-                            leader_span = Some(span);
-                        }
-
-                        let _enter = leader_span.as_ref().map(|s| s.enter());
-
+                    TickAction::StartElection => {
+                        let trace_id = TraceId::generate();
+                        info!(
+                            target: ClinicalTarget::RaftFoundation.as_str(),
+                            %trace_id,
+                            %term,
+                            "Tick loop triggered election campaign."
+                        );
+                        initiate_transition_to_candidate(
+                            config.clone(),
+                            state.clone(),
+                            peer_manager.clone(),
+                            trace_id,
+                        )
+                        .await;
+                    }
+                    TickAction::SendHeartbeat => {
                         let trace_id = TraceId::generate();
                         initiate_replication(
                             config.clone(),
@@ -260,17 +179,14 @@ pub fn spawn_heartbeat_task(
                             term,
                         );
                     }
-                    HeartbeatAction::Stop => {
+                    TickAction::Stop => {
                         error!(
                             target: ClinicalTarget::ClinicalFoundation.as_str(),
-                            "Node is poisoned. Heartbeat task stopping."
+                            "Tick loop received Stop signal (Node Poisoned). Halting."
                         );
                         return;
                     }
-                    HeartbeatAction::None => {
-                        // Node is no longer leader; drop the span.
-                        leader_span = None;
-                    }
+                    TickAction::None => {}
                 }
             }
         }
@@ -830,59 +746,6 @@ fn determine_node_role_name(node: &LogicalNode) -> &'static str {
     }
 }
 
-// --- Election Timing ---
-
-/// Generates a randomized duration to prevent split votes (ADR 003).
-fn calculate_election_timeout(config: &Config) -> Duration {
-    let mut rng = rand::rng();
-    Duration::from_millis(
-        rng.random_range(config.raft.election_timeout_min_ms..config.raft.election_timeout_max_ms),
-    )
-}
-
-/// Evaluates the node's physical state against the elapsed timeout.
-///
-/// Returns a deterministic TimerAction instructing the orchestrator on
-/// whether to restart the timer, campaign for leadership, or halt.
-fn evaluate_timer_action(node: &LogicalNode, timeout: Duration) -> TimerAction {
-    match node.state() {
-        RoleState::Follower(_) => handle_follower_tick(node, timeout),
-        RoleState::Candidate(_) => handle_candidate_tick(node),
-        RoleState::Leader(_) => handle_leader_tick(node),
-        RoleState::Poisoned => TimerAction::Stop,
-    }
-}
-
-/// Evaluates the Follower's election timer.
-fn handle_follower_tick(state: &LogicalNode, _timeout: Duration) -> TimerAction {
-    match state.state() {
-        RoleState::Follower(_) => {
-            // NOTE: Wall-clock timing is temporarily disabled in evaluation
-            // logic during refactoring (Commit 2). It will be replaced by
-            // deterministic tick evaluation in Commit 3/4.
-            // For now, we simulate "no timeout" to keep the loop active.
-            TimerAction::Restart
-        }
-        _ => TimerAction::Restart,
-    }
-}
-
-/// Evaluates the Candidate's election timer.
-fn handle_candidate_tick(state: &LogicalNode) -> TimerAction {
-    match state.state() {
-        RoleState::Candidate(_) => TimerAction::StartElection,
-        _ => TimerAction::Restart,
-    }
-}
-
-/// Evaluates the Leader's election timer.
-fn handle_leader_tick(state: &LogicalNode) -> TimerAction {
-    match state.state() {
-        RoleState::Leader(_) => TimerAction::Restart,
-        _ => TimerAction::Restart,
-    }
-}
-
 // --- Replication & State Machine ---
 
 /// Dynamically constructs an AppendEntries payload for a specific peer.
@@ -1053,71 +916,6 @@ mod tests {
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
         (config, state, peer_manager)
-    }
-
-    mod calculate_election_timeout {
-        use super::*;
-        #[test]
-        fn should_return_duration_within_configured_range() {
-            let config = mock_config(150, 300);
-            for _ in 0..100 {
-                let timeout = calculate_election_timeout(&config);
-                assert!(
-                    timeout >= Duration::from_millis(150) && timeout < Duration::from_millis(300)
-                );
-            }
-        }
-    }
-
-    mod spawn_election_timer {
-        use super::*;
-        #[tokio::test]
-        async fn follower_should_transition_to_candidate_on_timeout() {
-            let (config, state, peer_manager) = setup().await;
-            spawn_election_timer(config, state.clone(), peer_manager);
-            // In Commit 2, follower timeout is disabled in evaluation
-            // to allow refactoring. So this test won't transition yet.
-            // But we check it doesn't CRASH.
-            sleep(Duration::from_millis(250)).await;
-            // assert!(matches!(state.read().await.state(),
-            // RoleState::Candidate(_)));
-        }
-
-        #[tokio::test]
-        async fn candidate_should_restart_election_on_timeout() {
-            let (config, state, peer_manager) = setup().await;
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
-            }
-            let initial_term = state.read().await.try_current_term().unwrap();
-            spawn_election_timer(config, state.clone(), peer_manager);
-            sleep(Duration::from_millis(250)).await;
-            let guard = state.read().await;
-            assert!(matches!(guard.state(), RoleState::Candidate(_)));
-            assert!(guard.try_current_term().unwrap() > initial_term);
-        }
-
-        #[tokio::test]
-        async fn timer_should_remain_active_after_leader_demotion() {
-            let (config, state, peer_manager) = setup().await;
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![]);
-            }
-            spawn_election_timer(config, state.clone(), peer_manager);
-            sleep(Duration::from_millis(50)).await;
-            {
-                let mut guard = state.write().await;
-                let term = guard.try_current_term().unwrap();
-                guard.into_follower(term, None);
-            }
-            // Follower timeout disabled in Commit 2.
-            sleep(Duration::from_millis(300)).await;
-            // assert!(matches!(state.read().await.state(),
-            // RoleState::Candidate(_)));
-        }
     }
 
     mod process_vote_response {

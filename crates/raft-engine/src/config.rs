@@ -73,6 +73,10 @@ impl RaftConfig {
         Duration::from_millis(self.heartbeat_interval_ms)
     }
 
+    pub fn tick_interval(&self) -> Duration {
+        Duration::from_millis(self.tick_interval_ms)
+    }
+
     pub fn rpc_timeout(&self) -> Duration {
         Duration::from_millis(self.rpc_timeout_ms)
     }

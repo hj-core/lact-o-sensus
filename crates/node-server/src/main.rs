@@ -13,8 +13,7 @@ use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use lacto_fsm::LactoStore;
 use raft_engine::config::Config;
-use raft_engine::consensus::spawn_election_timer;
-use raft_engine::consensus::spawn_heartbeat_task;
+use raft_engine::consensus::spawn_tick_loop;
 use raft_engine::engine::LogicalNode;
 use raft_engine::identity::initialize_node_identity;
 use raft_engine::peer::PeerManager;
@@ -241,11 +240,9 @@ async fn main() -> Result<()> {
     let consensus_trace_interceptor = TraceInterceptor::propagative();
 
     async move {
-        // 10. Spawn Consensus Background Tasks (Election Timer & Heartbeats)
-        // Spawning inside this block ensures they are child tasks of the root node
-        // span.
-        spawn_election_timer(config.clone(), shared_state.clone(), peer_manager.clone());
-        spawn_heartbeat_task(config.clone(), shared_state.clone(), peer_manager.clone());
+        // 10. Spawn the unified deterministic Tick Loop
+        // Spawning inside this block ensures it is a child task of the root node span.
+        spawn_tick_loop(config.clone(), shared_state.clone(), peer_manager.clone());
 
         info!(
             target: ClinicalTarget::ClinicalFoundation.as_str(),
