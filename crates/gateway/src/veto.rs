@@ -104,12 +104,12 @@ impl VetoRelay for GrpcVetoRelay {
     ) -> Result<VetoOutcome, VetoError> {
         let mut client = self.client.clone();
 
-        let mut request = Request::new(EvaluateProposalRequest {
-            client_id: client_id.as_str().to_string(),
-            intent: Some(intent.clone()),
-            current_inventory: current_inventory.to_vec(),
-            request_context: "AI Policy Evaluation".to_string(),
-        });
+        let mut request = Request::new(EvaluateProposalRequest::new(
+            &client_id,
+            intent.clone(),
+            current_inventory.to_vec(),
+            "AI Policy Evaluation".to_string(),
+        ));
         request.set_timeout(timeout);
 
         // Explicit Outbound Propagation (ADR 010)

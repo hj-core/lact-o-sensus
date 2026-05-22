@@ -220,10 +220,7 @@ impl LactoClient {
         query_filter: Option<String>,
         min_state_version: Option<LogIndex>,
     ) -> Result<(QueryStateResponse, Option<TraceId>)> {
-        let request_payload = QueryStateRequest {
-            query_filter,
-            min_state_version: min_state_version.map(|v| v.as_u64()),
-        };
+        let request_payload = QueryStateRequest::new(query_filter, min_state_version);
 
         self.dispatch_query(request_payload).await
     }
@@ -585,13 +582,13 @@ mod tests {
     }
 
     fn test_intent() -> MutationIntent {
-        MutationIntent {
-            item_key: "milk".to_string(),
-            quantity: Some("2".to_string()),
-            unit: None,
-            category: None,
-            operation: OperationType::Add as i32,
-        }
+        MutationIntent::new(
+            "milk".to_string(),
+            Some("2".to_string()),
+            None,
+            None,
+            OperationType::Add,
+        )
     }
 
     mod propose_mutation {
@@ -1114,13 +1111,13 @@ mod tests {
                 let wal_path = dir.path().join("wal");
                 let wal = IntentWal::open(&wal_path)?;
                 let seq = SequenceId::new(42);
-                let intent = MutationIntent {
-                    item_key: "eggs".to_string(),
-                    quantity: Some("12".to_string()),
-                    unit: None,
-                    category: None,
-                    operation: OperationType::Add as i32,
-                };
+                let intent = MutationIntent::new(
+                    "eggs".to_string(),
+                    Some("12".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                );
                 let client_id = ClientId::generate();
                 let req = ProposeMutationRequest::new(&client_id, seq, intent);
                 wal.append(seq, &req)?;

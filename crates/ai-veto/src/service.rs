@@ -390,19 +390,19 @@ mod tests {
 
     mod build_chat_request {
         use common::proto::v1::app::EvaluateProposalRequest;
+        use common::proto::v1::app::MutationIntent;
 
         use super::*;
 
         #[test]
         fn specifies_reasoning_state_based_on_think_flag() {
             let service_no_think = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(common::proto::v1::app::MutationIntent {
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                vec![],
+                "".into(),
+            );
             match service_no_think.build_chat_request(&req).unwrap().think {
                 Some(ThinkType::False) => (),
                 _ => panic!("Expected Some(ThinkType::False)"),
@@ -418,13 +418,12 @@ mod tests {
         #[test]
         fn enforces_strict_isolation_by_sending_exactly_two_messages() {
             let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(common::proto::v1::app::MutationIntent {
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                vec![],
+                "".into(),
+            );
             let chat_req = service.build_chat_request(&req).unwrap();
 
             assert_eq!(chat_req.messages.len(), 2);
@@ -435,13 +434,12 @@ mod tests {
         #[test]
         fn enforces_json_mode_for_caching_and_formatting() {
             let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(common::proto::v1::app::MutationIntent {
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                vec![],
+                "".into(),
+            );
             let chat_req = service.build_chat_request(&req).unwrap();
             assert!(matches!(chat_req.format, Some(FormatType::Json)));
         }
@@ -449,13 +447,12 @@ mod tests {
         #[test]
         fn mandates_clinical_brevity_in_system_prompt() {
             let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(common::proto::v1::app::MutationIntent {
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                vec![],
+                "".into(),
+            );
             let chat_req = service.build_chat_request(&req).unwrap();
             assert!(chat_req.messages[0].content.contains("Brevity"));
             assert!(chat_req.messages[0].content.contains("200 characters"));
@@ -466,28 +463,27 @@ mod tests {
         use common::proto::v1::app::EvaluateProposalRequest;
         use common::proto::v1::app::GroceryItem;
         use common::proto::v1::app::MutationIntent;
+        use common::types::LogIndex;
 
         use super::*;
 
         #[test]
         fn serializes_inventory_densely_by_excluding_unnecessary_metadata() {
             let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(MutationIntent {
-                    item_key: "oat_milk".to_string(),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-                current_inventory: vec![GroceryItem {
-                    item_key: "apple".to_string(),
-                    quantity: "5".to_string(),
-                    unit: "units".to_string(),
-                    category: "Primary Flora".to_string(),
-                    last_modifier_id: "client-1".to_string(), // Should be excluded
-                    ..Default::default()
-                }],
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("oat_milk".into(), None, None, None, OperationType::Add),
+                vec![GroceryItem::new(
+                    "apple".to_string(),
+                    "5".to_string(),
+                    "units".to_string(),
+                    "Primary Flora".to_string(),
+                    "client-1".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                )],
+                "".into(),
+            );
 
             let prompt = service.build_user_prompt(&req).unwrap();
             assert!(prompt.contains("apple: 5 units (Primary Flora)"));
@@ -497,13 +493,12 @@ mod tests {
         #[test]
         fn rejects_unspecified_operation_early() {
             let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest {
-                intent: Some(MutationIntent {
-                    operation: OperationType::Unspecified as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
+            let req = EvaluateProposalRequest::new(
+                &ClientId::generate(),
+                MutationIntent::new("".into(), None, None, None, OperationType::Unspecified),
+                vec![],
+                "".into(),
+            );
 
             let result = service.build_user_prompt(&req);
             assert!(result.is_err());

@@ -1296,18 +1296,20 @@ mod tests {
                 mock: successful_raft(),
             });
             let inventory = Arc::new(DuplicateSource { committed_index });
-
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
@@ -1337,16 +1339,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "  BANANAS  ".to_string(),
-                    quantity: Some(" 5 ".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "  BANANAS  ".to_string(),
+                    Some(" 5 ".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let _ = dispatcher.propose_mutation(req).await.unwrap();
 
@@ -1377,17 +1381,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "  MiLk  ".to_string(),
-                    quantity: Some(" 1.5 ".to_string()),
-                    unit: Some(" gal ".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "  MiLk  ".to_string(),
+                    Some(" 1.5 ".to_string()),
+                    Some(" gal ".to_string()),
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
@@ -1418,16 +1423,12 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: None,
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new("bananas".to_string(), None, None, None, OperationType::Add),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1454,16 +1455,12 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: None,
-                    operation: OperationType::Delete as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new("milk".to_string(), None, None, None, OperationType::Delete),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
@@ -1486,16 +1483,18 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "   ".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "   ".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1513,17 +1512,18 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    category: Some("Forbidden Snacks".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    Some("Forbidden Snacks".to_string()),
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1543,16 +1543,18 @@ mod tests {
                     successful_veto(),
                 )
             };
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("-5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("-5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1624,31 +1626,35 @@ mod tests {
 
             let d1 = dispatcher.clone();
             let h1 = tokio::spawn(async move {
-                let req = make_request(ProposeMutationRequest {
-                    client_id: ClientId::generate().as_str().to_string(),
-                    sequence_id: 1,
-                    intent: Some(MutationIntent {
-                        item_key: "item1".to_string(),
-                        quantity: Some("1".to_string()),
-                        operation: OperationType::Add as i32,
-                        ..Default::default()
-                    }),
-                });
+                let cid = ClientId::generate();
+                let req = make_request(ProposeMutationRequest::new(
+                    &cid,
+                    SequenceId::new(1),
+                    MutationIntent::new(
+                        "item1".to_string(),
+                        Some("1".to_string()),
+                        None,
+                        None,
+                        OperationType::Add,
+                    ),
+                ));
                 d1.propose_mutation(req).await
             });
 
             let d2 = dispatcher.clone();
             let h2 = tokio::spawn(async move {
-                let req = make_request(ProposeMutationRequest {
-                    client_id: ClientId::generate().as_str().to_string(),
-                    sequence_id: 2,
-                    intent: Some(MutationIntent {
-                        item_key: "item2".to_string(),
-                        quantity: Some("2".to_string()),
-                        operation: OperationType::Add as i32,
-                        ..Default::default()
-                    }),
-                });
+                let cid = ClientId::generate();
+                let req = make_request(ProposeMutationRequest::new(
+                    &cid,
+                    SequenceId::new(2),
+                    MutationIntent::new(
+                        "item2".to_string(),
+                        Some("2".to_string()),
+                        None,
+                        None,
+                        OperationType::Add,
+                    ),
+                ));
                 d2.propose_mutation(req).await
             });
 
@@ -1679,16 +1685,18 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
@@ -1709,16 +1717,18 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft.clone(), inventory.clone(), inventory, veto);
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
@@ -1746,16 +1756,18 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(successful_raft(), inventory.clone(), inventory, veto);
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1784,16 +1796,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
@@ -1824,16 +1838,18 @@ mod tests {
                     ..Default::default()
                 }),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
@@ -1881,16 +1897,18 @@ mod tests {
                 inventory,
                 successful_veto(),
             );
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "bananas".to_string(),
-                    quantity: Some("5".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -1916,16 +1934,18 @@ mod tests {
                 512,
             );
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Committed as i32);
@@ -1968,16 +1988,18 @@ mod tests {
                 512,
             );
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Committed as i32);
@@ -2010,16 +2032,18 @@ mod tests {
                 512,
             );
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Vetoed as i32);
@@ -2058,16 +2082,18 @@ mod tests {
                 512,
             );
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
@@ -2128,16 +2154,18 @@ mod tests {
                 512,
             );
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "unethical item".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "unethical item".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let _ = dispatcher.propose_mutation(req).await.unwrap();
             assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -2174,16 +2202,18 @@ mod tests {
                 )
             };
 
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1,
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let result = dispatcher.propose_mutation(req).await;
             assert!(result.is_err());
@@ -2211,10 +2241,13 @@ mod tests {
         #[test]
         fn rejects_hallucinated_category() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1".to_string()),
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 category_assignment: "Space Matter".to_string(), // Hallucination
@@ -2233,10 +2266,13 @@ mod tests {
         #[test]
         fn rejects_hallucinated_unit() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1".to_string()),
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 category_assignment: "Primary Flora".to_string(),
@@ -2255,10 +2291,13 @@ mod tests {
         #[test]
         fn rejects_invalid_si_unit_conversion() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("abc".to_string()), // Malformed quantity
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("abc".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 category_assignment: "Primary Flora".to_string(),
@@ -2277,11 +2316,13 @@ mod tests {
         #[test]
         fn rejects_cross_dimensional_arithmetic() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1".to_string()),
-                operation: OperationType::Add as i32,
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             // AI resolves a liquid unit for an item that exists as weight
             let veto = VetoOutcome {
                 is_approved: true,
@@ -2292,11 +2333,15 @@ mod tests {
                 resolved_unit: "ml".to_string(),
                 conversion_multiplier_to_base: "1".to_string(),
             };
-            let inventory = vec![GroceryItem {
-                item_key: "milk".to_string(),
-                unit: "g".to_string(), // Dimension: Mass
-                ..Default::default()
-            }];
+            let inventory = vec![GroceryItem::new(
+                "milk".to_string(),
+                "0".to_string(),
+                "g".to_string(),
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(0),
+            )];
 
             let result = dispatcher.validate_and_stabilize(&intent, &veto, &inventory);
             assert!(result.is_err());
@@ -2308,10 +2353,13 @@ mod tests {
         #[test]
         fn applies_bankers_rounding_to_si_stabilization() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1.5".to_string()), // Half-way point
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1.5".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 category_assignment: "Primary Flora".to_string(),
@@ -2335,10 +2383,13 @@ mod tests {
         #[test]
         fn grants_contextual_override_when_unit_is_dynamic() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("2".to_string()),
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("2".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 resolved_unit: "pack".to_string(), // Contextual unit
@@ -2356,10 +2407,13 @@ mod tests {
         #[test]
         fn ignores_physical_constant_redefinition_when_unit_is_static() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1".to_string()),
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
             let veto = VetoOutcome {
                 is_approved: true,
                 resolved_unit: "kg".to_string(), // Static unit
@@ -2380,10 +2434,13 @@ mod tests {
         #[test]
         fn rejects_non_positive_quantity_during_stabilization() {
             let dispatcher = test_dispatcher();
-            let intent = MutationIntent {
-                quantity: Some("1".to_string()),
-                ..Default::default()
-            };
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
 
             // Test 1: Zero (using contextual unit to ensure AI multiplier is applied)
             let veto_zero = VetoOutcome {
@@ -2657,16 +2714,18 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 5, // Should be 1
-                intent: Some(MutationIntent {
-                    item_key: "milk".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(5),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Rejected as i32);
@@ -2706,16 +2765,18 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 1, // Correct start
-                intent: Some(MutationIntent {
-                    item_key: "item".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "item".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Committed as i32);
@@ -2757,16 +2818,18 @@ mod tests {
             let mock_source = Arc::new(MockSource);
             let dispatcher =
                 mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
-            let req = make_request(ProposeMutationRequest {
-                client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: 2, // Valid: 1 + 1
-                intent: Some(MutationIntent {
-                    item_key: "item".to_string(),
-                    quantity: Some("1".to_string()),
-                    operation: OperationType::Add as i32,
-                    ..Default::default()
-                }),
-            });
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(2),
+                MutationIntent::new(
+                    "item".to_string(),
+                    Some("1".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Committed as i32);
@@ -2829,10 +2892,7 @@ mod tests {
             });
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
-            let req = make_request(QueryStateRequest {
-                query_filter: None,
-                min_state_version: None,
-            });
+            let req = make_request(QueryStateRequest::new(None, None));
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Rejected as i32);
@@ -2842,18 +2902,24 @@ mod tests {
         #[tokio::test]
         async fn returns_all_items_when_no_filter_is_provided() {
             let items = vec![
-                GroceryItem {
-                    item_key: "milk".to_string(),
-                    quantity: "1000".to_string(),
-                    unit: "ml".to_string(),
-                    ..Default::default()
-                },
-                GroceryItem {
-                    item_key: "eggs".to_string(),
-                    quantity: "12".to_string(),
-                    unit: "units".to_string(),
-                    ..Default::default()
-                },
+                GroceryItem::new(
+                    "milk".to_string(),
+                    "1000".to_string(),
+                    "ml".to_string(),
+                    "Dairy".to_string(),
+                    "client".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                ),
+                GroceryItem::new(
+                    "eggs".to_string(),
+                    "12".to_string(),
+                    "units".to_string(),
+                    "Dairy".to_string(),
+                    "client".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                ),
             ];
 
             let raft = Arc::new(MockRaftHandle {
@@ -2866,10 +2932,7 @@ mod tests {
             });
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = make_request(QueryStateRequest {
-                query_filter: None,
-                min_state_version: None,
-            });
+            let req = make_request(QueryStateRequest::new(None, None));
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Success as i32);
@@ -2884,18 +2947,33 @@ mod tests {
         #[tokio::test]
         async fn filters_items_by_substring_match() {
             let items = vec![
-                GroceryItem {
-                    item_key: "milk-whole".to_string(),
-                    ..Default::default()
-                },
-                GroceryItem {
-                    item_key: "milk-skim".to_string(),
-                    ..Default::default()
-                },
-                GroceryItem {
-                    item_key: "eggs".to_string(),
-                    ..Default::default()
-                },
+                GroceryItem::new(
+                    "milk-whole".to_string(),
+                    "1".to_string(),
+                    "unit".to_string(),
+                    "Dairy".to_string(),
+                    "client".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                ),
+                GroceryItem::new(
+                    "milk-skim".to_string(),
+                    "1".to_string(),
+                    "unit".to_string(),
+                    "Dairy".to_string(),
+                    "client".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                ),
+                GroceryItem::new(
+                    "eggs".to_string(),
+                    "12".to_string(),
+                    "units".to_string(),
+                    "Dairy".to_string(),
+                    "client".to_string(),
+                    prost_types::Timestamp::default(),
+                    LogIndex::new(0),
+                ),
             ];
 
             let raft = Arc::new(MockRaftHandle {
@@ -2908,10 +2986,7 @@ mod tests {
             });
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = make_request(QueryStateRequest {
-                query_filter: Some("milk".to_string()),
-                min_state_version: None,
-            });
+            let req = make_request(QueryStateRequest::new(Some("milk".to_string()), None));
 
             let response = dispatcher.query_state(req).await.unwrap().into_inner();
             assert_eq!(response.status, QueryStatus::Success as i32);
@@ -2959,10 +3034,7 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = make_request(QueryStateRequest {
-                query_filter: None,
-                min_state_version: Some(10),
-            });
+            let req = make_request(QueryStateRequest::new(None, Some(LogIndex::new(10))));
 
             let result = dispatcher.query_state(req).await;
             assert!(result.is_err());
@@ -2981,10 +3053,7 @@ mod tests {
             let inventory = successful_inventory();
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
 
-            let req = make_request(QueryStateRequest {
-                query_filter: None,
-                min_state_version: Some(10), // Exceeds horizon (5)
-            });
+            let req = make_request(QueryStateRequest::new(None, Some(LogIndex::new(10)))); // Exceeds horizon (5)
 
             let result = dispatcher.query_state(req).await;
             assert!(result.is_err());

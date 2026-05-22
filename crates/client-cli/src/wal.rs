@@ -109,13 +109,13 @@ mod tests {
         ProposeMutationRequest::new(
             &ClientId::generate(),
             SequenceId::new(seq),
-            MutationIntent {
-                item_key: "milk".to_string(),
-                quantity: Some("1".to_string()),
-                unit: None,
-                category: None,
-                operation: OperationType::Add as i32,
-            },
+            MutationIntent::new(
+                "milk".to_string(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            ),
         )
     }
 

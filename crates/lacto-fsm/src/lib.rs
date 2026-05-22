@@ -86,15 +86,15 @@ impl LactoStore {
 
     /// Factory to construct a GroceryItem from a committed mutation record.
     fn item_from_mutation(index: LogIndex, mutation: CommittedMutation) -> GroceryItem {
-        GroceryItem {
-            item_key: mutation.resolved_item_key,
-            quantity: mutation.updated_base_quantity,
-            unit: mutation.base_unit,
-            category: mutation.updated_category,
-            last_modifier_id: mutation.client_id,
-            last_activity: mutation.event_time,
-            state_version: index.as_u64(),
-        }
+        GroceryItem::new(
+            mutation.resolved_item_key,
+            mutation.updated_base_quantity,
+            mutation.base_unit,
+            mutation.updated_category,
+            mutation.client_id,
+            mutation.event_time.unwrap_or_default(),
+            index,
+        )
     }
 
     /// Internal helper to retrieve and decode a SessionRecord from sled.

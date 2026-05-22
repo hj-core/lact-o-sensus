@@ -50,13 +50,13 @@ impl MutationArgs {
 
     /// Converts the arguments into a protocol intent.
     fn into_intent(self, operation: OperationType) -> MutationIntent {
-        MutationIntent {
-            item_key: self.item_key,
-            quantity: Some(self.quantity),
-            unit: self.unit,
-            category: self.category,
-            operation: operation as i32,
-        }
+        MutationIntent::new(
+            self.item_key,
+            Some(self.quantity),
+            self.unit,
+            self.category,
+            operation,
+        )
     }
 }
 
@@ -248,13 +248,7 @@ async fn execute_command(client: &LactoClient, cmd: Command) -> Result<String> {
             format_mutation_response(res, tid)
         }
         Command::Delete { item_key } => {
-            let intent = MutationIntent {
-                item_key,
-                quantity: None,
-                unit: None,
-                category: None,
-                operation: OperationType::Delete as i32,
-            };
+            let intent = MutationIntent::new(item_key, None, None, None, OperationType::Delete);
             let (res, tid) = client.propose_mutation(intent).await?;
             format_mutation_response(res, tid)
         }
@@ -449,13 +443,7 @@ mod tests {
 
             // Logic: The REPL handler constructs the intent for Delete
             if let Command::Delete { item_key } = cmd {
-                let intent = common::proto::v1::app::MutationIntent {
-                    item_key,
-                    quantity: None,
-                    unit: None,
-                    category: None,
-                    operation: OperationType::Delete as i32,
-                };
+                let intent = MutationIntent::new(item_key, None, None, None, OperationType::Delete);
                 assert_eq!(intent.quantity, None);
             } else {
                 panic!("Expected Delete command");
