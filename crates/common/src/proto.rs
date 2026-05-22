@@ -81,6 +81,71 @@ pub mod v1 {
         use crate::types::LogIndex;
         use crate::types::SequenceId;
 
+        impl GroceryItem {
+            pub fn new(
+                item_key: String,
+                quantity: String,
+                unit: String,
+                category: String,
+                last_modifier_id: String,
+                last_activity: Timestamp,
+                state_version: LogIndex,
+            ) -> Self {
+                Self {
+                    item_key,
+                    quantity,
+                    unit,
+                    category,
+                    last_modifier_id,
+                    last_activity: Some(last_activity),
+                    state_version: state_version.as_u64(),
+                }
+            }
+        }
+
+        impl MutationIntent {
+            pub fn new(
+                item_key: String,
+                quantity: Option<String>,
+                unit: Option<String>,
+                category: Option<String>,
+                operation: OperationType,
+            ) -> Self {
+                Self {
+                    item_key,
+                    quantity,
+                    unit,
+                    category,
+                    operation: operation as i32,
+                }
+            }
+        }
+
+        impl QueryStateRequest {
+            pub fn new(query_filter: Option<String>, min_state_version: Option<LogIndex>) -> Self {
+                Self {
+                    query_filter,
+                    min_state_version: min_state_version.map(|v| v.as_u64()),
+                }
+            }
+        }
+
+        impl EvaluateProposalRequest {
+            pub fn new(
+                client_id: &ClientId,
+                intent: MutationIntent,
+                current_inventory: Vec<GroceryItem>,
+                request_context: String,
+            ) -> Self {
+                Self {
+                    client_id: client_id.as_str().to_string(),
+                    intent: Some(intent),
+                    current_inventory,
+                    request_context,
+                }
+            }
+        }
+
         impl ProposeMutationRequest {
             pub fn new(
                 client_id: &ClientId,
@@ -299,6 +364,86 @@ mod tests {
                 assert_eq!(resp.category_assignment, "Dairy");
                 assert_eq!(resp.resolved_item_key, "milk-slug");
                 assert_eq!(resp.conversion_multiplier_to_base, "1000.0");
+            }
+        }
+    }
+
+    mod query_state_request {
+        use super::*;
+        use crate::types::LogIndex;
+
+        mod instantiation {
+            use super::*;
+
+            #[test]
+            fn maps_optional_log_index_correctly_when_present() {
+                let index = LogIndex::new(42);
+                let req = QueryStateRequest::new(None, Some(index));
+                assert_eq!(req.min_state_version, Some(42));
+            }
+
+            #[test]
+            fn handles_none_for_all_optional_fields() {
+                let req = QueryStateRequest::new(None, None);
+                assert!(req.query_filter.is_none());
+                assert!(req.min_state_version.is_none());
+            }
+        }
+    }
+
+    mod mutation_intent {
+        use super::*;
+
+        mod instantiation {
+            use super::*;
+
+            #[test]
+            fn handles_optional_fields_correctly() {
+                let intent = MutationIntent::new(
+                    "apple".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                );
+
+                assert_eq!(intent.item_key, "apple");
+                assert_eq!(intent.quantity, Some("5".to_string()));
+                assert!(intent.unit.is_none());
+                assert!(intent.category.is_none());
+                assert_eq!(intent.operation, OperationType::Add as i32);
+            }
+        }
+    }
+
+    mod grocery_item {
+        use prost_types::Timestamp;
+
+        use super::*;
+        use crate::types::LogIndex;
+
+        mod instantiation {
+            use super::*;
+
+            #[test]
+            fn correctly_maps_log_index_to_u64_when_created() {
+                let index = LogIndex::new(100);
+                let ts = Timestamp {
+                    seconds: 123,
+                    nanos: 456,
+                };
+                let item = GroceryItem::new(
+                    "key".into(),
+                    "1".into(),
+                    "unit".into(),
+                    "cat".into(),
+                    "mod".into(),
+                    ts,
+                    index,
+                );
+
+                assert_eq!(item.state_version, 100);
+                assert_eq!(item.last_activity.unwrap().seconds, 123);
             }
         }
     }
