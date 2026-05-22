@@ -255,7 +255,7 @@ mod tests {
     fn test_identity(id: u64) -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(id),
+            NodeId::try_new(id).unwrap(),
         ))
     }
 

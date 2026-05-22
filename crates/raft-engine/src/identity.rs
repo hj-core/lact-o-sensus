@@ -82,7 +82,7 @@ mod tests {
     fn mock_config(cluster_id: &str, node_id: u64) -> Config {
         Config {
             cluster_id: ClusterId::try_new(cluster_id).unwrap(),
-            node_id: NodeId::new(node_id),
+            node_id: NodeId::try_new(node_id).unwrap(),
             listen_addr: "127.0.0.1:50051".parse().unwrap(),
             data_dir: "".into(),
             peers: HashMap::new(),
@@ -105,7 +105,7 @@ mod tests {
                 id.cluster_id(),
                 &ClusterId::try_new("test-cluster").unwrap()
             );
-            assert_eq!(id.node_id(), NodeId::new(1));
+            assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
             Ok(())
         }
 
@@ -123,7 +123,7 @@ mod tests {
                 id.cluster_id(),
                 &ClusterId::try_new("test-cluster").unwrap()
             );
-            assert_eq!(id.node_id(), NodeId::new(1));
+            assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
             Ok(())
         }
 

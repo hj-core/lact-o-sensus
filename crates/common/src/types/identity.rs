@@ -23,14 +23,6 @@ impl NodeId {
         Ok(Self(id))
     }
 
-    /// Convenience constructor for tests or known-safe values.
-    ///
-    /// # Panics
-    /// Panics if the id is 0.
-    pub fn new(id: u64) -> Self {
-        Self::try_new(id).expect("NodeId cannot be 0")
-    }
-
     pub fn as_u64(&self) -> u64 {
         self.0
     }

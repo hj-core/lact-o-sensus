@@ -439,11 +439,11 @@ impl LactoClient {
         // Example: "127.0.0.1:50051" -> node_1 is configured for 50051.
         // For tests, we use a simple mapping or just 0 if unknown.
         if addr.contains("50051") {
-            Some(NodeId::new(1))
+            Some(NodeId::try_new(1).unwrap())
         } else if addr.contains("50052") {
-            Some(NodeId::new(2))
+            Some(NodeId::try_new(2).unwrap())
         } else if addr.contains("50053") {
-            Some(NodeId::new(3))
+            Some(NodeId::try_new(3).unwrap())
         } else {
             None
         }

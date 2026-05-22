@@ -902,7 +902,7 @@ mod tests {
         let config = mock_config(50, 100);
         let id = Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(1),
+            NodeId::try_new(1).unwrap(),
         ));
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
@@ -924,10 +924,15 @@ mod tests {
         async fn should_demote_on_higher_term() {
             let (_, state, pm) = setup().await;
             let res = Ok(RequestVoteResponse::new(Term::new(2), false));
-            let action =
-                process_vote_response(&state, Term::new(1), &pm.peer_ids(), NodeId::new(2), res)
-                    .await
-                    .unwrap();
+            let action = process_vote_response(
+                &state,
+                Term::new(1),
+                &pm.peer_ids(),
+                NodeId::try_new(2).unwrap(),
+                res,
+            )
+            .await
+            .unwrap();
             assert_eq!(action, VoteAction::Demoted);
             assert_eq!(state.read().await.try_current_term().unwrap(), Term::new(2));
         }
@@ -943,8 +948,8 @@ mod tests {
             let action = process_vote_response(
                 &state,
                 Term::new(1),
-                &[NodeId::new(2), NodeId::new(3)],
-                NodeId::new(2),
+                &[NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()],
+                NodeId::try_new(2).unwrap(),
                 res,
             )
             .await
@@ -959,7 +964,7 @@ mod tests {
         #[tokio::test]
         async fn should_advance_indices_on_success() {
             let (_, state, _) = setup().await;
-            let peer_id = NodeId::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
             {
                 let mut guard = state.write().await;
                 guard.into_candidate();
@@ -991,7 +996,7 @@ mod tests {
         #[tokio::test]
         async fn should_optimize_backoff_on_log_mismatch() {
             let (_, state, _) = setup().await;
-            let peer_id = NodeId::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
             {
                 let mut guard = state.write().await;
                 guard.into_candidate();
@@ -1027,8 +1032,8 @@ mod tests {
         #[tokio::test]
         async fn should_advance_commit_index_on_quorum() {
             let (_, state, _) = setup().await;
-            let p2 = NodeId::new(2);
-            let p3 = NodeId::new(3);
+            let p2 = NodeId::try_new(2).unwrap();
+            let p3 = NodeId::try_new(3).unwrap();
             {
                 let mut guard = state.write().await;
                 guard.into_candidate();
@@ -1072,7 +1077,9 @@ mod tests {
             let mut response = Response::new(());
             TraceInterceptor::inject_response(&mut response, trace_id)
                 .expect("Should inject trace ID");
-            assert!(verify_trace_integrity(&response, trace_id, NodeId::new(2)).is_ok());
+            assert!(
+                verify_trace_integrity(&response, trace_id, NodeId::try_new(2).unwrap()).is_ok()
+            );
         }
 
         #[test]
@@ -1081,7 +1088,7 @@ mod tests {
             let got = TraceId::generate();
             let mut response = Response::new(());
             TraceInterceptor::inject_response(&mut response, got).expect("Should inject trace ID");
-            let res = verify_trace_integrity(&response, expected, NodeId::new(2));
+            let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
             assert!(res.is_err());
             assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
         }
@@ -1090,7 +1097,7 @@ mod tests {
         fn should_fail_missing_trace_id() {
             let expected = TraceId::generate();
             let response = Response::new(());
-            let res = verify_trace_integrity(&response, expected, NodeId::new(2));
+            let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
             assert!(res.is_err());
             assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
         }

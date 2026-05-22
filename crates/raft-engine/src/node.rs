@@ -842,7 +842,7 @@ mod tests {
     fn test_identity(id: u64) -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(id),
+            NodeId::try_new(id).unwrap(),
         ))
     }
 
@@ -917,7 +917,7 @@ mod tests {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = MemoryStorage::new();
                     log_store
-                        .save_hard_state(Term::new(1), Some(NodeId::new(1)))
+                        .save_hard_state(Term::new(1), Some(NodeId::try_new(1).unwrap()))
                         .unwrap();
                     let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
@@ -941,7 +941,7 @@ mod tests {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = MemoryStorage::new();
                     log_store
-                        .save_hard_state(Term::new(1), Some(NodeId::new(3)))
+                        .save_hard_state(Term::new(1), Some(NodeId::try_new(3).unwrap()))
                         .unwrap();
                     let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
@@ -955,7 +955,10 @@ mod tests {
                     let demoted = node
                         .try_into_follower(Term::new(1), None, Tick::new(0), TickDuration::new(100))
                         .unwrap();
-                    assert_eq!(demoted.voted_for().unwrap(), Some(NodeId::new(3)));
+                    assert_eq!(
+                        demoted.voted_for().unwrap(),
+                        Some(NodeId::try_new(3).unwrap())
+                    );
                 }
             }
         }
@@ -1433,7 +1436,7 @@ mod tests {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     log_store
-                        .save_hard_state(STARTING_TERM, Some(NodeId::new(2)))
+                        .save_hard_state(STARTING_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
                     let node = setup_node_as_follower(fsm, log_store);
                     check_persists_new_term_and_resets_voted_for(node).await;
@@ -1446,12 +1449,12 @@ mod tests {
                     // Start at BOOTSTRAP_TERM so setup_node_as_candidate increments to
                     // STARTING_TERM.
                     log_store
-                        .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::new(2)))
+                        .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
                     let mut node = setup_node_as_candidate(fsm, log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.persist_vote(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
                     check_persists_new_term_and_resets_voted_for(node).await;
                 }
 
@@ -1461,12 +1464,12 @@ mod tests {
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     // Start at BOOTSTRAP_TERM so setup_node_as_leader increments to STARTING_TERM.
                     log_store
-                        .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::new(2)))
+                        .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
                     let mut node = setup_node_as_leader(fsm, log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.persist_vote(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
                     check_persists_new_term_and_resets_voted_for(node).await;
                 }
             }
@@ -1482,7 +1485,7 @@ mod tests {
                 ) {
                     node.advance_term(SAME_TERM).unwrap();
                     assert_eq!(node.current_term().unwrap(), STARTING_TERM);
-                    assert_eq!(node.voted_for().unwrap(), Some(NodeId::new(2)));
+                    assert_eq!(node.voted_for().unwrap(), Some(NodeId::try_new(2).unwrap()));
                 }
 
                 #[tokio::test]
@@ -1490,7 +1493,7 @@ mod tests {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     log_store
-                        .save_hard_state(STARTING_TERM, Some(NodeId::new(2)))
+                        .save_hard_state(STARTING_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
                     let node = setup_node_as_follower(fsm, log_store);
                     check_preserves_current_term_and_voting_state(node).await;
@@ -1505,7 +1508,7 @@ mod tests {
                     let mut node = setup_node_as_candidate(fsm, log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.persist_vote(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
                     check_preserves_current_term_and_voting_state(node).await;
                 }
 
@@ -1518,7 +1521,7 @@ mod tests {
                     let mut node = setup_node_as_leader(fsm, log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
-                    node.persist_vote(NodeId::new(2)).unwrap();
+                    node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
                     check_preserves_current_term_and_voting_state(node).await;
                 }
             }
@@ -1694,7 +1697,7 @@ mod tests {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
                 let mut node = setup_node_as_follower(fsm, log_store.clone());
-                let candidate_id = NodeId::new(2);
+                let candidate_id = NodeId::try_new(2).unwrap();
 
                 node.persist_vote(candidate_id).unwrap();
 
@@ -1723,7 +1726,7 @@ mod tests {
                         let db = sled::open(dir.path()).unwrap();
                         let log_store = SledStorage::new(db).unwrap();
                         log_store
-                            .save_hard_state(Term::new(7), Some(NodeId::new(2)))
+                            .save_hard_state(Term::new(7), Some(NodeId::try_new(2).unwrap()))
                             .unwrap();
                     }
 
@@ -1740,7 +1743,7 @@ mod tests {
                         .unwrap();
 
                         assert_eq!(node.current_term().unwrap(), Term::new(7));
-                        assert_eq!(node.voted_for().unwrap(), Some(NodeId::new(2)));
+                        assert_eq!(node.voted_for().unwrap(), Some(NodeId::try_new(2).unwrap()));
                     }
                 }
             }
@@ -2076,11 +2079,11 @@ mod tests {
                     )
                     .unwrap();
                     node.advance_term(Term::new(1)).unwrap();
-                    node.persist_vote(NodeId::new(3)).unwrap();
+                    node.persist_vote(NodeId::try_new(3).unwrap()).unwrap();
 
                     let granted = node
                         .attempt_grant_vote(
-                            NodeId::new(2),
+                            NodeId::try_new(2).unwrap(),
                             Term::new(1),
                             LogIndex::ZERO,
                             Term::ZERO,
@@ -2090,7 +2093,7 @@ mod tests {
 
                     let granted = node
                         .attempt_grant_vote(
-                            NodeId::new(3),
+                            NodeId::try_new(3).unwrap(),
                             Term::new(1),
                             LogIndex::ZERO,
                             Term::ZERO,
@@ -2195,7 +2198,10 @@ mod tests {
                         .unwrap();
 
                     assert_eq!(candidate.current_term().unwrap(), Term::new(1));
-                    assert_eq!(candidate.voted_for().unwrap(), Some(NodeId::new(1)));
+                    assert_eq!(
+                        candidate.voted_for().unwrap(),
+                        Some(NodeId::try_new(1).unwrap())
+                    );
                     assert_eq!(candidate.state().vote_count(), 1);
                 }
             }
@@ -2249,7 +2255,7 @@ mod tests {
                     .unwrap();
 
                 let node = setup_node_as_candidate(fsm, log_store);
-                let peer_ids = vec![NodeId::new(2), NodeId::new(3)];
+                let peer_ids = vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()];
 
                 let leader = node
                     .try_into_leader(peer_ids.clone(), Tick::new(0))
@@ -2278,8 +2284,8 @@ mod tests {
                 let log_store = Arc::new(MemoryStorage::new());
                 let mut node = setup_node_as_candidate(fsm, log_store);
 
-                node.state_mut().add_vote(NodeId::new(2));
-                node.state_mut().add_vote(NodeId::new(2)); // Duplicate
+                node.state_mut().add_vote(NodeId::try_new(2).unwrap());
+                node.state_mut().add_vote(NodeId::try_new(2).unwrap()); // Duplicate
 
                 assert_eq!(node.state().vote_count(), 2); // Self (from setup) + Node 2
             }

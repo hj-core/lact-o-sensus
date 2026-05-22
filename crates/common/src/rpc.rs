@@ -251,7 +251,7 @@ mod tests {
     fn mock_identity(cluster: &str, node_id: u64) -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new(cluster).unwrap(),
-            NodeId::new(node_id),
+            NodeId::try_new(node_id).unwrap(),
         ))
     }
 
@@ -342,7 +342,7 @@ mod tests {
             fn inserts_identity_headers_correctly() {
                 let mut request = Request::new(());
                 let cluster_id = ClusterId::try_new("test-cluster").unwrap();
-                let node_id = NodeId::new(42);
+                let node_id = NodeId::try_new(42).unwrap();
 
                 IdentityInterceptor::inject_request(&mut request, &cluster_id, node_id).unwrap();
 

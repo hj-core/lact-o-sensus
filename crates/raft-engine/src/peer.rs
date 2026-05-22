@@ -136,17 +136,20 @@ mod tests {
         fn mock_identity() -> Arc<NodeIdentity> {
             Arc::new(NodeIdentity::new(
                 ClusterId::try_new("test-cluster").unwrap(),
-                NodeId::new(1),
+                NodeId::try_new(1).unwrap(),
             ))
         }
 
         #[tokio::test]
         async fn returns_intercepted_client_when_node_exists() {
             let mut peers = HashMap::new();
-            peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
+            peers.insert(
+                NodeId::try_new(2).unwrap(),
+                "http://127.0.0.1:50052".to_string(),
+            );
 
             let manager = PeerManager::new(mock_identity(), &peers).unwrap();
-            let result = manager.get_client(NodeId::new(2));
+            let result = manager.get_client(NodeId::try_new(2).unwrap());
 
             assert!(result.is_ok());
         }
@@ -154,7 +157,7 @@ mod tests {
         #[test]
         fn returns_error_when_node_id_is_missing() {
             let manager = PeerManager::new(mock_identity(), &HashMap::new()).unwrap();
-            let result = manager.get_client(NodeId::new(99));
+            let result = manager.get_client(NodeId::try_new(99).unwrap());
 
             assert!(matches!(result, Err(PeerError::NodeNotFound(_))));
         }
@@ -166,17 +169,20 @@ mod tests {
         fn mock_identity() -> Arc<NodeIdentity> {
             Arc::new(NodeIdentity::new(
                 ClusterId::try_new("test-cluster").unwrap(),
-                NodeId::new(1),
+                NodeId::try_new(1).unwrap(),
             ))
         }
 
         #[tokio::test]
         async fn returns_network_address_when_node_exists() {
             let mut peers = HashMap::new();
-            peers.insert(NodeId::new(2), "http://127.0.0.1:50052".to_string());
+            peers.insert(
+                NodeId::try_new(2).unwrap(),
+                "http://127.0.0.1:50052".to_string(),
+            );
 
             let manager = PeerManager::new(mock_identity(), &peers).unwrap();
-            let result = manager.get_address(NodeId::new(2));
+            let result = manager.get_address(NodeId::try_new(2).unwrap());
 
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), "http://127.0.0.1:50052");

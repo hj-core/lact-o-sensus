@@ -649,7 +649,7 @@ mod tests {
     fn test_identity(id: u64) -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(id),
+            NodeId::try_new(id).unwrap(),
         ))
     }
 
@@ -679,7 +679,7 @@ mod tests {
                 // AppendEntries from leader of same term
                 let result = state
                     .handle_append_entries(
-                        NodeId::new(2),
+                        NodeId::try_new(2).unwrap(),
                         Term::new(1),
                         LogIndex::ZERO,
                         Term::ZERO,
@@ -701,7 +701,7 @@ mod tests {
 
                 let result = state
                     .handle_append_entries(
-                        NodeId::new(2),
+                        NodeId::try_new(2).unwrap(),
                         Term::new(10), // Higher term
                         LogIndex::ZERO,
                         Term::ZERO,
@@ -722,7 +722,7 @@ mod tests {
 
                 let result = state
                     .handle_append_entries(
-                        NodeId::new(2),
+                        NodeId::try_new(2).unwrap(),
                         Term::new(1), // Stale term
                         LogIndex::ZERO,
                         Term::ZERO,
@@ -748,7 +748,7 @@ mod tests {
 
                 state
                     .handle_append_entries(
-                        NodeId::new(2),
+                        NodeId::try_new(2).unwrap(),
                         Term::new(1), // Same term as local leader
                         LogIndex::ZERO,
                         Term::ZERO,
@@ -785,7 +785,7 @@ mod tests {
 
                 // Request from higher term, but with stale candidate log
                 let result = state.handle_request_vote(
-                    NodeId::new(2),
+                    NodeId::try_new(2).unwrap(),
                     Term::new(5),
                     LogIndex::ZERO, // Stale index
                     Term::ZERO,
@@ -806,14 +806,14 @@ mod tests {
                 state.into_follower(Term::new(1), None);
 
                 let result = state.handle_request_vote(
-                    NodeId::new(2),
+                    NodeId::try_new(2).unwrap(),
                     Term::new(1),
                     LogIndex::ZERO,
                     Term::ZERO,
                 );
 
                 assert!(result.vote_granted);
-                assert_eq!(state.voted_for(), Some(NodeId::new(2)));
+                assert_eq!(state.voted_for(), Some(NodeId::try_new(2).unwrap()));
             }
         }
     }

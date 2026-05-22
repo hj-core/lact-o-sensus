@@ -123,11 +123,14 @@ impl SledStorage {
                     "Corrupted HardState: missing vote data",
                 ));
             }
-            Some(NodeId::new(u64::from_be_bytes(
-                data[9..17].try_into().map_err(|_| {
-                    LogStorageError::deserialization("NodeId byte conversion failed")
+            Some(
+                NodeId::try_new(u64::from_be_bytes(data[9..17].try_into().map_err(
+                    |_| LogStorageError::deserialization("NodeId byte conversion failed"),
+                )?))
+                .map_err(|e| {
+                    LogStorageError::deserialization(format!("Invalid NodeId in storage: {}", e))
                 })?,
-            )))
+            )
         } else {
             None
         };
@@ -466,7 +469,7 @@ mod tests {
         fn persists_hard_state() {
             let storage = setup_storage();
             let term = Term::new(5);
-            let vote = Some(NodeId::new(1));
+            let vote = Some(NodeId::try_new(1).unwrap());
 
             storage.save_hard_state(term, vote).unwrap();
 
@@ -554,7 +557,7 @@ mod tests {
                 let db = sled::open(db_path).unwrap();
                 let storage = SledStorage::new(db).unwrap();
                 storage
-                    .save_hard_state(Term::new(10), Some(NodeId::new(42)))
+                    .save_hard_state(Term::new(10), Some(NodeId::try_new(42).unwrap()))
                     .unwrap();
                 storage
                     .append_entries(vec![
@@ -571,7 +574,10 @@ mod tests {
                 let storage = SledStorage::new(db).unwrap();
 
                 assert_eq!(storage.current_term().unwrap(), Term::new(10));
-                assert_eq!(storage.voted_for().unwrap(), Some(NodeId::new(42)));
+                assert_eq!(
+                    storage.voted_for().unwrap(),
+                    Some(NodeId::try_new(42).unwrap())
+                );
                 assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
                 assert_eq!(storage.last_log_term().unwrap(), Term::new(10));
                 assert_eq!(
@@ -593,7 +599,7 @@ mod tests {
         fn persists_hard_state() {
             let storage = MemoryStorage::new();
             let term = Term::new(5);
-            let vote = Some(NodeId::new(1));
+            let vote = Some(NodeId::try_new(1).unwrap());
 
             storage.save_hard_state(term, vote).unwrap();
 

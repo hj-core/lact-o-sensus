@@ -184,7 +184,7 @@ mod tests {
     fn mock_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),
-            NodeId::new(1),
+            NodeId::try_new(1).unwrap(),
         ))
     }
 
