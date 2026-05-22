@@ -109,7 +109,7 @@ impl ClientState {
     /// This MUST be called before issuing a new mutation request to ensure
     /// Exactly-Once Semantics across client restarts.
     pub fn next_sequence_id(&mut self) -> Result<SequenceId> {
-        self.sequence_id = self.sequence_id + 1;
+        self.sequence_id = (self.sequence_id + 1)?;
         self.save()
             .context("Failed to persist sequence_id increment")?;
         Ok(self.sequence_id)

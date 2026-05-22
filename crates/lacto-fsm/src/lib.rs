@@ -222,7 +222,7 @@ impl StateMachine for LactoStore {
 
         // 1. Physical Log Monotonicity (Physical Fence)
         let current_applied = self.last_applied_index()?;
-        if index != current_applied + 1 {
+        if index != (current_applied + 1)? {
             return Err(FsmError::invariant(format!(
                 "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
                 current_applied, index
@@ -230,7 +230,7 @@ impl StateMachine for LactoStore {
         }
 
         let client_id = mutation.client_id.clone();
-        let seq = mutation.sequence_id;
+        let seq = SequenceId::new(mutation.sequence_id);
 
         let client_id_obj = ClientId::from_str(&client_id).map_err(|e| {
             FsmError::invariant(format!(
@@ -241,13 +241,15 @@ impl StateMachine for LactoStore {
 
         // Record truncated client_id in the span context
         tracing::Span::current().record("client_id", client_id_obj.truncated());
-        tracing::Span::current().record("seq", seq);
+        tracing::Span::current().record("seq", seq.as_u64());
 
         // 2. Client Sequence Validation (ADR 006)
-        let last_seen = self
-            .get_session_record(&client_id)?
-            .map(|r| r.last_sequence_id)
-            .unwrap_or(0);
+        let last_seen = SequenceId::new(
+            self.get_session_record(&client_id)?
+                .map(|r| r.last_sequence_id)
+                .unwrap_or(0),
+        );
+        let expected_seq = (last_seen + 1)?;
 
         if seq <= last_seen {
             warn!(
@@ -268,18 +270,16 @@ impl StateMachine for LactoStore {
             return Ok(());
         }
 
-        if seq > last_seen + 1 {
+        if seq > expected_seq {
             // ADR 006: Invariant Enforcement
             error!(
                 target: ClinicalTarget::ClinicalFsm.as_str(),
-                expected_seq = %(last_seen + 1),
+                expected_seq = %expected_seq,
                 "HALT MANDATE (ADR 006): Sequence gap detected. Causal history broken."
             );
             return Err(FsmError::invariant(format!(
                 "Sequence gap for client {}: expected {}, got {}",
-                client_id,
-                last_seen + 1,
-                seq
+                client_id, expected_seq, seq
             )));
         }
 
@@ -338,7 +338,7 @@ impl StateMachine for LactoStore {
                 // 2. Update Session Table (ADR 006)
                 let record = SessionRecord::new(
                     &client_id_obj,
-                    SequenceId::new(seq),
+                    seq,
                     status,
                     index,
                     moral_justification.clone(),

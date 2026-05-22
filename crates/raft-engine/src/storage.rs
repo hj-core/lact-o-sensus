@@ -427,7 +427,7 @@ impl LogStorage for MemoryStorage {
                 .last()
                 .map(|e| LogIndex::new(e.index))
                 .unwrap_or(LogIndex::ZERO);
-            let expected_idx = last_idx + 1;
+            let expected_idx = (last_idx + 1)?;
             if LogIndex::new(entry.index) != expected_idx {
                 return Err(LogStorageError::invariant(format!(
                     "Non-contiguous log append: expected index {}, got {}",

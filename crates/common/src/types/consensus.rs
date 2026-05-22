@@ -3,6 +3,8 @@ use std::fmt;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::types::errors::ArithmeticError;
+
 macro_rules! define_u64_newtype {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]
@@ -53,14 +55,15 @@ macro_rules! define_u64_newtype {
         }
 
         impl std::ops::Add<u64> for $name {
-            type Output = Self;
+            type Output = Result<Self, ArithmeticError>;
 
-            fn add(self, rhs: u64) -> Self {
-                Self(
-                    self.0
-                        .checked_add(rhs)
-                        .expect("Halt Mandate: Arithmetic overflow in domain type"),
-                )
+            fn add(self, rhs: u64) -> Self::Output {
+                self.0
+                    .checked_add(rhs)
+                    .map(Self)
+                    .ok_or(ArithmeticError::Overflow {
+                        type_name: stringify!($name),
+                    })
             }
         }
     };
@@ -76,14 +79,15 @@ define_u64_newtype!(
 // --- Domain-Specific Arithmetic Overrides ---
 
 impl std::ops::Sub<u64> for LogIndex {
-    type Output = Self;
+    type Output = Result<Self, ArithmeticError>;
 
-    fn sub(self, rhs: u64) -> Self {
-        Self(
-            self.0
-                .checked_sub(rhs)
-                .expect("Halt Mandate: LogIndex underflow (protocol violation)"),
-        )
+    fn sub(self, rhs: u64) -> Self::Output {
+        self.0
+            .checked_sub(rhs)
+            .map(Self)
+            .ok_or(ArithmeticError::Underflow {
+                type_name: "LogIndex",
+            })
     }
 }
 
@@ -127,29 +131,39 @@ mod tests {
             #[test]
             fn supports_addition_with_u64() {
                 let idx = LogIndex::new(10);
-                let result = idx + 5;
+                let result = (idx + 5).unwrap();
                 assert_eq!(result.as_u64(), 15);
             }
 
             #[test]
             fn supports_subtraction_with_u64() {
                 let idx = LogIndex::new(10);
-                let result = idx - 3;
+                let result = (idx - 3).unwrap();
                 assert_eq!(result.as_u64(), 7);
             }
 
             #[test]
-            #[should_panic(expected = "Halt Mandate: Arithmetic overflow")]
-            fn panics_on_overflow() {
+            fn returns_error_on_overflow() {
                 let idx = LogIndex::new(u64::MAX);
-                let _ = idx + 1;
+                let result = idx + 1;
+                assert_eq!(
+                    result,
+                    Err(ArithmeticError::Overflow {
+                        type_name: "LogIndex"
+                    })
+                );
             }
 
             #[test]
-            #[should_panic(expected = "Halt Mandate: LogIndex underflow")]
-            fn panics_on_underflow() {
+            fn returns_error_on_underflow() {
                 let idx = LogIndex::new(0);
-                let _ = idx - 1;
+                let result = idx - 1;
+                assert_eq!(
+                    result,
+                    Err(ArithmeticError::Underflow {
+                        type_name: "LogIndex"
+                    })
+                );
             }
         }
     }
@@ -190,15 +204,15 @@ mod tests {
             #[test]
             fn supports_addition_with_u64() {
                 let term = Term::new(10);
-                let result = term + 1;
+                let result = (term + 1).unwrap();
                 assert_eq!(result.as_u64(), 11);
             }
 
             #[test]
-            #[should_panic(expected = "Halt Mandate: Arithmetic overflow")]
-            fn panics_on_overflow() {
+            fn returns_error_on_overflow() {
                 let term = Term::new(u64::MAX);
-                let _ = term + 1;
+                let result = term + 1;
+                assert_eq!(result, Err(ArithmeticError::Overflow { type_name: "Term" }));
             }
         }
     }
@@ -239,15 +253,20 @@ mod tests {
             #[test]
             fn supports_addition_with_u64() {
                 let seq = SequenceId::new(10);
-                let result = seq + 1;
+                let result = (seq + 1).unwrap();
                 assert_eq!(result.as_u64(), 11);
             }
 
             #[test]
-            #[should_panic(expected = "Halt Mandate: Arithmetic overflow")]
-            fn panics_on_overflow() {
+            fn returns_error_on_overflow() {
                 let seq = SequenceId::new(u64::MAX);
-                let _ = seq + 1;
+                let result = seq + 1;
+                assert_eq!(
+                    result,
+                    Err(ArithmeticError::Overflow {
+                        type_name: "SequenceId"
+                    })
+                );
             }
         }
     }

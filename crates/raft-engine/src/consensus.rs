@@ -10,6 +10,7 @@ use common::rpc::TraceInterceptor;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
+use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use futures::StreamExt;
@@ -221,14 +222,23 @@ async fn initiate_transition_to_candidate(
         }
         let t = guard.current_term();
         guard.into_candidate();
-        t + 1
+
+        match t + 1 {
+            Ok(new_term) => new_term,
+            Err(e) => {
+                // Rule 4.1: Transition logical state to Poisoned immediately before any
+                // invariant-violation panic!.
+                guard.poison();
+                panic!("Secure Clinical: Terminal Invariant Violation: {}", e);
+            }
+        }
     };
 
     let span = info_span!(
         target: ClinicalTarget::RaftFoundation.as_str(),
         "election_campaign",
         trace_id = %trace_id,
-        term = %term
+        %term
     );
 
     let state_clone = state.clone();
@@ -529,8 +539,8 @@ async fn process_append_entries_response(
     if let Some(node) = guard.as_leader_mut() {
         if node.current_term().unwrap_or(Term::ZERO) == term {
             if resp.success {
-                let new_match = sent_prev_index + sent_entries_len;
-                let new_next = new_match + 1;
+                let new_match = (sent_prev_index + sent_entries_len)?;
+                let new_next = (new_match + 1)?;
 
                 let current_match = *node
                     .state()
@@ -554,9 +564,9 @@ async fn process_append_entries_response(
 
                 let last_log_index = LogIndex::new(resp.last_log_index);
                 let new_next = if last_log_index > LogIndex::ZERO {
-                    std::cmp::min(current_next, last_log_index + 1)
+                    std::cmp::min(current_next, (last_log_index + 1)?)
                 } else {
-                    (current_next - 1).max(LogIndex::new(1))
+                    (current_next - 1).map(|idx| idx.max(LogIndex::new(1)))?
                 };
 
                 node.state_mut().next_index_mut().insert(peer_id, new_next);
@@ -672,13 +682,27 @@ fn broadcast_append_entries(
                 let request = {
                     let mut guard = state.write().await;
                     match guard.state() {
-                        RoleState::Leader(_) => build_append_entries_request(
-                            &mut guard,
-                            peer_id,
-                            term,
-                            node_id,
-                            last_committed,
-                        ),
+                        RoleState::Leader(_) => {
+                            match build_append_entries_request(
+                                &mut guard,
+                                peer_id,
+                                term,
+                                node_id,
+                                last_committed,
+                            ) {
+                                Ok(req) => req,
+                                Err(e) => {
+                                    // If arithmetic fails here, it's a protocol violation.
+                                    // We must poison and halt according to Rule 4.1.
+                                    guard.poison();
+                                    panic!(
+                                        "Secure Clinical: Terminal Invariant Violation during \
+                                         replication: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                         _ => return (peer_id, Ok(None)),
                     }
                 };
@@ -755,7 +779,7 @@ fn build_append_entries_request(
     term: Term,
     node_id: NodeId,
     last_committed: LogIndex,
-) -> AppendEntriesRequest {
+) -> Result<AppendEntriesRequest, NodeError> {
     let next_idx = if let RoleState::Leader(n) = node.state() {
         *n.state()
             .next_index()
@@ -766,19 +790,19 @@ fn build_append_entries_request(
     };
     let last_log_idx = node.last_log_index();
 
-    let prev_log_index = next_idx - 1;
+    let prev_log_index = (next_idx - 1)?;
     let prev_log_term = node.get_term_at(prev_log_index);
 
     let entries = node.read_entries(next_idx, last_log_idx);
 
-    AppendEntriesRequest::new(
+    Ok(AppendEntriesRequest::new(
         term,
         node_id,
         prev_log_index,
         prev_log_term,
         entries,
         last_committed,
-    )
+    ))
 }
 
 /// Computes the consensus quorum and advances the Leader's commit index.

@@ -97,16 +97,18 @@ impl RecoveryManager {
         last_applied: LogIndex,
         last_committed: LogIndex,
     ) -> Result<(), NodeError> {
+        let start_index = (last_applied + 1)?;
+
         info!(
             target: ClinicalTarget::ClinicalRecovery.as_str(),
-            start_index = %(last_applied + 1),
+            start_index = %start_index,
             end_index = %last_committed,
             "Recovery: REPLAY START"
         );
 
         let mut current = last_applied;
         while current < last_committed {
-            let apply_idx = current + 1;
+            let apply_idx = (current + 1)?;
             let entry = self.log_store.read_entry(apply_idx)?.ok_or_else(|| {
                 error!(
                     target: ClinicalTarget::ClinicalRecovery.as_str(),
@@ -177,7 +179,7 @@ mod tests {
                 return Err(FsmError::invariant("FSM simulated failure"));
             }
             let mut last = self.last_applied.lock().unwrap();
-            if index != *last + 1 {
+            if index != (*last + 1).unwrap() {
                 return Err(FsmError::invariant("Out of order apply"));
             }
             *last = index;

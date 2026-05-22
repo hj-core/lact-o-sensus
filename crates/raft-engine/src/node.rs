@@ -290,7 +290,7 @@ impl<S: NodeState> RaftNode<S> {
         }
 
         while self.last_applied < self.last_committed {
-            let apply_idx = self.last_applied + 1;
+            let apply_idx = (self.last_applied + 1)?;
             let entry = self.log_store.read_entry(apply_idx)?.ok_or_else(|| {
                 NodeError::Protocol(format!(
                     "Committed entry {} missing from log during apply",
@@ -476,7 +476,7 @@ impl RaftNode<Follower> {
             state: Candidate::new(election_start, timeout),
         };
 
-        let new_term = node.current_term()? + 1;
+        let new_term = (node.current_term()? + 1)?;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
@@ -543,7 +543,7 @@ impl RaftNode<Follower> {
         }
 
         let mut to_append = Vec::new();
-        let mut next_expected = self.last_log_index()? + 1;
+        let mut next_expected = (self.last_log_index()? + 1)?;
 
         for entry in entries {
             let entry_index = LogIndex::new(entry.index);
@@ -556,7 +556,7 @@ impl RaftNode<Follower> {
                     return Ok(false);
                 }
                 to_append.push(entry);
-                next_expected = next_expected + 1;
+                next_expected = (next_expected + 1)?;
             }
         }
 
@@ -616,7 +616,7 @@ impl RaftNode<Candidate> {
             state: Candidate::new(election_start, timeout),
         };
 
-        let new_term = node.current_term()? + 1;
+        let new_term = (node.current_term()? + 1)?;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
@@ -646,7 +646,7 @@ impl RaftNode<Candidate> {
             log_store,
             last_committed,
             last_applied,
-            state: Leader::new(peer_ids, last_log_index, last_heartbeat),
+            state: Leader::new(peer_ids, last_log_index, last_heartbeat)?,
         };
 
         info!(
@@ -671,7 +671,7 @@ impl RaftNode<Leader> {
             info_span!(target: ClinicalTarget::RaftReplication.as_str(), "proposal_ingestion");
         let _enter = span.enter();
 
-        let index = self.last_log_index()? + 1;
+        let index = (self.last_log_index()? + 1)?;
         let entry = LogEntry::new(index, self.current_term()?, command);
         self.log_store
             .append_entries(vec![entry])
@@ -757,20 +757,24 @@ impl Candidate {
 }
 
 impl Leader {
-    pub fn new(peer_ids: Vec<NodeId>, last_log_index: LogIndex, last_heartbeat: Tick) -> Self {
+    pub fn new(
+        peer_ids: Vec<NodeId>,
+        last_log_index: LogIndex,
+        last_heartbeat: Tick,
+    ) -> Result<Self, NodeError> {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
 
         for peer_id in peer_ids {
-            next_index.insert(peer_id, last_log_index + 1);
+            next_index.insert(peer_id, (last_log_index + 1)?);
             match_index.insert(peer_id, LogIndex::ZERO);
         }
 
-        Self {
+        Ok(Self {
             next_index,
             match_index,
             last_heartbeat,
-        }
+        })
     }
 
     pub fn last_heartbeat(&self) -> Tick {
@@ -1276,7 +1280,7 @@ mod tests {
                         log_store: log_store.clone(),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
                     };
                     check_returns_error_when_state_machine_apply_fails(node, log_store).await;
                 }
@@ -1351,7 +1355,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
                     };
                     check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
                 }
@@ -1407,7 +1411,7 @@ mod tests {
                         log_store: Arc::new(MemoryStorage::new()),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
                     };
                     check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
                 }
@@ -1682,7 +1686,7 @@ mod tests {
                         log_store: Arc::new(FailingStorage),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
+                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
                     };
                     check_propagates_persistence_error_when_storage_fails(node).await;
                 }
@@ -2225,7 +2229,10 @@ mod tests {
                     .try_into_restarted_candidate(Tick::new(0), TickDuration::new(150))
                     .unwrap();
 
-                assert_eq!(restarted.current_term().unwrap(), initial_term + 1);
+                assert_eq!(
+                    restarted.current_term().unwrap(),
+                    (initial_term + 1).unwrap()
+                );
                 assert_eq!(restarted.voted_for().unwrap(), Some(restarted.node_id()));
                 assert_eq!(restarted.state().vote_count(), 1);
             }
@@ -2382,7 +2389,7 @@ mod tests {
                     log_store,
                     last_committed: LogIndex::ZERO,
                     last_applied: LogIndex::ZERO,
-                    state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)),
+                    state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
                 };
 
                 let result = node.propose(vec![1]);
