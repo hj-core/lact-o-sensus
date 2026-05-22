@@ -9,8 +9,8 @@ pub mod v1 {
         impl LogEntry {
             pub fn new(index: LogIndex, term: Term, data: Vec<u8>) -> Self {
                 Self {
-                    index: index.value(),
-                    term: term.value(),
+                    index: index.as_u64(),
+                    term: term.as_u64(),
                     data,
                 }
             }
@@ -24,10 +24,10 @@ pub mod v1 {
                 last_log_term: Term,
             ) -> Self {
                 Self {
-                    term: term.value(),
+                    term: term.as_u64(),
                     candidate_id: candidate_id.to_string(),
-                    last_log_index: last_log_index.value(),
-                    last_log_term: last_log_term.value(),
+                    last_log_index: last_log_index.as_u64(),
+                    last_log_term: last_log_term.as_u64(),
                 }
             }
         }
@@ -35,7 +35,7 @@ pub mod v1 {
         impl RequestVoteResponse {
             pub fn new(term: Term, vote_granted: bool) -> Self {
                 Self {
-                    term: term.value(),
+                    term: term.as_u64(),
                     vote_granted,
                 }
             }
@@ -51,12 +51,12 @@ pub mod v1 {
                 leader_commit: LogIndex,
             ) -> Self {
                 Self {
-                    term: term.value(),
+                    term: term.as_u64(),
                     leader_id: leader_id.to_string(),
-                    prev_log_index: prev_log_index.value(),
-                    prev_log_term: prev_log_term.value(),
+                    prev_log_index: prev_log_index.as_u64(),
+                    prev_log_term: prev_log_term.as_u64(),
                     entries,
-                    leader_commit: leader_commit.value(),
+                    leader_commit: leader_commit.as_u64(),
                 }
             }
         }
@@ -64,9 +64,9 @@ pub mod v1 {
         impl AppendEntriesResponse {
             pub fn new(term: Term, success: bool, last_log_index: LogIndex) -> Self {
                 Self {
-                    term: term.value(),
+                    term: term.as_u64(),
                     success,
-                    last_log_index: last_log_index.value(),
+                    last_log_index: last_log_index.as_u64(),
                 }
             }
         }
@@ -89,7 +89,7 @@ pub mod v1 {
             ) -> Self {
                 Self {
                     client_id: client_id.as_str().to_string(),
-                    sequence_id: sequence_id.value(),
+                    sequence_id: sequence_id.as_u64(),
                     intent: Some(intent),
                 }
             }
@@ -105,7 +105,7 @@ pub mod v1 {
             ) -> Self {
                 Self {
                     items,
-                    current_state_version: current_state_version.value(),
+                    current_state_version: current_state_version.as_u64(),
                     status: status as i32,
                     leader_hint,
                     error_message,
@@ -122,7 +122,7 @@ pub mod v1 {
             ) -> Self {
                 Self {
                     status: status as i32,
-                    state_version: state_version.value(),
+                    state_version: state_version.as_u64(),
                     leader_hint,
                     error_message,
                 }
@@ -140,9 +140,9 @@ pub mod v1 {
             ) -> Self {
                 Self {
                     client_id: client_id.as_str().to_string(),
-                    last_sequence_id: last_sequence_id.value(),
+                    last_sequence_id: last_sequence_id.as_u64(),
                     status: status as i32,
-                    log_index: log_index.value(),
+                    log_index: log_index.as_u64(),
                     moral_justification,
                     last_activity_effective_time: Some(last_activity_effective_time),
                 }
@@ -195,7 +195,7 @@ pub mod v1 {
             ) -> Self {
                 Self {
                     client_id: client_id.as_str().to_string(),
-                    sequence_id: sequence_id.value(),
+                    sequence_id: sequence_id.as_u64(),
                     resolved_item_key,
                     suggested_display_name,
                     updated_base_quantity,

@@ -94,7 +94,7 @@ impl SledStorage {
     /// present)]
     fn serialize_hard_state(term: Term, vote: Option<NodeId>) -> Vec<u8> {
         let mut data = Vec::with_capacity(17);
-        data.extend_from_slice(&term.value().to_be_bytes());
+        data.extend_from_slice(&term.as_u64().to_be_bytes());
         match vote {
             Some(node_id) => {
                 data.push(1);
@@ -208,7 +208,7 @@ impl LogStorage for SledStorage {
     }
 
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
-        let key = index.value().to_be_bytes();
+        let key = index.as_u64().to_be_bytes();
         self.log
             .get(key)
             .map_err(|e| {
@@ -243,8 +243,8 @@ impl LogStorage for SledStorage {
             return Ok(Vec::new());
         }
 
-        let start_key = start.value().to_be_bytes();
-        let end_key = end.value().to_be_bytes();
+        let start_key = start.as_u64().to_be_bytes();
+        let end_key = end.as_u64().to_be_bytes();
 
         let mut entries = Vec::new();
         for res in self.log.range(start_key..=end_key) {
@@ -271,7 +271,7 @@ impl LogStorage for SledStorage {
 
     fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
         self.meta
-            .insert(Self::KEY_LAST_COMMITTED, &index.value().to_be_bytes())
+            .insert(Self::KEY_LAST_COMMITTED, &index.as_u64().to_be_bytes())
             .map_err(|e| {
                 LogStorageError::persistence(format!("Failed to persist last_committed: {}", e))
             })?;
@@ -304,7 +304,7 @@ impl LogStorage for SledStorage {
         }
 
         let mut batch = sled::Batch::default();
-        for i in index.value()..=last_idx.value() {
+        for i in index.as_u64()..=last_idx.as_u64() {
             batch.remove(&i.to_be_bytes());
         }
         self.log.apply_batch(batch).map_err(|e| {
@@ -378,7 +378,7 @@ impl LogStorage for MemoryStorage {
             return Ok(None);
         }
         let state = self.state.lock().unwrap();
-        Ok(state.log.get((index.value() - 1) as usize).cloned())
+        Ok(state.log.get((index.as_u64() - 1) as usize).cloned())
     }
 
     fn read_entries(
@@ -397,8 +397,8 @@ impl LogStorage for MemoryStorage {
         }
 
         let state = self.state.lock().unwrap();
-        let start_idx = (start.value() - 1) as usize;
-        let end_idx = (end.value() - 1) as usize;
+        let start_idx = (start.as_u64() - 1) as usize;
+        let end_idx = (end.as_u64() - 1) as usize;
         Ok(state
             .log
             .get(start_idx..=end_idx)
@@ -444,7 +444,7 @@ impl LogStorage for MemoryStorage {
         if index == LogIndex::ZERO {
             state.log.clear();
         } else {
-            state.log.truncate((index.value() - 1) as usize);
+            state.log.truncate((index.as_u64() - 1) as usize);
         }
         Ok(())
     }

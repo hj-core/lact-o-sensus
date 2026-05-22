@@ -28,7 +28,7 @@ impl IntentWal {
     ///
     /// This must be called BEFORE the RPC is dispatched to the cluster.
     pub fn append(&self, sequence_id: SequenceId, req: &ProposeMutationRequest) -> Result<()> {
-        let key = sequence_id.value().to_be_bytes();
+        let key = sequence_id.as_u64().to_be_bytes();
         let value = req.encode_to_vec();
 
         self.db
@@ -47,7 +47,7 @@ impl IntentWal {
     /// This should be called once the mutation has reached a terminal state
     /// (e.g., COMMITTED or VETOED).
     pub fn remove(&self, sequence_id: SequenceId) -> Result<()> {
-        let key = sequence_id.value().to_be_bytes();
+        let key = sequence_id.as_u64().to_be_bytes();
 
         self.db
             .remove(key)
@@ -73,7 +73,7 @@ impl IntentWal {
         }
 
         // Ensure monotonic recovery order.
-        recovered.sort_by_key(|(seq, _)| seq.value());
+        recovered.sort_by_key(|(seq, _)| seq.as_u64());
         Ok(recovered)
     }
 
@@ -186,9 +186,9 @@ mod tests {
 
             let recovered = wal.recover()?;
             assert_eq!(recovered.len(), 3);
-            assert_eq!(recovered[0].0.value(), 5);
-            assert_eq!(recovered[1].0.value(), 10);
-            assert_eq!(recovered[2].0.value(), 15);
+            assert_eq!(recovered[0].0.as_u64(), 5);
+            assert_eq!(recovered[1].0.as_u64(), 10);
+            assert_eq!(recovered[2].0.as_u64(), 15);
             Ok(())
         }
     }

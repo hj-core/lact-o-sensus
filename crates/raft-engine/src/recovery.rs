@@ -125,7 +125,7 @@ impl RecoveryManager {
                 .map_err(NodeError::from)?;
             current = apply_idx;
 
-            if current.value().is_multiple_of(100) {
+            if current.as_u64().is_multiple_of(100) {
                 info!(
                     target: ClinicalTarget::ClinicalRecovery.as_str(),
                     progress = %current,

@@ -276,11 +276,11 @@ impl IngressDispatcher {
         // If a minimum state version is requested, we ensure the local state
         // machine has caught up to that version before responding.
         if let Some(version) = req.min_state_version {
-            if version > status.last_committed.value() {
+            if version > status.last_committed.as_u64() {
                 return Err(Status::failed_precondition(format!(
                     "Requested version {} exceeds consistent horizon {}.",
                     version,
-                    status.last_committed.value()
+                    status.last_committed.as_u64()
                 )));
             }
 
@@ -308,7 +308,7 @@ impl IngressDispatcher {
 
         Ok(Response::new(QueryStateResponse {
             items: filtered_items,
-            current_state_version: version.value(),
+            current_state_version: version.as_u64(),
             status: QueryStatus::Success as i32,
             ..Default::default()
         }))
@@ -326,7 +326,7 @@ impl IngressDispatcher {
         client_id: &ClientId,
         sequence_id: SequenceId,
     ) -> Result<Option<Response<ProposeMutationResponse>>, Status> {
-        if sequence_id.value() == 0 {
+        if sequence_id.as_u64() == 0 {
             return Ok(Some(Response::new(ProposeMutationResponse {
                 status: MutationStatus::Rejected as i32,
                 state_version: 0,
@@ -342,7 +342,7 @@ impl IngressDispatcher {
             .map_err(|e| self.invalid_argument(format!("Session lookup failed: {}", e)))?;
 
         if let Some(record) = last_session {
-            if sequence_id.value() == record.last_sequence_id {
+            if sequence_id.as_u64() == record.last_sequence_id {
                 info!(
                     target: ClinicalTarget::ClinicalIngress.as_str(),
                     client_id = %client_id.truncated(),
@@ -361,7 +361,7 @@ impl IngressDispatcher {
                 })));
             }
 
-            if sequence_id.value() < record.last_sequence_id {
+            if sequence_id.as_u64() < record.last_sequence_id {
                 warn!(
                     target: ClinicalTarget::ClinicalIngress.as_str(),
                     client_id = %client_id.truncated(),
@@ -377,7 +377,7 @@ impl IngressDispatcher {
                 })));
             }
 
-            if sequence_id.value() > record.last_sequence_id + 1 {
+            if sequence_id.as_u64() > record.last_sequence_id + 1 {
                 warn!(
                     target: ClinicalTarget::ClinicalIngress.as_str(),
                     client_id = %client_id.truncated(),
@@ -392,7 +392,7 @@ impl IngressDispatcher {
                     error_message: "Secure Clinical: Sequence Continuity Violation".to_string(),
                 })));
             }
-        } else if sequence_id.value() != 1 {
+        } else if sequence_id.as_u64() != 1 {
             // New client must start with sequence 1
             warn!(
                 target: ClinicalTarget::ClinicalIngress.as_str(),
@@ -622,7 +622,7 @@ impl IngressDispatcher {
     ) -> Response<ProposeMutationResponse> {
         Response::new(ProposeMutationResponse {
             status: status as i32,
-            state_version: index.value(),
+            state_version: index.as_u64(),
             leader_hint: String::new(),
             error_message: if status == MutationStatus::Vetoed {
                 moral_justification
@@ -1312,7 +1312,7 @@ mod tests {
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
 
             assert_eq!(response.status, MutationStatus::Committed as i32);
-            assert_eq!(response.state_version, committed_index.value());
+            assert_eq!(response.state_version, committed_index.as_u64());
         }
 
         // --- Phase 2: Concurrency & Syntactic (Layer 2) ---
@@ -2462,13 +2462,13 @@ mod tests {
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: sid.value(),
+                sequence_id: sid.as_u64(),
                 intent: Some(MutationIntent::default()),
             });
 
             let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
             assert_eq!(response.status, MutationStatus::Committed as i32);
-            assert_eq!(response.state_version, committed_index.value());
+            assert_eq!(response.state_version, committed_index.as_u64());
         }
 
         #[tokio::test]
@@ -2515,7 +2515,7 @@ mod tests {
             let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
             let req = make_request(ProposeMutationRequest {
                 client_id: ClientId::generate().as_str().to_string(),
-                sequence_id: sid.value(),
+                sequence_id: sid.as_u64(),
                 intent: Some(MutationIntent::default()),
             });
 

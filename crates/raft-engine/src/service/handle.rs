@@ -340,7 +340,7 @@ mod tests {
                 // We first need to ensure the log contains the entries we are committing.
                 if let Some(node) = guard.as_follower_mut() {
                     let mut entries = Vec::new();
-                    for i in 1..=index.value() {
+                    for i in 1..=index.as_u64() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
                     }
                     node.log_store().append_entries(entries).unwrap();
@@ -363,7 +363,7 @@ mod tests {
                 // Prepare log and advance state
                 if let Some(node) = guard.as_follower_mut() {
                     let mut entries = Vec::new();
-                    for i in 1..=index.value() {
+                    for i in 1..=index.as_u64() {
                         entries.push(LogEntry::new(LogIndex::new(i), Term::new(1), vec![]));
                     }
                     node.log_store().append_entries(entries).unwrap();

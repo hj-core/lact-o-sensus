@@ -29,7 +29,7 @@ macro_rules! define_u64_newtype {
                 Self(val)
             }
 
-            pub fn value(&self) -> u64 {
+            pub fn as_u64(&self) -> u64 {
                 self.0
             }
         }
@@ -99,7 +99,7 @@ mod tests {
             #[test]
             fn stores_provided_u64() {
                 let idx = LogIndex::new(42);
-                assert_eq!(idx.value(), 42);
+                assert_eq!(idx.as_u64(), 42);
             }
         }
 
@@ -128,14 +128,14 @@ mod tests {
             fn supports_addition_with_u64() {
                 let idx = LogIndex::new(10);
                 let result = idx + 5;
-                assert_eq!(result.value(), 15);
+                assert_eq!(result.as_u64(), 15);
             }
 
             #[test]
             fn supports_subtraction_with_u64() {
                 let idx = LogIndex::new(10);
                 let result = idx - 3;
-                assert_eq!(result.value(), 7);
+                assert_eq!(result.as_u64(), 7);
             }
 
             #[test]
@@ -162,7 +162,7 @@ mod tests {
             #[test]
             fn stores_provided_u64() {
                 let term = Term::new(5);
-                assert_eq!(term.value(), 5);
+                assert_eq!(term.as_u64(), 5);
             }
         }
 
@@ -191,7 +191,7 @@ mod tests {
             fn supports_addition_with_u64() {
                 let term = Term::new(10);
                 let result = term + 1;
-                assert_eq!(result.value(), 11);
+                assert_eq!(result.as_u64(), 11);
             }
 
             #[test]
@@ -211,7 +211,7 @@ mod tests {
             #[test]
             fn stores_provided_u64() {
                 let seq = SequenceId::new(100);
-                assert_eq!(seq.value(), 100);
+                assert_eq!(seq.as_u64(), 100);
             }
         }
 
@@ -240,7 +240,7 @@ mod tests {
             fn supports_addition_with_u64() {
                 let seq = SequenceId::new(10);
                 let result = seq + 1;
-                assert_eq!(result.value(), 11);
+                assert_eq!(result.as_u64(), 11);
             }
 
             #[test]

@@ -222,7 +222,7 @@ impl LactoClient {
     ) -> Result<(QueryStateResponse, Option<TraceId>)> {
         let request_payload = QueryStateRequest {
             query_filter,
-            min_state_version: min_state_version.map(|v| v.value()),
+            min_state_version: min_state_version.map(|v| v.as_u64()),
         };
 
         self.dispatch_query(request_payload).await
@@ -1062,7 +1062,7 @@ mod tests {
 
                 let recovered = client.wal().recover()?;
                 assert_eq!(recovered.len(), 1, "WAL should preserve intent on failure");
-                assert_eq!(recovered[0].0.value(), 1);
+                assert_eq!(recovered[0].0.as_u64(), 1);
                 Ok(())
             }
         }

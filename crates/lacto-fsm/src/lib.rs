@@ -93,7 +93,7 @@ impl LactoStore {
             category: mutation.updated_category,
             last_modifier_id: mutation.client_id,
             last_activity: mutation.event_time,
-            state_version: index.value(),
+            state_version: index.as_u64(),
         }
     }
 
@@ -162,7 +162,7 @@ impl SessionProvider for LactoStore {
     ) -> Result<Option<SessionRecord>, FsmError> {
         match self.get_session_record(client_id.as_str())? {
             Some(record)
-                if sequence_id.value() == 0 || record.last_sequence_id == sequence_id.value() =>
+                if sequence_id.as_u64() == 0 || record.last_sequence_id == sequence_id.as_u64() =>
             {
                 Ok(Some(record))
             }
@@ -258,7 +258,7 @@ impl StateMachine for LactoStore {
             // Even for duplicates, we must advance last_applied to ensure
             // the Raft engine stays in sync with the log.
             self.meta
-                .insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())
+                .insert(Self::KEY_LAST_APPLIED, &index.as_u64().to_be_bytes())
                 .map_err(|e| {
                     FsmError::persistence(format!("Failed to persist last_applied index: {}", e))
                 })?;
@@ -347,7 +347,7 @@ impl StateMachine for LactoStore {
                 sessions.insert(client_id.as_bytes(), record.encode_to_vec().as_slice())?;
 
                 // 3. Update Apply Index & Clinical Time
-                meta.insert(Self::KEY_LAST_APPLIED, &index.value().to_be_bytes())?;
+                meta.insert(Self::KEY_LAST_APPLIED, &index.as_u64().to_be_bytes())?;
                 meta.insert(
                     Self::KEY_LAST_EFFECTIVE_TIME,
                     next_effective.encode_to_vec().as_slice(),
