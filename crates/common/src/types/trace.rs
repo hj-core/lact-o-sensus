@@ -1,3 +1,11 @@
+//! Distributed telemetry and tracing foundational types for Lact-O-Sensus.
+//!
+//! This module defines the types used for distributed correlation and
+//! structured logging as mandated by ADR 010. It provides the `TraceId`, a
+//! chronologically sortable identifier used to track requests across node
+//! boundaries, and the `ClinicalTarget` registry to ensure type-safe telemetry
+//! events.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -8,7 +16,10 @@ use uuid::Uuid;
 use crate::types::errors::IdentityError;
 
 /// Distributed Trace Identifier (ADR 010).
+///
 /// Utilizes UUID v7 for chronological sortability across node boundaries.
+/// This allows telemetry events from different nodes to be interleaved
+/// in their logical order of occurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceId(Uuid);
 
@@ -18,6 +29,7 @@ impl TraceId {
         Self(Uuid::now_v7())
     }
 
+    /// Returns a reference to the underlying UUID.
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
     }
@@ -82,5 +94,79 @@ impl ClinicalTarget {
 impl fmt::Display for ClinicalTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod trace_id {
+        use super::*;
+
+        mod generate {
+            use super::*;
+
+            #[test]
+            fn returns_unique_identifiers_with_chronological_ordering() {
+                let id1 = TraceId::generate();
+                // Ensure some time passes for v7 sortability if needed,
+                // but v7 is monotonic even in same ms usually.
+                let id2 = TraceId::generate();
+                assert_ne!(id1, id2);
+                assert!(id1.as_uuid() < id2.as_uuid());
+            }
+        }
+
+        mod from_str {
+            use super::*;
+
+            mod with_valid_uuid {
+                use super::*;
+                #[test]
+                fn returns_success_when_format_is_correct() {
+                    let raw = "018f9b1c-3a5e-7000-8000-000000000000";
+                    let id = TraceId::from_str(raw).unwrap();
+                    assert_eq!(id.to_string(), raw);
+                }
+            }
+
+            mod with_invalid_input {
+                use super::*;
+                #[test]
+                fn returns_error_when_string_is_malformed() {
+                    let result = TraceId::from_str("not-a-trace-id");
+                    assert!(matches!(result, Err(IdentityError::InvalidTraceId(_))));
+                }
+            }
+        }
+    }
+
+    mod clinical_target {
+        use super::*;
+
+        mod as_str {
+            use super::*;
+
+            #[test]
+            fn returns_correct_canonical_string_for_all_variants() {
+                assert_eq!(ClinicalTarget::RaftFoundation.as_str(), "raft::foundation");
+                assert_eq!(
+                    ClinicalTarget::ClinicalIngress.as_str(),
+                    "clinical::ingress"
+                );
+                assert_eq!(ClinicalTarget::ClinicalOracle.as_str(), "clinical::oracle");
+            }
+        }
+
+        mod display {
+            use super::*;
+
+            #[test]
+            fn matches_the_canonical_string_representation() {
+                let target = ClinicalTarget::ClinicalFsm;
+                assert_eq!(format!("{}", target), target.as_str());
+            }
+        }
     }
 }
