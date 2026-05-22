@@ -1,3 +1,10 @@
+//! System-wide clinical contracts and boundary traits for Lact-O-Sensus.
+//!
+//! This module defines the core interfaces between the Raft consensus engine
+//! and the application-specific logic. It facilitates the "Decoupled Oracle"
+//! and "Clean Architecture" models by providing opaque handles for consensus
+//! and structured traits for state machine interactions.
+
 use std::fmt::Debug;
 
 use async_trait::async_trait;
@@ -11,11 +18,15 @@ use crate::types::errors::ConsensusError;
 use crate::types::errors::FsmError;
 
 /// Snapshot of the current consensus state relative to this node.
+///
+/// This structure provides a stable, atomic view of the node's relationship
+/// with the cluster, used to populate gRPC response metadata and leader
+/// hints.
 #[derive(Debug, Clone, Default)]
 pub struct ConsensusStatus {
     /// True if this node currently believes itself to be the leader.
     pub is_leader: bool,
-    /// The current cluster-wide consistent horizon.
+    /// The current cluster-wide consistent horizon (commit_index).
     pub last_committed: LogIndex,
     /// The address of the current leader if known, or an empty string.
     pub leader_hint: String,
@@ -96,4 +107,26 @@ pub trait InventoryReader: Send + Sync + Debug {
 
     /// Returns the version (LogIndex) that this snapshot represents.
     async fn current_version(&self) -> LogIndex;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod consensus_status {
+        use super::*;
+
+        mod default {
+            use super::*;
+
+            #[test]
+            fn returns_safe_defaults_when_initialized() {
+                let status = ConsensusStatus::default();
+                assert!(!status.is_leader);
+                assert_eq!(status.last_committed.as_u64(), 0);
+                assert!(status.leader_hint.is_empty());
+                assert!(status.rejection_reason.is_empty());
+            }
+        }
+    }
 }
