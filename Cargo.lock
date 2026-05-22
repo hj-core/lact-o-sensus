@@ -423,6 +423,7 @@ dependencies = [
  "prost-types",
  "rust_decimal",
  "serde",
+ "serde_json",
  "strum",
  "thiserror",
  "tonic",
