@@ -1,3 +1,10 @@
+//! Identity types for the Lact-O-Sensus cluster.
+//!
+//! This module provides the foundational identifiers used to distinguish nodes
+//! and clusters within the system. These types are implemented as
+//! self-validating NewTypes to prevent primitive obsession and ensure
+//! architectural invariants are maintained from the moment of construction.
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -23,6 +30,7 @@ impl NodeId {
         Ok(Self(id))
     }
 
+    /// Returns the underlying primitive value.
     pub fn as_u64(&self) -> u64 {
         self.0
     }
@@ -95,6 +103,7 @@ impl ClusterId {
         Ok(Self(trimmed.to_string()))
     }
 
+    /// Returns the underlying string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -130,6 +139,8 @@ pub struct NodeIdentity {
 }
 
 impl NodeIdentity {
+    /// Constructs a new NodeIdentity from the given cluster and node
+    /// identifiers.
     pub fn new(cluster_id: ClusterId, node_id: NodeId) -> Self {
         Self {
             cluster_id,
@@ -137,10 +148,12 @@ impl NodeIdentity {
         }
     }
 
+    /// Returns a reference to the cluster identifier.
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
     }
 
+    /// Returns the node identifier.
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -155,41 +168,55 @@ mod tests {
 
         mod try_new {
             use super::*;
-            #[test]
-            fn accepts_valid_id() {
-                let id = NodeId::try_new(1);
-                assert!(id.is_ok());
-                assert_eq!(id.unwrap().as_u64(), 1);
+
+            mod with_valid_input {
+                use super::*;
+                #[test]
+                fn returns_success_when_id_is_positive() {
+                    let id = NodeId::try_new(1);
+                    assert!(id.is_ok());
+                    assert_eq!(id.unwrap().as_u64(), 1);
+                }
             }
 
-            #[test]
-            fn rejects_reserved_zero() {
-                let id = NodeId::try_new(0);
-                assert_eq!(id.unwrap_err(), IdentityError::ReservedNodeId);
+            mod with_invalid_input {
+                use super::*;
+                #[test]
+                fn returns_error_when_id_is_zero() {
+                    let id = NodeId::try_new(0);
+                    assert_eq!(id.unwrap_err(), IdentityError::ReservedNodeId);
+                }
             }
         }
 
         mod from_str {
             use super::*;
-            #[test]
-            fn parses_valid_string() {
-                let id: NodeId = "42".parse().unwrap();
-                assert_eq!(id.as_u64(), 42);
+
+            mod with_valid_string {
+                use super::*;
+                #[test]
+                fn returns_node_id_when_string_is_numeric() {
+                    let id: NodeId = "42".parse().unwrap();
+                    assert_eq!(id.as_u64(), 42);
+                }
             }
 
-            #[test]
-            fn fails_on_invalid_string() {
-                let result: Result<NodeId, _> = "abc".parse();
-                assert!(matches!(
-                    result.unwrap_err(),
-                    IdentityError::InvalidNodeIdFormat { .. }
-                ));
-            }
+            mod with_invalid_string {
+                use super::*;
+                #[test]
+                fn returns_error_when_string_is_non_numeric() {
+                    let result: Result<NodeId, _> = "abc".parse();
+                    assert!(matches!(
+                        result.unwrap_err(),
+                        IdentityError::InvalidNodeIdFormat { .. }
+                    ));
+                }
 
-            #[test]
-            fn fails_on_zero_string() {
-                let result: Result<NodeId, _> = "0".parse();
-                assert_eq!(result.unwrap_err(), IdentityError::ReservedNodeId);
+                #[test]
+                fn returns_error_when_string_is_zero() {
+                    let result: Result<NodeId, _> = "0".parse();
+                    assert_eq!(result.unwrap_err(), IdentityError::ReservedNodeId);
+                }
             }
         }
     }
@@ -199,33 +226,40 @@ mod tests {
 
         mod try_new {
             use super::*;
-            #[test]
-            fn accepts_valid_id() {
-                assert!(ClusterId::try_new("lacto-prod_01").is_ok());
+
+            mod with_valid_input {
+                use super::*;
+                #[test]
+                fn returns_success_when_id_is_alphanumeric() {
+                    assert!(ClusterId::try_new("lacto-prod_01").is_ok());
+                }
+
+                #[test]
+                fn returns_success_and_trims_whitespace() {
+                    let id = ClusterId::try_new("  my-cluster  ").unwrap();
+                    assert_eq!(id.as_str(), "my-cluster");
+                }
             }
 
-            #[test]
-            fn rejects_empty_string() {
-                assert_eq!(
-                    ClusterId::try_new("  ").unwrap_err(),
-                    IdentityError::EmptyClusterId
-                );
-            }
+            mod with_invalid_input {
+                use super::*;
+                #[test]
+                fn returns_error_when_id_is_empty() {
+                    assert_eq!(
+                        ClusterId::try_new("  ").unwrap_err(),
+                        IdentityError::EmptyClusterId
+                    );
+                }
 
-            #[test]
-            fn rejects_invalid_characters() {
-                let id = "cluster!@#";
-                let result = ClusterId::try_new(id);
-                assert!(matches!(
-                    result.unwrap_err(),
-                    IdentityError::InvalidClusterId { .. }
-                ));
-            }
-
-            #[test]
-            fn trims_whitespace() {
-                let id = ClusterId::try_new("  my-cluster  ").unwrap();
-                assert_eq!(id.as_str(), "my-cluster");
+                #[test]
+                fn returns_error_when_id_contains_special_characters() {
+                    let id = "cluster!@#";
+                    let result = ClusterId::try_new(id);
+                    assert!(matches!(
+                        result.unwrap_err(),
+                        IdentityError::InvalidClusterId { .. }
+                    ));
+                }
             }
         }
     }
