@@ -712,6 +712,14 @@ impl Follower {
     pub fn reset_heartbeat(&mut self, current_tick: Tick) {
         self.last_heartbeat = current_tick;
     }
+
+    pub fn evaluate_tick(&self, now: Tick) -> TickAction {
+        if now - self.last_heartbeat >= self.timeout {
+            TickAction::StartElection
+        } else {
+            TickAction::None
+        }
+    }
 }
 
 impl Candidate {
@@ -737,6 +745,14 @@ impl Candidate {
 
     pub fn vote_count(&self) -> usize {
         self.votes_received.len()
+    }
+
+    pub fn evaluate_tick(&self, now: Tick) -> TickAction {
+        if now - self.election_start >= self.timeout {
+            TickAction::StartElection
+        } else {
+            TickAction::None
+        }
     }
 }
 
@@ -779,6 +795,14 @@ impl Leader {
 
     pub fn match_index_mut(&mut self) -> &mut HashMap<NodeId, LogIndex> {
         &mut self.match_index
+    }
+
+    pub fn evaluate_tick(&self, now: Tick, threshold: TickDuration) -> TickAction {
+        if now - self.last_heartbeat >= threshold {
+            TickAction::SendHeartbeat
+        } else {
+            TickAction::None
+        }
     }
 }
 

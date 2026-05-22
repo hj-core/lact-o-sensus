@@ -432,11 +432,29 @@ impl LogicalNode {
         self.state = f(old_state);
     }
 
-    /// Resets the election timer if the node is a Follower.
+    /// Advances the monotonic system clock and evaluates the current role state
+    /// for deterministic timeout actions.
+    pub fn tick(&mut self) -> TickAction {
+        self.current_tick.increment();
+        let now = self.current_tick;
+
+        match &mut self.state {
+            RoleState::Follower(node) => node.state().evaluate_tick(now),
+            RoleState::Candidate(node) => node.state().evaluate_tick(now),
+            RoleState::Leader(node) => node
+                .state()
+                .evaluate_tick(now, self.thresholds.heartbeat_interval),
+            RoleState::Poisoned => TickAction::Stop,
+        }
+    }
+
+    /// Resets the election or heartbeat timer based on the current role.
     pub fn reset_heartbeat(&mut self) {
         let tick = self.current_tick;
-        if let RoleState::Follower(node) = &mut self.state {
-            node.state_mut().reset_heartbeat(tick);
+        match &mut self.state {
+            RoleState::Follower(node) => node.state_mut().reset_heartbeat(tick),
+            RoleState::Leader(node) => node.state_mut().reset_heartbeat(tick),
+            _ => {}
         }
     }
 
@@ -923,6 +941,119 @@ mod tests {
             assert!(result.is_err());
             // Verify that the node is now permanently poisoned
             assert!(state.is_poisoned());
+        }
+    }
+
+    mod tick {
+        use super::*;
+
+        mod follower {
+            use super::*;
+
+            #[test]
+            fn should_not_trigger_election_before_timeout() {
+                let mut node = setup_node(1);
+                // Min election is 15 in setup_node
+                for _ in 0..14 {
+                    assert_eq!(node.tick(), TickAction::None);
+                }
+            }
+
+            #[test]
+            fn should_trigger_election_at_timeout() {
+                let mut node = setup_node(1);
+                // We don't know the exact randomized timeout (15..30),
+                // but it MUST trigger by 30.
+                let mut triggered = false;
+                for _ in 0..30 {
+                    if node.tick() == TickAction::StartElection {
+                        triggered = true;
+                        break;
+                    }
+                }
+                assert!(triggered);
+            }
+
+            #[test]
+            fn should_reset_timer_on_heartbeat() {
+                let mut node = setup_node(1);
+                // Advance almost to timeout
+                for _ in 0..10 {
+                    node.tick();
+                }
+
+                node.reset_heartbeat();
+
+                // Should now survive another 10 ticks without triggering
+                for _ in 0..10 {
+                    assert_eq!(node.tick(), TickAction::None);
+                }
+            }
+        }
+
+        mod candidate {
+            use super::*;
+
+            #[test]
+            fn should_trigger_election_restart_on_timeout() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+
+                let mut triggered = false;
+                for _ in 0..30 {
+                    if node.tick() == TickAction::StartElection {
+                        triggered = true;
+                        break;
+                    }
+                }
+                assert!(triggered);
+            }
+        }
+
+        mod leader {
+            use super::*;
+
+            #[test]
+            fn should_trigger_heartbeat_at_interval() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+                node.into_leader(vec![]);
+
+                // Heartbeat interval is 10 in setup_node
+                for _ in 0..9 {
+                    assert_eq!(node.tick(), TickAction::None);
+                }
+                assert_eq!(node.tick(), TickAction::SendHeartbeat);
+            }
+
+            #[test]
+            fn should_reset_heartbeat_timer_on_manual_reset() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+                node.into_leader(vec![]);
+
+                for _ in 0..5 {
+                    node.tick();
+                }
+                node.reset_heartbeat();
+
+                // Should now need 10 more ticks
+                for _ in 0..9 {
+                    assert_eq!(node.tick(), TickAction::None);
+                }
+                assert_eq!(node.tick(), TickAction::SendHeartbeat);
+            }
+        }
+
+        mod poisoned {
+            use super::*;
+
+            #[test]
+            fn should_return_stop_action() {
+                let mut node = setup_node(1);
+                node.poison();
+                assert_eq!(node.tick(), TickAction::Stop);
+            }
         }
     }
 }
