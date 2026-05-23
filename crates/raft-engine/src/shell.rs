@@ -100,6 +100,7 @@ impl<'a> Drop for MutationGuard<'a> {
                 last_log_index: self.before.last_log_index,
                 last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
+                leader_hint: None,
             }
         } else if self.guard.is_poisoned() {
             ConsensusProgress {
@@ -108,6 +109,7 @@ impl<'a> Drop for MutationGuard<'a> {
                 last_log_index: self.before.last_log_index,
                 last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
+                leader_hint: None,
             }
         } else {
             // In the normal case, we extract the progress from the healthy node.

@@ -40,6 +40,8 @@ pub struct ConsensusProgress {
     pub last_log_index: LogIndex,
     pub last_committed: LogIndex,
     pub last_applied: LogIndex,
+    /// The identifier of the current leader if known, or None.
+    pub leader_hint: Option<NodeId>,
 }
 
 /// The Dispatcher Enum (Logical State Machine).
@@ -568,6 +570,7 @@ impl LogicalNode {
                 last_log_index: LogIndex::ZERO,
                 last_committed: LogIndex::ZERO,
                 last_applied: LogIndex::ZERO,
+                leader_hint: None,
             }),
             RoleState::Follower(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -575,6 +578,7 @@ impl LogicalNode {
                 last_log_index: n.last_log_index()?,
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
+                leader_hint: n.state().leader_id(),
             }),
             RoleState::Candidate(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -582,6 +586,7 @@ impl LogicalNode {
                 last_log_index: n.last_log_index()?,
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
+                leader_hint: None,
             }),
             RoleState::Leader(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -589,6 +594,7 @@ impl LogicalNode {
                 last_log_index: n.last_log_index()?,
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
+                leader_hint: Some(self.identity().node_id()),
             }),
         }
     }
