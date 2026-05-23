@@ -1,3 +1,10 @@
+//! Execution Shell for the Raft engine.
+//!
+//! This module implements the `ConsensusHandle` trait, providing the primary
+//! API for the gateway and application layers to interact with the consensus
+//! engine. It acts as the "Execution Shell" (ADR 009) that translates
+//! high-level intents into consensus operations.
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,12 +15,20 @@ use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
+use common::types::trace::ClinicalTarget;
+use tracing::Instrument;
+use tracing::info_span;
 
 use crate::engine::NodeRole;
 use crate::engine::RoleState;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
+/// Authoritative handle for local Raft operations.
+///
+/// This handle provides a thread-safe, reactive interface for proposing
+/// mutations and awaiting state transitions. It utilizes a `watch` channel to
+/// monitor consensus progress without excessive lock contention.
 #[derive(Debug)]
 pub struct LocalRaftHandle<S: StateMachine> {
     state: Arc<ConsensusShell<S>>,
@@ -21,6 +36,7 @@ pub struct LocalRaftHandle<S: StateMachine> {
 }
 
 impl<S: StateMachine> LocalRaftHandle<S> {
+    /// Creates a new execution shell for the given consensus state.
     pub fn new(state: Arc<ConsensusShell<S>>, peer_manager: Arc<PeerManager>) -> Self {
         Self {
             state,
@@ -70,62 +86,92 @@ impl<S: StateMachine> LocalRaftHandle<S> {
 #[async_trait]
 impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
     async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
-        let mut guard = self.state.write().await;
-        guard.propose(data).map_err(|e| match e {
-            NodeError::NotLeader { .. } => ConsensusError::NotLeader,
-            _ => ConsensusError::Internal(e.to_string()),
-        })
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "propose",
+            data_len = data.len()
+        );
+
+        async {
+            let mut guard = self.state.write().await;
+            guard.propose(data).map_err(|e| match e {
+                NodeError::NotLeader { .. } => ConsensusError::NotLeader,
+                _ => ConsensusError::Internal(e.to_string()),
+            })
+        }
+        .instrument(span)
+        .await
     }
 
     async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {
-        let mut progress_rx = self.state.subscribe();
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "await_commit",
+            index = %index
+        );
 
-        loop {
-            // Check condition first (prevents missing updates before subscription)
-            {
-                let guard = self.state.read().await;
-                match guard.state() {
-                    RoleState::Leader(node) => {
-                        if node.last_committed() >= index {
-                            return Ok(());
+        async {
+            let mut progress_rx = self.state.subscribe();
+
+            loop {
+                // Check condition first (prevents missing updates before subscription)
+                {
+                    let guard = self.state.read().await;
+                    match guard.state() {
+                        RoleState::Leader(node) => {
+                            if node.last_committed() >= index {
+                                return Ok(());
+                            }
+                        }
+                        RoleState::Poisoned => {
+                            return Err(ConsensusError::Poisoned);
+                        }
+                        _ => {
+                            return Err(ConsensusError::NotLeader);
                         }
                     }
-                    RoleState::Poisoned => {
-                        return Err(ConsensusError::Poisoned);
-                    }
-                    _ => {
-                        return Err(ConsensusError::NotLeader);
-                    }
+                }
+
+                // Park until something changes (LogIndex OR Term/Role/Poison)
+                if progress_rx.changed().await.is_err() {
+                    return Err(ConsensusError::Terminated);
                 }
             }
-
-            // Park until something changes (LogIndex OR Term/Role/Poison)
-            if progress_rx.changed().await.is_err() {
-                return Err(ConsensusError::Terminated);
-            }
         }
+        .instrument(span)
+        .await
     }
 
     async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError> {
-        let mut progress_rx = self.state.subscribe();
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "await_apply",
+            index = %index
+        );
 
-        loop {
-            // Check condition first
-            {
-                let progress = progress_rx.borrow();
-                if progress.role == NodeRole::Poisoned {
-                    return Err(ConsensusError::Poisoned);
-                }
-                if progress.last_applied >= index {
-                    return Ok(());
-                }
-            }
+        async {
+            let mut progress_rx = self.state.subscribe();
 
-            // Park until something changes
-            if progress_rx.changed().await.is_err() {
-                return Err(ConsensusError::Terminated);
+            loop {
+                // Check condition first
+                {
+                    let progress = progress_rx.borrow();
+                    if progress.role == NodeRole::Poisoned {
+                        return Err(ConsensusError::Poisoned);
+                    }
+                    if progress.last_applied >= index {
+                        return Ok(());
+                    }
+                }
+
+                // Park until something changes
+                if progress_rx.changed().await.is_err() {
+                    return Err(ConsensusError::Terminated);
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     async fn authority(&self) -> ConsensusAuthority {
