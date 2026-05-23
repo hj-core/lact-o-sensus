@@ -102,6 +102,7 @@ impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
                 last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
                 leader_hint: None,
+                confirmed_read_epoch: self.before.confirmed_read_epoch,
             }
         } else if self.guard.is_poisoned() {
             ConsensusProgress {
@@ -111,6 +112,7 @@ impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
                 last_committed: self.before.last_committed,
                 last_applied: self.before.last_applied,
                 leader_hint: None,
+                confirmed_read_epoch: self.before.confirmed_read_epoch,
             }
         } else {
             // In the normal case, we extract the progress from the healthy node.

@@ -42,6 +42,8 @@ pub struct ConsensusProgress {
     pub last_applied: LogIndex,
     /// The identifier of the current leader if known, or None.
     pub leader_hint: Option<NodeId>,
+    /// The highest read epoch confirmed by a majority (§8).
+    pub confirmed_read_epoch: u64,
 }
 
 /// The Dispatcher Enum (Logical State Machine).
@@ -572,6 +574,7 @@ impl<S: StateMachine> LogicalNode<S> {
                 last_committed: LogIndex::ZERO,
                 last_applied: LogIndex::ZERO,
                 leader_hint: None,
+                confirmed_read_epoch: 0,
             }),
             RoleState::Follower(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -580,6 +583,7 @@ impl<S: StateMachine> LogicalNode<S> {
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
                 leader_hint: n.state().leader_id(),
+                confirmed_read_epoch: 0,
             }),
             RoleState::Candidate(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -588,6 +592,7 @@ impl<S: StateMachine> LogicalNode<S> {
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
                 leader_hint: None,
+                confirmed_read_epoch: 0,
             }),
             RoleState::Leader(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
@@ -596,6 +601,7 @@ impl<S: StateMachine> LogicalNode<S> {
                 last_committed: n.last_committed(),
                 last_applied: n.last_applied(),
                 leader_hint: Some(self.identity().node_id()),
+                confirmed_read_epoch: n.state().confirmed_read_epoch(),
             }),
         }
     }
@@ -881,6 +887,35 @@ mod tests {
             let progress = state.consensus_progress();
             assert_eq!(progress.role, NodeRole::Leader);
             assert_eq!(progress.term, Term::new(1));
+        }
+
+        #[test]
+        fn reports_confirmed_epoch() {
+            let mut state = setup_node(1);
+            state.into_candidate();
+            state.into_leader(vec![NodeId::try_new(2).unwrap()]);
+
+            // Simulate epoch advancement in physical node
+            if let RoleState::Leader(ref mut n) = state.state {
+                n.state_mut()
+                    .prepare_read_probe(NodeId::try_new(1).unwrap());
+                n.state_mut()
+                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+            }
+
+            let progress = state.consensus_progress();
+            assert_eq!(progress.confirmed_read_epoch, 0); // Still 0 since prepare didn't increment (acks were empty)
+
+            // Increment for real
+            if let RoleState::Leader(ref mut n) = state.state {
+                n.state_mut()
+                    .prepare_read_probe(NodeId::try_new(1).unwrap());
+                n.state_mut()
+                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+            }
+
+            let progress2 = state.consensus_progress();
+            assert_eq!(progress2.confirmed_read_epoch, 1);
         }
 
         #[test]
