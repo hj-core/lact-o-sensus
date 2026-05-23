@@ -2,7 +2,7 @@
 //!
 //! This module defines the interfaces for interacting with the grocery-specific
 //! business state and session metadata. By isolating these traits from the
-//! generic Raft engine, we maintain strict architectural boundaries (Rule 1).
+//! generic Raft engine, we maintain strict architectural boundaries.
 
 use std::fmt::Debug;
 
