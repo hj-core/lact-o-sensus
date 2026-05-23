@@ -417,7 +417,7 @@ async fn process_vote_response<S: StateMachine>(
 ///
 /// Ensures the 'replication_round' telemetry context is properly established
 /// before yielding to the asynchronous fan-out phase (ADR 010).
-fn initiate_replication<S: StateMachine>(
+pub(crate) fn initiate_replication<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
@@ -539,6 +539,11 @@ async fn process_append_entries_response<S: StateMachine>(
     #[allow(clippy::collapsible_if)]
     if let Some(node) = guard.as_leader_mut() {
         if node.current_term().unwrap_or(Term::ZERO) == term {
+            // Acknowledge read quorums (§8)
+            let total_nodes = node.state().next_index().len() + 1;
+            let quorum = (total_nodes / 2) + 1;
+            node.state_mut().acknowledge_heartbeat(peer_id, quorum);
+
             if resp.success {
                 let new_match = (sent_prev_index + sent_entries_len)?;
                 let new_next = (new_match + 1)?;

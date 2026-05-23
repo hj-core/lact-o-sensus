@@ -196,6 +196,14 @@ impl<S: StateMachine> LogicalNode<S> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn as_leader(&self) -> Option<&RaftNode<Leader, S>> {
+        match &self.state {
+            RoleState::Leader(node) => Some(node),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader, S>> {
         match &mut self.state {
             RoleState::Leader(node) => Some(node),
@@ -904,9 +912,9 @@ mod tests {
             }
 
             let progress = state.consensus_progress();
-            assert_eq!(progress.confirmed_read_epoch, 0); // Still 0 since prepare didn't increment (acks were empty)
+            assert_eq!(progress.confirmed_read_epoch, 1);
 
-            // Increment for real
+            // Start new round
             if let RoleState::Leader(ref mut n) = state.state {
                 n.state_mut()
                     .prepare_read_probe(NodeId::try_new(1).unwrap());
@@ -915,7 +923,7 @@ mod tests {
             }
 
             let progress2 = state.consensus_progress();
-            assert_eq!(progress2.confirmed_read_epoch, 1);
+            assert_eq!(progress2.confirmed_read_epoch, 2);
         }
 
         #[test]
