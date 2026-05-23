@@ -17,20 +17,22 @@ use crate::types::SequenceId;
 use crate::types::errors::ConsensusError;
 use crate::types::errors::FsmError;
 
-/// Snapshot of the current consensus state relative to this node.
+/// Atomic snapshot of the node's consensus authority and cluster horizon.
 ///
-/// This structure provides a stable, atomic view of the node's relationship
-/// with the cluster, used to populate gRPC response metadata and leader
-/// hints.
+/// This structure provides a stable, lock-free view of the node's relationship
+/// with the cluster. It is the primary mechanism used by the Gateway to
+/// authorize mutations and linearizable queries.
 #[derive(Debug, Clone, Default)]
-pub struct ConsensusStatus {
-    /// True if this node currently believes itself to be the leader.
+pub struct ConsensusAuthority {
+    /// True if this node is currently the authorized cluster leader.
     pub is_leader: bool,
+    /// True if the node has encountered a fatal invariant and is halted.
+    pub is_poisoned: bool,
     /// The current cluster-wide consistent horizon (commit_index).
     pub last_committed: LogIndex,
-    /// The address of the current leader if known, or an empty string.
+    /// The network address of the authorized leader, if known.
     pub leader_hint: String,
-    /// A human-readable message explaining why mutations might be rejected.
+    /// Clinical explanation for why authority is absent or restricted.
     pub rejection_reason: String,
 }
 
@@ -53,10 +55,10 @@ pub trait ConsensusHandle: Send + Sync + Debug {
     /// This is used to enforce Read-Your-Writes consistency (ADR 006).
     async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError>;
 
-    /// Returns a consistent snapshot of the node's current consensus status.
-    /// This is preferred over individual checks to ensure atomicity in
-    /// response generation.
-    async fn consensus_status(&self) -> ConsensusStatus;
+    /// Returns a lock-free snapshot of the node's current consensus authority.
+    ///
+    /// This is the "Pre-flight Check" used to authorize external requests.
+    async fn authority(&self) -> ConsensusAuthority;
 
     /// Verifies that this node is still the current cluster leader.
     ///
@@ -113,7 +115,7 @@ pub trait InventoryReader: Send + Sync + Debug {
 mod tests {
     use super::*;
 
-    mod consensus_status {
+    mod consensus_authority {
         use super::*;
 
         mod default {
@@ -121,8 +123,9 @@ mod tests {
 
             #[test]
             fn returns_safe_defaults_when_initialized() {
-                let status = ConsensusStatus::default();
+                let status = ConsensusAuthority::default();
                 assert!(!status.is_leader);
+                assert!(!status.is_poisoned);
                 assert_eq!(status.last_committed.as_u64(), 0);
                 assert!(status.leader_hint.is_empty());
                 assert!(status.rejection_reason.is_empty());

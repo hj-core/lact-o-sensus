@@ -13,8 +13,8 @@ use common::proto::v1::app::QueryStateRequest;
 use common::proto::v1::app::QueryStateResponse;
 use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
+use common::raft_api::ConsensusAuthority;
 use common::raft_api::ConsensusHandle;
-use common::raft_api::ConsensusStatus;
 use common::raft_api::InventoryReader;
 use common::raft_api::SessionProvider;
 use common::rpc::TraceInterceptor;
@@ -55,6 +55,16 @@ struct StabilizedMutation {
     display_unit: String,
     category: GroceryCategory,
     moral_justification: String,
+}
+
+/// Outcome of a clinical authority verification check.
+enum AuthorityOutcome<R> {
+    /// Node is healthy and authorized as the leader.
+    Authorized(ConsensusAuthority),
+    /// Node is healthy but not the leader; request should be redirected.
+    Redirect(Response<R>),
+    /// Node is poisoned; request must fail immediately (Halt Mandate).
+    Fatal(Status),
 }
 
 /// Implementation of the external client ingress RPCs.
@@ -159,10 +169,11 @@ impl IngressDispatcher {
         let _enter = span.enter();
 
         // 1. Verifies that this node is the authorized leader.
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
-            return Ok(self.rejection_response_with_status(status));
-        }
+        let status = match self.authorize_mutation().await {
+            AuthorityOutcome::Authorized(s) => s,
+            AuthorityOutcome::Redirect(r) => return Ok(r),
+            AuthorityOutcome::Fatal(e) => return Err(e),
+        };
 
         // 2. Enforces linearizability via the sequence firewall.
         if let Some(cached_response) = self
@@ -249,24 +260,17 @@ impl IngressDispatcher {
         let _enter = span.enter();
 
         // 1. Verifies that this node is the authorized leader.
-        let status = self.raft_handle.consensus_status().await;
-        if !status.is_leader {
-            return Ok(Response::new(QueryStateResponse {
-                status: QueryStatus::Rejected as i32,
-                leader_hint: status.leader_hint,
-                ..Default::default()
-            }));
-        }
+        let status = match self.authorize_query().await {
+            AuthorityOutcome::Authorized(s) => s,
+            AuthorityOutcome::Redirect(r) => return Ok(r),
+            AuthorityOutcome::Fatal(e) => return Err(e),
+        };
 
         // 2. Linearizable Quorum Read (Verification of leadership continuity).
         if let Err(e) = self.raft_handle.verify_leadership().await {
             match e {
                 ConsensusError::NotLeader => {
-                    return Ok(Response::new(QueryStateResponse {
-                        status: QueryStatus::Rejected as i32,
-                        leader_hint: status.leader_hint,
-                        ..Default::default()
-                    }));
+                    return Ok(self.query_redirection_response(status));
                 }
                 _ => return Err(Status::internal(format!("Linearizable read failed: {}", e))),
             }
@@ -316,6 +320,59 @@ impl IngressDispatcher {
 }
 
 impl IngressDispatcher {
+    // --- Implementation Detail Helpers ---
+
+    /// Orchestrates the authority check for mutation requests.
+    async fn authorize_mutation(&self) -> AuthorityOutcome<ProposeMutationResponse> {
+        let status = self.raft_handle.authority().await;
+        if status.is_poisoned {
+            return AuthorityOutcome::Fatal(self.poisoned_node_error());
+        }
+        if !status.is_leader {
+            return AuthorityOutcome::Redirect(self.mutation_redirection_response(status));
+        }
+        AuthorityOutcome::Authorized(status)
+    }
+
+    /// Orchestrates the authority check for query requests.
+    async fn authorize_query(&self) -> AuthorityOutcome<QueryStateResponse> {
+        let status = self.raft_handle.authority().await;
+        if status.is_poisoned {
+            return AuthorityOutcome::Fatal(self.poisoned_node_error());
+        }
+        if !status.is_leader {
+            return AuthorityOutcome::Redirect(self.query_redirection_response(status));
+        }
+        AuthorityOutcome::Authorized(status)
+    }
+
+    /// Generates a redirection response for a mutation request.
+    fn mutation_redirection_response(
+        &self,
+        status: ConsensusAuthority,
+    ) -> Response<ProposeMutationResponse> {
+        Response::new(ProposeMutationResponse {
+            status: MutationStatus::Rejected as i32,
+            state_version: 0,
+            leader_hint: status.leader_hint,
+            error_message: status.rejection_reason,
+        })
+    }
+
+    /// Generates a redirection response for a query request.
+    fn query_redirection_response(
+        &self,
+        status: ConsensusAuthority,
+    ) -> Response<QueryStateResponse> {
+        Response::new(QueryStateResponse {
+            status: QueryStatus::Rejected as i32,
+            current_state_version: 0,
+            leader_hint: status.leader_hint,
+            error_message: status.rejection_reason,
+            ..Default::default()
+        })
+    }
+
     /// Enforces Exactly-Once Semantics by validating request sequences against
     /// the authoritative session table.
     ///
@@ -569,7 +626,7 @@ impl IngressDispatcher {
         stabilized: StabilizedMutation,
         raw_user_input: String,
         status: MutationStatus,
-        consensus_status: &ConsensusStatus,
+        consensus_status: &ConsensusAuthority,
     ) -> Result<LogIndex, Status> {
         let is_delete = intent.operation == OperationType::Delete as i32;
 
@@ -629,22 +686,6 @@ impl IngressDispatcher {
             } else {
                 String::new()
             },
-        })
-    }
-
-    // --- Implementation Detail Helpers ---
-
-    /// Generates a logical rejection response containing a leader hint for
-    /// redirection.
-    fn rejection_response_with_status(
-        &self,
-        status: ConsensusStatus,
-    ) -> Response<ProposeMutationResponse> {
-        Response::new(ProposeMutationResponse {
-            status: MutationStatus::Rejected as i32,
-            state_version: 0,
-            leader_hint: status.leader_hint,
-            error_message: status.rejection_reason,
         })
     }
 
@@ -886,7 +927,7 @@ impl IngressDispatcher {
     }
 
     /// Translates domain ConsensusErrors into standard gRPC Status objects.
-    fn map_consensus_error(&self, err: ConsensusError, status: &ConsensusStatus) -> Status {
+    fn map_consensus_error(&self, err: ConsensusError, status: &ConsensusAuthority) -> Status {
         match err {
             ConsensusError::NotLeader => Status::failed_precondition(format!(
                 "Not the leader. Hint: {} ({})",
@@ -926,6 +967,11 @@ impl IngressDispatcher {
     fn internal_error(&self, msg: impl Into<String>) -> Status {
         Status::internal(msg)
     }
+
+    /// Generates a fatal gRPC error for poisoned nodes (Halt Mandate).
+    fn poisoned_node_error(&self) -> Status {
+        self.internal_error("Secure Clinical: Node is poisoned and cannot process requests")
+    }
 }
 
 #[cfg(test)]
@@ -943,8 +989,8 @@ mod tests {
     use common::proto::v1::app::QueryStateRequest;
     use common::proto::v1::app::QueryStatus;
     use common::proto::v1::app::SessionRecord;
+    use common::raft_api::ConsensusAuthority;
     use common::raft_api::ConsensusHandle;
-    use common::raft_api::ConsensusStatus;
     use common::raft_api::InventoryReader;
     use common::raft_api::SessionProvider;
     use common::types::ClientId;
@@ -961,6 +1007,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockRaftHandle {
         is_leader: bool,
+        is_poisoned: bool,
         last_committed: LogIndex,
         leader_hint: String,
         rejection_reason: String,
@@ -990,9 +1037,10 @@ mod tests {
             Ok(())
         }
 
-        async fn consensus_status(&self) -> ConsensusStatus {
-            ConsensusStatus {
+        async fn authority(&self) -> ConsensusAuthority {
+            ConsensusAuthority {
                 is_leader: self.is_leader,
+                is_poisoned: self.is_poisoned,
                 last_committed: self.last_committed,
                 leader_hint: self.leader_hint.clone(),
                 rejection_reason: self.rejection_reason.clone(),
@@ -1228,6 +1276,28 @@ mod tests {
             assert!(response.error_message.contains("Follower"));
         }
 
+        #[tokio::test]
+        async fn returns_error_when_node_is_poisoned() {
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                is_poisoned: true,
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
+            let req = make_request(ProposeMutationRequest {
+                client_id: ClientId::generate().as_str().to_string(),
+                sequence_id: 1,
+                intent: None,
+            });
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert!(status.message().contains("Node is poisoned"));
+        }
+
         // --- Phase 1: Deduplication (EOS) ---
 
         #[tokio::test]
@@ -1250,8 +1320,8 @@ mod tests {
                     self.mock.await_apply(index).await
                 }
 
-                async fn consensus_status(&self) -> ConsensusStatus {
-                    self.mock.consensus_status().await
+                async fn authority(&self) -> ConsensusAuthority {
+                    self.mock.authority().await
                 }
 
                 async fn verify_leadership(&self) -> Result<(), ConsensusError> {
@@ -1878,9 +1948,10 @@ mod tests {
                     Ok(())
                 }
 
-                async fn consensus_status(&self) -> ConsensusStatus {
-                    ConsensusStatus {
+                async fn authority(&self) -> ConsensusAuthority {
+                    ConsensusAuthority {
                         is_leader: true,
+                        is_poisoned: false,
                         ..Default::default()
                     }
                 }
@@ -2900,6 +2971,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn returns_error_when_node_is_poisoned() {
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                is_poisoned: true,
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, successful_veto());
+            let req = make_request(QueryStateRequest::new(None, None));
+
+            let result = dispatcher.query_state(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::Internal);
+            assert!(status.message().contains("Node is poisoned"));
+        }
+
+        #[tokio::test]
         async fn returns_all_items_when_no_filter_is_provided() {
             let items = vec![
                 GroceryItem::new(
@@ -3017,9 +3106,10 @@ mod tests {
                     Err(ConsensusError::Poisoned)
                 }
 
-                async fn consensus_status(&self) -> ConsensusStatus {
-                    ConsensusStatus {
+                async fn authority(&self) -> ConsensusAuthority {
+                    ConsensusAuthority {
                         is_leader: true,
+                        is_poisoned: false,
                         last_committed: LogIndex::new(100),
                         ..Default::default()
                     }

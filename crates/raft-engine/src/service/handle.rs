@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use common::raft_api::ConsensusAuthority;
 use common::raft_api::ConsensusHandle;
-use common::raft_api::ConsensusStatus;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
 
-use crate::engine::LogicalNode;
 use crate::engine::NodeRole;
 use crate::engine::RoleState;
 use crate::peer::PeerManager;
@@ -30,15 +29,19 @@ impl LocalRaftHandle {
 
     /// Determines the leader address and status message based on the current
     /// role.
-    fn calculate_redirection(&self, node_state: &LogicalNode) -> (String, String) {
-        match node_state.state() {
-            RoleState::Follower(node) => self.follower_redirection(node.state().leader_id()),
-            RoleState::Candidate(_) => (
+    fn calculate_redirection(
+        &self,
+        role: NodeRole,
+        leader_hint: Option<NodeId>,
+    ) -> (String, String) {
+        match role {
+            NodeRole::Follower => self.follower_redirection(leader_hint),
+            NodeRole::Candidate => (
                 String::new(),
                 "Election in progress. No leader established.".to_string(),
             ),
-            RoleState::Leader(_) => (String::new(), String::new()),
-            RoleState::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
+            NodeRole::Leader => (String::new(), String::new()),
+            NodeRole::Poisoned => (String::new(), "Node is in a poisoned state.".to_string()),
         }
     }
 
@@ -124,14 +127,15 @@ impl ConsensusHandle for LocalRaftHandle {
         }
     }
 
-    async fn consensus_status(&self) -> ConsensusStatus {
+    async fn authority(&self) -> ConsensusAuthority {
         let progress = *self.state.subscribe().borrow();
-        let guard = self.state.read().await;
-        let is_leader = matches!(guard.state(), RoleState::Leader(_));
-        let (leader_hint, rejection_reason) = self.calculate_redirection(&guard);
 
-        ConsensusStatus {
-            is_leader,
+        let (leader_hint, rejection_reason) =
+            self.calculate_redirection(progress.role, progress.leader_hint);
+
+        ConsensusAuthority {
+            is_leader: progress.role == NodeRole::Leader,
+            is_poisoned: progress.role == NodeRole::Poisoned,
             last_committed: progress.last_committed,
             leader_hint,
             rejection_reason,
@@ -211,7 +215,7 @@ mod tests {
         #[tokio::test]
         async fn reports_correctly_for_follower_without_leader() {
             let (handle, _) = setup();
-            let status = handle.consensus_status().await;
+            let status = handle.authority().await;
 
             assert!(!status.is_leader);
             assert!(status.leader_hint.is_empty());
@@ -226,7 +230,7 @@ mod tests {
                 guard.into_candidate();
                 guard.into_leader(vec![]);
             }
-            let status = handle.consensus_status().await;
+            let status = handle.authority().await;
 
             assert!(status.is_leader);
             assert!(status.leader_hint.is_empty());
@@ -406,7 +410,7 @@ mod tests {
                 guard.poison();
             }
 
-            let status = handle.consensus_status().await;
+            let status = handle.authority().await;
             assert!(!status.is_leader);
             assert_eq!(status.rejection_reason, "Node is in a poisoned state.");
         }
