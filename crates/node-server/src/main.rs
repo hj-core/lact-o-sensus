@@ -211,6 +211,7 @@ async fn main() -> Result<()> {
         let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
 
         let raft_handle = Arc::new(LocalRaftHandle::new(
+            config.clone(),
             shared_state.clone(),
             peer_manager.clone(),
         ));

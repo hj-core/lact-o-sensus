@@ -1,4 +1,4 @@
-//! Execution Shell for the Raft engine.
+//! Local API Handle (The "Execution Shell").
 //!
 //! This module implements the `ConsensusHandle` trait, providing the primary
 //! API for the gateway and application layers to interact with the consensus
@@ -16,9 +16,11 @@ use common::types::NodeId;
 use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use tracing::Instrument;
 use tracing::info_span;
 
+use crate::config::Config;
 use crate::engine::NodeRole;
 use crate::engine::RoleState;
 use crate::peer::PeerManager;
@@ -31,14 +33,20 @@ use crate::shell::ConsensusShell;
 /// monitor consensus progress without excessive lock contention.
 #[derive(Debug)]
 pub struct LocalRaftHandle<S: StateMachine> {
+    config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
 }
 
 impl<S: StateMachine> LocalRaftHandle<S> {
     /// Creates a new execution shell for the given consensus state.
-    pub fn new(state: Arc<ConsensusShell<S>>, peer_manager: Arc<PeerManager>) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        state: Arc<ConsensusShell<S>>,
+        peer_manager: Arc<PeerManager>,
+    ) -> Self {
         Self {
+            config,
             state,
             peer_manager,
         }
@@ -190,17 +198,19 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
     }
 
     async fn verify_leadership(&self) -> Result<(), ConsensusError> {
-        let guard = self.state.read().await;
-        match guard.state() {
-            RoleState::Leader(_) => {
-                // TODO: Step 3 - Enhance with Quorum Heartbeat for strict linearizability.
-                // Currently, this only performs a local authority check which is
-                // vulnerable to stale reads in partitioned scenarios.
-                Ok(())
-            }
-            RoleState::Poisoned => Err(ConsensusError::Poisoned),
-            _ => Err(ConsensusError::NotLeader),
-        }
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "verify_leadership"
+        );
+
+        self.state
+            .verify_leadership_quorum(
+                self.config.clone(),
+                self.peer_manager.clone(),
+                TraceId::generate(),
+            )
+            .instrument(span)
+            .await
     }
 }
 
@@ -243,6 +253,15 @@ mod tests {
 
     fn setup() -> (LocalRaftHandle<MockFsm>, Arc<ConsensusShell<MockFsm>>) {
         let id = mock_identity();
+        let config = Arc::new(Config {
+            cluster_id: id.cluster_id().clone(),
+            node_id: id.node_id(),
+            listen_addr: "127.0.0.1:50051".parse().unwrap(),
+            data_dir: "data".into(),
+            peers: std::collections::HashMap::new(),
+            raft: crate::config::RaftConfig::default(),
+            policy: crate::config::PolicyConfig::default(),
+        });
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
         let thresholds = TickThresholds {
@@ -255,7 +274,47 @@ mod tests {
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager =
             Arc::new(PeerManager::new(id, &std::collections::HashMap::new()).unwrap());
-        (LocalRaftHandle::new(state.clone(), peer_manager), state)
+        (
+            LocalRaftHandle::new(config, state.clone(), peer_manager),
+            state,
+        )
+    }
+
+    mod verify_leadership {
+        use super::*;
+
+        #[tokio::test]
+        async fn guarantees_quorum_authority() {
+            let (handle, state) = setup();
+
+            // 1. Transition to leader
+            {
+                let mut guard = state.write().await;
+                guard.into_candidate();
+                guard.into_leader(vec![
+                    NodeId::try_new(2).unwrap(),
+                    NodeId::try_new(3).unwrap(),
+                ]);
+            }
+
+            // 2. Start verification
+            let handle_clone = Arc::new(handle);
+            let task = tokio::spawn(async move { handle_clone.verify_leadership().await });
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            // 3. Simulate network acks advancing the epoch
+            {
+                let mut guard = state.write().await;
+                let leader = guard.as_leader_mut().unwrap();
+                leader
+                    .state_mut()
+                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+            }
+
+            let result = task.await.unwrap();
+            assert!(result.is_ok());
+        }
     }
 
     mod consensus_status {
