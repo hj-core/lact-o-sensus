@@ -187,7 +187,9 @@ impl InventoryReader for LactoStore {
 
 #[async_trait]
 impl StateMachine for LactoStore {
-    fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+    type Error = FsmError;
+
+    fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
         self.meta
             .get(Self::KEY_LAST_APPLIED)
             .map_err(|e| {
@@ -212,7 +214,7 @@ impl StateMachine for LactoStore {
             seq = tracing::field::Empty,
         )
     )]
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
+    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
             FsmError::deserialization(format!(
                 "Failed to deserialize mutation at index {}: {}",

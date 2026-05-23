@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use common::raft_api::ConsensusAuthority;
 use common::raft_api::ConsensusHandle;
+use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::ConsensusError;
@@ -14,13 +15,13 @@ use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
 #[derive(Debug)]
-pub struct LocalRaftHandle {
-    state: Arc<ConsensusShell>,
+pub struct LocalRaftHandle<S: StateMachine> {
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
 }
 
-impl LocalRaftHandle {
-    pub fn new(state: Arc<ConsensusShell>, peer_manager: Arc<PeerManager>) -> Self {
+impl<S: StateMachine> LocalRaftHandle<S> {
+    pub fn new(state: Arc<ConsensusShell<S>>, peer_manager: Arc<PeerManager>) -> Self {
         Self {
             state,
             peer_manager,
@@ -67,7 +68,7 @@ impl LocalRaftHandle {
 }
 
 #[async_trait]
-impl ConsensusHandle for LocalRaftHandle {
+impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
     async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
         let mut guard = self.state.write().await;
         guard.propose(data).map_err(|e| match e {
@@ -176,11 +177,13 @@ mod tests {
     struct MockFsm;
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -192,7 +195,7 @@ mod tests {
         ))
     }
 
-    fn setup() -> (LocalRaftHandle, Arc<ConsensusShell>) {
+    fn setup() -> (LocalRaftHandle<MockFsm>, Arc<ConsensusShell<MockFsm>>) {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());

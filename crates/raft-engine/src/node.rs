@@ -108,20 +108,20 @@ impl NodeState for Leader {}
 /// signaling channels or perform I/O. Signaling is the responsibility of the
 /// high-level orchestrator shell.
 #[derive(Debug)]
-pub struct RaftNode<S: NodeState> {
+pub struct RaftNode<R: NodeState, S: StateMachine> {
     identity: Arc<NodeIdentity>,
-    fsm: Arc<dyn StateMachine>,
+    fsm: Arc<S>,
     log_store: Arc<dyn LogStorage>,
 
     // --- Volatile State ---
     last_committed: LogIndex,
     last_applied: LogIndex,
-    state: S,
+    state: R,
 }
 
 // --- Implementation: Shared Accessors ---
 
-impl<S: NodeState> RaftNode<S> {
+impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
     pub fn cluster_id(&self) -> &ClusterId {
         self.identity.cluster_id()
     }
@@ -150,11 +150,11 @@ impl<S: NodeState> RaftNode<S> {
         self.last_applied
     }
 
-    pub fn state(&self) -> &S {
+    pub fn state(&self) -> &R {
         &self.state
     }
 
-    pub fn state_mut(&mut self) -> &mut S {
+    pub fn state_mut(&mut self) -> &mut R {
         &mut self.state
     }
 
@@ -196,7 +196,7 @@ impl<S: NodeState> RaftNode<S> {
 
 // --- Implementation: Shared Physical Mutations ---
 
-impl<S: NodeState> RaftNode<S> {
+impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
     /// Consumes the current node and returns it in a Follower role.
     /// This is the primary mechanism for demotion and term updates.
     ///
@@ -207,7 +207,7 @@ impl<S: NodeState> RaftNode<S> {
         leader_id: Option<NodeId>,
         last_heartbeat: Tick,
         timeout: TickDuration,
-    ) -> Result<RaftNode<Follower>, NodeError> {
+    ) -> Result<RaftNode<Follower, S>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
@@ -281,7 +281,7 @@ impl<S: NodeState> RaftNode<S> {
     /// State Machine.
     async fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
-        let fsm_last = self.fsm.last_applied_index().map_err(NodeError::from)?;
+        let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
         if fsm_last > self.last_committed {
             return Err(NodeError::Protocol(format!(
                 "FSM index {} is ahead of last_committed {}. Possible log regression.",
@@ -305,7 +305,7 @@ impl<S: NodeState> RaftNode<S> {
                     error = %e,
                     "State machine failed to apply index. Triggering Halt Mandate."
                 );
-                return Err(NodeError::from(e));
+                return Err(e.into());
             }
 
             debug!(
@@ -356,7 +356,7 @@ impl<S: NodeState> RaftNode<S> {
         self,
     ) -> (
         Arc<NodeIdentity>,
-        Arc<dyn StateMachine>,
+        Arc<S>,
         Arc<dyn LogStorage>,
         LogIndex,
         LogIndex,
@@ -375,15 +375,15 @@ impl<S: NodeState> RaftNode<S> {
 // 4. Role: Follower Behavior
 // =============================================================================
 
-impl RaftNode<Follower> {
+impl<S: StateMachine> RaftNode<Follower, S> {
     pub fn try_new(
         identity: Arc<NodeIdentity>,
-        fsm: Arc<dyn StateMachine>,
+        fsm: Arc<S>,
         log_store: Arc<dyn LogStorage>,
         last_heartbeat: Tick,
         timeout: TickDuration,
     ) -> Result<Self, NodeError> {
-        let last_applied = fsm.last_applied_index().map_err(NodeError::from)?;
+        let last_applied = fsm.last_applied_index().map_err(|e| e.into())?;
         let last_committed = log_store.last_committed().map_err(NodeError::from)?;
 
         if last_applied > last_committed {
@@ -464,7 +464,7 @@ impl RaftNode<Follower> {
         self,
         election_start: Tick,
         timeout: TickDuration,
-    ) -> Result<RaftNode<Candidate>, NodeError> {
+    ) -> Result<RaftNode<Candidate, S>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
@@ -599,12 +599,12 @@ impl RaftNode<Follower> {
 // 5. Role: Candidate Behavior
 // =============================================================================
 
-impl RaftNode<Candidate> {
+impl<S: StateMachine> RaftNode<Candidate, S> {
     pub fn try_into_restarted_candidate(
         self,
         election_start: Tick,
         timeout: TickDuration,
-    ) -> Result<RaftNode<Candidate>, NodeError> {
+    ) -> Result<RaftNode<Candidate, S>, NodeError> {
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
 
         let mut node = RaftNode {
@@ -635,7 +635,7 @@ impl RaftNode<Candidate> {
         self,
         peer_ids: Vec<NodeId>,
         last_heartbeat: Tick,
-    ) -> Result<RaftNode<Leader>, NodeError> {
+    ) -> Result<RaftNode<Leader, S>, NodeError> {
         let last_log_index = self.last_log_index()?;
         let term = self.current_term()?;
         let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
@@ -663,7 +663,7 @@ impl RaftNode<Candidate> {
 // 6. Role: Leader Behavior
 // =============================================================================
 
-impl RaftNode<Leader> {
+impl<S: StateMachine> RaftNode<Leader, S> {
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
@@ -832,11 +832,13 @@ mod tests {
 
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
             self.applied_indices.lock().unwrap().push(index);
             self.applied_data.lock().unwrap().push(data.to_vec());
             Ok(())
@@ -853,7 +855,7 @@ mod tests {
     fn setup_node_as_follower(
         fsm: Arc<MockFsm>,
         log_store: Arc<MemoryStorage>,
-    ) -> RaftNode<Follower> {
+    ) -> RaftNode<Follower, MockFsm> {
         RaftNode::try_new(
             test_identity(1),
             fsm,
@@ -867,13 +869,16 @@ mod tests {
     fn setup_node_as_candidate(
         fsm: Arc<MockFsm>,
         log_store: Arc<MemoryStorage>,
-    ) -> RaftNode<Candidate> {
+    ) -> RaftNode<Candidate, MockFsm> {
         setup_node_as_follower(fsm, log_store)
             .try_into_candidate(Tick::new(0), TickDuration::new(150))
             .unwrap()
     }
 
-    fn setup_node_as_leader(fsm: Arc<MockFsm>, log_store: Arc<MemoryStorage>) -> RaftNode<Leader> {
+    fn setup_node_as_leader(
+        fsm: Arc<MockFsm>,
+        log_store: Arc<MemoryStorage>,
+    ) -> RaftNode<Leader, MockFsm> {
         setup_node_as_candidate(fsm, log_store)
             .try_into_leader(vec![], Tick::new(0))
             .unwrap()
@@ -892,7 +897,7 @@ mod tests {
                 fn reset_heartbeat_updates_timer() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -923,7 +928,7 @@ mod tests {
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::try_new(1).unwrap()))
                         .unwrap();
-                    let node = RaftNode::<Follower>::try_new(
+                    let node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -947,7 +952,7 @@ mod tests {
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::try_new(3).unwrap()))
                         .unwrap();
-                    let node = RaftNode::<Follower>::try_new(
+                    let node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -973,8 +978,11 @@ mod tests {
             mod on_valid_index {
                 use super::*;
 
-                async fn check_persists_to_log_store_when_index_is_valid<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_persists_to_log_store_when_index_is_valid<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                     log_store: Arc<MemoryStorage>,
                 ) {
                     log_store
@@ -1014,8 +1022,8 @@ mod tests {
                     check_persists_to_log_store_when_index_is_valid(node, log_store).await;
                 }
 
-                async fn check_applies_to_fsm_when_index_is_valid<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_applies_to_fsm_when_index_is_valid<R: NodeState, S: StateMachine>(
+                    mut node: RaftNode<R, S>,
                     fsm: Arc<MockFsm>,
                     log_store: Arc<MemoryStorage>,
                 ) {
@@ -1058,9 +1066,10 @@ mod tests {
                 }
 
                 async fn check_applies_multiple_entries_sequentially_when_index_jumps_ahead<
-                    S: NodeState,
+                    R: NodeState,
+                    S: StateMachine,
                 >(
-                    mut node: RaftNode<S>,
+                    mut node: RaftNode<R, S>,
                     fsm: Arc<MockFsm>,
                     log_store: Arc<MemoryStorage>,
                 ) {
@@ -1123,8 +1132,11 @@ mod tests {
             mod on_stale_index {
                 use super::*;
 
-                async fn check_ignores_update_when_index_is_lower_than_current<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_ignores_update_when_index_is_lower_than_current<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                     log_store: Arc<MemoryStorage>,
                 ) {
                     log_store
@@ -1169,8 +1181,11 @@ mod tests {
             mod on_invalid_index {
                 use super::*;
 
-                async fn check_returns_error_when_index_exceeds_last_log_index<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_returns_error_when_index_exceeds_last_log_index<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                 ) {
                     let result = node.advance_last_committed(LogIndex::new(1)).await;
                     assert!(result.is_err());
@@ -1209,17 +1224,26 @@ mod tests {
                 struct PoisonFsm;
                 #[async_trait]
                 impl StateMachine for PoisonFsm {
-                    fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+                    type Error = FsmError;
+
+                    fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
                         Ok(LogIndex::ZERO)
                     }
 
-                    async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+                    async fn apply(
+                        &self,
+                        _index: LogIndex,
+                        _data: &[u8],
+                    ) -> Result<(), Self::Error> {
                         Err(FsmError::invariant("Simulated FSM failure"))
                     }
                 }
 
-                async fn check_returns_error_when_state_machine_apply_fails<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_returns_error_when_state_machine_apply_fails<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                     log_store: Arc<MemoryStorage>,
                 ) {
                     log_store
@@ -1243,10 +1267,10 @@ mod tests {
 
                 #[tokio::test]
                 async fn returns_error_when_state_machine_apply_fails_as_follower() {
-                    let (_fsm, log_store) = (Arc::new(PoisonFsm), Arc::new(MemoryStorage::new()));
-                    let node = RaftNode::<Follower>::try_new(
+                    let (fsm, log_store) = (Arc::new(PoisonFsm), Arc::new(MemoryStorage::new()));
+                    let node = RaftNode::<Follower, PoisonFsm>::try_new(
                         test_identity(1),
-                        Arc::new(PoisonFsm),
+                        fsm,
                         log_store.clone(),
                         Tick::new(0),
                         TickDuration::new(100),
@@ -1297,19 +1321,26 @@ mod tests {
                 struct RegressionFsm;
                 #[async_trait]
                 impl StateMachine for RegressionFsm {
-                    fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+                    type Error = FsmError;
+
+                    fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
                         Ok(LogIndex::new(100))
                     }
 
-                    async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+                    async fn apply(
+                        &self,
+                        _index: LogIndex,
+                        _data: &[u8],
+                    ) -> Result<(), Self::Error> {
                         Ok(())
                     }
                 }
 
                 async fn check_returns_error_when_fsm_index_is_ahead_of_last_committed<
-                    S: NodeState,
+                    R: NodeState,
+                    S: StateMachine,
                 >(
-                    mut node: RaftNode<S>,
+                    mut node: RaftNode<R, S>,
                 ) {
                     let result = node.apply_to_state_machine().await;
                     assert!(result.is_err());
@@ -1365,9 +1396,10 @@ mod tests {
                 use super::*;
 
                 async fn check_returns_error_when_committed_entry_is_missing_from_log_store<
-                    S: NodeState,
+                    R: NodeState,
+                    S: StateMachine,
                 >(
-                    mut node: RaftNode<S>,
+                    mut node: RaftNode<R, S>,
                 ) {
                     node.last_committed = LogIndex::new(5);
                     let result = node.apply_to_state_machine().await;
@@ -1378,7 +1410,7 @@ mod tests {
                 #[tokio::test]
                 async fn returns_error_when_committed_entry_is_missing_from_log_store_as_follower()
                 {
-                    let node = RaftNode::<Follower>::try_new(
+                    let node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         Arc::new(MockFsm::default()),
                         Arc::new(MemoryStorage::new()),
@@ -1427,8 +1459,11 @@ mod tests {
                 const HIGHER_TERM: Term = Term::new(6);
                 const BOOTSTRAP_TERM: Term = Term::new(4);
 
-                async fn check_persists_new_term_and_resets_voted_for<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_persists_new_term_and_resets_voted_for<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                 ) {
                     node.advance_term(HIGHER_TERM).unwrap();
                     assert_eq!(node.current_term().unwrap(), HIGHER_TERM);
@@ -1484,8 +1519,11 @@ mod tests {
                 const SAME_TERM: Term = Term::new(5);
                 const BOOTSTRAP_TERM: Term = Term::new(4);
 
-                async fn check_preserves_current_term_and_voting_state<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_preserves_current_term_and_voting_state<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                 ) {
                     node.advance_term(SAME_TERM).unwrap();
                     assert_eq!(node.current_term().unwrap(), STARTING_TERM);
@@ -1535,8 +1573,11 @@ mod tests {
                 const TARGET_TERM: Term = Term::new(10);
                 const LOWER_TERM: Term = Term::new(5);
 
-                async fn check_returns_error_when_new_term_is_lower_than_current<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_returns_error_when_new_term_is_lower_than_current<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                 ) {
                     node.advance_term(TARGET_TERM).unwrap();
 
@@ -1634,8 +1675,11 @@ mod tests {
                     }
                 }
 
-                async fn check_propagates_persistence_error_when_storage_fails<S: NodeState>(
-                    mut node: RaftNode<S>,
+                async fn check_propagates_persistence_error_when_storage_fails<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
+                    mut node: RaftNode<R, S>,
                 ) {
                     let result = node.advance_term(Term::new(2));
 
@@ -1652,7 +1696,7 @@ mod tests {
                 async fn propagates_persistence_error_when_storage_fails_as_follower() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(FailingStorage);
-                    let node = RaftNode::<Follower>::try_new(
+                    let node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -1737,7 +1781,7 @@ mod tests {
                     {
                         let db = sled::open(dir.path()).unwrap();
                         let log_store = Arc::new(SledStorage::new(db).unwrap());
-                        let node = RaftNode::<Follower>::try_new(
+                        let node = RaftNode::<Follower, MockFsm>::try_new(
                             test_identity(1),
                             fsm,
                             log_store,
@@ -1759,11 +1803,13 @@ mod tests {
                 struct AheadFsm;
                 #[async_trait]
                 impl StateMachine for AheadFsm {
-                    fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+                    type Error = FsmError;
+
+                    fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
                         Ok(LogIndex::new(100))
                     }
 
-                    async fn apply(&self, _: LogIndex, _: &[u8]) -> Result<(), FsmError> {
+                    async fn apply(&self, _: LogIndex, _: &[u8]) -> Result<(), Self::Error> {
                         Ok(())
                     }
                 }
@@ -1773,7 +1819,7 @@ mod tests {
                     let fsm = Arc::new(AheadFsm);
                     let log_store = Arc::new(MemoryStorage::new());
 
-                    let result = RaftNode::<Follower>::try_new(
+                    let result = RaftNode::<Follower, AheadFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -1802,7 +1848,7 @@ mod tests {
                 async fn rejects_inconsistent_prev_index() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -1839,7 +1885,7 @@ mod tests {
                             },
                         ])
                         .unwrap();
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -1881,7 +1927,7 @@ mod tests {
                         });
                     }
                     log_store.append_entries(entries).unwrap();
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -1925,7 +1971,7 @@ mod tests {
                     };
                     let log_store = MemoryStorage::new();
                     log_store.append_entries(vec![entry.clone()]).unwrap();
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -1951,7 +1997,7 @@ mod tests {
                 async fn rejects_non_contiguous_append() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -1995,7 +2041,7 @@ mod tests {
                             data: vec![],
                         }])
                         .unwrap();
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -2033,7 +2079,7 @@ mod tests {
                             data: vec![],
                         }])
                         .unwrap();
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -2074,7 +2120,7 @@ mod tests {
                 fn grant_vote_respects_voting_state() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = RaftNode::<Follower>::try_new(
+                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,
@@ -2110,7 +2156,10 @@ mod tests {
             mod on_log_up_to_date_check {
                 use super::*;
 
-                fn setup_node_with_log(last_idx: u64, last_term: u64) -> RaftNode<Follower> {
+                fn setup_node_with_log(
+                    last_idx: u64,
+                    last_term: u64,
+                ) -> RaftNode<Follower, MockFsm> {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = MemoryStorage::new();
                     let mut entries = Vec::new();
@@ -2129,7 +2178,7 @@ mod tests {
                         });
                     }
                     log_store.append_entries(entries).unwrap();
-                    RaftNode::<Follower>::try_new(
+                    RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         Arc::new(log_store),
@@ -2188,7 +2237,7 @@ mod tests {
                 fn promotion_preserves_invariants() {
                     let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let node = RaftNode::<Follower>::try_new(
+                    let node = RaftNode::<Follower, MockFsm>::try_new(
                         test_identity(1),
                         fsm,
                         log_store,

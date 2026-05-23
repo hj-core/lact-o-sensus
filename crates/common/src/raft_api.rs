@@ -6,12 +6,13 @@
 //! and structured traits for state machine interactions.
 
 use std::fmt::Debug;
+use std::fmt::Display;
 
 use async_trait::async_trait;
 
 use crate::types::LogIndex;
 use crate::types::errors::ConsensusError;
-use crate::types::errors::FsmError;
+use crate::types::errors::NodeError;
 
 /// Atomic snapshot of the node's consensus authority and cluster horizon.
 ///
@@ -69,18 +70,23 @@ pub trait ConsensusHandle: Send + Sync + Debug {
 /// Implementations are responsible for deserializing the opaque bytes and
 /// applying the mutation to their internal state.
 #[async_trait]
-pub trait StateMachine: Send + Sync + Debug {
+pub trait StateMachine: Send + Sync + Debug + 'static {
+    /// The clinical error type returned by the state machine.
+    ///
+    /// Must be convertible to NodeError to satisfy the Halt Mandate (ADR 009).
+    type Error: Into<NodeError> + Send + Sync + Debug + Display;
+
     /// Returns the last log index applied to this state machine.
     ///
     /// Used by the Raft engine during startup to align volatile pointers
     /// with persistent application state.
-    fn last_applied_index(&self) -> Result<LogIndex, FsmError>;
+    fn last_applied_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Applies a committed log entry to the application state.
     ///
     /// This method is called sequentially by the Raft engine as the
     /// commit_index advances.
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), FsmError>;
+    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

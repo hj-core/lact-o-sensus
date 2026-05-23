@@ -46,21 +46,21 @@ pub struct ConsensusProgress {
 
 /// The Dispatcher Enum (Logical State Machine).
 ///
-/// This is the primary entry point for all consensus operations, managing
+/// Orchestrates the physical Raft node according to its current role, managing
 /// the transitions between Raft roles (ADR 002).
 #[derive(Debug)]
-pub enum RoleState {
-    Follower(RaftNode<Follower>),
-    Candidate(RaftNode<Candidate>),
-    Leader(RaftNode<Leader>),
+pub enum RoleState<S: StateMachine> {
+    Follower(RaftNode<Follower, S>),
+    Candidate(RaftNode<Candidate, S>),
+    Leader(RaftNode<Leader, S>),
     Poisoned, // ADR 001: Safety barrier during transition failures
 }
 
 /// The logical orchestrator of a Raft node, managing its role state,
 /// deterministic clock, and randomized timeouts.
 #[derive(Debug)]
-pub struct LogicalNode {
-    state: RoleState,
+pub struct LogicalNode<S: StateMachine> {
+    state: RoleState<S>,
     current_tick: Tick,
     thresholds: TickThresholds,
     rng: StdRng,
@@ -152,11 +152,11 @@ impl RequestVoteResult {
 // Implementation: LogicalNode (High-Level Protocol Orchestrator)
 // =============================================================================
 
-impl LogicalNode {
+impl<S: StateMachine> LogicalNode<S> {
     /// Creates a new LogicalNode in the Follower role.
     pub fn try_new(
         identity: Arc<NodeIdentity>,
-        fsm: Arc<dyn StateMachine>,
+        fsm: Arc<S>,
         log_store: Arc<dyn LogStorage>,
         thresholds: TickThresholds,
         mut rng: StdRng,
@@ -164,7 +164,8 @@ impl LogicalNode {
         let current_tick = Tick::ZERO;
         let timeout = thresholds.generate_election_timeout(&mut rng);
 
-        let node = RaftNode::<Follower>::try_new(identity, fsm, log_store, current_tick, timeout)?;
+        let node =
+            RaftNode::<Follower, S>::try_new(identity, fsm, log_store, current_tick, timeout)?;
 
         Ok(Self {
             state: RoleState::Follower(node),
@@ -174,26 +175,26 @@ impl LogicalNode {
         })
     }
 
-    pub fn state(&self) -> &RoleState {
+    pub fn state(&self) -> &RoleState<S> {
         &self.state
     }
 
     #[allow(dead_code)]
-    pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower>> {
+    pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower, S>> {
         match &mut self.state {
             RoleState::Follower(node) => Some(node),
             _ => None,
         }
     }
 
-    pub(crate) fn as_candidate_mut(&mut self) -> Option<&mut RaftNode<Candidate>> {
+    pub(crate) fn as_candidate_mut(&mut self) -> Option<&mut RaftNode<Candidate, S>> {
         match &mut self.state {
             RoleState::Candidate(node) => Some(node),
             _ => None,
         }
     }
 
-    pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader>> {
+    pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader, S>> {
         match &mut self.state {
             RoleState::Leader(node) => Some(node),
             _ => None,
@@ -428,7 +429,7 @@ impl LogicalNode {
     /// Safely transitions the node state using an ownership-consuming closure.
     pub fn transition<F>(&mut self, f: F)
     where
-        F: FnOnce(RoleState) -> RoleState,
+        F: FnOnce(RoleState<S>) -> RoleState<S>,
     {
         let old_state = std::mem::replace(&mut self.state, RoleState::Poisoned);
         self.state = f(old_state);
@@ -643,11 +644,13 @@ mod tests {
     struct MockFsm;
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -659,7 +662,7 @@ mod tests {
         ))
     }
 
-    fn setup_node(node_id: u64) -> LogicalNode {
+    fn setup_node(node_id: u64) -> LogicalNode<MockFsm> {
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());
         let thresholds = TickThresholds {

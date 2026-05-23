@@ -12,18 +12,14 @@ use crate::storage::LogStorage;
 
 /// Orchestrates the synchronization of the persistent State Machine with the
 /// Raft Consensus Log on node startup.
-pub struct RecoveryManager {
+pub struct RecoveryManager<S: StateMachine> {
     identity: Arc<NodeIdentity>,
-    fsm: Arc<dyn StateMachine>,
+    fsm: Arc<S>,
     log_store: Arc<dyn LogStorage>,
 }
 
-impl RecoveryManager {
-    pub fn new(
-        identity: Arc<NodeIdentity>,
-        fsm: Arc<dyn StateMachine>,
-        log_store: Arc<dyn LogStorage>,
-    ) -> Self {
+impl<S: StateMachine> RecoveryManager<S> {
+    pub fn new(identity: Arc<NodeIdentity>, fsm: Arc<S>, log_store: Arc<dyn LogStorage>) -> Self {
         Self {
             identity,
             fsm,
@@ -37,7 +33,7 @@ impl RecoveryManager {
     /// This method blocks until the FSM reaches the last persisted commit
     /// index.
     pub async fn recover(&self) -> Result<(), NodeError> {
-        let last_applied = self.fsm.last_applied_index().map_err(NodeError::from)?;
+        let last_applied = self.fsm.last_applied_index().map_err(|e| e.into())?;
         let last_committed = self.log_store.last_committed().map_err(NodeError::from)?;
 
         self.verify_causal_integrity(last_applied, last_committed)?;
@@ -124,7 +120,7 @@ impl RecoveryManager {
             self.fsm
                 .apply(apply_idx, &entry.data)
                 .await
-                .map_err(NodeError::from)?;
+                .map_err(|e| e.into())?;
             current = apply_idx;
 
             if current.as_u64().is_multiple_of(100) {
@@ -170,11 +166,13 @@ mod tests {
 
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(*self.last_applied.lock().unwrap())
         }
 
-        async fn apply(&self, index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             if *self.fail_apply.lock().unwrap() {
                 return Err(FsmError::invariant("FSM simulated failure"));
             }

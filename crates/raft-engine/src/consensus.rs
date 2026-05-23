@@ -6,6 +6,7 @@ use common::proto::v1::raft::AppendEntriesRequest;
 use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
+use common::raft_api::StateMachine;
 use common::rpc::TraceInterceptor;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -107,9 +108,9 @@ enum ReplicationAction {
 /// This is the system's "Heartbeat" (ADR 003). It pulses at a fixed interval,
 /// driving the logical engine's absolute clock and dispatching consensus
 /// actions (Elections, Heartbeats) based on deterministic tick boundaries.
-pub fn spawn_tick_loop(
+pub fn spawn_tick_loop<S: StateMachine>(
     config: Arc<Config>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
 ) {
     let interval = config.raft.tick_interval();
@@ -205,9 +206,9 @@ pub fn spawn_tick_loop(
 /// occurs under a discrete write lock before establishing the
 /// 'election_campaign' telemetry span and yielding to the asynchronous network
 /// phase.
-async fn initiate_transition_to_candidate(
+async fn initiate_transition_to_candidate<S: StateMachine>(
     config: Arc<Config>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
 ) {
@@ -262,9 +263,9 @@ async fn initiate_transition_to_candidate(
 /// Acts as the high-level coordinator: it snapshots the physical log state,
 /// delegates the network fan-out, and processes the asynchronous stream of
 /// vote responses to determine the campaign's success or failure.
-async fn initiate_election(
+async fn initiate_election<S: StateMachine>(
     config: Arc<Config>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
 ) -> Result<()> {
@@ -342,8 +343,8 @@ async fn initiate_election(
 ///
 /// Responsible for: 1. Term check and opportunistic demotion (§5.1)
 /// 2. Tally vote if granted and we are still campaigning for the same term
-async fn process_vote_response(
-    state: &ConsensusShell,
+async fn process_vote_response<S: StateMachine>(
+    state: &ConsensusShell<S>,
     term: Term,
     peer_ids: &[NodeId],
     peer_id: NodeId,
@@ -416,9 +417,9 @@ async fn process_vote_response(
 ///
 /// Ensures the 'replication_round' telemetry context is properly established
 /// before yielding to the asynchronous fan-out phase (ADR 010).
-fn initiate_replication(
+fn initiate_replication<S: StateMachine>(
     config: Arc<Config>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
     term: Term,
@@ -445,9 +446,9 @@ fn initiate_replication(
 /// Coordinates the concurrent transmission of AppendEntries RPCs and
 /// processes the resulting stream. If a higher term is discovered, it
 /// terminates the round early to allow for immediate demotion.
-async fn replicate_to_peers(
+async fn replicate_to_peers<S: StateMachine>(
     config: Arc<Config>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
 ) -> Result<()> {
@@ -493,8 +494,8 @@ async fn replicate_to_peers(
 ///    log mismatch.
 /// 3. Quorum Commitment: Advancing the Leader's commit index once a majority is
 ///    reached (ADR 002).
-async fn process_append_entries_response(
-    state: &ConsensusShell,
+async fn process_append_entries_response<S: StateMachine>(
+    state: &ConsensusShell<S>,
     term: Term,
     peer_id: NodeId,
     res: RpcResult<Option<ReplicationOutcome>>,
@@ -659,10 +660,10 @@ async fn request_vote_from_peer(
 ///
 /// Dynamically constructs the specific payload for each peer based on their
 /// individual 'next_index' state to ensure efficient log synchronization.
-fn broadcast_append_entries(
+fn broadcast_append_entries<S: StateMachine>(
     config: &Config,
     peer_manager: Arc<PeerManager>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
     term: Term,
     node_id: NodeId,
     last_committed: LogIndex,
@@ -761,7 +762,7 @@ async fn replicate_to_peer(
 // --- Telemetry & Identity ---
 
 /// Maps the physical node state to a semantic role name for telemetry spans.
-fn determine_node_role_name(node: &LogicalNode) -> &'static str {
+fn determine_node_role_name<S: StateMachine>(node: &LogicalNode<S>) -> &'static str {
     match node.state() {
         RoleState::Follower(_) => "follower_session",
         RoleState::Candidate(_) => "candidate_session",
@@ -773,8 +774,8 @@ fn determine_node_role_name(node: &LogicalNode) -> &'static str {
 // --- Replication & State Machine ---
 
 /// Dynamically constructs an AppendEntries payload for a specific peer.
-fn build_append_entries_request(
-    node: &mut LogicalNode,
+fn build_append_entries_request<S: StateMachine>(
+    node: &mut LogicalNode<S>,
     peer_id: NodeId,
     term: Term,
     node_id: NodeId,
@@ -806,7 +807,7 @@ fn build_append_entries_request(
 }
 
 /// Computes the consensus quorum and advances the Leader's commit index.
-async fn update_leader_last_committed(node: &mut LogicalNode) {
+async fn update_leader_last_committed<S: StateMachine>(node: &mut LogicalNode<S>) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
     let (median_idx, commit_idx) = if let RoleState::Leader(n) = node.state() {
@@ -875,7 +876,6 @@ fn verify_trace_integrity<T>(
 mod tests {
     use std::collections::HashMap;
 
-    use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
@@ -893,11 +893,13 @@ mod tests {
     use common::types::errors::FsmError;
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -922,7 +924,7 @@ mod tests {
         Arc::new(toml::from_str(&toml_str).unwrap())
     }
 
-    async fn setup() -> (Arc<Config>, Arc<ConsensusShell>, Arc<PeerManager>) {
+    async fn setup() -> (Arc<Config>, Arc<ConsensusShell<MockFsm>>, Arc<PeerManager>) {
         let config = mock_config(50, 100);
         let id = Arc::new(NodeIdentity::new(
             ClusterId::try_new("test-cluster").unwrap(),

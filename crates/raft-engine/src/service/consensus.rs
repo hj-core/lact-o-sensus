@@ -5,6 +5,7 @@ use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
+use common::raft_api::StateMachine;
 use common::rpc::TraceInterceptor;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -87,19 +88,19 @@ impl AppendParams {
 /// This service acts as a dispatcher, delegating logic to the underlying
 /// Type-State node engine while enforcing cluster identity and node health.
 #[derive(Debug)]
-pub struct ConsensusDispatcher {
+pub struct ConsensusDispatcher<S: StateMachine> {
     identity: Arc<NodeIdentity>,
-    state: Arc<ConsensusShell>,
+    state: Arc<ConsensusShell<S>>,
 }
 
-impl ConsensusDispatcher {
-    pub fn new(identity: Arc<NodeIdentity>, state: Arc<ConsensusShell>) -> Self {
+impl<S: StateMachine> ConsensusDispatcher<S> {
+    pub fn new(identity: Arc<NodeIdentity>, state: Arc<ConsensusShell<S>>) -> Self {
         Self { identity, state }
     }
 
     /// Verifies that the node engine is healthy and matches the service
     /// identity.
-    fn verify_node_integrity(&self, node: &mut LogicalNode) -> Result<(), Status> {
+    fn verify_node_integrity(&self, node: &mut LogicalNode<S>) -> Result<(), Status> {
         let engine_id = node.identity();
         if Arc::ptr_eq(&engine_id, &self.identity) {
             Ok(())
@@ -159,7 +160,7 @@ impl ConsensusDispatcher {
 }
 
 #[tonic::async_trait]
-impl ConsensusService for ConsensusDispatcher {
+impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
     async fn request_vote(
         &self,
         request: Request<RequestVoteRequest>,
@@ -243,11 +244,13 @@ mod tests {
     struct MockFsm;
     #[async_trait]
     impl StateMachine for MockFsm {
-        fn last_applied_index(&self) -> Result<LogIndex, FsmError> {
+        type Error = FsmError;
+
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), FsmError> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -263,7 +266,7 @@ mod tests {
         test_identity(1)
     }
 
-    fn mock_dispatcher() -> ConsensusDispatcher {
+    fn mock_dispatcher() -> ConsensusDispatcher<MockFsm> {
         let id = mock_identity();
         let fsm = Arc::new(MockFsm);
         let storage = Arc::new(MemoryStorage::new());

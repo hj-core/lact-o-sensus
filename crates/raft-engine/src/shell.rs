@@ -2,6 +2,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
+use common::raft_api::StateMachine;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::RwLockWriteGuard;
@@ -17,14 +18,14 @@ use crate::engine::NodeRole;
 /// channel, ensuring that all mutations are atomically broadcast once
 /// logical consistency is reached.
 #[derive(Debug)]
-pub struct ConsensusShell {
-    inner: Arc<RwLock<LogicalNode>>,
+pub struct ConsensusShell<S: StateMachine> {
+    inner: Arc<RwLock<LogicalNode<S>>>,
     progress_tx: watch::Sender<ConsensusProgress>,
 }
 
-impl ConsensusShell {
+impl<S: StateMachine> ConsensusShell<S> {
     /// Creates a new consensus state shell and initializes the signal channel.
-    pub fn new(mut initial_state: LogicalNode) -> Self {
+    pub fn new(mut initial_state: LogicalNode<S>) -> Self {
         let progress = initial_state.consensus_progress();
 
         let (progress_tx, _) = watch::channel(progress);
@@ -35,7 +36,7 @@ impl ConsensusShell {
     }
 
     /// Acquires a read lock on the consensus state.
-    pub async fn read(&self) -> RwLockReadGuard<'_, LogicalNode> {
+    pub async fn read(&self) -> RwLockReadGuard<'_, LogicalNode<S>> {
         self.inner.read().await
     }
 
@@ -46,7 +47,7 @@ impl ConsensusShell {
     /// mutate the consensus state. The returned guard ensures that any
     /// changes to the logical epoch or physical state are published to
     /// observers before the write lock is released.
-    pub async fn write(&self) -> MutationGuard<'_> {
+    pub async fn write(&self) -> MutationGuard<'_, S> {
         let mut guard = self.inner.write().await;
         let before = guard.consensus_progress();
         MutationGuard {
@@ -67,27 +68,27 @@ impl ConsensusShell {
 /// When this guard is dropped, it compares the consensus state before and
 /// after the mutation. If the state (or the logical epoch) has changed,
 /// it broadcasts the new progress snapshot to all observers.
-pub struct MutationGuard<'a> {
-    shell: &'a ConsensusShell,
-    guard: RwLockWriteGuard<'a, LogicalNode>,
+pub struct MutationGuard<'a, S: StateMachine> {
+    shell: &'a ConsensusShell<S>,
+    guard: RwLockWriteGuard<'a, LogicalNode<S>>,
     before: ConsensusProgress,
 }
 
-impl<'a> Deref for MutationGuard<'a> {
-    type Target = LogicalNode;
+impl<'a, S: StateMachine> Deref for MutationGuard<'a, S> {
+    type Target = LogicalNode<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.guard
     }
 }
 
-impl<'a> DerefMut for MutationGuard<'a> {
+impl<'a, S: StateMachine> DerefMut for MutationGuard<'a, S> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.guard
     }
 }
 
-impl<'a> Drop for MutationGuard<'a> {
+impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
     fn drop(&mut self) {
         // We determine the 'after' state. If the thread is already panicking,
         // we MUST transition the node to Poisoned and broadcast a terminal
