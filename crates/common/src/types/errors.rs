@@ -82,6 +82,10 @@ pub enum ConsensusError {
     #[error("Consensus proposal at index {0} timed out before reaching quorum")]
     CommitTimeout(LogIndex),
 
+    /// A consensus operation (e.g. leadership verification) timed out.
+    #[error("Consensus operation timed out")]
+    Timeout,
+
     /// The node has encountered a fatal invariant and is poisoned.
     #[error("Node is in a poisoned state and cannot participate in consensus")]
     Poisoned,

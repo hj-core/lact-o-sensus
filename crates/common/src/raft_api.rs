@@ -59,8 +59,9 @@ pub trait ConsensusHandle: Send + Sync + Debug {
 
     /// Verifies that this node is still the current cluster leader.
     ///
-    /// For strict linearizability, this should perform a quorum check
-    /// (e.g., a heartbeat round-trip) to ensure it hasn't been deposed.
+    /// This method performs a network-bound quorum check (Batched Read Index)
+    /// to ensure the node has not been deposed, providing the strict
+    /// linearizability guarantee mandated by ADR 006.
     async fn verify_leadership(&self) -> Result<(), ConsensusError>;
 }
 

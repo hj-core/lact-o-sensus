@@ -955,6 +955,7 @@ impl IngressDispatcher {
                 Status::internal("Internal Consensus Failure")
             }
             ConsensusError::Terminated => Status::unavailable("Consensus engine is shutting down"),
+            ConsensusError::Timeout => Status::deadline_exceeded("Quorum verification timed out"),
         }
     }
 
