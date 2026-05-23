@@ -1,3 +1,4 @@
+pub mod app_api;
 pub mod proto;
 pub mod raft_api;
 pub mod rpc;

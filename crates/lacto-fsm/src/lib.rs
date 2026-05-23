@@ -1,12 +1,12 @@
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use common::app_api::InventoryReader;
+use common::app_api::SessionProvider;
 use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::SessionRecord;
-use common::raft_api::InventoryReader;
-use common::raft_api::SessionProvider;
 use common::raft_api::StateMachine;
 use common::types::ClientId;
 use common::types::LogIndex;

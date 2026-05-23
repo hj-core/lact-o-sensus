@@ -3,6 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::app_api::InventoryReader;
+use common::app_api::SessionProvider;
 use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
@@ -15,8 +17,6 @@ use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
 use common::raft_api::ConsensusAuthority;
 use common::raft_api::ConsensusHandle;
-use common::raft_api::InventoryReader;
-use common::raft_api::SessionProvider;
 use common::rpc::TraceInterceptor;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
@@ -981,6 +981,8 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use common::app_api::InventoryReader;
+    use common::app_api::SessionProvider;
     use common::proto::v1::app::GroceryItem;
     use common::proto::v1::app::MutationIntent;
     use common::proto::v1::app::MutationStatus;
@@ -991,8 +993,6 @@ mod tests {
     use common::proto::v1::app::SessionRecord;
     use common::raft_api::ConsensusAuthority;
     use common::raft_api::ConsensusHandle;
-    use common::raft_api::InventoryReader;
-    use common::raft_api::SessionProvider;
     use common::types::ClientId;
     use common::types::LogIndex;
     use common::types::SequenceId;
