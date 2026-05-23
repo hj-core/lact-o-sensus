@@ -115,6 +115,13 @@ pub struct Leader {
     next_index: HashMap<NodeId, LogIndex>,
     match_index: HashMap<NodeId, LogIndex>,
     last_heartbeat: Tick,
+
+    /// The epoch of the latest heartbeat round initiated (§8).
+    current_read_epoch: u64,
+    /// The highest epoch acknowledged by a majority (§8).
+    confirmed_read_epoch: u64,
+    /// Peers who have acknowledged the current_read_epoch.
+    heartbeat_acks: HashSet<NodeId>,
 }
 
 pub trait NodeState: Debug {}
@@ -801,6 +808,9 @@ impl Leader {
             next_index,
             match_index,
             last_heartbeat,
+            current_read_epoch: 0,
+            confirmed_read_epoch: 0,
+            heartbeat_acks: HashSet::new(),
         })
     }
 
@@ -828,11 +838,43 @@ impl Leader {
         &mut self.match_index
     }
 
+    pub fn current_read_epoch(&self) -> u64 {
+        self.current_read_epoch
+    }
+
+    pub fn confirmed_read_epoch(&self) -> u64 {
+        self.confirmed_read_epoch
+    }
+
     pub fn evaluate_tick(&self, now: Tick, threshold: TickDuration) -> TickAction {
         if now - self.last_heartbeat >= threshold {
             TickAction::SendHeartbeat
         } else {
             TickAction::None
+        }
+    }
+
+    /// Prepares a new read probe epoch (§8).
+    ///
+    /// If the current epoch has already reached quorum (or is otherwise
+    /// finished), increments the epoch to ensure the next round-trip proves
+    /// authority *after* this call. Returns the target epoch to wait for.
+    pub fn prepare_read_probe(&mut self, self_id: NodeId) -> u64 {
+        if self.confirmed_read_epoch == self.current_read_epoch {
+            self.current_read_epoch += 1;
+            self.heartbeat_acks.clear();
+            self.heartbeat_acks.insert(self_id);
+        }
+        self.current_read_epoch
+    }
+
+    /// Records an acknowledgment for the current heartbeat epoch (§8).
+    ///
+    /// If a majority is reached, advances the `confirmed_read_epoch`.
+    pub fn acknowledge_heartbeat(&mut self, peer_id: NodeId, quorum_size: usize) {
+        self.heartbeat_acks.insert(peer_id);
+        if self.heartbeat_acks.len() >= quorum_size {
+            self.confirmed_read_epoch = self.current_read_epoch;
         }
     }
 }
@@ -2485,6 +2527,46 @@ mod tests {
                 let result = node.propose(vec![1]);
                 assert!(result.is_err());
                 assert!(result.unwrap_err().to_string().contains("Append Failure"));
+            }
+        }
+
+        mod heartbeat_epochs {
+            use super::*;
+
+            #[test]
+            fn advances_epoch_on_quorum() {
+                let fsm = Arc::new(MockFsm::default());
+                let log_store = Arc::new(MemoryStorage::new());
+                let mut node = setup_node_as_candidate(fsm, log_store)
+                    .try_into_leader(
+                        vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()],
+                        Tick::new(0),
+                    )
+                    .unwrap();
+                let self_id = node.node_id();
+
+                // 1. Initial state
+                assert_eq!(node.state().current_read_epoch(), 0);
+                assert_eq!(node.state().confirmed_read_epoch(), 0);
+
+                // 2. Start round 1 (prepare_read_probe increments to 1)
+                let target = node.state_mut().prepare_read_probe(self_id);
+                assert_eq!(target, 1);
+
+                // 3. Acknowledge from peer 2 (1 peer + self = 2/3 quorum)
+                node.state_mut()
+                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+                assert_eq!(node.state().confirmed_read_epoch(), 1);
+
+                // 4. Start round 2 (increments to 2)
+                let target2 = node.state_mut().prepare_read_probe(self_id);
+                assert_eq!(target2, 2);
+                assert_eq!(node.state().confirmed_read_epoch(), 1);
+
+                // 5. Reach quorum for round 2
+                node.state_mut()
+                    .acknowledge_heartbeat(NodeId::try_new(3).unwrap(), 2);
+                assert_eq!(node.state().confirmed_read_epoch(), 2);
             }
         }
     }
