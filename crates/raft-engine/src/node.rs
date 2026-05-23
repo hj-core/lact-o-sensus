@@ -1,3 +1,15 @@
+//! Physical node foundation and Type-State orchestrator for the Raft engine.
+//!
+//! This module implements the "Physical Foundation" layer of the Tri-Layer
+//! Onion architecture (ADR 009). It manages the core Raft state (Term, Log,
+//! Commit Index) and enforces role-based behavioral transitions using the
+//! Type-State pattern.
+//!
+//! The `RaftNode` struct acts as a pure data mutator and invariant protector,
+//! delegating I/O and asynchronous signaling to the high-level
+//! `ConsensusShell`.
+
+use std::cmp;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -69,6 +81,11 @@ pub enum TickAction {
 // 2. Role Markers (Type-State Engine)
 // =============================================================================
 
+/// Passive role responsible for log reconciliation and heartbeat tracking.
+///
+/// Follower nodes maintain liveness by monitoring heartbeats from the leader
+/// (ADR 003). If the heartbeat timer expires, the node transitions to the
+/// Candidate role to initiate an election.
 #[derive(Debug)]
 pub struct Follower {
     leader_id: Option<NodeId>,
@@ -76,6 +93,11 @@ pub struct Follower {
     timeout: TickDuration,
 }
 
+/// Active role during leadership campaigns.
+///
+/// Candidate nodes solicit votes from peers and transition to the Leader role
+/// upon reaching a quorum (ADR 002). If an election times out before a quorum
+/// is reached, the term is incremented and a new campaign is initiated.
 #[derive(Debug)]
 pub struct Candidate {
     votes_received: HashSet<NodeId>,
@@ -83,6 +105,11 @@ pub struct Candidate {
     timeout: TickDuration,
 }
 
+/// Authoritative role responsible for mutation ingestion and log replication.
+///
+/// The Leader manages the cluster's logical timeline by replicating log
+/// entries to Followers and advancing the commit index once a quorum has
+/// acknowledged reception (§5.3).
 #[derive(Debug)]
 pub struct Leader {
     next_index: HashMap<NodeId, LogIndex>,
@@ -572,7 +599,7 @@ impl<S: StateMachine> RaftNode<Follower, S> {
     async fn reconcile_last_committed(&mut self, leader_commit: LogIndex) -> Result<(), NodeError> {
         if leader_commit > self.last_committed {
             let last_new_idx = self.last_log_index()?;
-            let new_commit = std::cmp::min(leader_commit, last_new_idx);
+            let new_commit = cmp::min(leader_commit, last_new_idx);
             self.advance_last_committed(new_commit).await?;
             debug!("Updated last_committed to {}", new_commit);
         }
@@ -839,8 +866,14 @@ mod tests {
         }
 
         async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
-            self.applied_indices.lock().unwrap().push(index);
-            self.applied_data.lock().unwrap().push(data.to_vec());
+            self.applied_indices
+                .lock()
+                .expect("Clinical Invariant: Mutex must be lockable")
+                .push(index);
+            self.applied_data
+                .lock()
+                .expect("Clinical Invariant: Mutex must be lockable")
+                .push(data.to_vec());
             Ok(())
         }
     }
@@ -893,24 +926,28 @@ mod tests {
             mod heartbeat_timer {
                 use super::*;
 
-                #[test]
-                fn reset_heartbeat_updates_timer() {
-                    let fsm = Arc::new(MockFsm::default());
-                    let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = RaftNode::<Follower, MockFsm>::try_new(
-                        test_identity(1),
-                        fsm,
-                        log_store,
-                        Tick::new(0),
-                        TickDuration::new(100),
-                    )
-                    .unwrap();
-                    let initial_time = node.state().last_heartbeat();
+                mod reset {
+                    use super::*;
 
-                    node.state_mut().reset_heartbeat(Tick::new(10));
+                    #[test]
+                    fn updates_timer_when_invoked() {
+                        let fsm = Arc::new(MockFsm::default());
+                        let log_store = Arc::new(MemoryStorage::new());
+                        let mut node = RaftNode::<Follower, MockFsm>::try_new(
+                            test_identity(1),
+                            fsm,
+                            log_store,
+                            Tick::new(0),
+                            TickDuration::new(100),
+                        )
+                        .unwrap();
+                        let initial_time = node.state().last_heartbeat();
 
-                    assert_eq!(node.state().last_heartbeat(), Tick::new(10));
-                    assert!(node.state().last_heartbeat() > initial_time);
+                        node.state_mut().reset_heartbeat(Tick::new(10));
+
+                        assert_eq!(node.state().last_heartbeat(), Tick::new(10));
+                        assert!(node.state().last_heartbeat() > initial_time);
+                    }
                 }
             }
         }
@@ -1740,17 +1777,21 @@ mod tests {
         mod persist_vote {
             use super::*;
 
-            #[test]
-            fn persists_vote_to_log_store() {
-                let fsm = Arc::new(MockFsm::default());
-                let log_store = Arc::new(MemoryStorage::new());
-                let mut node = setup_node_as_follower(fsm, log_store.clone());
-                let candidate_id = NodeId::try_new(2).unwrap();
+            mod call {
+                use super::*;
 
-                node.persist_vote(candidate_id).unwrap();
+                #[test]
+                fn persists_to_log_store_when_invoked() {
+                    let fsm = Arc::new(MockFsm::default());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let mut node = setup_node_as_follower(fsm, log_store.clone());
+                    let candidate_id = NodeId::try_new(2).unwrap();
 
-                assert_eq!(node.voted_for().unwrap(), Some(candidate_id));
-                assert_eq!(log_store.voted_for().unwrap(), Some(candidate_id));
+                    node.persist_vote(candidate_id).unwrap();
+
+                    assert_eq!(node.voted_for().unwrap(), Some(candidate_id));
+                    assert_eq!(log_store.voted_for().unwrap(), Some(candidate_id));
+                }
             }
         }
     }
