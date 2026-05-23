@@ -1,7 +1,15 @@
+//! Consensus delivery layer for Lact-O-Sensus.
+//!
+//! This module implements the gRPC-based peer-to-peer consensus service.
+//! It acts as the "Logical Orchestrator" (ADR 009) that extracts domain
+//! parameters from wire formats, establishes clinical telemetry boundaries,
+//! and delegates authoritative logic to the underlying consensus engine.
+
 use std::sync::Arc;
 
 use common::proto::v1::raft::AppendEntriesRequest;
 use common::proto::v1::raft::AppendEntriesResponse;
+use common::proto::v1::raft::LogEntry;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
@@ -16,13 +24,14 @@ use common::types::trace::ClinicalTarget;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::Instrument;
 use tracing::info_span;
 
 use crate::engine::LogicalNode;
 use crate::shell::ConsensusShell;
 
 // =============================================================================
-// I. Semantic Vocabulary (DTOs)
+// 1. Semantic Vocabulary (DTOs)
 // =============================================================================
 
 /// Encapsulates the fully validated and parsed parameters for a RequestVote
@@ -57,7 +66,7 @@ struct AppendParams {
     term: Term,
     prev_log_index: LogIndex,
     prev_log_term: Term,
-    entries: Vec<common::proto::v1::raft::LogEntry>,
+    entries: Vec<LogEntry>,
     leader_commit: LogIndex,
 }
 
@@ -80,7 +89,7 @@ impl AppendParams {
 }
 
 // =============================================================================
-// II. Public Orchestrators (ConsensusDispatcher)
+// 2. Public Orchestrators (ConsensusDispatcher)
 // =============================================================================
 
 /// Implementation of the internal Raft consensus RPCs.
@@ -179,10 +188,9 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
             term = %params.term,
             sender_id = %params.candidate_id
         );
-        let _enter = span.enter();
 
         // 3. Execution: Delegate to the internal logic shell.
-        let result = self.execute_vote_logic(&params).await?;
+        let result = self.execute_vote_logic(&params).instrument(span).await?;
 
         // 4. Construction: Build the response and inject telemetry feedback.
         let mut response =
@@ -210,10 +218,9 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
             term = %params.term,
             sender_id = %params.leader_id
         );
-        let _enter = span.enter();
 
         // 3. Execution: Delegate to the internal logic shell.
-        let result = self.execute_append_logic(params).await?;
+        let result = self.execute_append_logic(params).instrument(span).await?;
 
         // 4. Construction: Build the response and inject telemetry feedback.
         let mut response = Response::new(AppendEntriesResponse::new(
@@ -439,164 +446,172 @@ mod tests {
 
         use super::*;
 
-        #[tokio::test]
-        async fn grants_vote_when_term_is_higher_and_not_voted() {
-            let dispatcher = mock_dispatcher();
+        mod grants_vote {
+            use super::*;
 
-            let req = make_request(RequestVoteRequest {
-                term: 1, // Follower starts at term 0, so 1 is higher
-                candidate_id: "2".to_string(),
-                last_log_index: 0,
-                last_log_term: 0,
-            });
+            #[tokio::test]
+            async fn when_term_is_higher_and_not_voted() {
+                let dispatcher = mock_dispatcher();
 
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(response.vote_granted);
-            assert_eq!(response.term, 1);
-        }
+                let req = make_request(RequestVoteRequest {
+                    term: 1, // Follower starts at term 0, so 1 is higher
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                });
 
-        #[tokio::test]
-        async fn grants_vote_when_term_is_already_current_and_not_voted() {
-            let dispatcher = mock_dispatcher();
-            // Pre-initialize to term 1
-            {
-                let mut state = dispatcher.state.write().await;
-                state.into_follower(Term::new(1), None);
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(response.vote_granted);
+                assert_eq!(response.term, 1);
             }
 
-            let req = make_request(RequestVoteRequest {
-                term: 1, // Same as current term
-                candidate_id: "2".to_string(),
-                last_log_index: 0,
-                last_log_term: 0,
-            });
-
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(response.vote_granted);
-            assert_eq!(response.term, 1);
-        }
-
-        #[tokio::test]
-        async fn rejects_vote_when_term_is_older() {
-            let dispatcher = mock_dispatcher();
-
-            // First, update node to term 2
-            {
-                let mut state = dispatcher.state.write().await;
-                state.into_follower(Term::new(2), None);
-            }
-
-            let req = make_request(RequestVoteRequest {
-                term: 1, // Older term
-                candidate_id: "2".to_string(),
-                last_log_index: 0,
-                last_log_term: 0,
-            });
-
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(!response.vote_granted);
-            assert_eq!(response.term, 2);
-        }
-
-        #[tokio::test]
-        async fn rejects_vote_when_candidate_log_is_shorter_same_term() {
-            let dispatcher = mock_dispatcher();
-
-            // Populate local log: 2 entries in term 1
-            {
-                let mut state = dispatcher.state.write().await;
-                let node = state.as_follower_mut().expect("Should be follower");
-                node.log_store()
-                    .append_entries(vec![
-                        LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
-                        LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
-                    ])
-                    .unwrap();
-            }
-
-            let req = make_request(RequestVoteRequest {
-                term: 1,
-                candidate_id: "2".to_string(),
-                last_log_index: 1, // Shorter than local (2)
-                last_log_term: 1,
-            });
-
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(!response.vote_granted);
-        }
-
-        #[tokio::test]
-        async fn rejects_vote_when_candidate_log_has_older_term() {
-            let dispatcher = mock_dispatcher();
-
-            // Populate local log: 1 entry in term 2
-            {
-                let mut state = dispatcher.state.write().await;
-                let node = state.as_follower_mut().expect("Should be follower");
-                node.log_store()
-                    .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(2), vec![])])
-                    .unwrap();
-            }
-
-            let req = make_request(RequestVoteRequest {
-                term: 2,
-                candidate_id: "2".to_string(),
-                last_log_index: 10, // Longer, but...
-                last_log_term: 1,   // ...older term
-            });
-
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(!response.vote_granted);
-        }
-
-        #[tokio::test]
-        async fn grants_vote_when_candidate_log_is_longer_same_term() {
-            let dispatcher = mock_dispatcher();
-
-            // Populate local log: 1 entry in term 1
-            {
-                let mut state = dispatcher.state.write().await;
-                let node = state.as_follower_mut().expect("Should be follower");
-                node.log_store()
-                    .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
-                    .unwrap();
-            }
-
-            let req = make_request(RequestVoteRequest {
-                term: 1,
-                candidate_id: "2".to_string(),
-                last_log_index: 2, // Longer than local (1)
-                last_log_term: 1,
-            });
-
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(response.vote_granted);
-        }
-
-        #[tokio::test]
-        async fn grants_vote_when_candidate_log_has_newer_term() {
-            let dispatcher = mock_dispatcher();
-
-            // Populate local log: 10 entries in term 1
-            {
-                let mut state = dispatcher.state.write().await;
-                let node = state.as_follower_mut().expect("Should be follower");
-                let mut entries = Vec::new();
-                for i in 1..=10 {
-                    entries.push(LogEntry::new(LogIndex::new(i as u64), Term::new(1), vec![]));
+            #[tokio::test]
+            async fn when_term_is_already_current_and_not_voted() {
+                let dispatcher = mock_dispatcher();
+                // Pre-initialize to term 1
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.into_follower(Term::new(1), None);
                 }
-                node.log_store().append_entries(entries).unwrap();
+
+                let req = make_request(RequestVoteRequest {
+                    term: 1, // Same as current term
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(response.vote_granted);
+                assert_eq!(response.term, 1);
             }
 
-            let req = make_request(RequestVoteRequest {
-                term: 2,
-                candidate_id: "2".to_string(),
-                last_log_index: 1, // Shorter, but...
-                last_log_term: 2,  // ...newer term
-            });
+            #[tokio::test]
+            async fn when_candidate_log_is_longer_same_term() {
+                let dispatcher = mock_dispatcher();
 
-            let response = dispatcher.request_vote(req).await.unwrap().into_inner();
-            assert!(response.vote_granted);
+                // Populate local log: 1 entry in term 1
+                {
+                    let mut state = dispatcher.state.write().await;
+                    let node = state.as_follower_mut().expect("Should be follower");
+                    node.log_store()
+                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(1), vec![])])
+                        .unwrap();
+                }
+
+                let req = make_request(RequestVoteRequest {
+                    term: 1,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 2, // Longer than local (1)
+                    last_log_term: 1,
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(response.vote_granted);
+            }
+
+            #[tokio::test]
+            async fn when_candidate_log_has_newer_term() {
+                let dispatcher = mock_dispatcher();
+
+                // Populate local log: 10 entries in term 1
+                {
+                    let mut state = dispatcher.state.write().await;
+                    let node = state.as_follower_mut().expect("Should be follower");
+                    let mut entries = Vec::new();
+                    for i in 1..=10 {
+                        entries.push(LogEntry::new(LogIndex::new(i as u64), Term::new(1), vec![]));
+                    }
+                    node.log_store().append_entries(entries).unwrap();
+                }
+
+                let req = make_request(RequestVoteRequest {
+                    term: 2,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 1, // Shorter, but...
+                    last_log_term: 2,  // ...newer term
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(response.vote_granted);
+            }
+        }
+
+        mod rejects_vote {
+            use super::*;
+
+            #[tokio::test]
+            async fn when_term_is_older() {
+                let dispatcher = mock_dispatcher();
+
+                // First, update node to term 2
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.into_follower(Term::new(2), None);
+                }
+
+                let req = make_request(RequestVoteRequest {
+                    term: 1, // Older term
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(!response.vote_granted);
+                assert_eq!(response.term, 2);
+            }
+
+            #[tokio::test]
+            async fn when_candidate_log_is_shorter_same_term() {
+                let dispatcher = mock_dispatcher();
+
+                // Populate local log: 2 entries in term 1
+                {
+                    let mut state = dispatcher.state.write().await;
+                    let node = state.as_follower_mut().expect("Should be follower");
+                    node.log_store()
+                        .append_entries(vec![
+                            LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
+                            LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
+                        ])
+                        .unwrap();
+                }
+
+                let req = make_request(RequestVoteRequest {
+                    term: 1,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 1, // Shorter than local (2)
+                    last_log_term: 1,
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(!response.vote_granted);
+            }
+
+            #[tokio::test]
+            async fn when_candidate_log_has_older_term() {
+                let dispatcher = mock_dispatcher();
+
+                // Populate local log: 1 entry in term 2
+                {
+                    let mut state = dispatcher.state.write().await;
+                    let node = state.as_follower_mut().expect("Should be follower");
+                    node.log_store()
+                        .append_entries(vec![LogEntry::new(LogIndex::new(1), Term::new(2), vec![])])
+                        .unwrap();
+                }
+
+                let req = make_request(RequestVoteRequest {
+                    term: 2,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 10, // Longer, but...
+                    last_log_term: 1,   // ...older term
+                });
+
+                let response = dispatcher.request_vote(req).await.unwrap().into_inner();
+                assert!(!response.vote_granted);
+            }
         }
 
         #[tokio::test]
@@ -623,117 +638,130 @@ mod tests {
     }
 
     mod append_entries {
-
         use super::*;
         use crate::engine::RoleState;
         use crate::storage::MemoryStorage;
 
-        #[tokio::test]
-        async fn returns_success_when_term_is_current() {
-            let dispatcher = mock_dispatcher();
+        mod returns_success {
+            use super::*;
 
-            let req = make_request(AppendEntriesRequest {
-                term: 0,
-                leader_id: "2".to_string(),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: Vec::new(),
-                leader_commit: 0,
-            });
+            #[tokio::test]
+            async fn when_term_is_current() {
+                let dispatcher = mock_dispatcher();
 
-            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert!(response.success);
-            assert_eq!(response.term, 0);
+                let req = make_request(AppendEntriesRequest {
+                    term: 0,
+                    leader_id: "2".to_string(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                });
+
+                let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+                assert!(response.success);
+                assert_eq!(response.term, 0);
+            }
         }
 
-        #[tokio::test]
-        async fn rejects_when_term_is_older() {
-            let dispatcher = mock_dispatcher();
+        mod rejects_request {
+            use super::*;
 
-            // Update node to term 2
-            {
-                let mut state = dispatcher.state.write().await;
-                state.into_follower(Term::new(2), None);
+            #[tokio::test]
+            async fn when_term_is_older() {
+                let dispatcher = mock_dispatcher();
+
+                // Update node to term 2
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.into_follower(Term::new(2), None);
+                }
+
+                let req = make_request(AppendEntriesRequest {
+                    term: 1, // Older
+                    leader_id: "2".to_string(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                });
+
+                let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+                assert!(!response.success);
+                assert_eq!(response.term, 2);
+            }
+        }
+
+        mod transitions_role {
+            use super::*;
+
+            #[tokio::test]
+            async fn demotes_candidate_on_equal_term() {
+                let id = mock_identity();
+                let fsm = Arc::new(MockFsm);
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = rand::SeedableRng::seed_from_u64(1);
+                // Start as Follower term 0, transition to Candidate term 1
+                let mut node =
+                    LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                node.into_candidate();
+                let state = Arc::new(ConsensusShell::new(node));
+                let dispatcher = ConsensusDispatcher::new(id, state);
+
+                let req = make_request(AppendEntriesRequest {
+                    term: 1, // Equal to candidate term
+                    leader_id: "2".to_string(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                });
+
+                let response = dispatcher.append_entries(req).await.unwrap().into_inner();
+                assert!(response.success);
+
+                let state_guard = dispatcher.state.write().await;
+                assert!(matches!(state_guard.state(), RoleState::Follower(_)));
+                assert_eq!(state_guard.try_current_term().unwrap(), Term::new(1));
             }
 
-            let req = make_request(AppendEntriesRequest {
-                term: 1, // Older
-                leader_id: "2".to_string(),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: Vec::new(),
-                leader_commit: 0,
-            });
+            #[tokio::test]
+            #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+            async fn panics_on_rival_leader_same_term() {
+                let id = mock_identity();
+                let fsm = Arc::new(MockFsm);
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = rand::SeedableRng::seed_from_u64(1);
+                // Start as Leader term 1
+                let mut node =
+                    LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                node.into_candidate();
+                node.into_leader(Vec::new());
+                let state = Arc::new(ConsensusShell::new(node));
+                let dispatcher = ConsensusDispatcher::new(id, state);
 
-            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert!(!response.success);
-            assert_eq!(response.term, 2);
-        }
+                let req = make_request(AppendEntriesRequest {
+                    term: 1, // Rival leader for same term
+                    leader_id: "2".to_string(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                });
 
-        #[tokio::test]
-        async fn demotes_candidate_on_equal_term() {
-            let id = mock_identity();
-            let fsm = Arc::new(MockFsm);
-            let storage = Arc::new(MemoryStorage::new());
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(15),
-                max_election: TickDuration::new(30),
-            };
-            let rng = rand::SeedableRng::seed_from_u64(1);
-            // Start as Follower term 0, transition to Candidate term 1
-            let mut node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
-            node.into_candidate();
-            let state = Arc::new(ConsensusShell::new(node));
-            let dispatcher = ConsensusDispatcher::new(id, state);
-
-            let req = make_request(AppendEntriesRequest {
-                term: 1, // Equal to candidate term
-                leader_id: "2".to_string(),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: Vec::new(),
-                leader_commit: 0,
-            });
-
-            let response = dispatcher.append_entries(req).await.unwrap().into_inner();
-            assert!(response.success);
-
-            let state_guard = dispatcher.state.write().await;
-            assert!(matches!(state_guard.state(), RoleState::Follower(_)));
-            assert_eq!(state_guard.try_current_term().unwrap(), Term::new(1));
-        }
-
-        #[tokio::test]
-        #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
-        async fn panics_on_rival_leader_same_term() {
-            let id = mock_identity();
-            let fsm = Arc::new(MockFsm);
-            let storage = Arc::new(MemoryStorage::new());
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(15),
-                max_election: TickDuration::new(30),
-            };
-            let rng = rand::SeedableRng::seed_from_u64(1);
-            // Start as Leader term 1
-            let mut node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
-            node.into_candidate();
-            node.into_leader(Vec::new());
-            let state = Arc::new(ConsensusShell::new(node));
-            let dispatcher = ConsensusDispatcher::new(id, state);
-
-            let req = make_request(AppendEntriesRequest {
-                term: 1, // Rival leader for same term
-                leader_id: "2".to_string(),
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: Vec::new(),
-                leader_commit: 0,
-            });
-
-            // This should panic
-            let _ = dispatcher.append_entries(req).await;
+                // This should panic
+                let _ = dispatcher.append_entries(req).await;
+            }
         }
 
         #[tokio::test]
@@ -748,12 +776,6 @@ mod tests {
                     _ => panic!("Should be follower"),
                 }
             };
-
-            // Small sleep to ensure time moves forward
-            // (Actually we don't have time moving yet in this commit,
-            // but the test should still check for inequality if updated)
-            // Wait, in this commit current_tick doesn't increment yet in
-            // handle_append_entries. Oh, but reset_heartbeat is called.
 
             let req = make_request(AppendEntriesRequest {
                 term: 0,
