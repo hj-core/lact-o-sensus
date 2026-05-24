@@ -11,6 +11,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::service::Interceptor;
+use tracing::instrument;
 use tracing::warn;
 
 use crate::types::NodeId;
@@ -47,6 +48,15 @@ impl Interceptor for IdentityInterceptor {
     ///
     /// Delegates to specialized sub-functions to verify the cluster boundary
     /// and the target node routing.
+    #[instrument(
+        name = "identity_verification",
+        target = "clinical::foundation",
+        skip_all,
+        fields(
+            expected_cluster = %self.identity.cluster_id(),
+            expected_node = %self.identity.node_id()
+        )
+    )]
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         self.verify_cluster_id(&request)?;
         self.verify_target_node_id(&request)?;
@@ -82,11 +92,20 @@ impl IdentityInterceptor {
 
     /// Mandatory Boundary Check: Ensures the request belongs to this logical
     /// cluster.
+    #[instrument(
+        name = "verify_cluster_boundary",
+        target = "clinical::foundation",
+        skip_all
+    )]
     fn verify_cluster_id(&self, request: &Request<()>) -> Result<(), Status> {
         let cluster_id_header = request
             .metadata()
             .get(HEADER_CLUSTER_ID)
             .ok_or_else(|| {
+                warn!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    "ISOLATION FAILURE: Missing cluster ID header"
+                );
                 Status::unauthenticated(format!("Missing mandatory {} header", HEADER_CLUSTER_ID))
             })?
             .to_str()
@@ -107,11 +126,20 @@ impl IdentityInterceptor {
 
     /// Mandatory Routing Check: Ensures the request was intended for this
     /// specific node.
+    #[instrument(
+        name = "verify_node_routing",
+        target = "clinical::foundation",
+        skip_all
+    )]
     fn verify_target_node_id(&self, request: &Request<()>) -> Result<(), Status> {
         let node_id_header = request
             .metadata()
             .get(HEADER_TARGET_NODE_ID)
             .ok_or_else(|| {
+                warn!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    "ROUTING FAILURE: Missing target node ID header"
+                );
                 Status::unauthenticated(format!(
                     "Missing mandatory {} header",
                     HEADER_TARGET_NODE_ID
@@ -174,6 +202,12 @@ impl Interceptor for TraceInterceptor {
     ///
     /// Depending on the mode, it either generates a new trace ID or extracts
     /// it from the incoming request metadata.
+    #[instrument(
+        name = "trace_propagation",
+        target = "clinical::telemetry",
+        skip_all,
+        fields(authoritative = self.authoritative)
+    )]
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         if self.authoritative {
             // Gateway Authority: Always generate a new "Clinical Birth" ID.
