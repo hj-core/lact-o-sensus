@@ -22,7 +22,6 @@ use tracing::info_span;
 
 use crate::config::Config;
 use crate::engine::NodeRole;
-use crate::engine::RoleState;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
 
@@ -124,14 +123,14 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
             loop {
                 // Check condition first (prevents missing updates before subscription)
                 {
-                    let guard = self.state.read().await;
-                    match guard.state() {
-                        RoleState::Leader(node) => {
-                            if node.last_committed() >= index {
+                    let progress = progress_rx.borrow();
+                    match progress.role {
+                        NodeRole::Leader => {
+                            if progress.last_committed >= index {
                                 return Ok(());
                             }
                         }
-                        RoleState::Poisoned => {
+                        NodeRole::Poisoned => {
                             return Err(ConsensusError::Poisoned);
                         }
                         _ => {
@@ -398,6 +397,29 @@ mod tests {
                     guard.advance_last_committed(index).await;
                 }
             });
+
+            let result = handle.await_commit(index).await;
+            assert!(result.is_ok());
+        }
+
+        #[tokio::test]
+        async fn succeeds_immediately_if_already_committed() {
+            let (handle, state) = setup();
+            {
+                let mut guard = state.write().await;
+                guard.into_candidate();
+                guard.into_leader(vec![]);
+            }
+
+            let index = handle.propose(vec![1]).await.unwrap();
+
+            // Advance state before calling await_commit
+            {
+                let mut guard = state.write().await;
+                if guard.as_leader_mut().is_some() {
+                    guard.advance_last_committed(index).await;
+                }
+            }
 
             let result = handle.await_commit(index).await;
             assert!(result.is_ok());
