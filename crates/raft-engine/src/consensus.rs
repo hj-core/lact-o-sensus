@@ -36,6 +36,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::info_span;
+use tracing::instrument;
 use tracing::warn;
 
 use crate::config::Config;
@@ -325,6 +326,12 @@ fn start_election_campaign<S: StateMachine>(
 /// Acts as the high-level coordinator: it uses the pre-captured parameters
 /// to solicit votes concurrently from all peers and processes the asynchronous
 /// stream of responses to determine the campaign's success or failure.
+#[instrument(
+    name = "election_campaign_execution",
+    target = "raft::foundation",
+    skip_all,
+    fields(term = %params.term, trace_id = %params.trace_id)
+)]
 async fn initiate_election<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
@@ -398,6 +405,12 @@ async fn initiate_election<S: StateMachine>(
 ///    (§5.1).
 /// 2. Vote Tallying: Adding granted votes to the Candidate's state machine.
 /// 3. Victory Transition: Promoting to Leader immediately upon reaching quorum.
+#[instrument(
+    name = "process_vote_response",
+    target = "raft::foundation",
+    skip_all,
+    fields(peer = %peer_id, term = %term)
+)]
 async fn process_vote_response<S: StateMachine>(
     state: &ConsensusShell<S>,
     term: Term,
@@ -502,6 +515,12 @@ pub(crate) fn initiate_replication<S: StateMachine>(
 /// Coordinates the concurrent transmission of AppendEntries RPCs and
 /// processes the resulting stream. If a higher term is discovered, it
 /// terminates the round early to allow for immediate demotion.
+#[instrument(
+    name = "replication_round_execution",
+    target = "raft::replication",
+    skip_all,
+    fields(term = %params.term, trace_id = %params.trace_id)
+)]
 async fn replicate_to_peers<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
@@ -534,6 +553,12 @@ async fn replicate_to_peers<S: StateMachine>(
 ///    log mismatch (§5.3).
 /// 3. Quorum Commitment: Advancing the Leader's commit index once a majority is
 ///    reached (ADR 002).
+#[instrument(
+    name = "process_replication_response",
+    target = "raft::replication",
+    skip_all,
+    fields(peer = %peer_id, term = %term)
+)]
 async fn process_append_entries_response<S: StateMachine>(
     state: &ConsensusShell<S>,
     term: Term,
@@ -763,6 +788,12 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
                         // If arithmetic fails here, it's a protocol violation.
                         // We must poison and halt according to Rule 4.1.
                         guard.poison();
+                        error!(
+                            target: ClinicalTarget::ClinicalFoundation.as_str(),
+                            error = %e,
+                            peer = %peer_id,
+                            "TERMINAL INVARIANT VIOLATION: Arithmetic failure during replication preparation. Halting."
+                        );
                         panic!(
                             "Secure Clinical: Terminal Invariant Violation during replication: {}",
                             e
