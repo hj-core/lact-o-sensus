@@ -12,6 +12,7 @@
 
 use std::fmt::Debug;
 
+use common::proto::v1::raft::HardState;
 use common::proto::v1::raft::LogEntry;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -101,51 +102,24 @@ impl SledStorage {
         Ok(Self { db, log, meta })
     }
 
-    /// Serializes HardState (§5.1) to manual binary format:
-    /// [Term (8 bytes BE)] [HasVote (1 byte)] [VoteNodeId (8 bytes BE if
-    /// present)]
     fn serialize_hard_state(term: Term, vote: Option<NodeId>) -> Vec<u8> {
-        let mut data = Vec::with_capacity(17);
-        data.extend_from_slice(&term.as_u64().to_be_bytes());
-        match vote {
-            Some(node_id) => {
-                data.push(1);
-                data.extend_from_slice(&node_id.as_u64().to_be_bytes());
-            }
-            None => {
-                data.push(0);
-            }
-        }
-        data
+        HardState::new(term, vote).encode_to_vec()
     }
 
     fn deserialize_hard_state(data: &[u8]) -> Result<(Term, Option<NodeId>), LogStorageError> {
-        if data.len() < 9 {
-            return Err(LogStorageError::deserialization(
-                "Corrupted HardState: insufficient data length",
-            ));
-        }
-        let term = Term::new(u64::from_be_bytes(data[0..8].try_into().map_err(|_| {
-            LogStorageError::deserialization("Term byte conversion failed")
-        })?));
-        let has_vote = data[8] == 1;
-        let vote = if has_vote {
-            if data.len() < 17 {
-                return Err(LogStorageError::deserialization(
-                    "Corrupted HardState: missing vote data",
-                ));
-            }
-            Some(
-                NodeId::try_new(u64::from_be_bytes(data[9..17].try_into().map_err(
-                    |_| LogStorageError::deserialization("NodeId byte conversion failed"),
-                )?))
-                .map_err(|e| {
-                    LogStorageError::deserialization(format!("Invalid NodeId in storage: {}", e))
-                })?,
-            )
-        } else {
+        let hs = HardState::decode(data).map_err(|e| {
+            LogStorageError::deserialization(format!("Failed to decode HardState: {}", e))
+        })?;
+
+        let term = Term::new(hs.term);
+        let vote = if hs.vote.is_empty() {
             None
+        } else {
+            Some(hs.vote.parse::<NodeId>().map_err(|e| {
+                LogStorageError::deserialization(format!("Invalid NodeId in HardState: {}", e))
+            })?)
         };
+
         Ok((term, vote))
     }
 }
@@ -352,19 +326,27 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Acquires the state lock, handling potential poisoning according to
+    /// the Halt Mandate (ADR 009).
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, LogStorageError> {
+        self.state.lock().map_err(|_| {
+            LogStorageError::invariant("MemoryStorage Mutex is poisoned (Halt Mandate)")
+        })
+    }
 }
 
 impl LogStorage for MemoryStorage {
     fn current_term(&self) -> Result<Term, LogStorageError> {
-        Ok(self.state.lock().unwrap().current_term)
+        Ok(self.state()?.current_term)
     }
 
     fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
-        Ok(self.state.lock().unwrap().voted_for)
+        Ok(self.state()?.voted_for)
     }
 
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         Ok(state
             .log
             .last()
@@ -373,7 +355,7 @@ impl LogStorage for MemoryStorage {
     }
 
     fn last_log_term(&self) -> Result<Term, LogStorageError> {
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         Ok(state
             .log
             .last()
@@ -382,14 +364,14 @@ impl LogStorage for MemoryStorage {
     }
 
     fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
-        Ok(self.state.lock().unwrap().last_committed)
+        Ok(self.state()?.last_committed)
     }
 
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         if index == LogIndex::ZERO {
             return Ok(None);
         }
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         Ok(state.log.get((index.as_u64() - 1) as usize).cloned())
     }
 
@@ -408,7 +390,7 @@ impl LogStorage for MemoryStorage {
             return Ok(Vec::new());
         }
 
-        let state = self.state.lock().unwrap();
+        let state = self.state()?;
         let start_idx = (start.as_u64() - 1) as usize;
         let end_idx = (end.as_u64() - 1) as usize;
         Ok(state
@@ -419,20 +401,20 @@ impl LogStorage for MemoryStorage {
     }
 
     fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         state.current_term = term;
         state.voted_for = vote;
         Ok(())
     }
 
     fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         state.last_committed = index;
         Ok(())
     }
 
     fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         for entry in entries {
             let last_idx = state
                 .log
@@ -452,7 +434,7 @@ impl LogStorage for MemoryStorage {
     }
 
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state()?;
         if index == LogIndex::ZERO {
             state.log.clear();
         } else {

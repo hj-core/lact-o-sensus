@@ -89,6 +89,16 @@ pub mod v1 {
                 }
             }
         }
+
+        impl HardState {
+            /// Constructs a new HardState with proper NewType conversion.
+            pub fn new(term: Term, vote: Option<NodeId>) -> Self {
+                Self {
+                    term: term.as_u64(),
+                    vote: vote.map(|v| v.to_string()).unwrap_or_default(),
+                }
+            }
+        }
     }
 
     /// Lact-O-Sensus application-level messages.
@@ -363,6 +373,27 @@ mod tests {
                     assert_eq!(req.candidate_id, "1");
                     assert_eq!(req.last_log_index, 10);
                     assert_eq!(req.last_log_term, 4);
+                }
+            }
+        }
+
+        mod hard_state {
+            use super::*;
+            mod new {
+                use super::*;
+                #[test]
+                fn initializes_fields_with_correct_conversions() {
+                    let vote = Some(NodeId::try_new(42).unwrap());
+                    let hs = HardState::new(Term::new(10), vote);
+                    assert_eq!(hs.term, 10);
+                    assert_eq!(hs.vote, "42");
+                }
+
+                #[test]
+                fn handles_none_vote_correctly() {
+                    let hs = HardState::new(Term::new(10), None);
+                    assert_eq!(hs.term, 10);
+                    assert_eq!(hs.vote, "");
                 }
             }
         }
