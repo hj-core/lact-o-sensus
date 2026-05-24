@@ -18,7 +18,10 @@ use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use tracing::Instrument;
+use tracing::error;
 use tracing::info_span;
+use tracing::instrument;
+use tracing::warn;
 
 use crate::config::Config;
 use crate::engine::NodeRole;
@@ -103,7 +106,14 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
             let mut guard = self.state.write().await;
             guard.propose(data).map_err(|e| match e {
                 NodeError::NotLeader { .. } => ConsensusError::NotLeader,
-                _ => ConsensusError::Internal(e.to_string()),
+                _ => {
+                    error!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        error = %e,
+                        "Failed to propose mutation to consensus"
+                    );
+                    ConsensusError::Internal(e.to_string())
+                }
             })
         }
         .instrument(span)
@@ -131,6 +141,11 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
                             }
                         }
                         NodeRole::Poisoned => {
+                            warn!(
+                                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                                index = %index,
+                                "Wait-for-Commit aborted: Node is POISONED"
+                            );
                             return Err(ConsensusError::Poisoned);
                         }
                         _ => {
@@ -164,6 +179,11 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
                 {
                     let progress = progress_rx.borrow();
                     if progress.role == NodeRole::Poisoned {
+                        warn!(
+                            target: ClinicalTarget::ClinicalFoundation.as_str(),
+                            index = %index,
+                            "Wait-for-Apply aborted: Node is POISONED"
+                        );
                         return Err(ConsensusError::Poisoned);
                     }
                     if progress.last_applied >= index {
@@ -181,6 +201,7 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
         .await
     }
 
+    #[instrument(name = "authority_check", target = "raft::foundation", skip_all)]
     async fn authority(&self) -> ConsensusAuthority {
         let progress = *self.state.subscribe().borrow();
 
