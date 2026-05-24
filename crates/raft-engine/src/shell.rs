@@ -11,7 +11,10 @@ use tokio::sync::RwLockReadGuard;
 use tokio::sync::RwLockWriteGuard;
 use tokio::sync::watch;
 use tracing::Instrument;
+use tracing::debug;
+use tracing::error;
 use tracing::info_span;
+use tracing::instrument;
 
 use crate::config::Config;
 use crate::consensus::ReplicationRoundParams;
@@ -56,6 +59,7 @@ impl<S: StateMachine> ConsensusShell<S> {
     /// mutate the consensus state. The returned guard ensures that any
     /// changes to the logical epoch or physical state are published to
     /// observers before the write lock is released.
+    #[instrument(name = "acquire_mutation_lock", target = "raft::foundation", skip_all)]
     pub async fn write(&self) -> MutationGuard<'_, S> {
         let mut guard = self.inner.write().await;
         let before = guard.consensus_progress();
@@ -112,6 +116,7 @@ impl<S: StateMachine> ConsensusShell<S> {
         let span = info_span!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             "quorum_probe",
+            node_id = %node_id,
             trace_id = %trace_id,
             target_epoch = %target_epoch,
             term = %term
@@ -198,6 +203,10 @@ impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
         // signal to halt other tasks (ADR 009).
         let after = if std::thread::panicking() {
             self.guard.poison();
+            error!(
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                "HALT MANDATE: Thread panicked while holding mutation lock. Poisoning node."
+            );
             ConsensusProgress {
                 term: self.before.term,
                 role: NodeRole::Poisoned,
@@ -226,6 +235,12 @@ impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
 
         // Broadcast if anything has changed (Term, Role, Index, or Poison).
         if self.before != after {
+            debug!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                old_role = ?self.before.role,
+                new_role = ?after.role,
+                "Atomic State Signal Broadcast"
+            );
             let _ = self.shell.progress_tx.send_replace(after);
         }
     }
