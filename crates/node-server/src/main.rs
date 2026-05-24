@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
             "cold_boot_recovery",
             trace_id = %trace_id
         );
-        let recovery = RecoveryManager::new(identity.clone(), fsm.clone(), storage.clone());
+        let recovery = RecoveryManager::new(fsm.clone(), storage.clone());
         info!(
             target: ClinicalTarget::ClinicalRecovery.as_str(),
             %trace_id,
