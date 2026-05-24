@@ -1,3 +1,15 @@
+//! Physical storage abstraction and persistent implementations for Raft.
+//!
+//! This module provides the foundational persistence layer for the Raft
+//! consensus engine. It adheres to the "Tri-Layer Onion" model (ADR 009) by
+//! isolating physical disk I/O from logical consensus orchestration.
+//!
+//! The primary implementation, `SledStorage`, utilizes the `sled` embedded
+//! database to provide atomic, crash-recovery-safe (ADR 001) storage for:
+//! 1. **Hard State**: Persistent term and voting records (§5.1).
+//! 2. **Log Entries**: Replicated consensus commands (§5.3).
+//! 3. **Commit Index**: The highest known committed log entry.
+
 use std::fmt::Debug;
 
 use common::proto::v1::raft::LogEntry;
@@ -465,129 +477,144 @@ mod tests {
             SledStorage::new(db).unwrap()
         }
 
-        #[test]
-        fn persists_hard_state() {
-            let storage = setup_storage();
-            let term = Term::new(5);
-            let vote = Some(NodeId::try_new(1).unwrap());
+        mod save_hard_state {
+            use super::*;
+            #[test]
+            fn persists_term_and_vote_to_disk() {
+                let storage = setup_storage();
+                let term = Term::new(5);
+                let vote = Some(NodeId::try_new(1).unwrap());
 
-            storage.save_hard_state(term, vote).unwrap();
+                storage.save_hard_state(term, vote).unwrap();
 
-            assert_eq!(storage.current_term().unwrap(), term);
-            assert_eq!(storage.voted_for().unwrap(), vote);
+                assert_eq!(storage.current_term().unwrap(), term);
+                assert_eq!(storage.voted_for().unwrap(), vote);
+            }
         }
 
-        #[test]
-        fn persists_last_committed() {
-            let storage = setup_storage();
-            let index = LogIndex::new(42);
+        mod save_last_committed {
+            use super::*;
+            #[test]
+            fn persists_commit_index_to_disk() {
+                let storage = setup_storage();
+                let index = LogIndex::new(42);
 
-            storage.save_last_committed(index).unwrap();
+                storage.save_last_committed(index).unwrap();
 
-            assert_eq!(storage.last_committed().unwrap(), index);
+                assert_eq!(storage.last_committed().unwrap(), index);
+            }
         }
 
-        #[test]
-        fn appends_and_retrieves_entries() {
-            let storage = setup_storage();
-            let entry1 = LogEntry {
-                index: 1,
-                term: 1,
-                data: b"cmd1".to_vec(),
-            };
-            let entry2 = LogEntry {
-                index: 2,
-                term: 1,
-                data: b"cmd2".to_vec(),
-            };
+        mod append_entries {
+            use super::*;
+            #[test]
+            fn stores_multiple_entries_and_updates_last_log_metadata() {
+                let storage = setup_storage();
+                let entry1 = LogEntry {
+                    index: 1,
+                    term: 1,
+                    data: b"cmd1".to_vec(),
+                };
+                let entry2 = LogEntry {
+                    index: 2,
+                    term: 1,
+                    data: b"cmd2".to_vec(),
+                };
 
-            storage
-                .append_entries(vec![entry1.clone(), entry2.clone()])
-                .unwrap();
-
-            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
-            assert_eq!(storage.last_log_term().unwrap(), Term::new(1));
-            assert_eq!(
-                storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
-                entry1
-            );
-            assert_eq!(
-                storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
-                entry2
-            );
-        }
-
-        #[test]
-        fn truncates_log_at_given_index() {
-            let storage = setup_storage();
-            storage
-                .append_entries(vec![
-                    LogEntry {
-                        index: 1,
-                        term: 1,
-                        data: vec![],
-                    },
-                    LogEntry {
-                        index: 2,
-                        term: 1,
-                        data: vec![],
-                    },
-                    LogEntry {
-                        index: 3,
-                        term: 2,
-                        data: vec![],
-                    },
-                ])
-                .unwrap();
-
-            storage.truncate_log(LogIndex::new(2)).unwrap();
-
-            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
-            assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
-            assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_none());
-        }
-
-        #[test]
-        fn survives_restart_with_consistent_state() {
-            let dir = tempdir().unwrap();
-            let db_path = dir.path();
-
-            // 1. Initial write
-            {
-                let db = sled::open(db_path).unwrap();
-                let storage = SledStorage::new(db).unwrap();
                 storage
-                    .save_hard_state(Term::new(10), Some(NodeId::try_new(42).unwrap()))
+                    .append_entries(vec![entry1.clone(), entry2.clone()])
                     .unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+                assert_eq!(storage.last_log_term().unwrap(), Term::new(1));
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
+                    entry1
+                );
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
+                    entry2
+                );
+            }
+        }
+
+        mod truncate_log {
+            use super::*;
+            #[test]
+            fn removes_entries_from_given_index_onwards() {
+                let storage = setup_storage();
                 storage
                     .append_entries(vec![
-                        LogEntry::new(LogIndex::new(1), Term::new(1), b"data1".to_vec()),
-                        LogEntry::new(LogIndex::new(2), Term::new(10), b"data2".to_vec()),
+                        LogEntry {
+                            index: 1,
+                            term: 1,
+                            data: vec![],
+                        },
+                        LogEntry {
+                            index: 2,
+                            term: 1,
+                            data: vec![],
+                        },
+                        LogEntry {
+                            index: 3,
+                            term: 2,
+                            data: vec![],
+                        },
                     ])
                     .unwrap();
-                // DB handle dropped here
+
+                storage.truncate_log(LogIndex::new(2)).unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
+                assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+                assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_none());
             }
+        }
 
-            // 2. Recovery and verification
-            {
-                let db = sled::open(db_path).unwrap();
-                let storage = SledStorage::new(db).unwrap();
+        mod recovery {
+            use super::*;
+            #[test]
+            fn restores_consistent_state_after_restart() {
+                let dir = tempdir().unwrap();
+                let db_path = dir.path();
 
-                assert_eq!(storage.current_term().unwrap(), Term::new(10));
-                assert_eq!(
-                    storage.voted_for().unwrap(),
-                    Some(NodeId::try_new(42).unwrap())
-                );
-                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
-                assert_eq!(storage.last_log_term().unwrap(), Term::new(10));
-                assert_eq!(
-                    storage.read_entry(LogIndex::new(1)).unwrap().unwrap().data,
-                    b"data1"
-                );
-                assert_eq!(
-                    storage.read_entry(LogIndex::new(2)).unwrap().unwrap().data,
-                    b"data2"
-                );
+                // 1. Initial write
+                {
+                    let db = sled::open(db_path).unwrap();
+                    let storage = SledStorage::new(db).unwrap();
+                    storage
+                        .save_hard_state(Term::new(10), Some(NodeId::try_new(42).unwrap()))
+                        .unwrap();
+                    storage
+                        .append_entries(vec![
+                            LogEntry::new(LogIndex::new(1), Term::new(1), b"data1".to_vec()),
+                            LogEntry::new(LogIndex::new(2), Term::new(10), b"data2".to_vec()),
+                        ])
+                        .unwrap();
+                    // DB handle dropped here
+                }
+
+                // 2. Recovery and verification
+                {
+                    let db = sled::open(db_path).unwrap();
+                    let storage = SledStorage::new(db).unwrap();
+
+                    assert_eq!(storage.current_term().unwrap(), Term::new(10));
+                    assert_eq!(
+                        storage.voted_for().unwrap(),
+                        Some(NodeId::try_new(42).unwrap())
+                    );
+                    assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+                    assert_eq!(storage.last_log_term().unwrap(), Term::new(10));
+                    assert_eq!(
+                        storage.read_entry(LogIndex::new(1)).unwrap().unwrap().data,
+                        b"data1"
+                    );
+                    assert_eq!(
+                        storage.read_entry(LogIndex::new(2)).unwrap().unwrap().data,
+                        b"data2"
+                    );
+                }
             }
         }
     }
@@ -595,85 +622,91 @@ mod tests {
     mod memory_storage {
         use super::*;
 
-        #[test]
-        fn persists_hard_state() {
-            let storage = MemoryStorage::new();
-            let term = Term::new(5);
-            let vote = Some(NodeId::try_new(1).unwrap());
+        mod save_hard_state {
+            use super::*;
+            #[test]
+            fn persists_term_and_vote_in_memory() {
+                let storage = MemoryStorage::new();
+                let term = Term::new(5);
+                let vote = Some(NodeId::try_new(1).unwrap());
 
-            storage.save_hard_state(term, vote).unwrap();
+                storage.save_hard_state(term, vote).unwrap();
 
-            assert_eq!(storage.current_term().unwrap(), term);
-            assert_eq!(storage.voted_for().unwrap(), vote);
+                assert_eq!(storage.current_term().unwrap(), term);
+                assert_eq!(storage.voted_for().unwrap(), vote);
+            }
         }
 
-        #[test]
-        fn persists_last_committed() {
-            let storage = MemoryStorage::new();
-            let index = LogIndex::new(42);
+        mod save_last_committed {
+            use super::*;
+            #[test]
+            fn persists_commit_index_in_memory() {
+                let storage = MemoryStorage::new();
+                let index = LogIndex::new(42);
 
-            storage.save_last_committed(index).unwrap();
+                storage.save_last_committed(index).unwrap();
 
-            assert_eq!(storage.last_committed().unwrap(), index);
+                assert_eq!(storage.last_committed().unwrap(), index);
+            }
         }
 
-        #[test]
-        fn appends_and_retrieves_entries() {
-            let storage = MemoryStorage::new();
-            let entry1 = LogEntry {
-                index: 1,
-                term: 1,
-                data: b"cmd1".to_vec(),
-            };
-            let entry2 = LogEntry {
-                index: 2,
-                term: 1,
-                data: b"cmd2".to_vec(),
-            };
+        mod append_entries {
+            use super::*;
+            #[test]
+            fn stores_entries_contiguously() {
+                let storage = MemoryStorage::new();
+                let entry1 = LogEntry {
+                    index: 1,
+                    term: 1,
+                    data: b"cmd1".to_vec(),
+                };
+                let entry2 = LogEntry {
+                    index: 2,
+                    term: 1,
+                    data: b"cmd2".to_vec(),
+                };
 
-            storage
-                .append_entries(vec![entry1.clone(), entry2.clone()])
-                .unwrap();
+                storage
+                    .append_entries(vec![entry1.clone(), entry2.clone()])
+                    .unwrap();
 
-            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
-            assert_eq!(storage.last_log_term().unwrap(), Term::new(1));
-            assert_eq!(
-                storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
-                entry1
-            );
-            assert_eq!(
-                storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
-                entry2
-            );
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(2));
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(1)).unwrap().unwrap(),
+                    entry1
+                );
+                assert_eq!(
+                    storage.read_entry(LogIndex::new(2)).unwrap().unwrap(),
+                    entry2
+                );
+            }
         }
 
-        #[test]
-        fn truncates_log_at_given_index() {
-            let storage = MemoryStorage::new();
-            storage
-                .append_entries(vec![
-                    LogEntry {
-                        index: 1,
-                        term: 1,
-                        data: vec![],
-                    },
-                    LogEntry {
-                        index: 2,
-                        term: 1,
-                        data: vec![],
-                    },
-                    LogEntry {
-                        index: 3,
-                        term: 2,
-                        data: vec![],
-                    },
-                ])
-                .unwrap();
+        mod truncate_log {
+            use super::*;
+            #[test]
+            fn removes_entries_from_tail() {
+                let storage = MemoryStorage::new();
+                storage
+                    .append_entries(vec![
+                        LogEntry {
+                            index: 1,
+                            term: 1,
+                            data: vec![],
+                        },
+                        LogEntry {
+                            index: 2,
+                            term: 1,
+                            data: vec![],
+                        },
+                    ])
+                    .unwrap();
 
-            storage.truncate_log(LogIndex::new(2)).unwrap();
+                storage.truncate_log(LogIndex::new(2)).unwrap();
 
-            assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
-            assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
+                assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+            }
         }
     }
 }
