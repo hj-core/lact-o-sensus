@@ -54,6 +54,10 @@ pub struct RaftConfig {
 
     /// Timeout for internal peer-to-peer RPC calls (in milliseconds).
     pub rpc_timeout_ms: u64,
+
+    /// Maximum time to wait for a mutation to reach consensus quorum or be
+    /// applied to the state machine (in milliseconds).
+    pub consensus_timeout_ms: u64,
 }
 
 impl Default for RaftConfig {
@@ -64,6 +68,7 @@ impl Default for RaftConfig {
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 300,
             rpc_timeout_ms: 40,
+            consensus_timeout_ms: 30000,
         }
     }
 }
@@ -79,6 +84,10 @@ impl RaftConfig {
 
     pub fn rpc_timeout(&self) -> Duration {
         Duration::from_millis(self.rpc_timeout_ms)
+    }
+
+    pub fn consensus_timeout(&self) -> Duration {
+        Duration::from_millis(self.consensus_timeout_ms)
     }
 
     /// Translates wall-clock millisecond configurations into sterile, unitless
@@ -117,6 +126,22 @@ impl RaftConfig {
             return Err(ConfigError::TimingInvariant(
                 "rpc_timeout_ms must be greater than 0".to_string(),
             ));
+        }
+
+        if self.consensus_timeout_ms == 0 {
+            return Err(ConfigError::TimingInvariant(
+                "consensus_timeout_ms must be greater than 0".to_string(),
+            ));
+        }
+
+        // The SLA Invariant: Consensus timeout must be at least as long as the
+        // underlying RPC timeout.
+        if self.consensus_timeout_ms < self.rpc_timeout_ms {
+            return Err(ConfigError::TimingInvariant(format!(
+                "The SLA Invariant: consensus_timeout_ms ({}) cannot be shorter than \
+                 rpc_timeout_ms ({}).",
+                self.consensus_timeout_ms, self.rpc_timeout_ms
+            )));
         }
 
         // The Congestion Invariant: RPC timeout must be shorter than heartbeat
@@ -518,6 +543,47 @@ mod tests {
         }
 
         #[test]
+        fn reject_config_when_consensus_timeout_is_zero() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            consensus_timeout_ms = 0
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("consensus_timeout_ms")
+            ));
+        }
+
+        #[test]
+        fn reject_config_when_consensus_timeout_is_below_rpc_timeout() {
+            let toml_str = r#"
+            cluster_id = "test-cluster"
+            node_id = 1
+            listen_addr = "127.0.0.1:50051"
+            data_dir = "data/node_1"
+            [peers]
+            2 = "http://127.0.0.1:50052"
+            [raft]
+            rpc_timeout_ms = 100
+            consensus_timeout_ms = 50 # Violation: Consensus < RPC
+        "#;
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let result = config.validate();
+            assert!(matches!(
+                result,
+                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("SLA Invariant")
+            ));
+        }
+
+        #[test]
         fn reject_config_when_veto_uri_is_malformed() {
             let toml_str = r#"
             cluster_id = "test-cluster"
@@ -546,6 +612,7 @@ mod tests {
                 election_timeout_min_ms: 150,
                 election_timeout_max_ms: 300,
                 rpc_timeout_ms: 40,
+                consensus_timeout_ms: 30000,
             };
 
             let thresholds = config.calculate_thresholds();
@@ -563,6 +630,7 @@ mod tests {
                 election_timeout_min_ms: 155,
                 election_timeout_max_ms: 305,
                 rpc_timeout_ms: 40,
+                consensus_timeout_ms: 30000,
             };
 
             let thresholds = config.calculate_thresholds();

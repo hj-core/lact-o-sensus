@@ -45,11 +45,19 @@ pub trait ConsensusHandle: Send + Sync + Debug {
     async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError>;
 
     /// Waits until the given index has been committed to a quorum.
+    ///
+    /// This method is intended to be **cancel-safe**. Callers should use
+    /// executor-level timeouts (e.g., `tokio::time::timeout`) to enforce
+    /// request SLAs.
     async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError>;
 
     /// Waits until the given index has been applied to the local state machine.
     ///
     /// This is used to enforce Read-Your-Writes consistency (ADR 006).
+    ///
+    /// This method is intended to be **cancel-safe**. Callers should use
+    /// executor-level timeouts (e.g., `tokio::time::timeout`) to enforce
+    /// request SLAs.
     async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError>;
 
     /// Returns a lock-free snapshot of the node's current consensus authority.

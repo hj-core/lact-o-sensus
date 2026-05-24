@@ -229,6 +229,7 @@ async fn main() -> Result<()> {
             fsm.clone(),
             veto_relay,
             config.policy.veto_timeout(),
+            config.raft.consensus_timeout(),
             config.policy.veto_max_retries,
             config.policy.max_justification_len,
         );

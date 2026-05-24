@@ -78,6 +78,7 @@ pub struct IngressDispatcher {
     inventory_reader: Arc<dyn InventoryReader>,
     veto_relay: Arc<dyn VetoRelay>,
     veto_timeout: Duration,
+    consensus_timeout: Duration,
     /// Maximum number of leader-internal retries for AI resolution.
     veto_max_retries: usize,
     /// Maximum characters allowed in the AI's moral justification.
@@ -89,12 +90,14 @@ pub struct IngressDispatcher {
 }
 
 impl IngressDispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft_handle: Arc<dyn ConsensusHandle>,
         session_provider: Arc<dyn SessionProvider>,
         inventory_reader: Arc<dyn InventoryReader>,
         veto_relay: Arc<dyn VetoRelay>,
         veto_timeout: Duration,
+        consensus_timeout: Duration,
         veto_max_retries: usize,
         max_justification_len: usize,
     ) -> Self {
@@ -104,6 +107,7 @@ impl IngressDispatcher {
             inventory_reader,
             veto_relay,
             veto_timeout,
+            consensus_timeout,
             veto_max_retries,
             max_justification_len,
             mutation_lock: Mutex::new(()),
@@ -288,10 +292,18 @@ impl IngressDispatcher {
                 )));
             }
 
-            self.raft_handle
-                .await_apply(LogIndex::new(version))
-                .await
-                .map_err(|e| self.map_consensus_error(e, &status))?;
+            tokio::time::timeout(
+                self.consensus_timeout,
+                self.raft_handle.await_apply(LogIndex::new(version)),
+            )
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "Consistency fence at version {} timed out after {:?}",
+                    version, self.consensus_timeout
+                ))
+            })?
+            .map_err(|e| self.map_consensus_error(e, &status))?;
         }
 
         // 4. Fetches the consolidated inventory from the State Machine.
@@ -662,10 +674,18 @@ impl IngressDispatcher {
             proposal_index
         );
 
-        self.raft_handle
-            .await_commit(proposal_index)
-            .await
-            .map_err(|e| self.map_consensus_error(e, consensus_status))?;
+        tokio::time::timeout(
+            self.consensus_timeout,
+            self.raft_handle.await_commit(proposal_index),
+        )
+        .await
+        .map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "Quorum commitment for index {} timed out after {:?}",
+                proposal_index, self.consensus_timeout
+            ))
+        })?
+        .map_err(|e| self.map_consensus_error(e, consensus_status))?;
         Ok(proposal_index)
     }
 
@@ -1013,6 +1033,10 @@ mod tests {
         leader_hint: String,
         rejection_reason: String,
         proposals: Mutex<Vec<Vec<u8>>>,
+        /// If set, await_commit will sleep for this duration.
+        commit_delay: Option<Duration>,
+        /// If set, await_apply will sleep for this duration.
+        apply_delay: Option<Duration>,
     }
 
     #[async_trait]
@@ -1027,6 +1051,9 @@ mod tests {
         }
 
         async fn await_commit(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+            if let Some(delay) = self.commit_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.is_leader {
                 Ok(())
             } else {
@@ -1035,6 +1062,9 @@ mod tests {
         }
 
         async fn await_apply(&self, _index: LogIndex) -> Result<(), ConsensusError> {
+            if let Some(delay) = self.apply_delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(())
         }
 
@@ -1218,6 +1248,7 @@ mod tests {
             session_provider,
             inventory_reader,
             veto_relay,
+            Duration::from_secs(1),
             Duration::from_secs(1),
             1,
             512,
@@ -1988,6 +2019,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn returns_error_on_consensus_timeout() {
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                commit_delay: Some(Duration::from_millis(50)),
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            // Configure very short consensus timeout
+            let dispatcher = IngressDispatcher::new(
+                raft.clone(),
+                inventory.clone(),
+                inventory,
+                successful_veto(),
+                Duration::from_secs(1),
+                Duration::from_millis(10), // Short consensus timeout
+                1,
+                512,
+            );
+
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let err = result.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+            assert!(err.message().contains("timed out"));
+        }
+
+        #[tokio::test]
         async fn retries_on_transient_ai_failure_and_succeeds() {
             let raft = successful_raft();
             let veto = Arc::new(FlakyVetoRelay {
@@ -2001,6 +2072,7 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 1,
                 512,
@@ -2056,6 +2128,7 @@ mod tests {
                 inventory,
                 veto,
                 Duration::from_secs(1),
+                Duration::from_secs(1),
                 1,
                 512,
             );
@@ -2099,6 +2172,7 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 1,
                 512,
@@ -2149,6 +2223,7 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 1,
                 512,
@@ -2221,6 +2296,7 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
+                Duration::from_secs(1),
                 Duration::from_secs(1),
                 10,
                 512,
@@ -3132,6 +3208,35 @@ mod tests {
             let status = result.unwrap_err();
             assert_eq!(status.code(), tonic::Code::Aborted);
             assert!(status.message().contains("fatal state"));
+        }
+
+        #[tokio::test]
+        async fn rejects_query_when_await_apply_timeouts() {
+            let raft = Arc::new(MockRaftHandle {
+                is_leader: true,
+                last_committed: LogIndex::new(100),
+                apply_delay: Some(Duration::from_millis(50)),
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            let dispatcher = IngressDispatcher::new(
+                raft,
+                inventory.clone(),
+                inventory,
+                successful_veto(),
+                Duration::from_secs(1),
+                Duration::from_millis(10), // Short consensus timeout
+                1,
+                512,
+            );
+
+            let req = make_request(QueryStateRequest::new(None, Some(LogIndex::new(10))));
+
+            let result = dispatcher.query_state(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+            assert!(status.message().contains("timed out"));
         }
 
         #[tokio::test]
