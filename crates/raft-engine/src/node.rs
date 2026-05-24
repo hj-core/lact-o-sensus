@@ -29,6 +29,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::info_span;
+use tracing::instrument;
 
 use crate::storage::LogStorage;
 use crate::tick::Tick;
@@ -267,6 +268,12 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
 
     /// Updates the commit index and triggers the application of entries to the
     /// FSM.
+    #[instrument(
+        name = "advance_commit_index",
+        target = "raft::replication",
+        skip_all,
+        fields(index = %index)
+    )]
     pub async fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
         if index < self.last_committed {
             debug!(
@@ -300,19 +307,19 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
                 "Commit Index Advanced"
             );
 
-            let fsm_span = info_span!(
-                target: ClinicalTarget::ClinicalFsm.as_str(),
-                "fsm_application",
-                last_committed = %self.last_committed
-            );
-
-            self.apply_to_state_machine().instrument(fsm_span).await?;
+            self.apply_to_state_machine().await?;
         }
         Ok(())
     }
 
     /// Orchestrates the sequential application of committed log entries to the
     /// State Machine.
+    #[instrument(
+        name = "fsm_application",
+        target = "clinical::fsm",
+        skip_all,
+        fields(last_committed = %self.last_committed)
+    )]
     async fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
         let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
@@ -539,8 +546,10 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         let last_idx = self.last_log_index()?;
         if prev_log_index > last_idx {
             debug!(
-                "Rejecting AppendEntries: prevLogIndex {} is beyond local log length {}",
-                prev_log_index, last_idx
+                target: ClinicalTarget::RaftReplication.as_str(),
+                index = %prev_log_index,
+                last_log_index = %last_idx,
+                "Rejecting AppendEntries: prevLogIndex is beyond local log length"
             );
             return Ok(false);
         }
@@ -548,8 +557,11 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         let local_term = self.get_term_at(prev_log_index)?;
         if local_term != prev_log_term {
             debug!(
-                "Rejecting AppendEntries: prevLogIndex {} has term mismatch (local {}, remote {})",
-                prev_log_index, local_term, prev_log_term
+                target: ClinicalTarget::RaftReplication.as_str(),
+                index = %prev_log_index,
+                local_term = %local_term,
+                remote_term = %prev_log_term,
+                "Rejecting AppendEntries: prevLogIndex has term mismatch"
             );
             return Ok(false);
         }
@@ -566,8 +578,9 @@ impl<S: StateMachine> RaftNode<Follower, S> {
             let local_term = self.get_term_at(entry_index)?;
             if local_term != Term::ZERO && local_term != Term::new(entry.term) {
                 info!(
-                    "Log conflict detected at index {}. Truncating log.",
-                    entry_index
+                    target: ClinicalTarget::RaftReplication.as_str(),
+                    index = %entry_index,
+                    "Log conflict detected. Truncating log."
                 );
                 self.log_store
                     .truncate_log(entry_index)
@@ -584,8 +597,10 @@ impl<S: StateMachine> RaftNode<Follower, S> {
             if entry_index >= next_expected {
                 if entry_index != next_expected {
                     error!(
-                        "Non-contiguous log append attempted by Leader. index={}, expected={}",
-                        entry_index, next_expected
+                        target: ClinicalTarget::RaftReplication.as_str(),
+                        index = %entry_index,
+                        expected = %next_expected,
+                        "Non-contiguous log append attempted by Leader."
                     );
                     return Ok(false);
                 }
@@ -608,7 +623,11 @@ impl<S: StateMachine> RaftNode<Follower, S> {
             let last_new_idx = self.last_log_index()?;
             let new_commit = cmp::min(leader_commit, last_new_idx);
             self.advance_last_committed(new_commit).await?;
-            debug!("Updated last_committed to {}", new_commit);
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                index = %new_commit,
+                "Updated last_committed"
+            );
         }
         Ok(())
     }
@@ -700,11 +719,13 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
 impl<S: StateMachine> RaftNode<Leader, S> {
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
+    #[instrument(
+        name = "proposal_ingestion",
+        target = "raft::replication",
+        skip_all,
+        fields(command_len = command.len())
+    )]
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
-        let span =
-            info_span!(target: ClinicalTarget::RaftReplication.as_str(), "proposal_ingestion");
-        let _enter = span.enter();
-
         let index = (self.last_log_index()? + 1)?;
         let entry = LogEntry::new(index, self.current_term()?, command);
         self.log_store
