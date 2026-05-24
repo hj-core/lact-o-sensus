@@ -14,6 +14,7 @@ use tracing::Instrument;
 use tracing::info_span;
 
 use crate::config::Config;
+use crate::consensus::ReplicationRoundParams;
 use crate::consensus::initiate_replication;
 use crate::engine::ConsensusProgress;
 use crate::engine::LogicalNode;
@@ -84,12 +85,15 @@ impl<S: StateMachine> ConsensusShell<S> {
         // We use explicit health and role checks here to avoid the delegate_to_inner!
         // macro, which panics on poisoned nodes. This allows the API to return a
         // structured error instead of a process-wide panic (ADR 009).
-        let (target_epoch, already_in_flight, term) = {
+        let (target_epoch, already_in_flight, term, node_id, last_committed) = {
             let mut guard = self.write().await;
 
             if guard.is_poisoned() {
                 return Err(ConsensusError::Poisoned);
             }
+
+            let node_id = guard.node_id();
+            let last_committed = guard.last_committed();
 
             if let Some(leader) = guard.as_leader_mut() {
                 let term = leader.current_term().map_err(|_| {
@@ -98,7 +102,7 @@ impl<S: StateMachine> ConsensusShell<S> {
                 let self_id = leader.node_id();
                 let current = leader.state().current_read_epoch();
                 let target = leader.state_mut().prepare_read_probe(self_id);
-                (target, target == current, term)
+                (target, target == current, term, node_id, last_committed)
             } else {
                 return Err(ConsensusError::NotLeader);
             }
@@ -120,7 +124,18 @@ impl<S: StateMachine> ConsensusShell<S> {
             // 3. Trigger immediate replication (heartbeat broadcast) if a new round is
             //    needed.
             if !already_in_flight {
-                initiate_replication(config, self.clone(), peer_manager, trace_id, term);
+                initiate_replication(
+                    config,
+                    self.clone(),
+                    peer_manager,
+                    ReplicationRoundParams {
+                        term,
+                        node_id,
+                        last_committed,
+                        trace_id,
+                    },
+                    span.clone(),
+                );
             }
 
             // 4. Await quorum confirmation, demotion, or timeout.
@@ -146,7 +161,7 @@ impl<S: StateMachine> ConsensusShell<S> {
                 }
             }
         }
-        .instrument(span)
+        .instrument(span.clone())
         .await
     }
 }

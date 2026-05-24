@@ -74,6 +74,21 @@ struct VoteRequestParams {
     trace_id: TraceId,
 }
 
+/// DTO for Election Campaign parameters, captured during the atomic tick
+/// boundary.
+///
+/// Ensures the asynchronous campaign task has a consistent snapshot of the
+/// node's identity and log coordinates at the moment the election was
+/// triggered.
+#[derive(Debug, Clone, Copy)]
+struct ElectionCampaignParams {
+    term: Term,
+    node_id: NodeId,
+    last_log_index: LogIndex,
+    last_log_term: Term,
+    trace_id: TraceId,
+}
+
 /// Decision outcomes from the vote-tallying process.
 ///
 /// Maps the distributed responses from peers into immediate state
@@ -102,6 +117,19 @@ struct ReplicationOutcome {
     response: AppendEntriesResponse,
 }
 
+/// DTO for Replication Round parameters, captured during the atomic tick
+/// boundary.
+///
+/// Encapsulates the global coordinates required to fan-out log entries to all
+/// peers without re-locking the global state for parameter collection.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplicationRoundParams {
+    pub(crate) term: Term,
+    pub(crate) node_id: NodeId,
+    pub(crate) last_committed: LogIndex,
+    pub(crate) trace_id: TraceId,
+}
+
 /// High-level orchestration instructions for the log replication cycle.
 ///
 /// Allows the replication orchestrator to handle opportunistic demotions
@@ -123,6 +151,12 @@ enum ReplicationAction {
 /// This is the system's "Heartbeat" (ADR 003). It pulses at a fixed interval,
 /// driving the logical engine's absolute clock and dispatching consensus
 /// actions (Elections, Heartbeats) based on deterministic tick boundaries.
+///
+/// ATOMIC HANDOFF PATTERN: State transitions (like into_candidate) are
+/// performed immediately within the locked boundary, and resulting DTOs
+/// are handed off to async tasks for network execution. This eliminates
+/// the "Double-Acquisition" race condition where the node state could
+/// change between the tick and the transition.
 pub fn spawn_tick_loop<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
@@ -140,12 +174,47 @@ pub fn spawn_tick_loop<S: StateMachine>(
                 sleep(interval).await;
 
                 // 2. Drive the logical engine and capture the required action
-                let (action, role_name, term) = {
+                // Perform state transitions (Atomic Handoff) while holding the lock.
+                let (action, role_name, term, campaign, replication) = {
                     let mut guard = state.write().await;
                     let action = guard.tick();
                     let role = determine_node_role_name(&guard);
                     let term = guard.try_current_term().unwrap_or(Term::ZERO);
-                    (action, role.to_string(), term)
+
+                    let mut campaign_params = None;
+                    let mut replication_params = None;
+
+                    match action {
+                        TickAction::StartElection => {
+                            let trace_id = TraceId::generate();
+                            guard.into_candidate();
+                            campaign_params = Some(ElectionCampaignParams {
+                                term: guard.current_term(),
+                                node_id: guard.node_id(),
+                                last_log_index: guard.last_log_index(),
+                                last_log_term: guard.last_log_term(),
+                                trace_id,
+                            });
+                        }
+                        TickAction::SendHeartbeat => {
+                            let trace_id = TraceId::generate();
+                            replication_params = Some(ReplicationRoundParams {
+                                term,
+                                node_id: guard.node_id(),
+                                last_committed: guard.last_committed(),
+                                trace_id,
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    (
+                        action,
+                        role.to_string(),
+                        term,
+                        campaign_params,
+                        replication_params,
+                    )
                 };
 
                 // 3. Telemetry: Manage Role Session Spans (ADR 010)
@@ -166,35 +235,36 @@ pub fn spawn_tick_loop<S: StateMachine>(
                     current_session = Some((span, role_name.clone(), term));
                 }
 
-                let _enter = current_session.as_ref().map(|(s, _, _)| s.enter());
+                // We do NOT use .enter() here across spawn calls to avoid Context Pollution.
+                // Spans are carried via .instrument() on the spawned futures.
+                let session_span = current_session
+                    .as_ref()
+                    .map(|(s, _, _)| s.clone())
+                    .unwrap_or_else(tracing::Span::none);
 
-                // 4. Dispatch deterministic actions
+                // 4. Dispatch deterministic actions using the DTOs
                 match action {
                     TickAction::StartElection => {
-                        let trace_id = TraceId::generate();
-                        info!(
-                            target: ClinicalTarget::RaftFoundation.as_str(),
-                            %trace_id,
-                            %term,
-                            "Tick loop triggered election campaign."
-                        );
-                        initiate_transition_to_candidate(
-                            config.clone(),
-                            state.clone(),
-                            peer_manager.clone(),
-                            trace_id,
-                        )
-                        .await;
+                        if let Some(params) = campaign {
+                            start_election_campaign(
+                                config.clone(),
+                                state.clone(),
+                                peer_manager.clone(),
+                                params,
+                                session_span,
+                            );
+                        }
                     }
                     TickAction::SendHeartbeat => {
-                        let trace_id = TraceId::generate();
-                        initiate_replication(
-                            config.clone(),
-                            state.clone(),
-                            peer_manager.clone(),
-                            trace_id,
-                            term,
-                        );
+                        if let Some(params) = replication {
+                            initiate_replication(
+                                config.clone(),
+                                state.clone(),
+                                peer_manager.clone(),
+                                params,
+                                session_span,
+                            );
+                        }
                     }
                     TickAction::Stop => {
                         error!(
@@ -215,46 +285,23 @@ pub fn spawn_tick_loop<S: StateMachine>(
 // III. Election Orchestration (The Candidate's World)
 // =============================================================================
 
-/// Safely transitions the node to Candidate and spawns the campaign task.
+/// Spawns an asynchronous task to orchestrate an election campaign.
 ///
-/// Ensures the state mutation (incrementing the term and declaring candidacy)
-/// occurs under a discrete write lock before establishing the
-/// 'election_campaign' telemetry span and yielding to the asynchronous network
-/// phase.
-async fn initiate_transition_to_candidate<S: StateMachine>(
+/// Establishes the 'election_campaign' telemetry context parented to the
+/// current role session, ensuring causal linkage (ADR 010).
+fn start_election_campaign<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
-    trace_id: TraceId,
+    params: ElectionCampaignParams,
+    parent_span: tracing::Span,
 ) {
-    let term = {
-        let mut guard = state.write().await;
-        let is_follower_or_candidate = matches!(
-            guard.state(),
-            RoleState::Follower(_) | RoleState::Candidate(_)
-        );
-        if !is_follower_or_candidate {
-            return;
-        }
-        let t = guard.current_term();
-        guard.into_candidate();
-
-        match t + 1 {
-            Ok(new_term) => new_term,
-            Err(e) => {
-                // Rule 4.1: Transition logical state to Poisoned immediately before any
-                // invariant-violation panic!.
-                guard.poison();
-                panic!("Secure Clinical: Terminal Invariant Violation: {}", e);
-            }
-        }
-    };
-
     let span = info_span!(
         target: ClinicalTarget::RaftFoundation.as_str(),
+        parent: &parent_span,
         "election_campaign",
-        trace_id = %trace_id,
-        %term
+        trace_id = %params.trace_id,
+        term = %params.term
     );
 
     let state_clone = state.clone();
@@ -264,9 +311,9 @@ async fn initiate_transition_to_candidate<S: StateMachine>(
     tokio::spawn(
         async move {
             if let Err(e) =
-                initiate_election(config_clone, state_clone, peer_manager_clone, trace_id).await
+                initiate_election(config_clone, state_clone, peer_manager_clone, params).await
             {
-                error!( error = %e, "Failed to initiate election");
+                error!( error = %e, "Failed to execute election campaign");
             }
         }
         .instrument(span),
@@ -275,52 +322,42 @@ async fn initiate_transition_to_candidate<S: StateMachine>(
 
 /// Orchestrates a Leadership Campaign by soliciting peer votes.
 ///
-/// Acts as the high-level coordinator: it snapshots the physical log state,
-/// delegates the network fan-out, and processes the asynchronous stream of
-/// vote responses to determine the campaign's success or failure.
+/// Acts as the high-level coordinator: it uses the pre-captured parameters
+/// to solicit votes concurrently from all peers and processes the asynchronous
+/// stream of responses to determine the campaign's success or failure.
 async fn initiate_election<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
-    trace_id: TraceId,
+    params: ElectionCampaignParams,
 ) -> ConsensusResult<()> {
-    // 1. Gather election parameters from the current state.
-    let (term, node_id, last_log_index, last_log_term) = {
-        let mut guard = state.write().await;
-        (
-            guard.current_term(),
-            guard.node_id(),
-            guard.last_log_index(),
-            guard.last_log_term(),
-        )
-    };
-
     info!(
         target: ClinicalTarget::RaftFoundation.as_str(),
-        last_log_index = %last_log_index,
-        last_log_term = %last_log_term,
-        "Election timeout reached. Transitioned to Candidate. Starting campaign."
+        last_log_index = %params.last_log_index,
+        last_log_term = %params.last_log_term,
+        term = %params.term,
+        "Starting election campaign."
     );
 
-    // 2. Request votes from all peers concurrently
+    // 1. Request votes from all peers concurrently
     let peer_ids = peer_manager.peer_ids();
     let mut vote_stream = broadcast_vote_requests(
         &config,
         peer_manager.clone(),
-        term,
-        node_id,
-        last_log_index,
-        last_log_term,
-        trace_id,
+        params.term,
+        params.node_id,
+        params.last_log_index,
+        params.last_log_term,
+        params.trace_id,
     );
 
-    // 3. Tally votes and handle term updates
+    // 2. Tally votes and handle term updates
     let mut votes_granted = 1; // Start with 1 (self-vote)
     let total_nodes = peer_ids.len() + 1;
     let quorum = (total_nodes / 2) + 1;
 
     while let Some((peer_id, res)) = vote_stream.next().await {
-        match process_vote_response(&state, term, &peer_ids, peer_id, res).await? {
+        match process_vote_response(&state, params.term, &peer_ids, peer_id, res).await? {
             VoteAction::QuorumReached => return Ok(()),
             VoteAction::Demoted => return Ok(()),
             VoteAction::Continue => {
@@ -338,7 +375,7 @@ async fn initiate_election<S: StateMachine>(
     let still_candidate = {
         let guard = state.read().await;
         let current = guard.try_current_term().unwrap_or(Term::ZERO);
-        matches!(guard.state(), RoleState::Candidate(_) if current == term)
+        matches!(guard.state(), RoleState::Candidate(_) if current == params.term)
     };
 
     if still_candidate {
@@ -356,8 +393,11 @@ async fn initiate_election<S: StateMachine>(
 /// Evaluates a single vote response and determines the immediate state
 /// transition.
 ///
-/// Responsible for: 1. Term check and opportunistic demotion (§5.1)
-/// 2. Tally vote if granted and we are still campaigning for the same term
+/// Responsible for:
+/// 1. Term Integrity: Opportunistic demotion if the peer has a higher term
+///    (§5.1).
+/// 2. Vote Tallying: Adding granted votes to the Candidate's state machine.
+/// 3. Victory Transition: Promoting to Leader immediately upon reaching quorum.
 async fn process_vote_response<S: StateMachine>(
     state: &ConsensusShell<S>,
     term: Term,
@@ -431,24 +471,25 @@ async fn process_vote_response<S: StateMachine>(
 /// Spawns a dedicated task to orchestrate a single log replication round.
 ///
 /// Ensures the 'replication_round' telemetry context is properly established
-/// before yielding to the asynchronous fan-out phase (ADR 010).
+/// and linked to the leader session span (ADR 010).
 pub(crate) fn initiate_replication<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
-    trace_id: TraceId,
-    term: Term,
+    params: ReplicationRoundParams,
+    parent_span: tracing::Span,
 ) {
     let span = info_span!(
         target: ClinicalTarget::RaftReplication.as_str(),
+        parent: &parent_span,
         "replication_round",
-        trace_id = %trace_id,
-        term = %term
+        trace_id = %params.trace_id,
+        term = %params.term
     );
 
     tokio::spawn(
         async move {
-            if let Err(e) = replicate_to_peers(config, state, peer_manager, trace_id).await {
+            if let Err(e) = replicate_to_peers(config, state, peer_manager, params).await {
                 error!( error = %e, "Failed to replicate to peers");
             }
         }
@@ -465,32 +506,15 @@ async fn replicate_to_peers<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
-    trace_id: TraceId,
+    params: ReplicationRoundParams,
 ) -> ConsensusResult<()> {
-    // 1. Gather global replication parameters.
-    let (term, node_id, last_committed) = {
-        let mut guard = state.write().await;
-        (
-            guard.current_term(),
-            guard.node_id(),
-            guard.last_committed(),
-        )
-    };
+    // 1. Prepare and send AppendEntries concurrently to all peers.
+    let mut response_stream =
+        broadcast_append_entries(&config, peer_manager.clone(), state.clone(), params);
 
-    // 2. Prepare and send AppendEntries concurrently to all peers.
-    let mut response_stream = broadcast_append_entries(
-        &config,
-        peer_manager.clone(),
-        state.clone(),
-        term,
-        node_id,
-        last_committed,
-        trace_id,
-    );
-
-    // 3. Process responses as they arrive (Opportunistic demotion & index updates).
+    // 2. Process responses as they arrive (Opportunistic demotion & index updates).
     while let Some((peer_id, res)) = response_stream.next().await {
-        if process_append_entries_response(&state, term, peer_id, res).await?
+        if process_append_entries_response(&state, params.term, peer_id, res).await?
             == ReplicationAction::Demoted
         {
             return Ok(());
@@ -503,10 +527,11 @@ async fn replicate_to_peers<S: StateMachine>(
 /// Evaluates a replication response and updates the Leader's internal
 /// bookkeeping.
 ///
-/// Responsible for: 1. Term Integrity: Opportunistic demotion if the peer has a
-///    higher term (§5.1).
+/// Responsible for:
+/// 1. Term Integrity: Opportunistic demotion if the peer has a higher term
+///    (§5.1).
 /// 2. Index Reconciliation: Advancing next_index on success or backtracking on
-///    log mismatch.
+///    log mismatch (§5.3).
 /// 3. Quorum Commitment: Advancing the Leader's commit index once a majority is
 ///    reached (ADR 002).
 async fn process_append_entries_response<S: StateMachine>(
@@ -678,16 +703,14 @@ async fn request_vote_from_peer(
 
 /// Broadcasts AppendEntries RPCs concurrently to all cluster peers.
 ///
-/// Dynamically constructs the specific payload for each peer based on their
-/// individual 'next_index' state to ensure efficient log synchronization.
+/// Acts as a high-level orchestrator for the replication fan-out, delegating
+/// the per-peer request preparation and network handling to
+/// `prepare_and_replicate_to_peer`.
 fn broadcast_append_entries<S: StateMachine>(
     config: &Config,
     peer_manager: Arc<PeerManager>,
     state: Arc<ConsensusShell<S>>,
-    term: Term,
-    node_id: NodeId,
-    last_committed: LogIndex,
-    trace_id: TraceId,
+    params: ReplicationRoundParams,
 ) -> FuturesUnordered<impl futures::Future<Output = (NodeId, RpcResult<Option<ReplicationOutcome>>)>>
 {
     let rpc_timeout = config.raft.rpc_timeout();
@@ -696,52 +719,74 @@ fn broadcast_append_entries<S: StateMachine>(
         .peer_ids()
         .into_iter()
         .map(|peer_id| {
-            let state = state.clone();
-            let pm = peer_manager.clone();
-            async move {
-                // Prepare the request for this specific peer
-                let request = {
-                    let mut guard = state.write().await;
-                    match guard.state() {
-                        RoleState::Leader(_) => {
-                            match build_append_entries_request(
-                                &mut guard,
-                                peer_id,
-                                term,
-                                node_id,
-                                last_committed,
-                            ) {
-                                Ok(req) => req,
-                                Err(e) => {
-                                    // If arithmetic fails here, it's a protocol violation.
-                                    // We must poison and halt according to Rule 4.1.
-                                    guard.poison();
-                                    panic!(
-                                        "Secure Clinical: Terminal Invariant Violation during \
-                                         replication: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        _ => return (peer_id, Ok(None)),
-                    }
-                };
-
-                (
-                    peer_id,
-                    replicate_to_peer(pm, peer_id, request, rpc_timeout, trace_id).await,
-                )
-            }
+            prepare_and_replicate_to_peer(
+                state.clone(),
+                peer_manager.clone(),
+                peer_id,
+                params,
+                rpc_timeout,
+            )
         })
         .collect()
+}
+
+/// Prepares and executes a single replication attempt for a specific peer.
+///
+/// This delegate function handles the "Tri-Layer" boundary:
+/// 1. Logical Layer: Acquires the node state to build a customized payload for
+///    the peer.
+/// 2. Physical Layer: Transitions to the asynchronous network phase to transmit
+///    the RPC.
+/// 3. Safety: Enforces the Halt Mandate if arithmetic invariants are violated
+///    during preparation.
+async fn prepare_and_replicate_to_peer<S: StateMachine>(
+    state: Arc<ConsensusShell<S>>,
+    peer_manager: Arc<PeerManager>,
+    peer_id: NodeId,
+    params: ReplicationRoundParams,
+    rpc_timeout: Duration,
+) -> (NodeId, RpcResult<Option<ReplicationOutcome>>) {
+    // 1. Prepare the request for this specific peer (Synchronous locked phase)
+    let request = {
+        let mut guard = state.write().await;
+        match guard.state() {
+            RoleState::Leader(_) => {
+                match build_append_entries_request(
+                    &mut guard,
+                    peer_id,
+                    params.term,
+                    params.node_id,
+                    params.last_committed,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        // If arithmetic fails here, it's a protocol violation.
+                        // We must poison and halt according to Rule 4.1.
+                        guard.poison();
+                        panic!(
+                            "Secure Clinical: Terminal Invariant Violation during replication: {}",
+                            e
+                        );
+                    }
+                }
+            }
+            _ => return (peer_id, Ok(None)),
+        }
+    };
+
+    // 2. Execute RPC (Asynchronous network phase)
+    (
+        peer_id,
+        replicate_to_peer(peer_manager, peer_id, request, rpc_timeout, params.trace_id).await,
+    )
 }
 
 /// Executes a single AppendEntries RPC with strict causal verification.
 ///
 /// Injects the current telemetry trace into the gRPC metadata and validates
-/// the returned trace ID. Returns a 'ReplicationOutcome' DTO for leader
-/// reconciliation.
+/// the returned trace ID back from the peer, guarding against Byzantine
+/// correlation failures (ADR 010). Returns a 'ReplicationOutcome' DTO for
+/// leader reconciliation.
 async fn replicate_to_peer(
     peer_manager: Arc<PeerManager>,
     peer_id: NodeId,
@@ -794,6 +839,9 @@ fn determine_node_role_name<S: StateMachine>(node: &LogicalNode<S>) -> &'static 
 // --- Replication & State Machine ---
 
 /// Dynamically constructs an AppendEntries payload for a specific peer.
+///
+/// Calculates the correct `prev_log_index` and `prev_log_term` based on the
+/// peer's `next_index` state.
 fn build_append_entries_request<S: StateMachine>(
     node: &mut LogicalNode<S>,
     peer_id: NodeId,
@@ -827,6 +875,9 @@ fn build_append_entries_request<S: StateMachine>(
 }
 
 /// Computes the consensus quorum and advances the Leader's commit index.
+///
+/// Implements the commit-at-majority logic from §5.3, ensuring that the
+/// commit index only advances for the current term to maintain safety.
 async fn update_leader_last_committed<S: StateMachine>(node: &mut LogicalNode<S>) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
