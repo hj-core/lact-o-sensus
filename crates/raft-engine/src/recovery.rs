@@ -55,6 +55,7 @@ impl<S: StateMachine> RecoveryManager<S> {
 
             if last_applied == last_committed {
                 info!(
+                    target: ClinicalTarget::ClinicalRecovery.as_str(),
                     index = %last_applied,
                     "State is already synchronized. Replay skipped."
                 );
@@ -75,6 +76,7 @@ impl<S: StateMachine> RecoveryManager<S> {
     /// regression.
     fn verify_causal_integrity(&self, last_applied: LogIndex, last_committed: LogIndex) {
         info!(
+            target: ClinicalTarget::ClinicalRecovery.as_str(),
             last_applied = %last_applied,
             last_committed = %last_committed,
             "Executing initial causal integrity check"
@@ -85,6 +87,7 @@ impl<S: StateMachine> RecoveryManager<S> {
             // Since the LogicalNode doesn't exist yet, we trigger an immediate panic
             // to prevent the node from starting with a corrupted state.
             error!(
+                target: ClinicalTarget::ClinicalRecovery.as_str(),
                 last_applied = %last_applied,
                 last_committed = %last_committed,
                 "HALT MANDATE (ADR 009): FSM index ahead of last_committed. Causal regression detected."
@@ -107,6 +110,7 @@ impl<S: StateMachine> RecoveryManager<S> {
         let start_index = (last_applied + 1)?;
 
         info!(
+            target: ClinicalTarget::ClinicalRecovery.as_str(),
             start_index = %start_index,
             end_index = %last_committed,
             "Commencing log replay"
@@ -121,6 +125,7 @@ impl<S: StateMachine> RecoveryManager<S> {
                     // Rule 3.4: Pre-boot Halt Mandate.
                     // A missing committed entry is a fatal data integrity failure.
                     error!(
+                        target: ClinicalTarget::ClinicalRecovery.as_str(),
                         index = %apply_idx,
                         "HALT MANDATE (ADR 009): Committed entry missing from log during recovery."
                     );
@@ -140,6 +145,7 @@ impl<S: StateMachine> RecoveryManager<S> {
 
             if current.as_u64().is_multiple_of(100) {
                 info!(
+                    target: ClinicalTarget::ClinicalRecovery.as_str(),
                     progress = %current,
                     target_index = %last_committed,
                     "Recovery in progress..."
@@ -148,6 +154,7 @@ impl<S: StateMachine> RecoveryManager<S> {
         }
 
         info!(
+            target: ClinicalTarget::ClinicalRecovery.as_str(),
             final_index = %current,
             "Recovery: REPLAY COMPLETE. FSM synchronized."
         );
