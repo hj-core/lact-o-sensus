@@ -304,12 +304,13 @@ impl LogStorage for SledStorage {
 }
 
 /// In-memory implementation of LogStorage for testing and initial bootstrap.
+#[cfg(test)]
 #[derive(Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct MemoryStorage {
     state: std::sync::Mutex<MemoryState>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct MemoryState {
     current_term: Term,
@@ -321,8 +322,8 @@ struct MemoryState {
     log: Vec<LogEntry>,
 }
 
+#[cfg(test)]
 impl MemoryStorage {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self::default()
     }
@@ -336,6 +337,7 @@ impl MemoryStorage {
     }
 }
 
+#[cfg(test)]
 impl LogStorage for MemoryStorage {
     fn current_term(&self) -> Result<Term, LogStorageError> {
         Ok(self.state()?.current_term)
