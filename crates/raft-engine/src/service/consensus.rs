@@ -26,6 +26,7 @@ use tonic::Response;
 use tonic::Status;
 use tracing::Instrument;
 use tracing::info_span;
+use tracing::instrument;
 
 use crate::engine::LogicalNode;
 use crate::shell::ConsensusShell;
@@ -109,6 +110,7 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
 
     /// Verifies that the node engine is healthy and matches the service
     /// identity.
+    #[instrument(name = "verify_integrity", target = "clinical::telemetry", skip_all)]
     fn verify_node_integrity(&self, node: &mut LogicalNode<S>) -> Result<(), Status> {
         let engine_id = node.identity();
         if Arc::ptr_eq(&engine_id, &self.identity) {
@@ -132,6 +134,12 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
     }
 
     /// Executes the core logic for a RequestVote RPC.
+    #[instrument(
+        name = "execute_vote_logic",
+        target = "raft::foundation",
+        skip_all,
+        fields(candidate = %params.candidate_id, term = %params.term)
+    )]
     async fn execute_vote_logic(
         &self,
         params: &VoteParams,
@@ -148,6 +156,12 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
     }
 
     /// Executes the core logic for an AppendEntries RPC.
+    #[instrument(
+        name = "execute_append_logic",
+        target = "raft::replication",
+        skip_all,
+        fields(leader = %params.leader_id, term = %params.term)
+    )]
     async fn execute_append_logic(
         &self,
         params: AppendParams,
