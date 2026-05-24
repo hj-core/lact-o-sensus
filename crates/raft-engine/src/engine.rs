@@ -22,6 +22,7 @@ use rand::rngs::StdRng;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing::instrument;
 
 pub use crate::node::Candidate;
 pub use crate::node::Follower;
@@ -221,6 +222,12 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     /// Processes an AppendEntries RPC.
+    #[instrument(
+        name = "handle_append_entries",
+        target = "raft::replication",
+        skip_all,
+        fields(leader = %leader_id, term = %req_term)
+    )]
     pub async fn handle_append_entries(
         &mut self,
         leader_id: NodeId,
@@ -235,7 +242,7 @@ impl<S: StateMachine> LogicalNode<S> {
         // 1. Term check (§5.1)
         if req_term < current_term {
             debug!(
-                target: "raft::replication",
+                target: ClinicalTarget::RaftReplication.as_str(),
                 remote_leader = %leader_id,
                 req_term = %req_term,
                 local_term = %current_term,
@@ -321,6 +328,12 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     /// Processes a RequestVote RPC.
+    #[instrument(
+        name = "handle_request_vote",
+        target = "raft::foundation",
+        skip_all,
+        fields(candidate = %candidate_id, term = %req_term)
+    )]
     pub fn handle_request_vote(
         &mut self,
         candidate_id: NodeId,
@@ -373,6 +386,12 @@ impl<S: StateMachine> LogicalNode<S> {
 
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
+    #[instrument(
+        name = "propose",
+        target = "raft::foundation",
+        skip_all,
+        fields(command_len = command.len())
+    )]
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
         match &mut self.state {
             RoleState::Leader(node) => match node.propose(command) {
@@ -399,6 +418,12 @@ impl<S: StateMachine> LogicalNode<S> {
 
     /// Consumes the current state and returns a Follower state for the given
     /// term. This is a universal transition mandated by Raft §5.1.
+    #[instrument(
+        name = "transition_to_follower",
+        target = "raft::foundation",
+        skip_all,
+        fields(term = %term, leader = ?leader_id)
+    )]
     pub fn into_follower(&mut self, term: Term, leader_id: Option<NodeId>) {
         let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
         let tick = self.current_tick;
@@ -421,6 +446,11 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     /// Transitions to Candidate role.
+    #[instrument(
+        name = "transition_to_candidate",
+        target = "raft::foundation",
+        skip_all
+    )]
     pub fn into_candidate(&mut self) {
         let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
         let tick = self.current_tick;
@@ -439,6 +469,7 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     /// Transitions to Leader role.
+    #[instrument(name = "transition_to_leader", target = "raft::foundation", skip_all)]
     pub fn into_leader(&mut self, peer_ids: Vec<NodeId>) {
         let tick = self.current_tick;
 
