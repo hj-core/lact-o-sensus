@@ -18,6 +18,7 @@ use rust_decimal::RoundingStrategy;
 use strum::Display;
 use strum::EnumString;
 use thiserror::Error;
+use tracing::instrument;
 
 /// Errors associated with physical quantity parsing and stabilization.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -202,6 +203,12 @@ const MULTIPLIER_FL_OZ: Decimal = Decimal::from_parts(2957353, 0, 0, false, 5); 
 impl UnitRegistry {
     /// High-level Orchestrator: Parses a quantity and unit symbol into a
     /// validated, stabilized `PhysicalQuantity`.
+    #[instrument(
+        name = "physical_stabilization",
+        target = "clinical::fsm",
+        skip_all,
+        fields(raw_qty = %quantity, raw_unit = %unit)
+    )]
     pub fn parse_and_convert(quantity: &str, unit: &str) -> Result<PhysicalQuantity, UnitError> {
         let entry = Self::resolve_symbol(unit)?;
         let base_val = Self::convert_to_base_val(quantity, entry.multiplier)?;
@@ -211,6 +218,12 @@ impl UnitRegistry {
     /// Specialized Orchestrator: Parses a quantity and unit symbol but uses an
     /// EXTERNALLY provided multiplier (e.g. from AI Oracle resolution).
     /// Still verifies the unit dimension via the registry.
+    #[instrument(
+        name = "contextual_stabilization",
+        target = "clinical::fsm",
+        skip_all,
+        fields(raw_qty = %quantity, raw_unit = %unit)
+    )]
     pub fn parse_and_convert_with_multiplier(
         quantity: &str,
         unit: &str,
@@ -222,6 +235,12 @@ impl UnitRegistry {
     }
 
     /// Resolves a unit symbol to its metadata. Returns an error if unknown.
+    #[instrument(
+        name = "unit_resolution",
+        target = "clinical::fsm",
+        skip_all,
+        fields(symbol = %symbol)
+    )]
     pub fn resolve_symbol(symbol: &str) -> Result<UnitRegistryEntry, UnitError> {
         let normalized = symbol.trim().to_lowercase();
 
@@ -311,6 +330,13 @@ impl UnitRegistry {
     }
 
     /// Performs the conversion to Base SI with mandatory Banker's Rounding.
+    #[instrument(
+        name = "base_conversion",
+        target = "clinical::fsm",
+        level = "debug",
+        skip_all,
+        fields(qty = %quantity)
+    )]
     fn convert_to_base_val(quantity: &str, multiplier: Decimal) -> Result<Decimal, UnitError> {
         let qty = Decimal::from_str(quantity)
             .map_err(|_| UnitError::InvalidQuantity(quantity.to_string()))?;
