@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 use serde::Deserialize;
 use serde::Serialize;
+use tracing::instrument;
 
 use crate::types::errors::IdentityError;
 
@@ -23,6 +24,7 @@ pub struct NodeId(u64);
 
 impl NodeId {
     /// Constructs a new NodeId. Returns an error if the ID is 0.
+    #[instrument(name = "node_id_init", target = "clinical::foundation", skip_all, fields(id = %id))]
     pub fn try_new(id: u64) -> Result<Self, IdentityError> {
         if id == 0 {
             return Err(IdentityError::ReservedNodeId);
@@ -85,6 +87,7 @@ impl ClusterId {
     ///
     /// Trims whitespace and verifies it is not empty and contains valid
     /// characters.
+    #[instrument(name = "cluster_id_init", target = "clinical::foundation", skip_all, fields(id = %id.as_ref()))]
     pub fn try_new(id: impl AsRef<str>) -> Result<Self, IdentityError> {
         let trimmed = id.as_ref().trim();
         if trimmed.is_empty() {
