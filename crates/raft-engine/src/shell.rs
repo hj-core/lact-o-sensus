@@ -92,9 +92,9 @@ impl<S: StateMachine> ConsensusShell<S> {
             }
 
             if let Some(leader) = guard.as_leader_mut() {
-                let term = leader
-                    .current_term()
-                    .map_err(|e| ConsensusError::Internal(e.to_string()))?;
+                let term = leader.current_term().map_err(|_| {
+                    ConsensusError::Internal("Leadership verification failed".to_string())
+                })?;
                 let self_id = leader.node_id();
                 let current = leader.state().current_read_epoch();
                 let target = leader.state_mut().prepare_read_probe(self_id);
@@ -108,6 +108,7 @@ impl<S: StateMachine> ConsensusShell<S> {
         let span = info_span!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             "quorum_probe",
+            trace_id = %trace_id,
             target_epoch = %target_epoch,
             term = %term
         );
@@ -278,107 +279,115 @@ mod tests {
     }
 
     mod verify_leadership_quorum {
-        use common::types::errors::ConsensusError;
-
         use super::*;
 
-        #[tokio::test]
-        async fn satisfies_concurrent_reads_in_single_round() {
-            let shell = mock_shell();
-            let config = Arc::new(test_config());
-            let peer_manager =
-                Arc::new(PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap());
+        mod with_stable_leader {
+            use super::*;
 
-            // 1. Transition to leader
-            {
-                let mut guard = shell.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![
-                    NodeId::try_new(2).unwrap(),
-                    NodeId::try_new(3).unwrap(),
-                ]);
+            #[tokio::test]
+            async fn completes_successfully_and_batches_concurrent_reads_in_single_round() {
+                let shell = mock_shell();
+                let config = Arc::new(test_config());
+                let peer_manager = Arc::new(
+                    PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                );
+
+                // 1. Transition to leader
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![
+                        NodeId::try_new(2).unwrap(),
+                        NodeId::try_new(3).unwrap(),
+                    ]);
+                }
+
+                // 2. Start two concurrent reads
+                let shell1 = shell.clone();
+                let config1 = config.clone();
+                let pm1 = peer_manager.clone();
+                let read1 = tokio::spawn(async move {
+                    shell1
+                        .verify_leadership_quorum(config1, pm1, TraceId::generate())
+                        .await
+                });
+
+                let shell2 = shell.clone();
+                let config2 = config.clone();
+                let pm2 = peer_manager.clone();
+                let read2 = tokio::spawn(async move {
+                    shell2
+                        .verify_leadership_quorum(config2, pm2, TraceId::generate())
+                        .await
+                });
+
+                // Give them time to register and start waiting
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // 3. Verify they are both waiting for the SAME epoch (batching)
+                {
+                    let guard = shell.read().await;
+                    let leader = guard.as_leader().unwrap();
+                    assert_eq!(leader.state().current_read_epoch(), 1);
+                }
+
+                // 4. Simulate quorum acknowledgment
+                {
+                    let mut guard = shell.write().await;
+                    let leader = guard.as_leader_mut().unwrap();
+                    leader
+                        .state_mut()
+                        .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+                    // Drop triggers signal
+                }
+
+                // 5. Verify both reads complete successfully
+                let res1 = read1.await.unwrap();
+                let res2 = read2.await.unwrap();
+
+                assert!(res1.is_ok());
+                assert!(res2.is_ok());
             }
-
-            // 2. Start two concurrent reads
-            let shell1 = shell.clone();
-            let config1 = config.clone();
-            let pm1 = peer_manager.clone();
-            let read1 = tokio::spawn(async move {
-                shell1
-                    .verify_leadership_quorum(config1, pm1, TraceId::generate())
-                    .await
-            });
-
-            let shell2 = shell.clone();
-            let config2 = config.clone();
-            let pm2 = peer_manager.clone();
-            let read2 = tokio::spawn(async move {
-                shell2
-                    .verify_leadership_quorum(config2, pm2, TraceId::generate())
-                    .await
-            });
-
-            // Give them time to register and start waiting
-            tokio::time::sleep(Duration::from_millis(20)).await;
-
-            // 3. Verify they are both waiting for the SAME epoch (batching)
-            {
-                let guard = shell.read().await;
-                let leader = guard.as_leader().unwrap();
-                assert_eq!(leader.state().current_read_epoch(), 1);
-            }
-
-            // 4. Simulate quorum acknowledgment
-            {
-                let mut guard = shell.write().await;
-                let leader = guard.as_leader_mut().unwrap();
-                leader
-                    .state_mut()
-                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
-                // Drop triggers signal
-            }
-
-            // 5. Verify both reads complete successfully
-            let res1 = read1.await.unwrap();
-            let res2 = read2.await.unwrap();
-
-            assert!(res1.is_ok());
-            assert!(res2.is_ok());
         }
 
-        #[tokio::test]
-        async fn returns_error_on_demotion() {
-            let shell = mock_shell();
-            let config = Arc::new(test_config());
-            let peer_manager =
-                Arc::new(PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap());
+        mod with_unstable_leader {
+            use super::*;
 
-            // 1. Transition to leader
-            {
-                let mut guard = shell.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![NodeId::try_new(2).unwrap()]);
+            #[tokio::test]
+            async fn returns_error_on_demotion() {
+                let shell = mock_shell();
+                let config = Arc::new(test_config());
+                let peer_manager = Arc::new(
+                    PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                );
+
+                // 1. Transition to leader
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![NodeId::try_new(2).unwrap()]);
+                }
+
+                let shell_clone = shell.clone();
+                let config_clone = config.clone();
+                let pm_clone = peer_manager.clone();
+                let task = tokio::spawn(async move {
+                    shell_clone
+                        .verify_leadership_quorum(config_clone, pm_clone, TraceId::generate())
+                        .await
+                });
+
+                tokio::time::sleep(Duration::from_millis(20)).await;
+
+                // 2. Simulate demotion
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_follower(Term::new(10), None);
+                }
+
+                let result = task.await.unwrap();
+                assert!(matches!(result, Err(ConsensusError::NotLeader)));
             }
-
-            let shell_clone = shell.clone();
-            let config_clone = config.clone();
-            let pm_clone = peer_manager.clone();
-            let task = tokio::spawn(async move {
-                shell_clone
-                    .verify_leadership_quorum(config_clone, pm_clone, TraceId::generate())
-                    .await
-            });
-
-            tokio::time::sleep(Duration::from_millis(20)).await;
-
-            // 2. Simulate demotion
-            {
-                let mut guard = shell.write().await;
-                guard.into_follower(Term::new(10), None);
-            }
-
-            let result = task.await.unwrap();
-            assert!(matches!(result, Err(ConsensusError::NotLeader)));
         }
     }
 }
