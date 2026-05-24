@@ -1,7 +1,19 @@
+//! Clinical Consensus Orchestration
+//!
+//! This module implements the Raft consensus state machine transitions,
+//! orchestrating the deterministic heartbeat, leader elections, and log
+//! replication cycles.
+//!
+//! It acts as the "Logical Orchestrator" within the internal node architecture
+//! (ADR 009). All asynchronous network fanning is decoupled from the strictly
+//! deterministic logical clock driven by the Tick Loop (ADR 003). To maintain
+//! clinical integrity, operations explicitly map distributed responses to
+//! internal state mutations while propagating causal telemetry traces (ADR
+//! 010).
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
 use common::proto::v1::raft::AppendEntriesRequest;
 use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::RequestVoteRequest;
@@ -40,8 +52,11 @@ use crate::shell::ConsensusShell;
 /// Standardized result type for internal Raft RPC operations.
 ///
 /// Distinguishes transient network or protocol errors (Status) from
-/// terminal system-level failures (anyhow::Error).
+/// terminal system-level failures (NodeError).
 type RpcResult<T> = std::result::Result<T, Status>;
+
+/// Standardized result type for consensus orchestration logic.
+type ConsensusResult<T> = std::result::Result<T, NodeError>;
 
 // --- 1. The Election Cycle ---
 
@@ -268,7 +283,7 @@ async fn initiate_election<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
-) -> Result<()> {
+) -> ConsensusResult<()> {
     // 1. Gather election parameters from the current state.
     let (term, node_id, last_log_index, last_log_term) = {
         let mut guard = state.write().await;
@@ -349,7 +364,7 @@ async fn process_vote_response<S: StateMachine>(
     peer_ids: &[NodeId],
     peer_id: NodeId,
     res: RpcResult<RequestVoteResponse>,
-) -> Result<VoteAction> {
+) -> ConsensusResult<VoteAction> {
     let resp = match res {
         Ok(val) => val,
         Err(e) => {
@@ -451,7 +466,7 @@ async fn replicate_to_peers<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     trace_id: TraceId,
-) -> Result<()> {
+) -> ConsensusResult<()> {
     // 1. Gather global replication parameters.
     let (term, node_id, last_committed) = {
         let mut guard = state.write().await;
@@ -499,7 +514,7 @@ async fn process_append_entries_response<S: StateMachine>(
     term: Term,
     peer_id: NodeId,
     res: RpcResult<Option<ReplicationOutcome>>,
-) -> Result<ReplicationAction> {
+) -> ConsensusResult<ReplicationAction> {
     let outcome = match res {
         Ok(Some(val)) => val,
         Ok(None) => return Ok(ReplicationAction::Continue),
@@ -785,7 +800,7 @@ fn build_append_entries_request<S: StateMachine>(
     term: Term,
     node_id: NodeId,
     last_committed: LogIndex,
-) -> Result<AppendEntriesRequest, NodeError> {
+) -> std::result::Result<AppendEntriesRequest, NodeError> {
     let next_idx = if let RoleState::Leader(n) = node.state() {
         *n.state()
             .next_index()
@@ -900,11 +915,15 @@ mod tests {
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
-        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+        fn last_applied_index(&self) -> std::result::Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        async fn apply(
+            &self,
+            _index: LogIndex,
+            _data: &[u8],
+        ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -951,147 +970,165 @@ mod tests {
 
     mod process_vote_response {
         use super::*;
-        #[tokio::test]
-        async fn should_demote_on_higher_term() {
-            let (_, state, pm) = setup().await;
-            let res = Ok(RequestVoteResponse::new(Term::new(2), false));
-            let action = process_vote_response(
-                &state,
-                Term::new(1),
-                &pm.peer_ids(),
-                NodeId::try_new(2).unwrap(),
-                res,
-            )
-            .await
-            .unwrap();
-            assert_eq!(action, VoteAction::Demoted);
-            assert_eq!(state.read().await.try_current_term().unwrap(), Term::new(2));
+
+        mod discovering_higher_term {
+            use super::*;
+            #[tokio::test]
+            async fn should_demote_to_follower_when_peer_has_newer_term() {
+                let (_, state, pm) = setup().await;
+                let res = Ok(RequestVoteResponse::new(Term::new(2), false));
+                let action = process_vote_response(
+                    &state,
+                    Term::new(1),
+                    &pm.peer_ids(),
+                    NodeId::try_new(2).unwrap(),
+                    res,
+                )
+                .await
+                .unwrap();
+                assert_eq!(action, VoteAction::Demoted);
+                assert_eq!(state.read().await.try_current_term().unwrap(), Term::new(2));
+            }
         }
 
-        #[tokio::test]
-        async fn should_detect_quorum_reached() {
-            let (_, state, _) = setup().await;
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
+        mod reaching_quorum {
+            use super::*;
+            #[tokio::test]
+            async fn should_transition_to_leader_when_majority_votes_granted() {
+                let (_, state, _) = setup().await;
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                }
+                let res = Ok(RequestVoteResponse::new(Term::new(1), true));
+                let action = process_vote_response(
+                    &state,
+                    Term::new(1),
+                    &[NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()],
+                    NodeId::try_new(2).unwrap(),
+                    res,
+                )
+                .await
+                .unwrap();
+                assert_eq!(action, VoteAction::QuorumReached);
+                assert!(matches!(state.read().await.state(), RoleState::Leader(_)));
             }
-            let res = Ok(RequestVoteResponse::new(Term::new(1), true));
-            let action = process_vote_response(
-                &state,
-                Term::new(1),
-                &[NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()],
-                NodeId::try_new(2).unwrap(),
-                res,
-            )
-            .await
-            .unwrap();
-            assert_eq!(action, VoteAction::QuorumReached);
-            assert!(matches!(state.read().await.state(), RoleState::Leader(_)));
         }
     }
 
     mod process_append_entries_response {
         use super::*;
-        #[tokio::test]
-        async fn should_advance_indices_on_success() {
-            let (_, state, _) = setup().await;
-            let peer_id = NodeId::try_new(2).unwrap();
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![peer_id]);
-            }
-            let res = Ok(Some(ReplicationOutcome {
-                sent_prev_index: LogIndex::new(0),
-                sent_entries_len: 1,
-                response: AppendEntriesResponse::new(Term::new(1), true, LogIndex::new(0)),
-            }));
-            process_append_entries_response(&state, Term::new(1), peer_id, res)
-                .await
-                .unwrap();
-            let guard = state.read().await;
-            if let RoleState::Leader(node) = guard.state() {
-                assert_eq!(
-                    *node.state().match_index().get(&peer_id).unwrap(),
-                    LogIndex::new(1)
-                );
-                assert_eq!(
-                    *node.state().next_index().get(&peer_id).unwrap(),
-                    LogIndex::new(2)
-                );
-            } else {
-                panic!("Should be leader");
+
+        mod successful_replication {
+            use super::*;
+            #[tokio::test]
+            async fn should_advance_indices_when_peer_accepts_entries() {
+                let (_, state, _) = setup().await;
+                let peer_id = NodeId::try_new(2).unwrap();
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![peer_id]);
+                }
+                let res = Ok(Some(ReplicationOutcome {
+                    sent_prev_index: LogIndex::new(0),
+                    sent_entries_len: 1,
+                    response: AppendEntriesResponse::new(Term::new(1), true, LogIndex::new(0)),
+                }));
+                process_append_entries_response(&state, Term::new(1), peer_id, res)
+                    .await
+                    .unwrap();
+                let guard = state.read().await;
+                if let RoleState::Leader(node) = guard.state() {
+                    assert_eq!(
+                        *node.state().match_index().get(&peer_id).unwrap(),
+                        LogIndex::new(1)
+                    );
+                    assert_eq!(
+                        *node.state().next_index().get(&peer_id).unwrap(),
+                        LogIndex::new(2)
+                    );
+                } else {
+                    panic!("Should be leader");
+                }
             }
         }
 
-        #[tokio::test]
-        async fn should_optimize_backoff_on_log_mismatch() {
-            let (_, state, _) = setup().await;
-            let peer_id = NodeId::try_new(2).unwrap();
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![peer_id]);
-                if let Some(node) = guard.as_leader_mut() {
-                    node.state_mut()
-                        .next_index_mut()
-                        .insert(peer_id, LogIndex::new(11));
+        mod log_mismatch_handling {
+            use super::*;
+            #[tokio::test]
+            async fn should_optimize_backoff_when_peer_rejects_due_to_mismatch() {
+                let (_, state, _) = setup().await;
+                let peer_id = NodeId::try_new(2).unwrap();
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![peer_id]);
+                    if let Some(node) = guard.as_leader_mut() {
+                        node.state_mut()
+                            .next_index_mut()
+                            .insert(peer_id, LogIndex::new(11));
+                    }
                 }
-            }
-            let res = Ok(Some(ReplicationOutcome {
-                sent_prev_index: LogIndex::new(10),
-                sent_entries_len: 0,
-                response: AppendEntriesResponse::new(Term::new(1), false, LogIndex::new(5)),
-            }));
-            process_append_entries_response(&state, Term::new(1), peer_id, res)
-                .await
-                .unwrap();
-            let guard = state.read().await;
-            if let RoleState::Leader(node) = guard.state() {
-                assert_eq!(
-                    *node.state().next_index().get(&peer_id).unwrap(),
-                    LogIndex::new(6)
-                );
-            } else {
-                panic!("Should be leader");
+                let res = Ok(Some(ReplicationOutcome {
+                    sent_prev_index: LogIndex::new(10),
+                    sent_entries_len: 0,
+                    response: AppendEntriesResponse::new(Term::new(1), false, LogIndex::new(5)),
+                }));
+                process_append_entries_response(&state, Term::new(1), peer_id, res)
+                    .await
+                    .unwrap();
+                let guard = state.read().await;
+                if let RoleState::Leader(node) = guard.state() {
+                    assert_eq!(
+                        *node.state().next_index().get(&peer_id).unwrap(),
+                        LogIndex::new(6)
+                    );
+                } else {
+                    panic!("Should be leader");
+                }
             }
         }
     }
 
     mod update_leader_last_committed {
         use super::*;
-        #[tokio::test]
-        async fn should_advance_commit_index_on_quorum() {
-            let (_, state, _) = setup().await;
-            let p2 = NodeId::try_new(2).unwrap();
-            let p3 = NodeId::try_new(3).unwrap();
-            {
-                let mut guard = state.write().await;
-                guard.into_candidate();
-                guard.into_leader(vec![p2, p3]);
-                if let Some(leader) = guard.as_leader_mut() {
-                    let entries: Vec<_> = (1..=5)
-                        .map(|i| common::proto::v1::raft::LogEntry {
-                            index: i,
-                            term: 1,
-                            data: vec![],
-                        })
-                        .collect();
-                    leader.log_store().append_entries(entries).unwrap();
+
+        mod quorum_commitment {
+            use super::*;
+            #[tokio::test]
+            async fn should_advance_commit_index_when_majority_matches_index() {
+                let (_, state, _) = setup().await;
+                let p2 = NodeId::try_new(2).unwrap();
+                let p3 = NodeId::try_new(3).unwrap();
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![p2, p3]);
+                    if let Some(leader) = guard.as_leader_mut() {
+                        let entries: Vec<_> = (1..=5)
+                            .map(|i| common::proto::v1::raft::LogEntry {
+                                index: i,
+                                term: 1,
+                                data: vec![],
+                            })
+                            .collect();
+                        leader.log_store().append_entries(entries).unwrap();
+                    }
                 }
-            }
-            {
-                let mut guard = state.write().await;
-                if let Some(node) = guard.as_leader_mut() {
-                    node.state_mut()
-                        .match_index_mut()
-                        .insert(p2, LogIndex::new(4));
-                    node.state_mut()
-                        .match_index_mut()
-                        .insert(p3, LogIndex::new(1));
+                {
+                    let mut guard = state.write().await;
+                    if let Some(node) = guard.as_leader_mut() {
+                        node.state_mut()
+                            .match_index_mut()
+                            .insert(p2, LogIndex::new(4));
+                        node.state_mut()
+                            .match_index_mut()
+                            .insert(p3, LogIndex::new(1));
+                    }
+                    update_leader_last_committed(&mut guard).await;
+                    assert_eq!(guard.last_committed(), LogIndex::new(4));
                 }
-                update_leader_last_committed(&mut guard).await;
-                assert_eq!(guard.last_committed(), LogIndex::new(4));
             }
         }
     }
@@ -1102,36 +1139,46 @@ mod tests {
 
         use super::*;
 
-        #[test]
-        fn should_pass_matching_trace_id() {
-            let trace_id = TraceId::generate();
-            let mut response = Response::new(());
-            TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)
-                .expect("Should inject trace ID");
-            assert!(
-                verify_trace_integrity(&response, trace_id, NodeId::try_new(2).unwrap()).is_ok()
-            );
+        mod matching_traces {
+            use super::*;
+            #[test]
+            fn should_pass_when_returned_trace_matches_expected() {
+                let trace_id = TraceId::generate();
+                let mut response = Response::new(());
+                TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)
+                    .expect("Should inject trace ID");
+                assert!(
+                    verify_trace_integrity(&response, trace_id, NodeId::try_new(2).unwrap())
+                        .is_ok()
+                );
+            }
         }
 
-        #[test]
-        fn should_fail_mismatched_trace_id() {
-            let expected = TraceId::generate();
-            let got = TraceId::generate();
-            let mut response = Response::new(());
-            TraceInterceptor::inject_trace_id_into_response(&mut response, got)
-                .expect("Should inject trace ID");
-            let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
-            assert!(res.is_err());
-            assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
+        mod mismatched_traces {
+            use super::*;
+            #[test]
+            fn should_fail_with_data_loss_when_returned_trace_differs() {
+                let expected = TraceId::generate();
+                let got = TraceId::generate();
+                let mut response = Response::new(());
+                TraceInterceptor::inject_trace_id_into_response(&mut response, got)
+                    .expect("Should inject trace ID");
+                let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
+                assert!(res.is_err());
+                assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
+            }
         }
 
-        #[test]
-        fn should_fail_missing_trace_id() {
-            let expected = TraceId::generate();
-            let response = Response::new(());
-            let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
-            assert!(res.is_err());
-            assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
+        mod missing_traces {
+            use super::*;
+            #[test]
+            fn should_fail_with_data_loss_when_trace_id_is_absent() {
+                let expected = TraceId::generate();
+                let response = Response::new(());
+                let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
+                assert!(res.is_err());
+                assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
+            }
         }
     }
 }
