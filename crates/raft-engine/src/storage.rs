@@ -18,7 +18,10 @@ use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
 use common::types::errors::LogStorageError;
+use common::types::trace::ClinicalTarget;
 use prost::Message;
+use tracing::debug;
+use tracing::instrument;
 
 /// Physical storage abstraction for Raft consensus state (§5.1, §5.3).
 ///
@@ -125,6 +128,12 @@ impl SledStorage {
 }
 
 impl LogStorage for SledStorage {
+    #[instrument(
+        name = "storage_read_term",
+        target = "clinical::foundation",
+        level = "debug",
+        skip_all
+    )]
     fn current_term(&self) -> Result<Term, LogStorageError> {
         self.meta
             .get(Self::KEY_HARD_STATE)
@@ -134,6 +143,12 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.map(|(t, _)| t).unwrap_or(Term::ZERO))
     }
 
+    #[instrument(
+        name = "storage_read_vote",
+        target = "clinical::foundation",
+        level = "debug",
+        skip_all
+    )]
     fn voted_for(&self) -> Result<Option<NodeId>, LogStorageError> {
         self.meta
             .get(Self::KEY_HARD_STATE)
@@ -143,6 +158,12 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.and_then(|(_, v)| v))
     }
 
+    #[instrument(
+        name = "storage_read_last_index",
+        target = "raft::replication",
+        level = "debug",
+        skip_all
+    )]
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
         self.log
             .last()
@@ -159,6 +180,12 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.unwrap_or(LogIndex::ZERO))
     }
 
+    #[instrument(
+        name = "storage_read_last_term",
+        target = "raft::replication",
+        level = "debug",
+        skip_all
+    )]
     fn last_log_term(&self) -> Result<Term, LogStorageError> {
         self.log
             .last()
@@ -177,6 +204,12 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))
     }
 
+    #[instrument(
+        name = "storage_read_committed",
+        target = "raft::replication",
+        level = "debug",
+        skip_all
+    )]
     fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
         self.meta
             .get(Self::KEY_LAST_COMMITTED)
@@ -193,6 +226,7 @@ impl LogStorage for SledStorage {
             .map(|opt| opt.unwrap_or(LogIndex::ZERO))
     }
 
+    #[instrument(name = "storage_read_entry", target = "raft::replication", level = "debug", skip_all, fields(index = %index))]
     fn read_entry(&self, index: LogIndex) -> Result<Option<LogEntry>, LogStorageError> {
         let key = index.as_u64().to_be_bytes();
         self.log
@@ -214,6 +248,7 @@ impl LogStorage for SledStorage {
             .transpose()
     }
 
+    #[instrument(name = "storage_read_range", target = "raft::replication", level = "debug", skip_all, fields(start = %start, end = %end))]
     fn read_entries(
         &self,
         start: LogIndex,
@@ -244,29 +279,42 @@ impl LogStorage for SledStorage {
         Ok(entries)
     }
 
+    #[instrument(name = "storage_write_hard_state", target = "clinical::foundation", skip_all, fields(term = %term, vote = ?vote))]
     fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         let data = Self::serialize_hard_state(term, vote);
         self.meta.insert(Self::KEY_HARD_STATE, data).map_err(|e| {
             LogStorageError::persistence(format!("Failed to persist hard_state: {}", e))
         })?;
-        self.db
-            .flush()
-            .map_err(|e| LogStorageError::persistence(format!("Sled flush failure: {}", e)))?;
+        self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                error = %e,
+                "Sled flush failure during hard_state save"
+            );
+            LogStorageError::persistence(format!("Sled flush failure: {}", e))
+        })?;
         Ok(())
     }
 
+    #[instrument(name = "storage_write_committed", target = "raft::replication", skip_all, fields(index = %index))]
     fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
         self.meta
             .insert(Self::KEY_LAST_COMMITTED, &index.as_u64().to_be_bytes())
             .map_err(|e| {
                 LogStorageError::persistence(format!("Failed to persist last_committed: {}", e))
             })?;
-        self.db
-            .flush()
-            .map_err(|e| LogStorageError::persistence(format!("Sled flush failure: {}", e)))?;
+        self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                error = %e,
+                "Sled flush failure during last_committed save"
+            );
+            LogStorageError::persistence(format!("Sled flush failure: {}", e))
+        })?;
         Ok(())
     }
 
+    #[instrument(name = "storage_write_append", target = "raft::replication", skip_all, fields(count = entries.len()))]
     fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for entry in entries {
@@ -278,11 +326,17 @@ impl LogStorage for SledStorage {
             LogStorageError::persistence(format!("Failed to apply log append batch: {}", e))
         })?;
         self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                error = %e,
+                "Sled flush failure after log append"
+            );
             LogStorageError::persistence(format!("Sled flush failure after log append: {}", e))
         })?;
         Ok(())
     }
 
+    #[instrument(name = "storage_write_truncate", target = "raft::replication", skip_all, fields(index = %index))]
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
         let last_idx = self.last_log_index()?;
         if index > last_idx {
@@ -297,6 +351,11 @@ impl LogStorage for SledStorage {
             LogStorageError::persistence(format!("Failed to apply log truncation batch: {}", e))
         })?;
         self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                error = %e,
+                "Sled flush failure after log truncation"
+            );
             LogStorageError::persistence(format!("Sled flush failure after log truncation: {}", e))
         })?;
         Ok(())
