@@ -1,3 +1,12 @@
+//! The Logical State Machine orchestrator for the Raft consensus engine.
+//!
+//! This module implements the middle layer of the "Tri-Layer Onion" model
+//! (ADR 009), acting as a dispatcher between the physical role-specific nodes
+//! and the imperative signaling shell. It manages high-level role transitions
+//! (Follower, Candidate, Leader) and enforces the "Halt Mandate" for
+//! protocol invariant violations.
+
+use std::mem;
 use std::sync::Arc;
 
 use common::proto::v1::raft::LogEntry;
@@ -181,7 +190,7 @@ impl<S: StateMachine> LogicalNode<S> {
         &self.state
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower, S>> {
         match &mut self.state {
             RoleState::Follower(node) => Some(node),
@@ -257,6 +266,12 @@ impl<S: StateMachine> LogicalNode<S> {
                     self.into_follower(req_term, Some(leader_id));
                 }
                 RoleState::Leader(_) => {
+                    error!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        rival_leader = %leader_id,
+                        "CRITICAL SAFETY VIOLATION: Rival leader detected for current term. Halting node."
+                    );
                     let msg = format!(
                         "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
                          node.",
@@ -441,7 +456,7 @@ impl<S: StateMachine> LogicalNode<S> {
     where
         F: FnOnce(RoleState<S>) -> RoleState<S>,
     {
-        let old_state = std::mem::replace(&mut self.state, RoleState::Poisoned);
+        let old_state = mem::replace(&mut self.state, RoleState::Poisoned);
         self.state = f(old_state);
     }
 
@@ -694,91 +709,107 @@ mod tests {
         mod term_safety {
             use super::*;
 
-            #[tokio::test]
-            async fn demotes_candidate_on_equal_term() {
-                let mut state = setup_node(1);
-                state.into_candidate();
+            mod with_follower {
+                use super::*;
 
-                // AppendEntries from leader of same term
-                let result = state
-                    .handle_append_entries(
-                        NodeId::try_new(2).unwrap(),
-                        Term::new(1),
-                        LogIndex::ZERO,
-                        Term::ZERO,
-                        vec![],
-                        LogIndex::ZERO,
-                    )
-                    .await;
+                #[tokio::test]
+                async fn rejects_stale_term() {
+                    let mut state = setup_node(1);
+                    state.into_follower(Term::new(5), None);
 
-                assert!(result.success);
-                assert_eq!(result.term, Term::new(1));
-                assert!(matches!(state.state, RoleState::Follower(_)));
+                    let result = state
+                        .handle_append_entries(
+                            NodeId::try_new(2).unwrap(),
+                            Term::new(1), // Stale term
+                            LogIndex::ZERO,
+                            Term::ZERO,
+                            vec![],
+                            LogIndex::ZERO,
+                        )
+                        .await;
+
+                    assert!(!result.success);
+                    assert_eq!(result.term, Term::new(5));
+                }
             }
 
-            #[tokio::test]
-            async fn demotes_any_role_on_higher_term() {
-                let mut state = setup_node(1);
-                state.into_candidate();
-                state.into_leader(vec![]);
+            mod with_candidate {
+                use super::*;
 
-                let result = state
-                    .handle_append_entries(
-                        NodeId::try_new(2).unwrap(),
-                        Term::new(10), // Higher term
-                        LogIndex::ZERO,
-                        Term::ZERO,
-                        vec![],
-                        LogIndex::ZERO,
-                    )
-                    .await;
+                #[tokio::test]
+                async fn demotes_candidate_on_equal_term() {
+                    let mut state = setup_node(1);
+                    state.into_candidate();
 
-                assert!(result.success);
-                assert_eq!(result.term, Term::new(10));
-                assert!(matches!(state.state, RoleState::Follower(_)));
+                    // AppendEntries from leader of same term
+                    let result = state
+                        .handle_append_entries(
+                            NodeId::try_new(2).unwrap(),
+                            Term::new(1),
+                            LogIndex::ZERO,
+                            Term::ZERO,
+                            vec![],
+                            LogIndex::ZERO,
+                        )
+                        .await;
+
+                    assert!(result.success);
+                    assert_eq!(result.term, Term::new(1));
+                    assert!(matches!(state.state, RoleState::Follower(_)));
+                }
             }
 
-            #[tokio::test]
-            async fn rejects_stale_term() {
-                let mut state = setup_node(1);
-                state.into_follower(Term::new(5), None);
+            mod with_any_role {
+                use super::*;
 
-                let result = state
-                    .handle_append_entries(
-                        NodeId::try_new(2).unwrap(),
-                        Term::new(1), // Stale term
-                        LogIndex::ZERO,
-                        Term::ZERO,
-                        vec![],
-                        LogIndex::ZERO,
-                    )
-                    .await;
+                #[tokio::test]
+                async fn demotes_any_role_on_higher_term() {
+                    let mut state = setup_node(1);
+                    state.into_candidate();
+                    state.into_leader(vec![]);
 
-                assert!(!result.success);
-                assert_eq!(result.term, Term::new(5));
+                    let result = state
+                        .handle_append_entries(
+                            NodeId::try_new(2).unwrap(),
+                            Term::new(10), // Higher term
+                            LogIndex::ZERO,
+                            Term::ZERO,
+                            vec![],
+                            LogIndex::ZERO,
+                        )
+                        .await;
+
+                    assert!(result.success);
+                    assert_eq!(result.term, Term::new(10));
+                    assert!(matches!(state.state, RoleState::Follower(_)));
+                }
             }
         }
 
         mod rival_leader_protection {
             use super::*;
 
-            #[tokio::test]
-            #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
-            async fn halts_on_rival_leader_same_term() {
-                let mut state = setup_node(1);
-                state.into_candidate();
-                state.into_leader(vec![]);
+            mod with_active_leader {
+                use super::*;
 
-                state
-                    .handle_append_entries(
-                        NodeId::try_new(2).unwrap(),
-                        Term::new(1), // Same term as local leader
-                        LogIndex::ZERO,
-                        Term::ZERO,
-                        vec![],
-                        LogIndex::ZERO,
-                    )
-                    .await;
+                #[tokio::test]
+                #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+                async fn halts_on_rival_leader_same_term() {
+                    let mut state = setup_node(1);
+                    state.into_candidate();
+                    state.into_leader(vec![]);
+
+                    state
+                        .handle_append_entries(
+                            NodeId::try_new(2).unwrap(),
+                            Term::new(1), // Same term as local leader
+                            LogIndex::ZERO,
+                            Term::ZERO,
+                            vec![],
+                            LogIndex::ZERO,
+                        )
+                        .await;
+                }
             }
         }
     }
@@ -789,54 +820,62 @@ mod tests {
         mod term_safety {
             use super::*;
 
-            #[test]
-            fn demotes_on_higher_term_even_if_vote_rejected() {
-                let mut state = setup_node(1);
-                match &mut state.state {
-                    RoleState::Follower(n) => {
-                        n.log_store()
-                            .append_entries(vec![LogEntry::new(
-                                LogIndex::new(1),
-                                Term::new(1),
-                                vec![],
-                            )])
-                            .unwrap();
+            mod with_candidate {
+                use super::*;
+
+                #[test]
+                fn demotes_on_higher_term_even_if_vote_rejected() {
+                    let mut state = setup_node(1);
+                    match &mut state.state {
+                        RoleState::Follower(n) => {
+                            n.log_store()
+                                .append_entries(vec![LogEntry::new(
+                                    LogIndex::new(1),
+                                    Term::new(1),
+                                    vec![],
+                                )])
+                                .unwrap();
+                        }
+                        _ => panic!("Setup failed"),
                     }
-                    _ => panic!("Setup failed"),
+                    state.into_candidate();
+
+                    // Request from higher term, but with stale candidate log
+                    let result = state.handle_request_vote(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(5),
+                        LogIndex::ZERO, // Stale index
+                        Term::ZERO,
+                    );
+
+                    assert!(!result.vote_granted);
+                    assert_eq!(result.term, Term::new(5));
+                    assert!(matches!(state.state, RoleState::Follower(_)));
                 }
-                state.into_candidate();
-
-                // Request from higher term, but with stale candidate log
-                let result = state.handle_request_vote(
-                    NodeId::try_new(2).unwrap(),
-                    Term::new(5),
-                    LogIndex::ZERO, // Stale index
-                    Term::ZERO,
-                );
-
-                assert!(!result.vote_granted);
-                assert_eq!(result.term, Term::new(5));
-                assert!(matches!(state.state, RoleState::Follower(_)));
             }
         }
 
         mod vote_granting {
             use super::*;
 
-            #[test]
-            fn grants_vote_on_same_term_if_eligible() {
-                let mut state = setup_node(1);
-                state.into_follower(Term::new(1), None);
+            mod with_follower {
+                use super::*;
 
-                let result = state.handle_request_vote(
-                    NodeId::try_new(2).unwrap(),
-                    Term::new(1),
-                    LogIndex::ZERO,
-                    Term::ZERO,
-                );
+                #[test]
+                fn grants_vote_on_same_term_if_eligible() {
+                    let mut state = setup_node(1);
+                    state.into_follower(Term::new(1), None);
 
-                assert!(result.vote_granted);
-                assert_eq!(state.voted_for(), Some(NodeId::try_new(2).unwrap()));
+                    let result = state.handle_request_vote(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(1),
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                    );
+
+                    assert!(result.vote_granted);
+                    assert_eq!(state.voted_for(), Some(NodeId::try_new(2).unwrap()));
+                }
             }
         }
     }
@@ -847,22 +886,30 @@ mod tests {
         mod role_restrictions {
             use super::*;
 
-            #[test]
-            fn succeeds_when_leader() {
-                let mut state = setup_node(1);
-                state.into_candidate();
-                state.into_leader(vec![]);
+            mod with_leader {
+                use super::*;
 
-                let result = state.propose(vec![42]);
-                assert!(result.is_ok());
-                assert_eq!(result.unwrap(), LogIndex::new(1));
+                #[test]
+                fn succeeds_when_leader() {
+                    let mut state = setup_node(1);
+                    state.into_candidate();
+                    state.into_leader(vec![]);
+
+                    let result = state.propose(vec![42]);
+                    assert!(result.is_ok());
+                    assert_eq!(result.unwrap(), LogIndex::new(1));
+                }
             }
 
-            #[test]
-            fn fails_when_not_leader() {
-                let mut state = setup_node(1);
-                let result = state.propose(vec![42]);
-                assert!(matches!(result, Err(NodeError::NotLeader { .. })));
+            mod with_follower {
+                use super::*;
+
+                #[test]
+                fn fails_when_not_leader() {
+                    let mut state = setup_node(1);
+                    let result = state.propose(vec![42]);
+                    assert!(matches!(result, Err(NodeError::NotLeader { .. })));
+                }
             }
         }
     }
@@ -870,136 +917,148 @@ mod tests {
     mod consensus_progress {
         use super::*;
 
-        #[test]
-        fn reports_follower_state_accurately() {
-            let mut state = setup_node(1);
-            let progress = state.consensus_progress();
-            assert_eq!(progress.role, NodeRole::Follower);
-            assert_eq!(progress.term, Term::ZERO);
-        }
+        mod state_reporting {
+            use super::*;
 
-        #[test]
-        fn reports_candidate_state_accurately() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            let progress = state.consensus_progress();
-            assert_eq!(progress.role, NodeRole::Candidate);
-            assert_eq!(progress.term, Term::new(1));
-        }
-
-        #[test]
-        fn reports_leader_state_accurately() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            state.into_leader(vec![]);
-            let progress = state.consensus_progress();
-            assert_eq!(progress.role, NodeRole::Leader);
-            assert_eq!(progress.term, Term::new(1));
-        }
-
-        #[test]
-        fn reports_confirmed_epoch() {
-            let mut state = setup_node(1);
-            state.into_candidate();
-            state.into_leader(vec![NodeId::try_new(2).unwrap()]);
-
-            // Simulate epoch advancement in physical node
-            if let RoleState::Leader(ref mut n) = state.state {
-                n.state_mut()
-                    .prepare_read_probe(NodeId::try_new(1).unwrap());
-                n.state_mut()
-                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+            #[test]
+            fn reports_follower_state_accurately() {
+                let mut state = setup_node(1);
+                let progress = state.consensus_progress();
+                assert_eq!(progress.role, NodeRole::Follower);
+                assert_eq!(progress.term, Term::ZERO);
             }
 
-            let progress = state.consensus_progress();
-            assert_eq!(progress.confirmed_read_epoch, 1);
-
-            // Start new round
-            if let RoleState::Leader(ref mut n) = state.state {
-                n.state_mut()
-                    .prepare_read_probe(NodeId::try_new(1).unwrap());
-                n.state_mut()
-                    .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+            #[test]
+            fn reports_candidate_state_accurately() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                let progress = state.consensus_progress();
+                assert_eq!(progress.role, NodeRole::Candidate);
+                assert_eq!(progress.term, Term::new(1));
             }
 
-            let progress2 = state.consensus_progress();
-            assert_eq!(progress2.confirmed_read_epoch, 2);
-        }
+            #[test]
+            fn reports_leader_state_accurately() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                state.into_leader(vec![]);
+                let progress = state.consensus_progress();
+                assert_eq!(progress.role, NodeRole::Leader);
+                assert_eq!(progress.term, Term::new(1));
+            }
 
-        #[test]
-        fn reports_poisoned_state_accurately() {
-            let fsm = Arc::new(MockFsm);
-            let storage = Arc::new(MemoryStorage::new());
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(15),
-                max_election: TickDuration::new(30),
-            };
-            let rng = StdRng::seed_from_u64(1);
-            let mut state =
-                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
-            state.state = RoleState::Poisoned;
-            let progress = state.consensus_progress();
-            assert_eq!(progress.role, NodeRole::Poisoned);
+            #[test]
+            fn reports_confirmed_epoch() {
+                let mut state = setup_node(1);
+                state.into_candidate();
+                state.into_leader(vec![NodeId::try_new(2).unwrap()]);
+
+                // Simulate epoch advancement in physical node
+                if let RoleState::Leader(ref mut n) = state.state {
+                    n.state_mut()
+                        .prepare_read_probe(NodeId::try_new(1).unwrap());
+                    n.state_mut()
+                        .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+                }
+
+                let progress = state.consensus_progress();
+                assert_eq!(progress.confirmed_read_epoch, 1);
+
+                // Start new round
+                if let RoleState::Leader(ref mut n) = state.state {
+                    n.state_mut()
+                        .prepare_read_probe(NodeId::try_new(1).unwrap());
+                    n.state_mut()
+                        .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+                }
+
+                let progress2 = state.consensus_progress();
+                assert_eq!(progress2.confirmed_read_epoch, 2);
+            }
+
+            #[test]
+            fn reports_poisoned_state_accurately() {
+                let fsm = Arc::new(MockFsm);
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let mut state =
+                    LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+                state.state = RoleState::Poisoned;
+                let progress = state.consensus_progress();
+                assert_eq!(progress.role, NodeRole::Poisoned);
+            }
         }
     }
 
     mod transition_safety {
         use super::*;
 
-        #[test]
-        #[should_panic(expected = "Halt Mandate: Node is poisoned")]
-        fn panics_on_propose_when_poisoned() {
-            let fsm = Arc::new(MockFsm);
-            let storage = Arc::new(MemoryStorage::new());
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(15),
-                max_election: TickDuration::new(30),
-            };
-            let rng = StdRng::seed_from_u64(1);
-            let mut state =
-                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
-            state.state = RoleState::Poisoned;
-            let _ = state.propose(vec![42]);
+        mod with_poisoned_node {
+            use super::*;
+
+            #[test]
+            #[should_panic(expected = "Halt Mandate: Node is poisoned")]
+            fn panics_on_propose_when_poisoned() {
+                let fsm = Arc::new(MockFsm);
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let mut state =
+                    LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+                state.state = RoleState::Poisoned;
+                let _ = state.propose(vec![42]);
+            }
+
+            #[test]
+            #[should_panic(expected = "Halt Mandate: Node is poisoned")]
+            fn panics_on_accessing_poisoned_node() {
+                let fsm = Arc::new(MockFsm);
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let mut state =
+                    LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
+                state.state = RoleState::Poisoned;
+                let _ = state.node_id();
+            }
         }
 
-        #[test]
-        #[should_panic(expected = "Halt Mandate: Node is poisoned")]
-        fn panics_on_accessing_poisoned_node() {
-            let fsm = Arc::new(MockFsm);
-            let storage = Arc::new(MemoryStorage::new());
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(15),
-                max_election: TickDuration::new(30),
-            };
-            let rng = StdRng::seed_from_u64(1);
-            let mut state =
-                LogicalNode::try_new(test_identity(1), fsm, storage, thresholds, rng).unwrap();
-            state.state = RoleState::Poisoned;
-            let _ = state.node_id();
-        }
+        mod during_transition {
+            use super::*;
 
-        #[test]
-        fn remains_poisoned_if_transition_closure_panics() {
-            let mut state = setup_node(1);
+            #[test]
+            fn remains_poisoned_if_transition_closure_panics() {
+                let mut state = setup_node(1);
 
-            // Execute a transition that is guaranteed to panic
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.transition(|_| panic!("Deliberate panic inside transition"));
-            }));
+                // Execute a transition that is guaranteed to panic
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.transition(|_| panic!("Deliberate panic inside transition"));
+                }));
 
-            assert!(result.is_err());
-            // Verify that the node is now permanently poisoned
-            assert!(state.is_poisoned());
+                assert!(result.is_err());
+                // Verify that the node is now permanently poisoned
+                assert!(state.is_poisoned());
+            }
         }
     }
 
     mod tick {
         use super::*;
 
-        mod follower {
+        mod with_follower {
             use super::*;
 
             #[test]
@@ -1043,7 +1102,7 @@ mod tests {
             }
         }
 
-        mod candidate {
+        mod with_candidate {
             use super::*;
 
             #[test]
@@ -1062,7 +1121,7 @@ mod tests {
             }
         }
 
-        mod leader {
+        mod with_leader {
             use super::*;
 
             #[test]
@@ -1097,7 +1156,7 @@ mod tests {
             }
         }
 
-        mod poisoned {
+        mod with_poisoned_node {
             use super::*;
 
             #[test]
