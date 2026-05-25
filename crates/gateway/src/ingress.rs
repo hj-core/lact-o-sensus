@@ -13,6 +13,7 @@ use std::time::Duration;
 use common::app_api::InventoryReader;
 use common::app_api::SessionProvider;
 use common::proto::v1::app::CommittedMutation;
+use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::OperationType;
@@ -231,13 +232,16 @@ impl IngressDispatcher {
 
             self.normalize_intent(&mut intent)?;
 
-            // 5. Resolves semantic metadata and stabilizes physical quantities via the AI
+            // 5. Fetches the authoritative linearizable state for context (ADR 007).
+            let current_inventory = self.inventory_reader.get_inventory().await;
+
+            // 6. Resolves semantic metadata and stabilizes physical quantities via the AI
             //    resolution loop.
             let (final_status, stabilized) = self
-                .resolve_semantic_mutation(client_id.clone(), &intent, trace_id)
+                .resolve_semantic_mutation(client_id.clone(), &intent, &current_inventory, trace_id)
                 .await?;
 
-            // 6. Proposes the finalized intent to the cluster for consensus.
+            // 7. Proposes the finalized intent to the cluster for consensus.
             let proposal_index = self
                 .commit_to_consensus(MutationProposal {
                     client_id: &client_id,
@@ -562,6 +566,7 @@ impl IngressDispatcher {
         &self,
         client_id: ClientId,
         intent: &MutationIntent,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
         trace_id: TraceId,
     ) -> Result<(MutationStatus, StabilizedMutation), Status> {
         let mut stabilized_mutation = None;
@@ -578,7 +583,7 @@ impl IngressDispatcher {
             }
 
             let veto = match self
-                .evaluate_policy(client_id.clone(), intent, trace_id)
+                .evaluate_policy(client_id.clone(), intent, current_inventory, trace_id)
                 .await
             {
                 Ok(v) => v,
@@ -608,7 +613,7 @@ impl IngressDispatcher {
                 break;
             }
 
-            match self.validate_and_stabilize(intent, &veto, &[]) {
+            match self.validate_and_stabilize(intent, &veto, current_inventory) {
                 Ok(s) => {
                     stabilized_mutation = Some(s);
                     break;
@@ -636,8 +641,10 @@ impl IngressDispatcher {
                         base_unit: "units".to_string(),
                         display_unit: "units".to_string(),
                         category: GroceryCategory::AnomalousInputs,
-                        moral_justification: "Semantic Integrity Violation: AI-resolved metadata \
-                                              failed internal verification."
+                        moral_justification: "A physical unit mismatch was detected between this \
+                                              request and the existing inventory record for this \
+                                              item. Please ensure the units are compatible with \
+                                              previous entries."
                             .to_string(),
                     });
                     break;
@@ -732,7 +739,7 @@ impl IngressDispatcher {
         &self,
         intent: &MutationIntent,
         veto: &VetoOutcome,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
+        current_inventory: &[GroceryItem],
     ) -> Result<StabilizedMutation, Status> {
         let category = self.verify_category_registry(&veto.category_assignment)?;
 
@@ -859,7 +866,7 @@ impl IngressDispatcher {
         intent: &MutationIntent,
         resolved_key: &str,
         new_quantity: &PhysicalQuantity,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
+        current_inventory: &[GroceryItem],
     ) -> Result<(), Status> {
         if (intent.operation == OperationType::Add as i32
             || intent.operation == OperationType::Subtract as i32)
@@ -891,6 +898,7 @@ impl IngressDispatcher {
         &self,
         client_id: ClientId,
         intent: &MutationIntent,
+        current_inventory: &[common::proto::v1::app::GroceryItem],
         trace_id: TraceId,
     ) -> Result<VetoOutcome, Status> {
         let span = info_span!(
@@ -910,7 +918,7 @@ impl IngressDispatcher {
             .evaluate(
                 client_id,
                 intent,
-                &[], // Inventory store implemented in Phase 5
+                current_inventory,
                 self.config.veto_timeout,
                 self.config.max_justification_len,
                 trace_id,
@@ -1439,6 +1447,58 @@ mod tests {
         }
 
         // --- Phase 2: Concurrency & Syntactic (Layer 2) ---
+
+        #[tokio::test]
+        async fn rejects_mutation_violating_dimensional_fence() {
+            let existing_item = GroceryItem::new(
+                "milk-whole".to_string(),
+                "1000".to_string(),
+                "g".to_string(), // Stored as MASS
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(1),
+            );
+
+            let raft = successful_raft();
+            let inventory = Arc::new(MockInventorySource {
+                items: vec![existing_item],
+                ..Default::default()
+            });
+
+            // AI resolves the same item but with VOLUME units (ml)
+            let veto = Arc::new(MockVetoRelay {
+                outcome: Some(VetoOutcome {
+                    is_approved: true,
+                    resolved_item_key: "milk-whole".to_string(),
+                    resolved_unit: "ml".to_string(), // VOLUME
+                    ..valid_outcome()
+                }),
+                ..Default::default()
+            });
+
+            let dispatcher = mock_dispatcher(raft, inventory.clone(), inventory, veto);
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "milk".to_string(),
+                    Some("500".to_string()),
+                    Some("ml".to_string()),
+                    None,
+                    OperationType::Add,
+                ),
+            ));
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+            assert_eq!(response.status, MutationStatus::Vetoed as i32);
+            assert!(
+                response
+                    .error_message
+                    .contains("A physical unit mismatch was detected")
+            );
+        }
 
         #[tokio::test]
         async fn normalizes_intent_syntactically() {
@@ -1970,7 +2030,7 @@ mod tests {
             assert!(
                 response
                     .error_message
-                    .contains("Semantic Integrity Violation:")
+                    .contains("A physical unit mismatch was detected")
             );
         }
 
@@ -2012,7 +2072,7 @@ mod tests {
             assert!(
                 response
                     .error_message
-                    .contains("Semantic Integrity Violation:")
+                    .contains("A physical unit mismatch was detected")
             );
         }
 
@@ -2258,7 +2318,7 @@ mod tests {
             assert!(
                 response
                     .error_message
-                    .contains("Semantic Integrity Violation:")
+                    .contains("A physical unit mismatch was detected")
             );
         }
 
@@ -2316,7 +2376,7 @@ mod tests {
             assert!(
                 response
                     .error_message
-                    .contains("Semantic Integrity Violation:")
+                    .contains("A physical unit mismatch was detected")
             );
         }
 
