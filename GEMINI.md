@@ -43,4 +43,4 @@ Implementation must adhere to the [Lact-O-Sensus Review Checklist](docs/checklis
   - `cargo clippy --all-targets -- -D warnings`
   - `python3 scripts/smoke_test.py`
 - **5.4. Clinical Review:** Evaluate verified changes against the [Review Checklist](docs/checklists/review_checklist.md). Wait for feedback and resolve all findings before proceeding.
-- **5.5. Atomic Commits:** Finalize changes as atomic units following [Conventional Commits](https://www.conventionalcommits.org/).
+- **5.5. Atomic Commits:** Finalize changes as atomic units following [Conventional Commits](https://www.conventionalcommits.org/). Ensure the commit message body briefly describes the context and the major works that have been done.
