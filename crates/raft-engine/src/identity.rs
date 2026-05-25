@@ -1,8 +1,18 @@
+//! Bootstrap Guard for Node Identity (ADR 004).
+//!
+//! This module enforces the "Identity Immutability" mandate. Once a node is
+//! initialized with a `(ClusterId, NodeId)` pair and persisted to disk, it
+//! will refuse to start if the provided configuration mismatches the
+//! physical truth on disk. This prevents data corruption and cross-cluster
+//! contamination.
+
 use common::types::NodeIdentity;
+use common::types::trace::ClinicalTarget;
 use sled::Db;
 use thiserror::Error;
 use tracing::error;
 use tracing::info;
+use tracing::instrument;
 
 use crate::config::Config;
 
@@ -28,6 +38,14 @@ pub enum IdentityError {
 ///
 /// This is a "Bootstrap Guard" that enforces ADR 004: identity must be
 /// immutable across restarts to prevent data corruption.
+#[instrument(
+    target = "clinical::foundation",
+    skip(db, config),
+    fields(
+        cluster_id = %config.cluster_id,
+        node_id = %config.node_id
+    )
+)]
 pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity, IdentityError> {
     let tree = db.open_tree(IDENTITY_TREE)?;
 
@@ -39,8 +57,10 @@ pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity
                 let disk_id = format!("({}, {})", existing.cluster_id(), existing.node_id());
 
                 error!(
-                    "IDENTITY MISMATCH: Config {} does not match Disk {}",
-                    config_id, disk_id
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    disk_identity = %disk_id,
+                    config_identity = %config_id,
+                    "IDENTITY MISMATCH: Node identity on disk does not match provided configuration"
                 );
                 return Err(IdentityError::Mismatch {
                     disk: disk_id,
@@ -48,9 +68,10 @@ pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity
                 });
             }
             info!(
-                "Identity verified: Cluster={}, NodeID={}",
-                existing.cluster_id(),
-                existing.node_id()
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                cluster_id = %existing.cluster_id(),
+                node_id = %existing.node_id(),
+                "Identity verified successfully"
             );
             Ok(existing)
         }
@@ -60,9 +81,10 @@ pub fn initialize_node_identity(db: &Db, config: &Config) -> Result<NodeIdentity
             tree.insert(IDENTITY_KEY, bytes)?;
             tree.flush()?; // Ensure fsync
             info!(
-                "New identity persisted to disk: Cluster={}, NodeID={}",
-                identity.cluster_id(),
-                identity.node_id()
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                cluster_id = %identity.cluster_id(),
+                node_id = %identity.node_id(),
+                "New identity persisted to disk"
             );
             Ok(identity)
         }
@@ -81,9 +103,9 @@ mod tests {
 
     fn mock_config(cluster_id: &str, node_id: u64) -> Config {
         Config {
-            cluster_id: ClusterId::try_new(cluster_id).unwrap(),
-            node_id: NodeId::try_new(node_id).unwrap(),
-            listen_addr: "127.0.0.1:50051".parse().unwrap(),
+            cluster_id: ClusterId::try_new(cluster_id).expect("valid cluster id"),
+            node_id: NodeId::try_new(node_id).expect("valid node id"),
+            listen_addr: "127.0.0.1:50051".parse().expect("valid address"),
             data_dir: "".into(),
             peers: HashMap::new(),
             raft: Default::default(),
@@ -94,69 +116,77 @@ mod tests {
     mod initialize_node_identity {
         use super::*;
 
-        #[test]
-        fn returns_new_identity_when_none_exists() -> Result<()> {
-            let db = sled::Config::new().temporary(true).open()?;
-            let config = mock_config("test-cluster", 1);
+        mod with_fresh_database {
+            use super::*;
 
-            let id = initialize_node_identity(&db, &config)?;
+            #[test]
+            fn returns_new_identity_when_none_exists() -> Result<()> {
+                let db = sled::Config::new().temporary(true).open()?;
+                let config = mock_config("test-cluster", 1);
 
-            assert_eq!(
-                id.cluster_id(),
-                &ClusterId::try_new("test-cluster").unwrap()
-            );
-            assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
-            Ok(())
+                let id = initialize_node_identity(&db, &config)?;
+
+                assert_eq!(
+                    id.cluster_id(),
+                    &ClusterId::try_new("test-cluster").unwrap()
+                );
+                assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
+                Ok(())
+            }
         }
 
-        #[test]
-        fn returns_existing_identity_when_matches() -> Result<()> {
-            let db = sled::Config::new().temporary(true).open()?;
-            let config = mock_config("test-cluster", 1);
+        mod with_existing_identity {
+            use super::*;
 
-            // Initial setup
-            initialize_node_identity(&db, &config)?;
+            #[test]
+            fn returns_existing_identity_when_matches() -> Result<()> {
+                let db = sled::Config::new().temporary(true).open()?;
+                let config = mock_config("test-cluster", 1);
 
-            // Verification
-            let id = initialize_node_identity(&db, &config)?;
-            assert_eq!(
-                id.cluster_id(),
-                &ClusterId::try_new("test-cluster").unwrap()
-            );
-            assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
-            Ok(())
-        }
+                // Initial setup
+                initialize_node_identity(&db, &config)?;
 
-        #[test]
-        fn returns_mismatch_error_when_cluster_id_mismatches() -> Result<()> {
-            let db = sled::Config::new().temporary(true).open()?;
-            let config = mock_config("test-cluster", 1);
+                // Verification
+                let id = initialize_node_identity(&db, &config)?;
+                assert_eq!(
+                    id.cluster_id(),
+                    &ClusterId::try_new("test-cluster").unwrap()
+                );
+                assert_eq!(id.node_id(), NodeId::try_new(1).unwrap());
+                Ok(())
+            }
 
-            // Initial setup
-            initialize_node_identity(&db, &config)?;
+            #[test]
+            fn returns_mismatch_error_when_cluster_id_mismatches() -> Result<()> {
+                let db = sled::Config::new().temporary(true).open()?;
+                let config = mock_config("test-cluster", 1);
 
-            // Attempt with mismatch
-            let mismatch_config = mock_config("wrong-cluster", 1);
-            let result = initialize_node_identity(&db, &mismatch_config);
+                // Initial setup
+                initialize_node_identity(&db, &config)?;
 
-            assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
-            Ok(())
-        }
+                // Attempt with mismatch
+                let mismatch_config = mock_config("wrong-cluster", 1);
+                let result = initialize_node_identity(&db, &mismatch_config);
 
-        #[test]
-        fn returns_mismatch_error_when_node_id_mismatches() -> Result<()> {
-            let db = sled::Config::new().temporary(true).open()?;
-            let config = mock_config("test-cluster", 1);
+                assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
+                Ok(())
+            }
 
-            // Initial setup
-            initialize_node_identity(&db, &config)?;
+            #[test]
+            fn returns_mismatch_error_when_node_id_mismatches() -> Result<()> {
+                let db = sled::Config::new().temporary(true).open()?;
+                let config = mock_config("test-cluster", 1);
 
-            // Attempt with mismatch
-            let mismatch_config = mock_config("test-cluster", 2);
-            let result = initialize_node_identity(&db, &mismatch_config);
+                // Initial setup
+                initialize_node_identity(&db, &config)?;
 
-            assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
-            Ok(())
+                // Attempt with mismatch
+                let mismatch_config = mock_config("test-cluster", 2);
+                let result = initialize_node_identity(&db, &mismatch_config);
+
+                assert!(matches!(result, Err(IdentityError::Mismatch { .. })));
+                Ok(())
+            }
         }
     }
 }
