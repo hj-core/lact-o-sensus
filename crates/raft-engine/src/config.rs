@@ -1,3 +1,10 @@
+//! Configuration Guard for Cluster and Protocol Invariants (ADR 003, ADR 004).
+//!
+//! This module defines the hierarchical configuration schema for the Raft
+//! engine and enforcing the clinical timing invariants mandated by the
+//! "Stability Invariant" (ADR 003). It ensures that a node is initialized
+//! with self-consistent parameters before participating in consensus.
+
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -7,6 +14,7 @@ use std::time::Duration;
 
 use common::types::ClusterId;
 use common::types::NodeId;
+use common::types::trace::ClinicalTarget;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -166,9 +174,10 @@ impl RaftConfig {
 
         if self.election_timeout_min_ms > self.heartbeat_interval_ms * 6 {
             warn!(
-                "Wide heartbeat-to-election ratio ({}ms : {}ms). Liveness may be delayed beyond \
-                 ADR 003 recommendations.",
-                self.heartbeat_interval_ms, self.election_timeout_min_ms
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                heartbeat = %self.heartbeat_interval_ms,
+                min_election = %self.election_timeout_min_ms,
+                "Wide heartbeat-to-election ratio. Liveness may be delayed beyond ADR 003 recommendations."
             );
         }
 
@@ -310,7 +319,10 @@ impl Config {
         self.policy.validate()?;
 
         if self.peers.is_empty() {
-            warn!("Configuration loaded with 0 peers. This node will be a single-node cluster.");
+            warn!(
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                "Configuration loaded with 0 peers. This node will be a single-node cluster."
+            );
         }
 
         Ok(())
@@ -324,320 +336,343 @@ mod tests {
     mod validate {
         use super::*;
 
-        #[test]
-        fn accept_valid_configuration() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_ok());
+        mod with_valid_parameters {
+            use super::*;
+
+            #[test]
+            fn accept_valid_configuration() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                assert!(config.validate().is_ok());
+            }
+
+            #[test]
+            fn accept_config_when_election_timeout_is_exactly_3x_heartbeat() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                heartbeat_interval_ms = 100
+                election_timeout_min_ms = 300
+                election_timeout_max_ms = 450
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                assert!(config.validate().is_ok());
+            }
+
+            #[test]
+            fn accept_config_with_warning_when_election_timeout_exceeds_6x_heartbeat() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                heartbeat_interval_ms = 100
+                election_timeout_min_ms = 700
+                election_timeout_max_ms = 900
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                assert!(config.validate().is_ok());
+            }
+
+            #[test]
+            fn use_default_protocol_settings_when_fields_are_unspecified() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                heartbeat_interval_ms = 45
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                assert!(config.validate().is_ok());
+                assert_eq!(config.raft.heartbeat_interval_ms, 45);
+                assert_eq!(config.raft.election_timeout_min_ms, 150);
+                assert_eq!(config.raft.rpc_timeout_ms, 40);
+            }
         }
 
-        #[test]
-        fn reject_config_when_node_id_is_in_peers_list() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            1 = "http://127.0.0.1:50051"
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(result, Err(ConfigError::SelfLoop(_))));
+        mod with_invalid_topology {
+            use super::*;
+
+            #[test]
+            fn reject_config_when_node_id_is_in_peers_list() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                1 = "http://127.0.0.1:50051"
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(result, Err(ConfigError::SelfLoop(_))));
+            }
+
+            #[test]
+            fn reject_config_when_cluster_id_is_empty() {
+                let toml_str = r#"
+                cluster_id = ""
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+            "#;
+                let result: Result<Config, toml::de::Error> = toml::from_str(toml_str);
+                assert!(result.is_err());
+            }
+
+            #[test]
+            fn reject_config_when_peer_uri_is_malformed() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://invalid uri.com"
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
+            }
         }
 
-        #[test]
-        fn reject_config_when_cluster_id_is_empty() {
-            let toml_str = r#"
-            cluster_id = ""
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-        "#;
-            // Fails during deserialization because of #[serde(try_from)] on ClusterId
-            let result: Result<Config, toml::de::Error> = toml::from_str(toml_str);
-            assert!(result.is_err());
+        mod with_timing_invariant_violations {
+            use super::*;
+
+            #[test]
+            fn reject_config_when_tick_interval_is_zero() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                tick_interval_ms = 0
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms")
+                ));
+            }
+
+            #[test]
+            fn reject_config_when_tick_interval_exceeds_heartbeat_interval() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                tick_interval_ms = 100
+                heartbeat_interval_ms = 50
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms") && msg.contains("less than or equal to heartbeat")
+                ));
+            }
+
+            #[test]
+            fn reject_config_when_rpc_timeout_exceeds_heartbeat_interval() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                heartbeat_interval_ms = 50
+                rpc_timeout_ms = 60
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("stacking")
+                ));
+            }
+
+            #[test]
+            fn reject_config_when_election_timeout_is_below_3x_heartbeat() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                heartbeat_interval_ms = 100
+                election_timeout_min_ms = 299
+                election_timeout_max_ms = 400
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("ADR 003")
+                ));
+            }
+
+            #[test]
+            fn reject_config_when_consensus_timeout_is_zero() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                consensus_timeout_ms = 0
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("consensus_timeout_ms")
+                ));
+            }
+
+            #[test]
+            fn reject_config_when_consensus_timeout_is_below_rpc_timeout() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                rpc_timeout_ms = 100
+                consensus_timeout_ms = 50
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("SLA Invariant")
+                ));
+            }
         }
 
-        #[test]
-        fn reject_config_when_tick_interval_is_zero() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            tick_interval_ms = 0
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms") && msg.contains("greater than 0")
-            ));
-        }
+        mod with_policy_violations {
+            use super::*;
 
-        #[test]
-        fn reject_config_when_tick_interval_exceeds_heartbeat_interval() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            tick_interval_ms = 100
-            heartbeat_interval_ms = 50
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("tick_interval_ms") && msg.contains("less than or equal to heartbeat")
-            ));
-        }
+            #[test]
+            fn reject_config_when_veto_timeout_is_zero() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [policy]
+                veto_timeout_ms = 0
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("veto_timeout_ms")
+                ));
+            }
 
-        #[test]
-        fn reject_config_when_rpc_timeout_exceeds_heartbeat_interval() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            heartbeat_interval_ms = 50
-            rpc_timeout_ms = 60
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("Heartbeat") || msg.contains("stacking")
-            ));
-        }
-
-        #[test]
-        fn reject_config_when_election_timeout_is_below_3x_heartbeat() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            heartbeat_interval_ms = 100
-            election_timeout_min_ms = 299 # Violation of ADR 003
-            election_timeout_max_ms = 400
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("ADR 003")
-            ));
-        }
-
-        #[test]
-        fn accept_config_when_election_timeout_is_exactly_3x_heartbeat() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            heartbeat_interval_ms = 100
-            election_timeout_min_ms = 300
-            election_timeout_max_ms = 450
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_ok());
-        }
-
-        #[test]
-        fn accept_config_with_warning_when_election_timeout_exceeds_6x_heartbeat() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            heartbeat_interval_ms = 100
-            election_timeout_min_ms = 700 # > 6x, should warn but pass
-            election_timeout_max_ms = 900
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_ok());
-        }
-
-        #[test]
-        fn use_default_protocol_settings_when_fields_are_unspecified() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            heartbeat_interval_ms = 45 # Override one; must be > rpc_timeout (40ms default)
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            assert!(config.validate().is_ok());
-            assert_eq!(config.raft.heartbeat_interval_ms, 45);
-            assert_eq!(config.raft.election_timeout_min_ms, 150); // Default (150 > 3*45)
-            assert_eq!(config.raft.rpc_timeout_ms, 40); // Default
-        }
-
-        #[test]
-        fn reject_config_when_veto_timeout_is_zero() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [policy]
-            veto_timeout_ms = 0
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("veto_timeout_ms")
-            ));
-        }
-
-        #[test]
-        fn reject_config_when_peer_uri_is_malformed() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://invalid uri.com"
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
-        }
-
-        #[test]
-        fn reject_config_when_consensus_timeout_is_zero() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            consensus_timeout_ms = 0
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("consensus_timeout_ms")
-            ));
-        }
-
-        #[test]
-        fn reject_config_when_consensus_timeout_is_below_rpc_timeout() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [raft]
-            rpc_timeout_ms = 100
-            consensus_timeout_ms = 50 # Violation: Consensus < RPC
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(
-                result,
-                Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("SLA Invariant")
-            ));
-        }
-
-        #[test]
-        fn reject_config_when_veto_uri_is_malformed() {
-            let toml_str = r#"
-            cluster_id = "test-cluster"
-            node_id = 1
-            listen_addr = "127.0.0.1:50051"
-            data_dir = "data/node_1"
-            [peers]
-            2 = "http://127.0.0.1:50052"
-            [policy]
-            veto_addr = "http://invalid uri.com" # Spaces are strictly forbidden
-        "#;
-            let config: Config = toml::from_str(toml_str).unwrap();
-            let result = config.validate();
-            assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
+            #[test]
+            fn reject_config_when_veto_uri_is_malformed() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [policy]
+                veto_addr = "http://invalid uri.com"
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(result, Err(ConfigError::InvalidUri(_))));
+            }
         }
     }
 
     mod calculate_thresholds {
         use super::*;
 
-        #[test]
-        fn translate_milliseconds_to_ticks_accurately() {
-            let config = RaftConfig {
-                tick_interval_ms: 10,
-                heartbeat_interval_ms: 50,
-                election_timeout_min_ms: 150,
-                election_timeout_max_ms: 300,
-                rpc_timeout_ms: 40,
-                consensus_timeout_ms: 30000,
-            };
+        mod with_exact_multiples {
+            use super::*;
 
-            let thresholds = config.calculate_thresholds();
+            #[test]
+            fn translate_milliseconds_to_ticks_accurately() {
+                let config = RaftConfig {
+                    tick_interval_ms: 10,
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 150,
+                    election_timeout_max_ms: 300,
+                    rpc_timeout_ms: 40,
+                    consensus_timeout_ms: 30000,
+                };
 
-            assert_eq!(thresholds.heartbeat_interval, TickDuration::new(5));
-            assert_eq!(thresholds.min_election, TickDuration::new(15));
-            assert_eq!(thresholds.max_election, TickDuration::new(30));
+                let thresholds = config.calculate_thresholds();
+
+                assert_eq!(thresholds.heartbeat_interval, TickDuration::new(5));
+                assert_eq!(thresholds.min_election, TickDuration::new(15));
+                assert_eq!(thresholds.max_election, TickDuration::new(30));
+            }
         }
 
-        #[test]
-        fn handle_non_multiple_intervals_with_ceiling_logic() {
-            let config = RaftConfig {
-                tick_interval_ms: 10,
-                heartbeat_interval_ms: 55,
-                election_timeout_min_ms: 155,
-                election_timeout_max_ms: 305,
-                rpc_timeout_ms: 40,
-                consensus_timeout_ms: 30000,
-            };
+        mod with_inexact_multiples {
+            use super::*;
 
-            let thresholds = config.calculate_thresholds();
+            #[test]
+            fn handle_non_multiple_intervals_with_ceiling_logic() {
+                let config = RaftConfig {
+                    tick_interval_ms: 10,
+                    heartbeat_interval_ms: 55,
+                    election_timeout_min_ms: 155,
+                    election_timeout_max_ms: 305,
+                    rpc_timeout_ms: 40,
+                    consensus_timeout_ms: 30000,
+                };
 
-            assert_eq!(thresholds.heartbeat_interval, TickDuration::new(6));
-            assert_eq!(thresholds.min_election, TickDuration::new(16));
-            assert_eq!(thresholds.max_election, TickDuration::new(31));
+                let thresholds = config.calculate_thresholds();
+
+                assert_eq!(thresholds.heartbeat_interval, TickDuration::new(6));
+                assert_eq!(thresholds.min_election, TickDuration::new(16));
+                assert_eq!(thresholds.max_election, TickDuration::new(31));
+            }
         }
     }
 }
