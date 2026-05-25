@@ -1,3 +1,10 @@
+//! # Ingress Layer (Layer 1-3)
+//!
+//! This module implements the "Fortress of Entry" (ADR 007), serving as the
+//! Ingress Firewall and Defensive Onion pipeline. It handles clinical
+//! stabilization of user intent, semantic resolution via the Byzantine AI
+//! Oracle, and linearizable consensus proposal.
+
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -43,6 +50,17 @@ use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
 
+/// Configuration for the Ingress Layer.
+#[derive(Debug, Clone)]
+pub struct IngressConfig {
+    pub veto_timeout: Duration,
+    pub consensus_timeout: Duration,
+    /// Maximum number of leader-internal retries for AI resolution.
+    pub veto_max_retries: usize,
+    /// Maximum characters allowed in the AI's moral justification.
+    pub max_justification_len: usize,
+}
+
 /// Validated and mathematically stabilized data ready for consensus.
 ///
 /// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
@@ -55,6 +73,18 @@ struct StabilizedMutation {
     display_unit: String,
     category: GroceryCategory,
     moral_justification: String,
+}
+
+/// Encapsulated data for a mutation proposal to be committed to consensus.
+#[derive(Debug)]
+struct MutationProposal<'a> {
+    client_id: &'a ClientId,
+    sequence_id: SequenceId,
+    intent: MutationIntent,
+    stabilized: StabilizedMutation,
+    raw_user_input: String,
+    status: MutationStatus,
+    consensus_status: &'a ConsensusAuthority,
 }
 
 /// Outcome of a clinical authority verification check.
@@ -77,12 +107,7 @@ pub struct IngressDispatcher {
     session_provider: Arc<dyn SessionProvider>,
     inventory_reader: Arc<dyn InventoryReader>,
     veto_relay: Arc<dyn VetoRelay>,
-    veto_timeout: Duration,
-    consensus_timeout: Duration,
-    /// Maximum number of leader-internal retries for AI resolution.
-    veto_max_retries: usize,
-    /// Maximum characters allowed in the AI's moral justification.
-    max_justification_len: usize,
+    config: IngressConfig,
     /// Mutex serving as the Layer 2 MutationLock (ADR 007).
     /// Ensures that AI evaluation and proposal happen sequentially on the
     /// leader.
@@ -90,26 +115,19 @@ pub struct IngressDispatcher {
 }
 
 impl IngressDispatcher {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft_handle: Arc<dyn ConsensusHandle>,
         session_provider: Arc<dyn SessionProvider>,
         inventory_reader: Arc<dyn InventoryReader>,
         veto_relay: Arc<dyn VetoRelay>,
-        veto_timeout: Duration,
-        consensus_timeout: Duration,
-        veto_max_retries: usize,
-        max_justification_len: usize,
+        config: IngressConfig,
     ) -> Self {
         Self {
             raft_handle,
             session_provider,
             inventory_reader,
             veto_relay,
-            veto_timeout,
-            consensus_timeout,
-            veto_max_retries,
-            max_justification_len,
+            config,
             mutation_lock: Mutex::new(()),
         }
     }
@@ -221,15 +239,15 @@ impl IngressDispatcher {
 
             // 6. Proposes the finalized intent to the cluster for consensus.
             let proposal_index = self
-                .commit_to_consensus(
-                    &client_id,
+                .commit_to_consensus(MutationProposal {
+                    client_id: &client_id,
                     sequence_id,
                     intent,
-                    stabilized.clone(),
+                    stabilized: stabilized.clone(),
                     raw_user_input,
-                    final_status,
-                    &status,
-                )
+                    status: final_status,
+                    consensus_status: &status,
+                })
                 .await?;
 
             info!(
@@ -293,14 +311,14 @@ impl IngressDispatcher {
             }
 
             tokio::time::timeout(
-                self.consensus_timeout,
+                self.config.consensus_timeout,
                 self.raft_handle.await_apply(LogIndex::new(version)),
             )
             .await
             .map_err(|_| {
                 Status::deadline_exceeded(format!(
                     "Consistency fence at version {} timed out after {:?}",
-                    version, self.consensus_timeout
+                    version, self.config.consensus_timeout
                 ))
             })?
             .map_err(|e| self.map_consensus_error(e, &status))?;
@@ -525,6 +543,12 @@ impl IngressDispatcher {
             return Err(self.invalid_argument("item_key cannot be empty"));
         }
 
+        if intent.operation == OperationType::Delete as i32 && intent.quantity.is_some() {
+            return Err(
+                self.invalid_argument("DELETE operations must not contain a quantity string")
+            );
+        }
+
         if intent.operation != OperationType::Delete as i32 && intent.quantity.is_none() {
             return Err(self.invalid_argument("quantity is required for this operation"));
         }
@@ -543,12 +567,12 @@ impl IngressDispatcher {
         let mut stabilized_mutation = None;
         let mut final_status = MutationStatus::Committed;
 
-        for attempt in 0..=self.veto_max_retries {
+        for attempt in 0..=self.config.veto_max_retries {
             if attempt > 0 {
                 info!(
                     target: ClinicalTarget::ClinicalOracle.as_str(),
                     attempt = attempt + 1,
-                    max_retries = self.veto_max_retries + 1,
+                    max_retries = self.config.veto_max_retries + 1,
                     "Retrying AI resolution..."
                 );
             }
@@ -558,7 +582,7 @@ impl IngressDispatcher {
                 .await
             {
                 Ok(v) => v,
-                Err(e) if attempt < self.veto_max_retries => {
+                Err(e) if attempt < self.config.veto_max_retries => {
                     warn!(
                         target: ClinicalTarget::ClinicalOracle.as_str(),
                         attempt = attempt + 1,
@@ -589,7 +613,7 @@ impl IngressDispatcher {
                     stabilized_mutation = Some(s);
                     break;
                 }
-                Err(status) if attempt < self.veto_max_retries => {
+                Err(status) if attempt < self.config.veto_max_retries => {
                     warn!(
                         target: ClinicalTarget::ClinicalOracle.as_str(),
                         attempt = attempt + 1,
@@ -629,32 +653,25 @@ impl IngressDispatcher {
 
     /// Commits the finalized intent to the consensus log and waits for quorum
     /// commitment.
-    #[allow(clippy::too_many_arguments)]
     async fn commit_to_consensus(
         &self,
-        client_id: &ClientId,
-        sequence_id: SequenceId,
-        intent: MutationIntent,
-        stabilized: StabilizedMutation,
-        raw_user_input: String,
-        status: MutationStatus,
-        consensus_status: &ConsensusAuthority,
+        proposal: MutationProposal<'_>,
     ) -> Result<LogIndex, Status> {
-        let is_delete = intent.operation == OperationType::Delete as i32;
+        let is_delete = proposal.intent.operation == OperationType::Delete as i32;
 
         let mutation = CommittedMutation::new(
-            client_id,
-            sequence_id,
-            stabilized.resolved_item_key,
-            stabilized.suggested_display_name,
-            stabilized.updated_base_quantity,
-            stabilized.base_unit,
-            stabilized.display_unit,
-            stabilized.category.to_string(),
-            raw_user_input,
-            stabilized.moral_justification,
+            proposal.client_id,
+            proposal.sequence_id,
+            proposal.stabilized.resolved_item_key,
+            proposal.stabilized.suggested_display_name,
+            proposal.stabilized.updated_base_quantity,
+            proposal.stabilized.base_unit,
+            proposal.stabilized.display_unit,
+            proposal.stabilized.category.to_string(),
+            proposal.raw_user_input,
+            proposal.stabilized.moral_justification,
             is_delete,
-            status,
+            proposal.status,
             std::time::SystemTime::now(),
         );
 
@@ -667,7 +684,7 @@ impl IngressDispatcher {
             .raft_handle
             .propose(command)
             .await
-            .map_err(|e| self.map_consensus_error(e, consensus_status))?;
+            .map_err(|e| self.map_consensus_error(e, proposal.consensus_status))?;
 
         info!(
             "Mutation index {} appended. Waiting for quorum...",
@@ -675,17 +692,17 @@ impl IngressDispatcher {
         );
 
         tokio::time::timeout(
-            self.consensus_timeout,
+            self.config.consensus_timeout,
             self.raft_handle.await_commit(proposal_index),
         )
         .await
         .map_err(|_| {
             Status::deadline_exceeded(format!(
                 "Quorum commitment for index {} timed out after {:?}",
-                proposal_index, self.consensus_timeout
+                proposal_index, self.config.consensus_timeout
             ))
         })?
-        .map_err(|e| self.map_consensus_error(e, consensus_status))?;
+        .map_err(|e| self.map_consensus_error(e, proposal.consensus_status))?;
         Ok(proposal_index)
     }
 
@@ -880,7 +897,7 @@ impl IngressDispatcher {
             target: ClinicalTarget::ClinicalOracle.as_str(),
             "veto_evaluation",
             %trace_id,
-            timeout = ?self.veto_timeout
+            timeout = ?self.config.veto_timeout
         );
 
         info!(
@@ -894,8 +911,8 @@ impl IngressDispatcher {
                 client_id,
                 intent,
                 &[], // Inventory store implemented in Phase 5
-                self.veto_timeout,
-                self.max_justification_len,
+                self.config.veto_timeout,
+                self.config.max_justification_len,
                 trace_id,
             )
             .instrument(span)
@@ -1248,10 +1265,12 @@ mod tests {
             session_provider,
             inventory_reader,
             veto_relay,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            1,
-            512,
+            IngressConfig {
+                veto_timeout: Duration::from_secs(1),
+                consensus_timeout: Duration::from_secs(1),
+                veto_max_retries: 1,
+                max_justification_len: 512,
+            },
         )
     }
 
@@ -1572,6 +1591,41 @@ mod tests {
             let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
             assert!(mutation.is_delete);
             assert_eq!(mutation.resolved_item_key, "milk-whole");
+        }
+
+        #[tokio::test]
+        async fn rejects_delete_operation_with_quantity() {
+            let dispatcher = {
+                let inventory = successful_inventory();
+                mock_dispatcher(
+                    successful_raft(),
+                    inventory.clone(),
+                    inventory,
+                    successful_veto(),
+                )
+            };
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Delete,
+                ),
+            ));
+
+            let result = dispatcher.propose_mutation(req).await;
+            assert!(result.is_err());
+            let status = result.unwrap_err();
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+            assert!(
+                status
+                    .message()
+                    .contains("DELETE operations must not contain a quantity string")
+            );
         }
 
         #[tokio::test]
@@ -2032,10 +2086,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 successful_veto(),
-                Duration::from_secs(1),
-                Duration::from_millis(10), // Short consensus timeout
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_millis(10), // Short consensus timeout
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -2072,10 +2128,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_secs(1),
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -2127,10 +2185,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_secs(1),
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -2172,10 +2232,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_secs(1),
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -2223,10 +2285,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_secs(1),
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -2296,10 +2360,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 veto,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                10,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_secs(1),
+                    veto_max_retries: 10,
+                    max_justification_len: 512,
+                },
             );
 
             let cid = ClientId::generate();
@@ -3224,10 +3290,12 @@ mod tests {
                 inventory.clone(),
                 inventory,
                 successful_veto(),
-                Duration::from_secs(1),
-                Duration::from_millis(10), // Short consensus timeout
-                1,
-                512,
+                IngressConfig {
+                    veto_timeout: Duration::from_secs(1),
+                    consensus_timeout: Duration::from_millis(10), // Short consensus timeout
+                    veto_max_retries: 1,
+                    max_justification_len: 512,
+                },
             );
 
             let req = make_request(QueryStateRequest::new(None, Some(LogIndex::new(10))));

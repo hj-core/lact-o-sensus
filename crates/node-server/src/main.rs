@@ -25,6 +25,7 @@ use common::types::NodeId;
 use common::types::identity::NodeIdentity;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use gateway::ingress::IngressConfig;
 use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use lacto_fsm::LactoStore;
@@ -337,10 +338,12 @@ fn init_dispatchers(
         fsm.clone(),
         fsm.clone(),
         veto_relay,
-        config.policy.veto_timeout(),
-        config.raft.consensus_timeout(),
-        config.policy.veto_max_retries,
-        config.policy.max_justification_len,
+        IngressConfig {
+            veto_timeout: config.policy.veto_timeout(),
+            consensus_timeout: config.raft.consensus_timeout(),
+            veto_max_retries: config.policy.veto_max_retries,
+            max_justification_len: config.policy.max_justification_len,
+        },
     );
 
     Ok((peer_manager, consensus_dispatcher, ingress_dispatcher))
