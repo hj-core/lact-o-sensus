@@ -1046,7 +1046,7 @@ mod tests {
         let rng = StdRng::seed_from_u64(1);
         let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
         let state = Arc::new(ConsensusShell::new(node));
-        let peer_manager = Arc::new(PeerManager::new(id, &HashMap::new()).unwrap());
+        let peer_manager = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
         (config, state, peer_manager)
     }
 

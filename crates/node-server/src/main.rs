@@ -196,17 +196,19 @@ async fn main() -> Result<()> {
         )
         .entered();
 
-        let peer_manager = Arc::new(match PeerManager::new(identity.clone(), &config.peers) {
-            Ok(m) => m,
-            Err(e) => {
-                error!(
-                    target: ClinicalTarget::ClinicalFoundation.as_str(),
-                    error = %e,
-                    "Fatal Error during Peer Manager initialization"
-                );
-                return Err(e.into());
-            }
-        });
+        let peer_manager = Arc::new(
+            match PeerManager::try_new(identity.clone(), &config.peers) {
+                Ok(m) => m,
+                Err(e) => {
+                    error!(
+                        target: ClinicalTarget::ClinicalFoundation.as_str(),
+                        error = %e,
+                        "Fatal Error during Peer Manager initialization"
+                    );
+                    return Err(e.into());
+                }
+            },
+        );
 
         let consensus_dispatcher = ConsensusDispatcher::new(identity.clone(), shared_state.clone());
 

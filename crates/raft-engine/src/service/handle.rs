@@ -293,7 +293,7 @@ mod tests {
         let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
         let state = Arc::new(ConsensusShell::new(node));
         let peer_manager =
-            Arc::new(PeerManager::new(id, &std::collections::HashMap::new()).unwrap());
+            Arc::new(PeerManager::try_new(id, &std::collections::HashMap::new()).unwrap());
         (
             LocalRaftHandle::new(config, state.clone(), peer_manager),
             state,

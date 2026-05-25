@@ -319,7 +319,7 @@ mod tests {
                 let shell = mock_shell();
                 let config = Arc::new(test_config());
                 let peer_manager = Arc::new(
-                    PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                    PeerManager::try_new(shell.read().await.identity(), &HashMap::new()).unwrap(),
                 );
 
                 // 1. Transition to leader
@@ -388,7 +388,7 @@ mod tests {
                 let shell = mock_shell();
                 let config = Arc::new(test_config());
                 let peer_manager = Arc::new(
-                    PeerManager::new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                    PeerManager::try_new(shell.read().await.identity(), &HashMap::new()).unwrap(),
                 );
 
                 // 1. Transition to leader
