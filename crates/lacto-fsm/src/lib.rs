@@ -1,3 +1,27 @@
+//! # Lacto-FSM: The Clinical Foundation
+//!
+//! This module implements the Replicated State Machine (RSM) foundation for the
+//! Lact-O-Sensus cluster. It is responsible for the transition from opaque
+//! consensus log entries to validated, persistent physical grocery state.
+//!
+//! ## Core Responsibilities
+//!
+//! 1. **Persistence (ADR 001/009):** Utilizes `sled` for isolated, tree-based
+//!    storage of inventory, session state, and system metadata.
+//! 2. **Exactly-Once Semantics (ADR 006):** Enforces linearizability via a
+//!    persistent Session Table that deduplicates client intents.
+//! 3. **Temporal Determinism (ADR 006):** Maintains a monotonic clinical clock
+//!    derived from consensus log timestamps.
+//! 4. **Halt Mandate (ADR 009):** Ensures that any invariant violation (e.g.,
+//!    sequence gaps, log regression) triggers a controlled transition to the
+//!    `Poisoned` state followed by a process panic.
+//!
+//! ## Tree Architecture
+//!
+//! - `inventory`: [resolved_item_key (String) => GroceryItem (Protobuf)]
+//! - `sessions`: [ClientId (String) => SessionRecord (Protobuf)]
+//! - `meta`: [Key (String) => Metadata (Binary)], e.g., last_applied_index.
+
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -141,12 +165,20 @@ impl LactoStore {
             Ok((_, v)) => match GroceryItem::decode(v.as_ref()) {
                 Ok(item) => Some(item),
                 Err(e) => {
-                    error!("FSM: Skipping corrupt inventory record: {}", e);
+                    error!(
+                        target: ClinicalTarget::ClinicalFsm.as_str(),
+                        error = %e,
+                        "Skipping corrupt inventory record"
+                    );
                     None
                 }
             },
             Err(e) => {
-                error!("FSM: Database error during inventory iteration: {}", e);
+                error!(
+                    target: ClinicalTarget::ClinicalFsm.as_str(),
+                    error = %e,
+                    "Database error during inventory iteration"
+                );
                 None
             }
         }
@@ -225,6 +257,12 @@ impl StateMachine for LactoStore {
         // 1. Physical Log Monotonicity (Physical Fence)
         let current_applied = self.last_applied_index()?;
         if index != (current_applied + 1)? {
+            error!(
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                last_applied = %current_applied,
+                got = %index,
+                "HALT MANDATE (ADR 009): Non-sequential LogIndex apply attempted. Log regression or divergence suspected."
+            );
             return Err(FsmError::invariant(format!(
                 "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
                 current_applied, index
@@ -234,12 +272,22 @@ impl StateMachine for LactoStore {
         let client_id = mutation.client_id.clone();
         let seq = SequenceId::new(mutation.sequence_id);
 
-        let client_id_obj = ClientId::from_str(&client_id).map_err(|e| {
-            FsmError::invariant(format!(
-                "Invalid client_id '{}' in ledger at index {}. Identity metadata is corrupted: {}",
-                client_id, index, e
-            ))
-        })?;
+        let client_id_obj = match ClientId::from_str(&client_id) {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    target: ClinicalTarget::ClinicalFsm.as_str(),
+                    raw_id = %client_id,
+                    error = %e,
+                    "HALT MANDATE (ADR 004): Invalid client_id in ledger. Identity metadata is corrupted."
+                );
+                return Err(FsmError::invariant(format!(
+                    "Invalid client_id '{}' in ledger at index {}. Identity metadata is \
+                     corrupted: {}",
+                    client_id, index, e
+                )));
+            }
+        };
 
         // Record truncated client_id in the span context
         tracing::Span::current().record("client_id", client_id_obj.truncated());
@@ -290,23 +338,38 @@ impl StateMachine for LactoStore {
         let sessions_tree = self.sessions.clone();
         let meta_tree = self.meta.clone();
 
-        let status = MutationStatus::try_from(mutation.status).map_err(|_| {
-            FsmError::invariant(format!(
-                "Unknown MutationStatus integer {} at index {}. The node is likely running an \
-                 obsolete version or the ledger is corrupted.",
-                mutation.status, index
-            ))
-        })?;
+        let status = match MutationStatus::try_from(mutation.status) {
+            Ok(s) => s,
+            Err(_) => {
+                error!(
+                    target: ClinicalTarget::ClinicalFsm.as_str(),
+                    status_int = %mutation.status,
+                    "HALT MANDATE (ADR 009): Unknown MutationStatus integer. Protocol version mismatch or ledger corruption."
+                );
+                return Err(FsmError::invariant(format!(
+                    "Unknown MutationStatus integer {} at index {}. The node is likely running an \
+                     obsolete version or the ledger is corrupted.",
+                    mutation.status, index
+                )));
+            }
+        };
         let moral_justification = mutation.moral_justification.clone();
 
         // Stateful Temporal Determinism (ADR 006)
-        let event_time = mutation.event_time.ok_or_else(|| {
-            FsmError::invariant(format!(
-                "Mutation at index {} is missing mandatory event_time. Cannot update \
-                 deterministic clinical clock.",
-                index
-            ))
-        })?;
+        let event_time = match mutation.event_time {
+            Some(t) => t,
+            None => {
+                error!(
+                    target: ClinicalTarget::ClinicalFsm.as_str(),
+                    "HALT MANDATE (ADR 006): Mutation is missing mandatory event_time. Cannot update deterministic clinical clock."
+                );
+                return Err(FsmError::invariant(format!(
+                    "Mutation at index {} is missing mandatory event_time. Cannot update \
+                     deterministic clinical clock.",
+                    index
+                )));
+            }
+        };
 
         // Global deterministic time update logic
         let current_effective = self.last_effective_time()?;
