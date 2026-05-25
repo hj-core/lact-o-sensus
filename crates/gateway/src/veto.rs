@@ -1,3 +1,18 @@
+//! # Gateway Veto: The Semantic Oracle Relay
+//!
+//! This module implements the client-side relay for the AI Veto Oracle.
+//! It corresponds to **Layer 3: Semantic Oracle** of the Defensive Mutation
+//! Lifecycle (ADR 007).
+//!
+//! ## Core Responsibilities
+//!
+//! 1. **Semantic Resolution:** Bridges the leader node to the external AI
+//!    service for item key mapping and moral evaluation.
+//! 2. **Causal Integrity (ADR 010):** Enforces Byzantine verification of
+//!    distributed TraceIds to prevent trace grafting.
+//! 3. **Audit Trimming:** Caps the length of AI-provided justifications to
+//!    prevent consensus log bloat while maintaining character boundary safety.
+
 use std::fmt::Debug;
 use std::time::Duration;
 
