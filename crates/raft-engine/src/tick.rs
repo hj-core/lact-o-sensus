@@ -1,3 +1,10 @@
+//! Clinical Logical Clock (ADR 003).
+//!
+//! This module implements the deterministic "system time" for the consensus
+//! engine. By abstracting time into discrete, unitless `Tick` measurements,
+//! the engine is shielded from OS-level non-determinism and I/O latency,
+//! ensuring that consensus safety is strictly independent of physical time.
+
 use std::fmt;
 use std::ops::Add;
 use std::ops::AddAssign;
@@ -77,9 +84,9 @@ impl fmt::Display for Tick {
     }
 }
 
-impl std::fmt::Display for TickDuration {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ticks", self.0)
+impl fmt::Display for TickDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TickDuration({})", self.0)
     }
 }
 
@@ -150,37 +157,45 @@ mod tests {
     mod tick_duration {
         use super::*;
 
-        #[test]
-        fn should_support_addition() {
-            let d1 = TickDuration::new(10);
-            let d2 = TickDuration::new(20);
-            assert_eq!(d1 + d2, TickDuration::new(30));
-        }
+        mod arithmetic {
+            use super::*;
 
-        #[test]
-        fn should_support_subtraction_with_saturation() {
-            let d1 = TickDuration::new(10);
-            let d2 = TickDuration::new(20);
-            assert_eq!(d1 - d2, TickDuration::new(0));
+            #[test]
+            fn should_support_addition() {
+                let d1 = TickDuration::new(10);
+                let d2 = TickDuration::new(20);
+                assert_eq!(d1 + d2, TickDuration::new(30));
+            }
+
+            #[test]
+            fn should_support_subtraction_with_saturation() {
+                let d1 = TickDuration::new(10);
+                let d2 = TickDuration::new(20);
+                assert_eq!(d1 - d2, TickDuration::new(0));
+            }
         }
     }
 
     mod tick_thresholds {
         use super::*;
 
-        #[test]
-        fn should_generate_timeout_within_bounds() {
-            let thresholds = TickThresholds {
-                heartbeat_interval: TickDuration::new(10),
-                min_election: TickDuration::new(100),
-                max_election: TickDuration::new(200),
-            };
-            let mut rng = StdRng::seed_from_u64(42);
+        mod generate_election_timeout {
+            use super::*;
 
-            for _ in 0..100 {
-                let timeout = thresholds.generate_election_timeout(&mut rng);
-                assert!(timeout.0 >= 100);
-                assert!(timeout.0 <= 200);
+            #[test]
+            fn should_generate_timeout_within_bounds() {
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(100),
+                    max_election: TickDuration::new(200),
+                };
+                let mut rng = StdRng::seed_from_u64(42);
+
+                for _ in 0..100 {
+                    let timeout = thresholds.generate_election_timeout(&mut rng);
+                    assert!(timeout.0 >= 100);
+                    assert!(timeout.0 <= 200);
+                }
             }
         }
     }
