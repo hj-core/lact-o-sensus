@@ -1,3 +1,10 @@
+//! Clinical Oracle Service implementation for Lact-O-Sensus.
+//!
+//! This module implements the `PolicyService` gRPC interface, acting as the
+//! Layer 3 "Semantic Oracle" within the Defensive Mutation Lifecycle (ADR 007).
+//! It utilizes a local LLM (via Ollama) to evaluate mutation intents for
+//! health-related moral integrity and SI unit normalization.
+
 use std::str::FromStr;
 
 use common::proto::v1::app::EvaluateProposalRequest;
@@ -183,7 +190,7 @@ Constraint: Do NOT invent units or categories. Use exactly the strings provided 
 
     /// Performs a No-Op request to pin the model in VRAM and ensure Ollama is
     /// reachable.
-    pub async fn warm_up(&self) -> anyhow::Result<()> {
+    pub async fn warm_up(&self) -> Result<(), Status> {
         info!(
             target: ClinicalTarget::ClinicalOracle.as_str(),
             model = %self.args.model,
@@ -193,7 +200,15 @@ Constraint: Do NOT invent units or categories. Use exactly the strings provided 
         let req =
             ChatMessageRequest::new(self.args.model.clone(), messages).think(ThinkType::False);
 
-        self.ollama.send_chat_messages(req).await?;
+        self.ollama.send_chat_messages(req).await.map_err(|e| {
+            error!(
+                target: ClinicalTarget::ClinicalOracle.as_str(),
+                error = %e,
+                "Warm-up failed"
+            );
+            Status::internal("Clinical Oracle warm-up failed.")
+        })?;
+
         info!(
             target: ClinicalTarget::ClinicalOracle.as_str(),
             model = %self.args.model,
@@ -287,7 +302,7 @@ impl PolicyService for RealPolicyService {
                         error = %e,
                         "Ollama chat failed"
                     );
-                    Status::internal(format!("LLM Error: {}", e))
+                    Status::internal("Clinical Oracle evaluation failed.")
                 })?;
 
             let duration = start.elapsed();
@@ -352,15 +367,15 @@ impl PolicyService for RealPolicyService {
                     .unwrap_or_else(|_| "1.0".to_string())
             };
 
-            let mut response = Response::new(EvaluateProposalResponse {
-                is_approved: llm_res.is_approved,
-                category_assignment: llm_res.category_assignment,
-                moral_justification: llm_res.moral_justification,
-                resolved_item_key: llm_res.resolved_item_key,
-                suggested_display_name: llm_res.suggested_display_name,
-                resolved_unit: llm_res.resolved_unit,
-                conversion_multiplier_to_base: multiplier,
-            });
+            let mut response = Response::new(EvaluateProposalResponse::new(
+                llm_res.is_approved,
+                llm_res.category_assignment,
+                llm_res.moral_justification,
+                llm_res.resolved_item_key,
+                llm_res.suggested_display_name,
+                llm_res.resolved_unit,
+                multiplier,
+            ));
 
             // Strict Causal Injection
             TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
@@ -374,6 +389,8 @@ impl PolicyService for RealPolicyService {
 
 #[cfg(test)]
 mod tests {
+    use prost_types::Timestamp;
+
     use super::*;
 
     fn test_args(think: bool) -> Args {
@@ -394,68 +411,89 @@ mod tests {
 
         use super::*;
 
-        #[test]
-        fn specifies_reasoning_state_based_on_think_flag() {
-            let service_no_think = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("".into(), None, None, None, OperationType::Add),
-                vec![],
-                "".into(),
-            );
-            match service_no_think.build_chat_request(&req).unwrap().think {
-                Some(ThinkType::False) => (),
-                _ => panic!("Expected Some(ThinkType::False)"),
+        mod reasoning_state {
+            use super::*;
+
+            #[test]
+            fn returns_think_false_when_args_specify_no_think() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                    vec![],
+                    "".into(),
+                );
+                match service.build_chat_request(&req).unwrap().think {
+                    Some(ThinkType::False) => (),
+                    _ => panic!("Expected Some(ThinkType::False)"),
+                }
             }
 
-            let service_think = RealPolicyService::new(test_args(true));
-            match service_think.build_chat_request(&req).unwrap().think {
-                Some(ThinkType::True) => (),
-                _ => panic!("Expected Some(ThinkType::True)"),
+            #[test]
+            fn returns_think_true_when_args_specify_think() {
+                let service = RealPolicyService::new(test_args(true));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                    vec![],
+                    "".into(),
+                );
+                match service.build_chat_request(&req).unwrap().think {
+                    Some(ThinkType::True) => (),
+                    _ => panic!("Expected Some(ThinkType::True)"),
+                }
             }
         }
 
-        #[test]
-        fn enforces_strict_isolation_by_sending_exactly_two_messages() {
-            let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("".into(), None, None, None, OperationType::Add),
-                vec![],
-                "".into(),
-            );
-            let chat_req = service.build_chat_request(&req).unwrap();
+        mod message_structure {
+            use super::*;
 
-            assert_eq!(chat_req.messages.len(), 2);
-            assert_eq!(chat_req.messages[0].role, MessageRole::System);
-            assert_eq!(chat_req.messages[1].role, MessageRole::User);
+            #[test]
+            fn sends_exactly_two_messages_when_requesting_evaluation() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                    vec![],
+                    "".into(),
+                );
+                let chat_req = service.build_chat_request(&req).unwrap();
+
+                assert_eq!(chat_req.messages.len(), 2);
+                assert_eq!(chat_req.messages[0].role, MessageRole::System);
+                assert_eq!(chat_req.messages[1].role, MessageRole::User);
+            }
         }
 
-        #[test]
-        fn enforces_json_mode_for_caching_and_formatting() {
-            let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("".into(), None, None, None, OperationType::Add),
-                vec![],
-                "".into(),
-            );
-            let chat_req = service.build_chat_request(&req).unwrap();
-            assert!(matches!(chat_req.format, Some(FormatType::Json)));
-        }
+        mod output_formatting {
+            use super::*;
 
-        #[test]
-        fn mandates_clinical_brevity_in_system_prompt() {
-            let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("".into(), None, None, None, OperationType::Add),
-                vec![],
-                "".into(),
-            );
-            let chat_req = service.build_chat_request(&req).unwrap();
-            assert!(chat_req.messages[0].content.contains("Brevity"));
-            assert!(chat_req.messages[0].content.contains("200 characters"));
+            #[test]
+            fn enforces_json_mode_when_requesting_evaluation() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                    vec![],
+                    "".into(),
+                );
+                let chat_req = service.build_chat_request(&req).unwrap();
+                assert!(matches!(chat_req.format, Some(FormatType::Json)));
+            }
+
+            #[test]
+            fn includes_brevity_constraint_in_system_prompt_when_requesting_evaluation() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Add),
+                    vec![],
+                    "".into(),
+                );
+                let chat_req = service.build_chat_request(&req).unwrap();
+                assert!(chat_req.messages[0].content.contains("Brevity"));
+                assert!(chat_req.messages[0].content.contains("200 characters"));
+            }
         }
     }
 
@@ -467,95 +505,107 @@ mod tests {
 
         use super::*;
 
-        #[test]
-        fn serializes_inventory_densely_by_excluding_unnecessary_metadata() {
-            let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("oat_milk".into(), None, None, None, OperationType::Add),
-                vec![GroceryItem::new(
-                    "apple".to_string(),
-                    "5".to_string(),
-                    "units".to_string(),
-                    "Primary Flora".to_string(),
-                    "client-1".to_string(),
-                    prost_types::Timestamp::default(),
-                    LogIndex::new(0),
-                )],
-                "".into(),
-            );
+        mod inventory_serialization {
+            use super::*;
 
-            let prompt = service.build_user_prompt(&req).unwrap();
-            assert!(prompt.contains("apple: 5 units (Primary Flora)"));
-            assert!(!prompt.contains("client-1")); // Metadata must be pruned
+            #[test]
+            fn prunes_unnecessary_metadata_when_serializing_inventory() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("oat_milk".into(), None, None, None, OperationType::Add),
+                    vec![GroceryItem::new(
+                        "apple".to_string(),
+                        "5".to_string(),
+                        "units".to_string(),
+                        "Primary Flora".to_string(),
+                        "client-1".to_string(),
+                        Timestamp::default(),
+                        LogIndex::new(0),
+                    )],
+                    "".into(),
+                );
+
+                let prompt = service.build_user_prompt(&req).unwrap();
+                assert!(prompt.contains("apple: 5 units (Primary Flora)"));
+                assert!(!prompt.contains("client-1")); // Metadata must be pruned
+            }
         }
 
-        #[test]
-        fn rejects_unspecified_operation_early() {
-            let service = RealPolicyService::new(test_args(false));
-            let req = EvaluateProposalRequest::new(
-                &ClientId::generate(),
-                MutationIntent::new("".into(), None, None, None, OperationType::Unspecified),
-                vec![],
-                "".into(),
-            );
+        mod input_validation {
+            use super::*;
 
-            let result = service.build_user_prompt(&req);
-            assert!(result.is_err());
-            assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+            #[test]
+            fn returns_invalid_argument_when_operation_is_unspecified() {
+                let service = RealPolicyService::new(test_args(false));
+                let req = EvaluateProposalRequest::new(
+                    &ClientId::generate(),
+                    MutationIntent::new("".into(), None, None, None, OperationType::Unspecified),
+                    vec![],
+                    "".into(),
+                );
+
+                let result = service.build_user_prompt(&req);
+                assert!(result.is_err());
+                assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+            }
         }
     }
 
     mod validate_semantic_integrity {
         use super::*;
 
-        #[test]
-        fn accepts_valid_registry_metadata() {
-            let service = RealPolicyService::new(test_args(false));
-            let res = LlmResponse {
-                is_approved: true,
-                category_assignment: "Liquefied Hydration".to_string(),
-                moral_justification: "OK".to_string(),
-                resolved_item_key: "oat_milk".to_string(),
-                suggested_display_name: "Oat Milk".to_string(),
-                resolved_unit: "ml".to_string(),
-                custom_multiplier: None,
-            };
-            assert!(service.validate_semantic_integrity(&res).is_ok());
-        }
+        mod registry_checks {
+            use super::*;
 
-        #[test]
-        fn rejects_hallucinated_categories_with_internal_error() {
-            let service = RealPolicyService::new(test_args(false));
-            let res = LlmResponse {
-                is_approved: true,
-                category_assignment: "Bakery".to_string(), // Not in enum
-                moral_justification: "OK".to_string(),
-                resolved_item_key: "oat_milk".to_string(),
-                suggested_display_name: "Oat Milk".to_string(),
-                resolved_unit: "ml".to_string(),
-                custom_multiplier: None,
-            };
-            let status = service.validate_semantic_integrity(&res).unwrap_err();
-            assert_eq!(status.code(), tonic::Code::Internal);
-            assert!(status.message().contains("Invalid Category"));
-        }
+            #[test]
+            fn returns_ok_when_metadata_matches_registries() {
+                let service = RealPolicyService::new(test_args(false));
+                let res = LlmResponse {
+                    is_approved: true,
+                    category_assignment: "Liquefied Hydration".to_string(),
+                    moral_justification: "OK".to_string(),
+                    resolved_item_key: "oat_milk".to_string(),
+                    suggested_display_name: "Oat Milk".to_string(),
+                    resolved_unit: "ml".to_string(),
+                    custom_multiplier: None,
+                };
+                assert!(service.validate_semantic_integrity(&res).is_ok());
+            }
 
-        #[test]
-        fn rejects_hallucinated_units_with_internal_error() {
-            let service = RealPolicyService::new(test_args(false));
-            let res = LlmResponse {
-                is_approved: true,
-                category_assignment: "Liquefied Hydration".to_string(),
-                moral_justification: "OK".to_string(),
-                resolved_item_key: "oat_milk".to_string(),
-                suggested_display_name: "Oat Milk".to_string(),
-                resolved_unit: "cartons".to_string(), // Not in registry
-                custom_multiplier: None,
-            };
-            let status = service.validate_semantic_integrity(&res).unwrap_err();
-            assert_eq!(status.code(), tonic::Code::Internal);
-            assert!(status.message().contains("Invalid Unit"));
+            #[test]
+            fn returns_internal_error_when_category_is_hallucinated() {
+                let service = RealPolicyService::new(test_args(false));
+                let res = LlmResponse {
+                    is_approved: true,
+                    category_assignment: "Bakery".to_string(), // Not in enum
+                    moral_justification: "OK".to_string(),
+                    resolved_item_key: "oat_milk".to_string(),
+                    suggested_display_name: "Oat Milk".to_string(),
+                    resolved_unit: "ml".to_string(),
+                    custom_multiplier: None,
+                };
+                let status = service.validate_semantic_integrity(&res).unwrap_err();
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert!(status.message().contains("Invalid Category"));
+            }
+
+            #[test]
+            fn returns_internal_error_when_unit_is_hallucinated() {
+                let service = RealPolicyService::new(test_args(false));
+                let res = LlmResponse {
+                    is_approved: true,
+                    category_assignment: "Liquefied Hydration".to_string(),
+                    moral_justification: "OK".to_string(),
+                    resolved_item_key: "oat_milk".to_string(),
+                    suggested_display_name: "Oat Milk".to_string(),
+                    resolved_unit: "cartons".to_string(), // Not in registry
+                    custom_multiplier: None,
+                };
+                let status = service.validate_semantic_integrity(&res).unwrap_err();
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert!(status.message().contains("Invalid Unit"));
+            }
         }
     }
 
@@ -564,109 +614,116 @@ mod tests {
 
         use super::*;
 
-        #[tokio::test]
-        async fn injects_trace_id_into_response() {
-            let _service = RealPolicyService::new(test_args(false));
+        mod trace_injection {
+            use super::*;
 
-            // We mock evaluate_proposal manually to verify trace injection
-            // since RealPolicyService::evaluate_proposal calls Ollama.
-            // But we can verify the TraceInterceptor::inject_response logic here.
-            let trace_id = TraceId::generate();
-            let mut response = Response::new(EvaluateProposalResponse::default());
+            #[tokio::test]
+            async fn propagates_trace_id_when_injecting_into_response() {
+                let _service = RealPolicyService::new(test_args(false));
 
-            TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id).unwrap();
+                // We mock evaluate_proposal manually to verify trace injection
+                // since RealPolicyService::evaluate_proposal calls Ollama.
+                // But we can verify the TraceInterceptor::inject_response logic here.
+                let trace_id = TraceId::generate();
+                let mut response = Response::new(EvaluateProposalResponse::default());
 
-            let extracted = TraceInterceptor::extract_trace_id_from_response(&response).unwrap();
-            assert_eq!(extracted, trace_id);
+                TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id).unwrap();
+
+                let extracted =
+                    TraceInterceptor::extract_trace_id_from_response(&response).unwrap();
+                assert_eq!(extracted, trace_id);
+            }
         }
     }
 
     mod json_scrubbing {
         use super::*;
-        use crate::model::LlmResponse;
 
-        // A helper to expose the scrubbing logic for testing without calling the LLM
-        fn scrub_and_parse(message_content: &str) -> Result<LlmResponse, Status> {
-            let clean_json = if message_content.starts_with("```") {
-                message_content
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                message_content
-            };
+        mod markdown_handling {
+            use super::*;
 
-            if clean_json.is_empty() {
-                return Err(Status::internal("AI Hallucination: Empty response"));
+            fn scrub_and_parse(message_content: &str) -> Result<LlmResponse, Status> {
+                let clean_json = if message_content.starts_with("```") {
+                    message_content
+                        .trim_start_matches("```json")
+                        .trim_start_matches("```")
+                        .trim_end_matches("```")
+                        .trim()
+                } else {
+                    message_content
+                };
+
+                if clean_json.is_empty() {
+                    return Err(Status::internal("AI Hallucination: Empty response"));
+                }
+
+                serde_json::from_str(clean_json)
+                    .map_err(|_| Status::internal("AI Hallucination: Malformed response format"))
             }
 
-            serde_json::from_str(clean_json)
-                .map_err(|_| Status::internal("AI Hallucination: Malformed response format"))
-        }
+            #[test]
+            fn successfully_parses_when_response_is_raw_json() {
+                let raw = r#"{
+                    "is_approved": true,
+                    "category_assignment": "Primary Flora",
+                    "moral_justification": "Healthy.",
+                    "resolved_item_key": "apple",
+                    "suggested_display_name": "Apple",
+                    "resolved_unit": "units",
+                    "custom_multiplier": null
+                }"#;
 
-        #[test]
-        fn successfully_parses_raw_json() {
-            let raw = r#"{
-                "is_approved": true,
-                "category_assignment": "Primary Flora",
-                "moral_justification": "Healthy.",
-                "resolved_item_key": "apple",
-                "suggested_display_name": "Apple",
-                "resolved_unit": "units",
-                "custom_multiplier": null
-            }"#;
-
-            let res = scrub_and_parse(raw).unwrap();
-            assert!(res.is_approved);
-            assert_eq!(res.resolved_item_key, "apple");
-        }
-
-        #[test]
-        fn strips_markdown_json_blocks_before_parsing() {
-            let markdown = r#"```json
-            {
-                "is_approved": false,
-                "category_assignment": "Anomalous Inputs",
-                "moral_justification": "Vetoed.",
-                "resolved_item_key": "brick",
-                "suggested_display_name": "Brick",
-                "resolved_unit": "misc",
-                "custom_multiplier": null
+                let res = scrub_and_parse(raw).unwrap();
+                assert!(res.is_approved);
+                assert_eq!(res.resolved_item_key, "apple");
             }
-            ```"#;
 
-            let res = scrub_and_parse(markdown).unwrap();
-            assert!(!res.is_approved);
-            assert_eq!(res.resolved_item_key, "brick");
-        }
+            #[test]
+            fn successfully_parses_when_response_is_wrapped_in_markdown_json_block() {
+                let markdown = r#"```json
+                {
+                    "is_approved": false,
+                    "category_assignment": "Anomalous Inputs",
+                    "moral_justification": "Vetoed.",
+                    "resolved_item_key": "brick",
+                    "suggested_display_name": "Brick",
+                    "resolved_unit": "misc",
+                    "custom_multiplier": null
+                }
+                ```"#;
 
-        #[test]
-        fn strips_generic_markdown_blocks_before_parsing() {
-            let markdown = r#"```
-            {
-                "is_approved": true,
-                "category_assignment": "Liquefied Hydration",
-                "moral_justification": "Water is essential.",
-                "resolved_item_key": "water",
-                "suggested_display_name": "Water",
-                "resolved_unit": "ml",
-                "custom_multiplier": "1000"
+                let res = scrub_and_parse(markdown).unwrap();
+                assert!(!res.is_approved);
+                assert_eq!(res.resolved_item_key, "brick");
             }
-            ```"#;
 
-            let res = scrub_and_parse(markdown).unwrap();
-            assert!(res.is_approved);
-            assert_eq!(res.resolved_item_key, "water");
-            assert_eq!(res.custom_multiplier.unwrap(), "1000");
-        }
+            #[test]
+            fn successfully_parses_when_response_is_wrapped_in_generic_markdown_block() {
+                let markdown = r#"```
+                {
+                    "is_approved": true,
+                    "category_assignment": "Liquefied Hydration",
+                    "moral_justification": "Water is essential.",
+                    "resolved_item_key": "water",
+                    "suggested_display_name": "Water",
+                    "resolved_unit": "ml",
+                    "custom_multiplier": "1000"
+                }
+                ```"#;
 
-        #[test]
-        fn returns_error_on_empty_code_block() {
-            let empty = "```json\n\n```";
-            let err = scrub_and_parse(empty).unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Internal);
-            assert!(err.message().contains("Empty response"));
+                let res = scrub_and_parse(markdown).unwrap();
+                assert!(res.is_approved);
+                assert_eq!(res.resolved_item_key, "water");
+                assert_eq!(res.custom_multiplier.unwrap(), "1000");
+            }
+
+            #[test]
+            fn returns_internal_error_when_code_block_is_empty() {
+                let empty = "```json\n\n```";
+                let err = scrub_and_parse(empty).unwrap_err();
+                assert_eq!(err.code(), tonic::Code::Internal);
+                assert!(err.message().contains("Empty response"));
+            }
         }
     }
 }
