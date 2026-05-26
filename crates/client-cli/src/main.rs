@@ -1,3 +1,9 @@
+//! Composition Root for the Lact-O-Sensus Smart Client.
+//!
+//! This binary initializes the client-side clinical environment, performs
+//! linearizable startup recovery (ADR 001), and provides an interactive shell
+//! for issuing cluster mutations and queries.
+
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -6,6 +12,7 @@ use client_cli::client::LactoClient;
 use client_cli::repl;
 use client_cli::state::ClientState;
 use common::types::ClusterId;
+use common::types::trace::ClinicalTarget;
 use tokio::io::BufReader;
 use tokio::io::stdin;
 use tokio::io::stdout;
@@ -51,6 +58,7 @@ async fn main() -> Result<()> {
     let cluster_id = ClusterId::try_new(&args.cluster_id)?;
 
     info!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
         "Bootstrapping Lact-O-Sensus client for cluster '{}'...",
         cluster_id
     );
@@ -69,7 +77,10 @@ async fn main() -> Result<()> {
     println!("Welcome to Lact-O-Sensus. Type 'exit' to quit.");
     repl::run_repl(&client, BufReader::new(stdin()), &mut stdout()).await?;
 
-    info!("Session terminated gracefully.");
+    info!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
+        "Session terminated gracefully."
+    );
     Ok(())
 }
 
@@ -84,22 +95,29 @@ async fn recover_pending_intents(client: &LactoClient) -> Result<()> {
     }
 
     warn!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
         "Found {} pending intents in WAL. Starting recovery reconciliation...",
         pending.len()
     );
 
     for (seq, req) in pending {
-        info!("Recovering intent sequence {}...", seq);
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "Recovering intent sequence {}...",
+            seq
+        );
         match client.repropose_mutation(seq, req).await {
             Ok((res, tid)) => {
                 let trace_info = tid.map(|t| format!(" [Trace: {}]", t)).unwrap_or_default();
                 info!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
                     "Successfully recovered intent {}. Status: {:?}{}",
                     seq, res.status, trace_info
                 );
             }
             Err(e) => {
                 error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
                     "Failed to recover intent {}: {:#}. Manual intervention may be required if \
                      the cluster is unreachable.",
                     seq, e
@@ -111,6 +129,9 @@ async fn recover_pending_intents(client: &LactoClient) -> Result<()> {
         }
     }
 
-    info!("Recovery reconciliation complete.");
+    info!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
+        "Recovery reconciliation complete."
+    );
     Ok(())
 }
