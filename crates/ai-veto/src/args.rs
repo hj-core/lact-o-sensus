@@ -1,3 +1,9 @@
+//! Configuration surface for the AI Veto Node.
+//!
+//! This module defines the command-line interface and configuration parameters
+//! for the Semantic Oracle, including server port assignments and Ollama LLM
+//! integration settings.
+
 use clap::Parser;
 
 /// The AI Veto Node (Moral Advocate) configuration.

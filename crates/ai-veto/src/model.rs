@@ -1,3 +1,9 @@
+//! Untrusted DTO boundary for AI evaluation payloads.
+//!
+//! This module defines the structured JSON schema used to deserialize raw
+//! outputs from the LLM. Data in these structures is considered unvetted and
+//! must be validated against system registries before use.
+
 use serde::Deserialize;
 
 /// Structured response from the LLM.
