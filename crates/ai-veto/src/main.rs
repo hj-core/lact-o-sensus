@@ -1,3 +1,10 @@
+//! Composition Root for the AI Moral Advocate.
+//!
+//! This binary initializes the clinical oracle environment, wires the
+//! `RealPolicyService` with gRPC interceptors, and performs proactive VRAM
+//! warm-up to ensure low-latency semantic evaluation during the mutation
+//! lifecycle.
+
 pub mod args;
 pub mod model;
 pub mod service;
