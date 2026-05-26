@@ -106,7 +106,7 @@ async fn recover_pending_intents(client: &LactoClient) -> Result<()> {
                 );
                 // We halt recovery if we can't even talk to the cluster,
                 // as ordering must be preserved.
-                return Err(e);
+                return Err(e.into());
             }
         }
     }

@@ -1,10 +1,15 @@
+//! The core networking and orchestration logic for the Lact-O-Sensus client.
+//!
+//! This module implements the `LactoClient`, a resilient coordinator that
+//! manages gRPC connections, performs leader discovery, handles automatic
+//! redirection, and orchestrates Exactly-Once Semantics (EOS) using exponential
+//! backoff as mandated by ADR 001 and ADR 003.
+
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
-use anyhow::Result;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
 use common::proto::v1::app::ProposeMutationRequest;
@@ -20,8 +25,10 @@ use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::SequenceId;
+use common::types::errors::IdentityError;
 use common::types::trace::TraceId;
 use rand::RngExt;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tonic::Code;
 use tonic::Request;
@@ -29,8 +36,10 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
 use crate::state::ClientState;
+use crate::state::ClientStateError;
 use crate::state::MAX_KNOWN_NODES;
 use crate::wal::IntentWal;
+use crate::wal::WalError;
 
 /// Default timeout for mutation requests, accounting for AI Veto egress (5s)
 /// and Raft consensus cycles as mandated by ADR 003.
@@ -46,6 +55,34 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// ±20% jitter factor to disperse "thundering herd" retry waves.
 const JITTER_FACTOR: f64 = 0.2;
+
+/// Errors associated with the LactoClient orchestration.
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("Configuration Error: {0}")]
+    Config(String),
+
+    #[error("State Persistence Error: {0}")]
+    State(#[from] ClientStateError),
+
+    #[error("Write-Ahead Log Error: {0}")]
+    Wal(#[from] WalError),
+
+    #[error("Network Transport Error: {0}")]
+    Transport(String),
+
+    #[error("Identity Injection Error: {0}")]
+    Identity(#[from] IdentityError),
+
+    #[error("Request rejected by Leader: {0}")]
+    Rejected(String),
+
+    #[error("gRPC Error: {0}")]
+    Grpc(#[from] tonic::Status),
+
+    #[error("Request failed after {attempts} attempts. Exhausted all known nodes and hints.")]
+    RetryExhausted { attempts: usize },
+}
 
 /// A resilient, high-performance client for interacting with a Lact-O-Sensus
 /// cluster.
@@ -78,7 +115,7 @@ pub struct LactoClient {
 
 impl LactoClient {
     /// Creates a new `LactoClient` with default timeouts and backoff.
-    pub fn new(state: ClientState, wal_path: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(state: ClientState, wal_path: impl AsRef<Path>) -> Result<Self, ClientError> {
         Self::with_timeouts(
             state,
             wal_path,
@@ -96,7 +133,7 @@ impl LactoClient {
         mutation_timeout: Duration,
         query_timeout: Duration,
         connect_timeout: Duration,
-    ) -> Result<Self> {
+    ) -> Result<Self, ClientError> {
         Self::with_config(
             state,
             wal_path,
@@ -118,9 +155,11 @@ impl LactoClient {
         connect_timeout: Duration,
         initial_backoff: Duration,
         max_backoff: Duration,
-    ) -> Result<Self> {
+    ) -> Result<Self, ClientError> {
         if mutation_timeout.is_zero() || query_timeout.is_zero() || connect_timeout.is_zero() {
-            anyhow::bail!("Client timeouts must be non-zero");
+            return Err(ClientError::Config(
+                "Client timeouts must be non-zero".into(),
+            ));
         }
 
         let cluster_id = state.cluster_id().clone();
@@ -163,13 +202,8 @@ impl LactoClient {
     pub async fn propose_mutation(
         &self,
         intent: MutationIntent,
-    ) -> Result<(ProposeMutationResponse, Option<TraceId>)> {
-        let sequence_id = self
-            .state
-            .write()
-            .await
-            .next_sequence_id()
-            .context("Failed to prepare session sequence for mutation")?;
+    ) -> Result<(ProposeMutationResponse, Option<TraceId>), ClientError> {
+        let sequence_id = self.state.write().await.next_sequence_id()?;
 
         let request_payload = ProposeMutationRequest::new(&self.client_id, sequence_id, intent);
 
@@ -187,7 +221,7 @@ impl LactoClient {
         &self,
         sequence_id: SequenceId,
         payload: ProposeMutationRequest,
-    ) -> Result<(ProposeMutationResponse, Option<TraceId>)> {
+    ) -> Result<(ProposeMutationResponse, Option<TraceId>), ClientError> {
         self.execute_mutation(sequence_id, payload).await
     }
 
@@ -196,7 +230,7 @@ impl LactoClient {
         &self,
         sequence_id: SequenceId,
         payload: ProposeMutationRequest,
-    ) -> Result<(ProposeMutationResponse, Option<TraceId>)> {
+    ) -> Result<(ProposeMutationResponse, Option<TraceId>), ClientError> {
         let (response, trace_id) = self.dispatch_mutation(payload).await?;
 
         // ADR 001: Only remove from WAL if the state is terminal.
@@ -219,7 +253,7 @@ impl LactoClient {
         &self,
         query_filter: Option<String>,
         min_state_version: Option<LogIndex>,
-    ) -> Result<(QueryStateResponse, Option<TraceId>)> {
+    ) -> Result<(QueryStateResponse, Option<TraceId>), ClientError> {
         let request_payload = QueryStateRequest::new(query_filter, min_state_version);
 
         self.dispatch_query(request_payload).await
@@ -235,7 +269,7 @@ impl LactoClient {
         rpc_fn: F,
         get_rejection: R,
         timeout: Duration,
-    ) -> Result<(Res, Option<TraceId>)>
+    ) -> Result<(Res, Option<TraceId>), ClientError>
     where
         Req: Clone,
         F: Fn(IngressServiceClient<Channel>, Request<Req>) -> Fut,
@@ -247,10 +281,9 @@ impl LactoClient {
 
         loop {
             if retry_count >= max_retries {
-                anyhow::bail!(
-                    "Request failed after {} attempts. Exhausted all known nodes and hints.",
-                    retry_count
-                );
+                return Err(ClientError::RetryExhausted {
+                    attempts: retry_count,
+                });
             }
             retry_count += 1;
 
@@ -264,8 +297,7 @@ impl LactoClient {
                     &mut request,
                     &self.cluster_id,
                     target_node_id,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to inject identity headers: {}", e))?;
+                )?;
             }
 
             let r = rpc_fn(client, request).await;
@@ -295,7 +327,7 @@ impl LactoClient {
                 }
                 Err(status) => match status.code() {
                     Code::InvalidArgument | Code::FailedPrecondition => {
-                        anyhow::bail!("Request rejected by Leader: {}", status.message());
+                        return Err(ClientError::Rejected(status.message().to_string()));
                     }
                     _ => {
                         self.reconcile_routing_failure(None, retry_count).await?;
@@ -309,7 +341,7 @@ impl LactoClient {
     async fn dispatch_mutation(
         &self,
         payload: ProposeMutationRequest,
-    ) -> Result<(ProposeMutationResponse, Option<TraceId>)> {
+    ) -> Result<(ProposeMutationResponse, Option<TraceId>), ClientError> {
         self.execute_with_retry(
             payload,
             |mut client, req| async move { client.propose_mutation(req).await },
@@ -325,7 +357,7 @@ impl LactoClient {
     async fn dispatch_query(
         &self,
         payload: QueryStateRequest,
-    ) -> Result<(QueryStateResponse, Option<TraceId>)> {
+    ) -> Result<(QueryStateResponse, Option<TraceId>), ClientError> {
         self.execute_with_retry(
             payload,
             |mut client, req| async move { client.query_state(req).await },
@@ -340,7 +372,7 @@ impl LactoClient {
 
     // --- Connection & Redirection Management ---
 
-    async fn get_or_connect(&self) -> Result<IngressServiceClient<Channel>> {
+    async fn get_or_connect(&self) -> Result<IngressServiceClient<Channel>, ClientError> {
         if let Some(client) = self.client.read().await.as_ref() {
             return Ok(client.clone());
         }
@@ -352,11 +384,9 @@ impl LactoClient {
 
         let addr = {
             let state = self.state.read().await;
-            state
-                .known_nodes()
-                .first()
-                .cloned()
-                .context("No known nodes available to connect")?
+            state.known_nodes().first().cloned().ok_or_else(|| {
+                ClientError::Transport("No known nodes available to connect".into())
+            })?
         };
 
         let uri = if addr.starts_with("http://") || addr.starts_with("https://") {
@@ -366,20 +396,20 @@ impl LactoClient {
         };
 
         let endpoint = Endpoint::from_shared(uri)
-            .context("Invalid node address format")?
+            .map_err(|_| ClientError::Transport("Invalid node address format".into()))?
             .connect_timeout(self.connect_timeout);
 
         let channel = endpoint
             .connect()
             .await
-            .with_context(|| format!("Failed to connect to node at {}", addr))?;
+            .map_err(|e| ClientError::Transport(format!("Failed to connect to {}: {}", addr, e)))?;
 
         let new_client = IngressServiceClient::new(channel);
         *client_lock = Some(new_client.clone());
         Ok(new_client)
     }
 
-    async fn handle_redirection(&self, leader_hint: &str) -> Result<()> {
+    async fn handle_redirection(&self, leader_hint: &str) -> Result<(), ClientError> {
         let mut state = self.state.write().await;
         state.record_hint(leader_hint.to_string())?;
 
@@ -388,7 +418,7 @@ impl LactoClient {
         Ok(())
     }
 
-    async fn handle_transport_error(&self) -> Result<()> {
+    async fn handle_transport_error(&self) -> Result<(), ClientError> {
         let mut state = self.state.write().await;
         state.rotate_nodes()?;
 
@@ -397,7 +427,7 @@ impl LactoClient {
         Ok(())
     }
 
-    async fn record_current_node_success(&self) -> Result<()> {
+    async fn record_current_node_success(&self) -> Result<(), ClientError> {
         let addr_opt = self.state.read().await.known_nodes().first().cloned();
         if let Some(addr) = addr_opt {
             let mut state = self.state.write().await;
@@ -415,7 +445,7 @@ impl LactoClient {
         &self,
         leader_hint: Option<String>,
         retry_count: usize,
-    ) -> Result<()> {
+    ) -> Result<(), ClientError> {
         if let Some(hint) = leader_hint
             && !hint.is_empty()
         {
@@ -440,11 +470,11 @@ impl LactoClient {
         // Example: "127.0.0.1:50051" -> node_1 is configured for 50051.
         // For tests, we use a simple mapping or just 0 if unknown.
         if addr.contains("50051") {
-            Some(NodeId::try_new(1).unwrap())
+            NodeId::try_new(1).ok()
         } else if addr.contains("50052") {
-            Some(NodeId::try_new(2).unwrap())
+            NodeId::try_new(2).ok()
         } else if addr.contains("50053") {
-            Some(NodeId::try_new(3).unwrap())
+            NodeId::try_new(3).ok()
         } else {
             None
         }
@@ -604,7 +634,10 @@ mod tests {
             ClusterId::try_new("test-cluster").unwrap()
         }
 
-        fn fast_client(state: ClientState, wal_path: impl AsRef<Path>) -> Result<LactoClient> {
+        fn fast_client(
+            state: ClientState,
+            wal_path: impl AsRef<Path>,
+        ) -> Result<LactoClient, ClientError> {
             LactoClient::with_config(
                 state,
                 wal_path,
@@ -616,11 +649,12 @@ mod tests {
             )
         }
 
-        mod when_connected_to_follower {
+        mod network_routing {
             use super::*;
 
             #[tokio::test]
-            async fn it_updates_state_on_redirection_hint() -> Result<()> {
+            async fn updates_state_when_connected_to_follower_with_hint()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock_leader = Arc::new(MockIngressService::new());
                 let mock_follower = Arc::new(MockIngressService::new());
                 let leader_addr = spawn_mock(mock_leader.clone()).await;
@@ -652,7 +686,8 @@ mod tests {
             }
 
             #[tokio::test]
-            async fn it_retries_successfully_on_hint() -> Result<()> {
+            async fn retries_successfully_when_connected_to_follower_with_hint()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock_leader = Arc::new(MockIngressService::new());
                 let mock_follower = Arc::new(MockIngressService::new());
                 let leader_addr = spawn_mock(mock_leader.clone()).await;
@@ -683,13 +718,10 @@ mod tests {
                 assert_eq!(mock_leader.call_count.load(Ordering::SeqCst), 1);
                 Ok(())
             }
-        }
-
-        mod when_multiple_redirections_occur {
-            use super::*;
 
             #[tokio::test]
-            async fn it_follows_the_path_to_the_leader() -> Result<()> {
+            async fn follows_path_to_leader_when_multiple_redirections_occur()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock_a = Arc::new(MockIngressService::new());
                 let mock_b = Arc::new(MockIngressService::new());
                 let mock_c = Arc::new(MockIngressService::new());
@@ -725,13 +757,10 @@ mod tests {
                 assert_eq!(mock_c.call_count.load(Ordering::SeqCst), 1);
                 Ok(())
             }
-        }
-
-        mod when_infinite_redirection_loop_detected {
-            use super::*;
 
             #[tokio::test]
-            async fn it_exhausts_retries_and_returns_error() -> Result<()> {
+            async fn exhausts_retries_and_returns_error_when_infinite_redirection_loop_detected()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -763,11 +792,12 @@ mod tests {
             }
         }
 
-        mod when_executing_successfully {
+        mod success_path {
             use super::*;
 
             #[tokio::test]
-            async fn it_ensures_exactly_once_semantics() -> Result<()> {
+            async fn ensures_exactly_once_semantics_when_executing_successfully()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -790,7 +820,8 @@ mod tests {
             }
 
             #[tokio::test]
-            async fn it_extracts_and_returns_the_trace_id() -> Result<()> {
+            async fn extracts_and_returns_trace_id_when_executing_successfully()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
                 let expected_tid = TraceId::generate();
@@ -825,7 +856,10 @@ mod tests {
             ClusterId::try_new("test-cluster").unwrap()
         }
 
-        fn fast_client(state: ClientState, wal_path: impl AsRef<Path>) -> Result<LactoClient> {
+        fn fast_client(
+            state: ClientState,
+            wal_path: impl AsRef<Path>,
+        ) -> Result<LactoClient, ClientError> {
             LactoClient::with_config(
                 state,
                 wal_path,
@@ -837,11 +871,12 @@ mod tests {
             )
         }
 
-        mod when_connected_to_follower {
+        mod network_routing {
             use super::*;
 
             #[tokio::test]
-            async fn it_follows_redirection_for_linearizable_read() -> Result<()> {
+            async fn follows_redirection_for_linearizable_read_when_connected_to_follower()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock_leader = Arc::new(MockIngressService::new());
                 let mock_follower = Arc::new(MockIngressService::new());
                 let leader_addr = spawn_mock(mock_leader.clone()).await;
@@ -873,11 +908,12 @@ mod tests {
             }
         }
 
-        mod when_executing_successfully {
+        mod success_path {
             use super::*;
 
             #[tokio::test]
-            async fn it_extracts_and_returns_the_trace_id() -> Result<()> {
+            async fn extracts_and_returns_trace_id_when_executing_successfully()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
                 let expected_tid = TraceId::generate();
@@ -926,11 +962,11 @@ mod tests {
             .unwrap()
         }
 
-        mod when_calculating_delays {
+        mod duration_calculation {
             use super::*;
 
             #[test]
-            fn it_scales_exponentially_within_jitter_bounds() {
+            fn scales_exponentially_within_jitter_bounds_when_calculating_delays() {
                 let client = test_client(INITIAL_BACKOFF, MAX_BACKOFF);
                 let b1 = client.calculate_backoff(1);
                 assert!(b1 >= Duration::from_millis(80));
@@ -942,7 +978,7 @@ mod tests {
             }
 
             #[test]
-            fn it_respects_maximum_configured_cap() {
+            fn respects_maximum_configured_cap_when_calculating_delays() {
                 let client = test_client(INITIAL_BACKOFF, MAX_BACKOFF);
                 let b10 = client.calculate_backoff(10);
                 assert!(b10 >= Duration::from_millis(4000));
@@ -950,7 +986,7 @@ mod tests {
             }
 
             #[test]
-            fn it_provides_random_variance_between_calls() {
+            fn provides_random_variance_between_calls_when_calculating_delays() {
                 let client = test_client(INITIAL_BACKOFF, MAX_BACKOFF);
                 let b_a = client.calculate_backoff(5);
                 let b_b = client.calculate_backoff(5);
@@ -958,7 +994,7 @@ mod tests {
             }
 
             #[test]
-            fn it_returns_zero_when_configured_to_do_so() {
+            fn returns_zero_when_configured_to_do_so_when_calculating_delays() {
                 let client = test_client(Duration::ZERO, Duration::ZERO);
                 assert_eq!(client.calculate_backoff(5), Duration::ZERO);
             }
@@ -974,7 +1010,10 @@ mod tests {
             ClusterId::try_new("test-cluster").unwrap()
         }
 
-        fn fast_client(state: ClientState, wal_path: impl AsRef<Path>) -> Result<LactoClient> {
+        fn fast_client(
+            state: ClientState,
+            wal_path: impl AsRef<Path>,
+        ) -> Result<LactoClient, ClientError> {
             LactoClient::with_config(
                 state,
                 wal_path,
@@ -986,11 +1025,12 @@ mod tests {
             )
         }
 
-        mod when_mutation_is_terminal {
+        mod intent_cleanup {
             use super::*;
 
             #[tokio::test]
-            async fn it_removes_intent_from_wal_on_committed() -> Result<()> {
+            async fn removes_intent_from_wal_on_committed_when_mutation_is_terminal()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -1015,7 +1055,8 @@ mod tests {
             }
 
             #[tokio::test]
-            async fn it_removes_intent_from_wal_on_vetoed() -> Result<()> {
+            async fn removes_intent_from_wal_on_vetoed_when_mutation_is_terminal()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -1040,11 +1081,12 @@ mod tests {
             }
         }
 
-        mod when_transport_failure_occurs {
+        mod network_failure {
             use super::*;
 
             #[tokio::test]
-            async fn it_preserves_intent_in_wal() -> Result<()> {
+            async fn preserves_intent_in_wal_when_transport_failure_occurs()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -1066,13 +1108,10 @@ mod tests {
                 assert_eq!(recovered[0].0.as_u64(), 1);
                 Ok(())
             }
-        }
-
-        mod when_election_in_progress {
-            use super::*;
 
             #[tokio::test]
-            async fn it_retries_on_empty_leader_hint() -> Result<()> {
+            async fn retries_on_empty_leader_hint_when_election_in_progress()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
@@ -1103,11 +1142,12 @@ mod tests {
             }
         }
 
-        mod when_starting_up_with_pending_intents {
+        mod startup_recovery {
             use super::*;
 
             #[tokio::test]
-            async fn it_performs_successful_recovery() -> Result<()> {
+            async fn performs_successful_recovery_when_starting_up_with_pending_intents()
+            -> Result<(), Box<dyn std::error::Error>> {
                 let mock = Arc::new(MockIngressService::new());
                 let addr = spawn_mock(mock.clone()).await;
 
