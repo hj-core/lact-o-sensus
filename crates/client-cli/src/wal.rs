@@ -1,44 +1,58 @@
+//! Client Write-Ahead Log (WAL) for mutation intent durability.
+//!
+//! This module provides the `IntentWal`, a disk-persistent log (backed by
+//! `sled`) that ensures mutation intents are recorded before network dispatch.
+//! This fulfills ADR 001 (Crash-Recovery) by enabling linearizable re-proposal
+//! of unacknowledged intents after a client crash or restart.
+
 use std::path::Path;
 
-use anyhow::Context;
-use anyhow::Result;
 use common::proto::v1::app::ProposeMutationRequest;
 use common::types::SequenceId;
 use prost::Message;
 use sled::Db;
+use thiserror::Error;
+
+/// Errors associated with WAL operations.
+#[derive(Debug, Error)]
+pub enum WalError {
+    #[error("Database failure: {0}")]
+    Db(#[from] sled::Error),
+
+    #[error("Data corruption: {0}")]
+    Corruption(String),
+
+    #[error("Serialization failure: {0}")]
+    Serialization(String),
+}
 
 /// A Write-Ahead Log (WAL) for ensuring the durability of mutation intents.
-///
-/// In accordance with ADR 001 (Crash-Recovery), the `IntentWal` persists
-/// intents to disk before they are dispatched over the network. This ensures
-/// that if the client crashes before receiving a confirmation, the intents
-/// can be re-proposed upon recovery, maintaining Exactly-Once Semantics (EOS).
 pub struct IntentWal {
     db: Db,
 }
 
 impl IntentWal {
     /// Opens the WAL at the specified path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = sled::open(path).context("Failed to open sled WAL database")?;
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, WalError> {
+        let db = sled::open(path)?;
         Ok(Self { db })
     }
 
     /// Appends a new mutation intent to the WAL.
     ///
     /// This must be called BEFORE the RPC is dispatched to the cluster.
-    pub fn append(&self, sequence_id: SequenceId, req: &ProposeMutationRequest) -> Result<()> {
+    pub fn append(
+        &self,
+        sequence_id: SequenceId,
+        req: &ProposeMutationRequest,
+    ) -> Result<(), WalError> {
         let key = sequence_id.as_u64().to_be_bytes();
         let value = req.encode_to_vec();
 
-        self.db
-            .insert(key, value)
-            .context("Failed to insert intent into WAL")?;
+        self.db.insert(key, value)?;
 
         // Mandatory fsync before acknowledging persistence (ADR 001).
-        self.db
-            .flush()
-            .context("Failed to flush WAL to stable storage")?;
+        self.db.flush()?;
         Ok(())
     }
 
@@ -46,16 +60,11 @@ impl IntentWal {
     ///
     /// This should be called once the mutation has reached a terminal state
     /// (e.g., COMMITTED or VETOED).
-    pub fn remove(&self, sequence_id: SequenceId) -> Result<()> {
+    pub fn remove(&self, sequence_id: SequenceId) -> Result<(), WalError> {
         let key = sequence_id.as_u64().to_be_bytes();
 
-        self.db
-            .remove(key)
-            .context("Failed to remove intent from WAL")?;
-
-        self.db
-            .flush()
-            .context("Failed to flush WAL after removal")?;
+        self.db.remove(key)?;
+        self.db.flush()?;
         Ok(())
     }
 
@@ -63,11 +72,11 @@ impl IntentWal {
     ///
     /// Returns intents sorted by sequence ID to maintain absolute temporal
     /// ordering during recovery.
-    pub fn recover(&self) -> Result<Vec<(SequenceId, ProposeMutationRequest)>> {
+    pub fn recover(&self) -> Result<Vec<(SequenceId, ProposeMutationRequest)>, WalError> {
         let mut recovered = Vec::new();
 
         for item in self.db.iter() {
-            let (key, value) = item.context("Failed to iterate WAL entries")?;
+            let (key, value) = item?;
             let entry = self.decode_entry(key, value)?;
             recovered.push(entry);
         }
@@ -82,15 +91,15 @@ impl IntentWal {
         &self,
         key: sled::IVec,
         value: sled::IVec,
-    ) -> Result<(SequenceId, ProposeMutationRequest)> {
+    ) -> Result<(SequenceId, ProposeMutationRequest), WalError> {
         let seq_val = u64::from_be_bytes(
             key.as_ref()
                 .try_into()
-                .map_err(|_| anyhow::anyhow!("WAL corruption: invalid sequence ID key length"))?,
+                .map_err(|_| WalError::Corruption("Invalid sequence ID key length".into()))?,
         );
 
         let req = ProposeMutationRequest::decode(value.as_ref())
-            .context("WAL corruption: failed to decode mutation request")?;
+            .map_err(|e| WalError::Serialization(e.to_string()))?;
 
         Ok((SequenceId::new(seq_val), req))
     }
@@ -122,74 +131,92 @@ mod tests {
     mod open {
         use super::*;
 
-        #[test]
-        fn creates_directory_on_init() -> Result<()> {
-            let dir = tempdir()?;
-            let wal_path = dir.path().join("test_wal");
-            let _wal = IntentWal::open(&wal_path)?;
-            assert!(wal_path.exists());
-            Ok(())
+        mod with_new_path {
+            use super::*;
+
+            #[test]
+            fn creates_directory_when_initialized() -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let wal_path = dir.path().join("test_wal");
+                let _wal = IntentWal::open(&wal_path)?;
+                assert!(wal_path.exists());
+                Ok(())
+            }
         }
     }
 
     mod append {
         use super::*;
 
-        #[test]
-        fn persists_intent_to_disk() -> Result<()> {
-            let dir = tempdir()?;
-            let wal = IntentWal::open(dir.path())?;
-            let seq = SequenceId::new(1);
-            let req = mock_request(1);
+        mod with_valid_request {
+            use super::*;
 
-            wal.append(seq, &req)?;
+            #[test]
+            fn persists_intent_to_disk_when_appended() -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let wal = IntentWal::open(dir.path())?;
+                let seq = SequenceId::new(1);
+                let req = mock_request(1);
 
-            let recovered = wal.recover()?;
-            assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].0, seq);
-            assert_eq!(recovered[0].1.client_id, req.client_id);
-            Ok(())
+                wal.append(seq, &req)?;
+
+                let recovered = wal.recover()?;
+                assert_eq!(recovered.len(), 1);
+                assert_eq!(recovered[0].0, seq);
+                assert_eq!(recovered[0].1.client_id, req.client_id);
+                Ok(())
+            }
         }
     }
 
     mod remove {
         use super::*;
 
-        #[test]
-        fn removes_intent_idempotently() -> Result<()> {
-            let dir = tempdir()?;
-            let wal = IntentWal::open(dir.path())?;
-            let seq = SequenceId::new(1);
-            wal.append(seq, &mock_request(1))?;
+        mod address_cleanup {
+            use super::*;
 
-            wal.remove(seq)?;
-            assert!(wal.recover()?.is_empty());
+            #[test]
+            fn removes_intent_idempotently_when_invoked() -> Result<(), Box<dyn std::error::Error>>
+            {
+                let dir = tempdir()?;
+                let wal = IntentWal::open(dir.path())?;
+                let seq = SequenceId::new(1);
+                wal.append(seq, &mock_request(1))?;
 
-            // Second removal should not error
-            wal.remove(seq)?;
-            Ok(())
+                wal.remove(seq)?;
+                assert!(wal.recover()?.is_empty());
+
+                // Second removal should not error
+                wal.remove(seq)?;
+                Ok(())
+            }
         }
     }
 
     mod recover {
         use super::*;
 
-        #[test]
-        fn maintains_monotonic_ordering() -> Result<()> {
-            let dir = tempdir()?;
-            let wal = IntentWal::open(dir.path())?;
+        mod log_reconstruction {
+            use super::*;
 
-            // Append out of order
-            wal.append(SequenceId::new(10), &mock_request(10))?;
-            wal.append(SequenceId::new(5), &mock_request(5))?;
-            wal.append(SequenceId::new(15), &mock_request(15))?;
+            #[test]
+            fn maintains_monotonic_ordering_when_recovering_scattered_entries()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let wal = IntentWal::open(dir.path())?;
 
-            let recovered = wal.recover()?;
-            assert_eq!(recovered.len(), 3);
-            assert_eq!(recovered[0].0.as_u64(), 5);
-            assert_eq!(recovered[1].0.as_u64(), 10);
-            assert_eq!(recovered[2].0.as_u64(), 15);
-            Ok(())
+                // Append out of order
+                wal.append(SequenceId::new(10), &mock_request(10))?;
+                wal.append(SequenceId::new(5), &mock_request(5))?;
+                wal.append(SequenceId::new(15), &mock_request(15))?;
+
+                let recovered = wal.recover()?;
+                assert_eq!(recovered.len(), 3);
+                assert_eq!(recovered[0].0.as_u64(), 5);
+                assert_eq!(recovered[1].0.as_u64(), 10);
+                assert_eq!(recovered[2].0.as_u64(), 15);
+                Ok(())
+            }
         }
     }
 }
