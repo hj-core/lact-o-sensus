@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Logical RPC Contracts and Service Definitions
 - **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
-- **Last Updated:** 2026-05-10
+- **Last Updated:** 2026-05-26
 
 ## Context
 
@@ -31,6 +31,9 @@ Used exclusively for Raft peer-to-peer communication. This interface is domain-a
   - **`AppendEntries`**:
     - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
     - **Output:** `cluster_id`, `node_id` (Responder), `term`, `success`, `last_log_index`.
+  - **`InstallSnapshot`**:
+    - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `last_included_index`, `last_included_term`, `data` (Snapshot payload).
+    - **Output:** `cluster_id`, `node_id` (Responder), `term`.
 - **`LogEntry`**:
   - **Structure:** `term`, `index`, `data` (Opaque `bytes` containing a serialized application-level entry).
 

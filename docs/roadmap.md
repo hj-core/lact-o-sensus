@@ -108,3 +108,4 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **Security & Access Control:** mutual TLS and RBAC for cluster access.
   - **Multi-Tenancy:** Utilizing `cluster_id` for isolated groups on shared infrastructure.
   - **Causal History:** Immutable audit trail and "point-in-time" recovery.
+  - **Streaming Snapshots:** Refactor snapshot distribution to use gRPC streams for multi-gigabyte state management.

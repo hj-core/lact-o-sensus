@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** System-wide Instrumentation and Diagnostics
 - **Primary Goal:** Transition from unstructured logging to a clinical-grade structured telemetry framework that enables deterministic reconstruction of distributed events while strictly preserving information opacity.
-- **Last Updated:** 2026-05-18
+- **Last Updated:** 2026-05-27
 
 ## Context
 
@@ -27,6 +27,7 @@ All events must utilize a standardized set of `target` and `kind` fields:
 
 - **`raft::foundation`**: Core consensus state (Term advances, Role transitions, VotedFor persistence).
 - **`raft::replication`**: Log maintenance (AppendEntries reconciliation, Commit index advances).
+- **`raft::compaction`**: Log truncation, snapshot generation, and physical disk reclamation (ADR 011).
 - **`clinical::ingress`**: The 5-Layer Defense Onion (ADR 007) lifecycle.
 - **`clinical::fsm`**: Physical state mutations and stabilization (ADR 008).
 - **`clinical::foundation`**: Node startup, identity verification (ADR 004), storage initialization, and lifecycle management.
@@ -41,6 +42,7 @@ Mandatory fields for telemetry correlation:
 - `trace_id`: Distributed trace identifier (UUID v7) for causal correlation.
 - `cluster_id`, `node_id`: Identity correlation.
 - `term`, `index`: Raft coordinates.
+- `last_included_index`, `last_included_term`: Snapshot coordinates for log compaction auditing.
 - `client_id`, `seq`: Session/Linearizability coordinates (ADR 006).
 - `resolution`: Outcomes of the Semantic Oracle (e.g., `Approved`, `Vetoed`).
 

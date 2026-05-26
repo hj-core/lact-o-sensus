@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Node Reliability and Failure Tolerance
 - **Primary Goal:** Ensure system integrity across crashes and provide linearizable semantics to clients.
-- **Last Updated:** 2026-04-20
+- **Last Updated:** 2026-05-26
 
 ## Context
 
@@ -22,7 +22,7 @@ We will adopt a layered failure model, transitioning from a "Honest Crash-Recove
 - **Assumption:** Nodes follow the Raft protocol but may stop and restart with persistent state intact.
 - **Mandate:**
   - Persist critical state (`currentTerm`, `votedFor`, `log[]`) to stable storage before responding to RPCs.
-  - Replay the persistent log on recovery to reconstruct the State Machine.
+  - Load the latest snapshot (if any) and replay the remaining persistent log on recovery to reconstruct the State Machine.
 
 ### 2. Client Nodes: Stateful Recovery & Linearizability
 

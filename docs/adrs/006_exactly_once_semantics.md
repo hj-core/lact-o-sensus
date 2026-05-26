@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** State Machine Reliability and Linearizability
 - **Primary Goal:** Ensure every mutation is executed exactly once, regardless of network retries or leader elections.
-- **Last Updated:** 2026-05-16
+- **Last Updated:** 2026-05-26
 
 ## Context
 
@@ -37,7 +37,7 @@ Upon applying a command from the Raft log, the state machine must execute the fo
 
 ### 3. Permanent Session Metadata (No-Purge Policy)
 
-To eliminate the **"Double-Bootstrap" hazard** (where a network replay is mistaken for a new session after a purge), the Session Table is considered **Permanent Metadata**. Client session records MUST NOT be purged from the state machine.
+To eliminate the **"Double-Bootstrap" hazard** (where a network replay is mistaken for a new session after a purge), the Session Table is considered **Permanent Metadata**. Client session records MUST NOT be purged from the state machine. This permanent metadata is securely preserved across log compaction boundaries by serializing the entire Session Table into the State Machine snapshots (ADR 011).
 
 Given the high clinical value of grocery linearizability and the low storage cost (~1KB per client including audit metadata), the system prioritizes absolute integrity over storage reclamation.
 

@@ -28,6 +28,7 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 - **3.8. Universal Unit Registry (ADR 008):** Internal SI stabilization using `rust_decimal`. All physical state is normalized to `g` or `ml` using Banker's Rounding.
 - **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Implements **Poison-then-Panic** to handle invariant violations.
 - **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with mandatory PII redaction (Client ID truncation, TRACE-only justifications) to enable deterministic reconstruction of distributed events.
+- **3.11. Asynchronous Log Compaction (ADR 011):** Mitigates unbounded disk growth via state machine snapshotting. Offloads generation to prevent heartbeat starvation, and serializes all FSM state to preserve EOS.
 
 ## 4. Technical Standards
 
@@ -42,5 +43,5 @@ Implementation must adhere to the [Lact-O-Sensus Review Checklist](docs/checklis
   - `cargo test --all-features`
   - `cargo clippy --all-targets -- -D warnings`
   - `python3 scripts/smoke_test.py`
-- **5.4. Clinical Review:** Evaluate verified changes against the [Review Checklist](docs/checklists/review_checklist.md). Wait for feedback and resolve all findings before proceeding.
+- **5.4. Clinical Review:** Evaluate verified changes against the [Review Checklist](docs/checklists/review_checklist.md) and resolve all violations.
 - **5.5. Atomic Commits:** Finalize changes as atomic units following [Conventional Commits](https://www.conventionalcommits.org/). Ensure the commit message body briefly describes the context and the major works that have been done.

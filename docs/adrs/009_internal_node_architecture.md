@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Internal Raft Node Structure and Concurrency
 - **Primary Goal:** Define the structural hierarchy of the Raft node to ensure strict isolation between protocol logic, concurrency management, and reactive signaling.
-- **Last Updated:** 2026-05-17
+- **Last Updated:** 2026-05-26
 
 ## Context
 
@@ -22,7 +22,7 @@ We will implement a tri-layered "Onion" architecture for the internal Raft node,
 
 - **Nature:** Pure Data Mutator.
 - **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
-- **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application).
+- **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application, Snapshot Metadata and Truncation).
 - **Constraint:** This layer must be synchronous and deterministic. It is the "Silent State Machine," containing only the logical state and transitions necessary for protocol correctness, independent of any specific concurrency or signaling primitives. It uses dedicated `sled` database handles (`log`, `fsm`, `system`) to ensure component isolation.
 
 ### 2. Layer 2: The Logical Orchestrator (Safety Barrier)
@@ -40,7 +40,7 @@ We will implement a tri-layered "Onion" architecture for the internal Raft node,
 
 - **Nature:** Imperative Shell and Signaling Hub.
 - **Abstractions:** `ConsensusShell` wrapping `Arc<RwLock<LogicalNode>>` and a `tokio::sync::watch` signaling channel.
-- **Responsibility:** Providing thread-safe access, managing async coordination, and broadcasting state changes to reactive observers.
+- **Responsibility:** Providing thread-safe access, managing async coordination (including offloading heavy operations like Snapshot Generation), and broadcasting state changes to reactive observers.
 - **Atomic Invariant:** The **Lock-Signal Atomicity** rule. A signal containing the current `ConsensusProgress` MUST be broadcast after a mutation is complete but *before* the write lock is released.
 
 ## Rationale
