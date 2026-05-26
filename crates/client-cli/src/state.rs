@@ -1,16 +1,47 @@
+//! Client state persistence and Exactly-Once Semantics (EOS) management.
+//!
+//! This module manages the local persistent state of the Lact-O-Sensus client,
+//! ensuring that mutation sequence IDs are advanced and persisted correctly to
+//! support linearizable retries. It also maintains a recency-prioritized
+//! discovery list of known cluster node addresses.
+
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::Context;
-use anyhow::Result;
 use common::types::ClientId;
 use common::types::ClusterId;
 use common::types::SequenceId;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 
 /// The maximum number of node addresses tracked in the client state.
 pub const MAX_KNOWN_NODES: usize = 10;
+
+/// Errors associated with client state management.
+#[derive(Debug, Error)]
+pub enum ClientStateError {
+    #[error("I/O failure during state persistence: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Serialization failure: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[error("Cluster ID mismatch: expected {expected}, found {found} in state file")]
+    ClusterIdMismatch {
+        expected: ClusterId,
+        found: ClusterId,
+    },
+
+    #[error("Bootstrap failed: no state file found and no node addresses provided")]
+    BootstrapMissingNodes,
+
+    #[error("Invalid sequence ID operation: {0}")]
+    SequenceIdError(#[from] common::types::errors::ConsensusError),
+
+    #[error("Arithmetic overflow in sequence ID: {0}")]
+    ArithmeticError(#[from] common::types::errors::ArithmeticError),
+}
 
 /// Represents the persistent state of the Lact-O-Sensus client.
 ///
@@ -23,6 +54,7 @@ pub struct ClientState {
     sequence_id: SequenceId,
     /// Capped list of known node addresses, prioritized by recency of success.
     known_nodes: Vec<String>,
+    /// Internal reference to the persistence file on disk.
     #[serde(skip)]
     path: PathBuf,
 }
@@ -39,32 +71,32 @@ impl ClientState {
     /// * `overriding_nodes` - Optional new nodes to add to the discovery list.
     ///
     /// # Behavior
-    /// - If file exists: Validates `cluster_id`, merges `overriding_nodes`
-    ///   (prioritizing them).
+    /// - If file exists: Validates `cluster_id`, merges `overriding_nodes` by
+    ///   prepending them and deduplicating existing entries.
     /// - If file is missing: Requires at least one entry in `overriding_nodes`
     ///   to bootstrap.
+    ///
+    /// Addresses are automatically deduplicated during the merge; if an address
+    /// is already known, it is moved to the front (highest priority).
     pub fn load_or_init<P: AsRef<Path>>(
         path: P,
         cluster_id: ClusterId,
         mut overriding_nodes: Vec<String>,
-    ) -> Result<Self> {
+    ) -> Result<Self, ClientStateError> {
         let path_buf = path.as_ref().to_path_buf();
 
         // Defensive: truncate input early if it's too large
         overriding_nodes.truncate(MAX_KNOWN_NODES);
 
         if path_buf.exists() {
-            let data = std::fs::read_to_string(&path_buf)
-                .with_context(|| format!("Failed to read state file at {:?}", path_buf))?;
-            let mut state: ClientState = serde_json::from_str(&data)
-                .with_context(|| "Failed to deserialize client state")?;
+            let data = std::fs::read_to_string(&path_buf)?;
+            let mut state: ClientState = serde_json::from_str(&data)?;
 
             if state.cluster_id != cluster_id {
-                anyhow::bail!(
-                    "Cluster ID mismatch: expected {}, found {} in state file.",
-                    cluster_id,
-                    state.cluster_id
-                );
+                return Err(ClientStateError::ClusterIdMismatch {
+                    expected: cluster_id,
+                    found: state.cluster_id,
+                });
             }
 
             state.path = path_buf;
@@ -85,9 +117,7 @@ impl ClientState {
             Ok(state)
         } else {
             if overriding_nodes.is_empty() {
-                anyhow::bail!(
-                    "Bootstrap failed: no state file found and no node addresses provided."
-                );
+                return Err(ClientStateError::BootstrapMissingNodes);
             }
 
             let state = Self {
@@ -108,10 +138,9 @@ impl ClientState {
     ///
     /// This MUST be called before issuing a new mutation request to ensure
     /// Exactly-Once Semantics across client restarts.
-    pub fn next_sequence_id(&mut self) -> Result<SequenceId> {
+    pub fn next_sequence_id(&mut self) -> Result<SequenceId, ClientStateError> {
         self.sequence_id = (self.sequence_id + 1)?;
-        self.save()
-            .context("Failed to persist sequence_id increment")?;
+        self.save()?;
         Ok(self.sequence_id)
     }
 
@@ -120,7 +149,7 @@ impl ClientState {
     ///
     /// If the node is already at the front, this is a no-op to avoid
     /// unnecessary disk I/O.
-    pub fn record_success(&mut self, node_addr: &str) -> Result<()> {
+    pub fn record_success(&mut self, node_addr: &str) -> Result<(), ClientStateError> {
         if self.known_nodes.first().map(|s| s.as_str()) == Some(node_addr) {
             return Ok(());
         }
@@ -130,11 +159,10 @@ impl ClientState {
         self.known_nodes.insert(0, addr);
         self.known_nodes.truncate(MAX_KNOWN_NODES);
         self.save()
-            .context("Failed to persist successful node update")
     }
 
     /// Records a new leader hint received from a node.
-    pub fn record_hint(&mut self, leader_addr: String) -> Result<()> {
+    pub fn record_hint(&mut self, leader_addr: String) -> Result<(), ClientStateError> {
         self.record_success(&leader_addr)
     }
 
@@ -142,7 +170,7 @@ impl ClientState {
     ///
     /// This is used when a node is unreachable or consistently fails to provide
     /// a valid leader hint.
-    pub fn rotate_nodes(&mut self) -> Result<()> {
+    pub fn rotate_nodes(&mut self) -> Result<(), ClientStateError> {
         if self.known_nodes.len() > 1 {
             let current = self.known_nodes.remove(0);
             self.known_nodes.push(current);
@@ -171,11 +199,9 @@ impl ClientState {
 
     // --- Internals ---
 
-    fn save(&self) -> Result<()> {
-        let data = serde_json::to_string_pretty(self)
-            .with_context(|| "Failed to serialize client state")?;
-        std::fs::write(&self.path, data)
-            .with_context(|| format!("Failed to write state file at {:?}", self.path))?;
+    fn save(&self) -> Result<(), ClientStateError> {
+        let data = serde_json::to_string_pretty(self)?;
+        std::fs::write(&self.path, data)?;
         Ok(())
     }
 }
@@ -189,145 +215,210 @@ mod tests {
     mod load_or_init {
         use super::*;
 
-        #[test]
-        fn initializes_new_state_when_file_missing() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
-            let cluster_id = ClusterId::try_new("test-cluster")?;
-            let nodes = vec!["127.0.0.1:50051".to_string()];
+        mod with_fresh_start {
+            use super::*;
 
-            let state = ClientState::load_or_init(&path, cluster_id.clone(), nodes.clone())?;
-            assert_eq!(state.cluster_id(), &cluster_id);
-            assert_eq!(state.known_nodes(), &nodes);
-            assert_eq!(state.sequence_id(), SequenceId::ZERO);
-            assert!(path.exists());
+            #[test]
+            fn initializes_new_state_when_file_missing() -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
+                let nodes = vec!["127.0.0.1:50051".to_string()];
 
-            Ok(())
+                let state = ClientState::load_or_init(&path, cluster_id.clone(), nodes.clone())?;
+                assert_eq!(state.cluster_id(), &cluster_id);
+                assert_eq!(state.known_nodes(), &nodes);
+                assert_eq!(state.sequence_id(), SequenceId::ZERO);
+                assert!(path.exists());
+
+                Ok(())
+            }
+
+            #[test]
+            fn returns_bootstrap_error_when_no_nodes_provided()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
+
+                let result = ClientState::load_or_init(&path, cluster_id, vec![]);
+                assert!(matches!(
+                    result,
+                    Err(ClientStateError::BootstrapMissingNodes)
+                ));
+
+                Ok(())
+            }
         }
 
-        #[test]
-        fn merges_and_prioritizes_overriding_nodes() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
-            let cluster_id = ClusterId::try_new("test-cluster")?;
+        mod with_existing_state {
+            use super::*;
 
-            // 1. Initial save
-            ClientState::load_or_init(&path, cluster_id.clone(), vec!["node1".to_string()])?;
+            #[test]
+            fn merges_and_prioritizes_overriding_nodes_when_provided()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
 
-            // 2. Load with override
-            let state = ClientState::load_or_init(
-                &path,
-                cluster_id,
-                vec!["node2".to_string(), "node1".to_string()],
-            )?;
+                // 1. Initial save
+                ClientState::load_or_init(&path, cluster_id.clone(), vec!["node1".to_string()])?;
 
-            assert_eq!(state.known_nodes()[0], "node2");
-            assert_eq!(state.known_nodes()[1], "node1");
-            assert_eq!(state.known_nodes().len(), 2);
+                // 2. Load with override
+                let state = ClientState::load_or_init(
+                    &path,
+                    cluster_id,
+                    vec!["node2".to_string(), "node1".to_string()],
+                )?;
 
-            Ok(())
-        }
+                assert_eq!(state.known_nodes()[0], "node2");
+                assert_eq!(state.known_nodes()[1], "node1");
+                assert_eq!(state.known_nodes().len(), 2);
 
-        #[test]
-        fn fails_on_cluster_id_mismatch() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
+                Ok(())
+            }
 
-            // 1. Init with cluster A
-            ClientState::load_or_init(
-                &path,
-                ClusterId::try_new("cluster-A")?,
-                vec!["node1".to_string()],
-            )?;
+            #[test]
+            fn deduplicates_addresses_when_merging_overrides()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
 
-            // 2. Load with cluster B
-            let result = ClientState::load_or_init(
-                &path,
-                ClusterId::try_new("cluster-B")?,
-                vec!["node1".to_string()],
-            );
+                // 1. Initial state: [node1]
+                ClientState::load_or_init(&path, cluster_id.clone(), vec!["node1".to_string()])?;
 
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("mismatch"));
+                // 2. Merge overrides containing node1 again: [node1, node2]
+                let state = ClientState::load_or_init(
+                    &path,
+                    cluster_id,
+                    vec!["node1".to_string(), "node2".to_string()],
+                )?;
 
-            Ok(())
+                assert_eq!(state.known_nodes().len(), 2);
+                assert_eq!(state.known_nodes()[0], "node1");
+                assert_eq!(state.known_nodes()[1], "node2");
+
+                Ok(())
+            }
+
+            #[test]
+            fn returns_error_when_cluster_id_mismatches() -> Result<(), Box<dyn std::error::Error>>
+            {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+
+                // 1. Init with cluster A
+                ClientState::load_or_init(
+                    &path,
+                    ClusterId::try_new("cluster-A")?,
+                    vec!["node1".to_string()],
+                )?;
+
+                // 2. Load with cluster B
+                let result = ClientState::load_or_init(
+                    &path,
+                    ClusterId::try_new("cluster-B")?,
+                    vec!["node1".to_string()],
+                );
+
+                assert!(matches!(
+                    result,
+                    Err(ClientStateError::ClusterIdMismatch { .. })
+                ));
+
+                Ok(())
+            }
         }
     }
 
     mod record_success {
         use super::*;
 
-        #[test]
-        fn moves_successful_node_to_front() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
-            let cluster_id = ClusterId::try_new("test-cluster")?;
-            let mut state = ClientState::load_or_init(
-                &path,
-                cluster_id,
-                vec!["node1".to_string(), "node2".to_string()],
-            )?;
+        mod address_prioritization {
+            use super::*;
 
-            state.record_success("node2")?;
-            assert_eq!(state.known_nodes()[0], "node2");
+            #[test]
+            fn moves_successful_node_to_front_when_recorded()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
+                let mut state = ClientState::load_or_init(
+                    &path,
+                    cluster_id,
+                    vec!["node1".to_string(), "node2".to_string()],
+                )?;
 
-            Ok(())
-        }
+                state.record_success("node2")?;
+                assert_eq!(state.known_nodes()[0], "node2");
 
-        #[test]
-        fn performs_no_op_if_node_is_already_front() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
-            let cluster_id = ClusterId::try_new("test-cluster")?;
-            let mut state =
-                ClientState::load_or_init(&path, cluster_id, vec!["node1".to_string()])?;
+                Ok(())
+            }
 
-            let metadata_before = std::fs::metadata(&path)?;
-            // Sleep to ensure potential mtime change is detectable
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            #[test]
+            fn skips_disk_write_when_node_is_already_at_front()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
+                let mut state =
+                    ClientState::load_or_init(&path, cluster_id, vec!["node1".to_string()])?;
 
-            state.record_success("node1")?;
+                let metadata_before = std::fs::metadata(&path)?;
+                // Sleep to ensure potential mtime change is detectable
+                std::thread::sleep(std::time::Duration::from_millis(10));
 
-            let metadata_after = std::fs::metadata(&path)?;
-            assert_eq!(
-                metadata_before.modified()?,
-                metadata_after.modified()?,
-                "Disk write occurred for redundant success record"
-            );
+                state.record_success("node1")?;
 
-            Ok(())
+                let metadata_after = std::fs::metadata(&path)?;
+                assert_eq!(
+                    metadata_before.modified()?,
+                    metadata_after.modified()?,
+                    "Disk write occurred for redundant success record"
+                );
+
+                Ok(())
+            }
         }
     }
 
     mod known_nodes_capping {
         use super::*;
 
-        #[test]
-        fn truncates_both_input_and_loaded_state() -> Result<()> {
-            let dir = tempdir()?;
-            let path = dir.path().join("state.json");
-            let cluster_id = ClusterId::try_new("test-cluster")?;
+        mod storage_limits {
+            use super::*;
 
-            // 1. Manually create a "bloated" state file
-            let mut large_nodes = Vec::new();
-            for i in 0..20 {
-                large_nodes.push(format!("node{}", i));
+            #[test]
+            fn truncates_node_list_to_maximum_allowed_when_loading_bloated_file()
+            -> Result<(), Box<dyn std::error::Error>> {
+                let dir = tempdir()?;
+                let path = dir.path().join("state.json");
+                let cluster_id = ClusterId::try_new("test-cluster")?;
+
+                // 1. Manually create a "bloated" state file
+                let mut large_nodes = Vec::new();
+                for i in 0..20 {
+                    large_nodes.push(format!("node{}", i));
+                }
+
+                let state = ClientState {
+                    cluster_id: cluster_id.clone(),
+                    client_id: ClientId::generate(),
+                    sequence_id: SequenceId::ZERO,
+                    known_nodes: large_nodes,
+                    path: path.clone(),
+                };
+                // Use standard save logic to bypass truncate checks during struct construction
+                let data = serde_json::to_string_pretty(&state)?;
+                std::fs::write(&path, data)?;
+
+                // 2. Load it - should be truncated to 10
+                let loaded = ClientState::load_or_init(&path, cluster_id, vec![])?;
+                assert_eq!(loaded.known_nodes().len(), MAX_KNOWN_NODES);
+
+                Ok(())
             }
-
-            let state = ClientState {
-                cluster_id: cluster_id.clone(),
-                client_id: ClientId::generate(),
-                sequence_id: SequenceId::ZERO,
-                known_nodes: large_nodes,
-                path: path.clone(),
-            };
-            state.save()?;
-
-            // 2. Load it - should be truncated to 10
-            let loaded = ClientState::load_or_init(&path, cluster_id, vec![])?;
-            assert_eq!(loaded.known_nodes().len(), 10);
-
-            Ok(())
         }
     }
 }
