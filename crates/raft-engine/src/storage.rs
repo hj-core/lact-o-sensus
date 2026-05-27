@@ -10,6 +10,7 @@
 //! 2. **Log Entries**: Replicated consensus commands (§5.3).
 //! 3. **Commit Index**: The highest known committed log entry.
 
+use std::cmp;
 use std::fmt::Debug;
 
 use common::proto::v1::raft::HardState;
@@ -70,6 +71,24 @@ pub trait LogStorage: Send + Sync + Debug {
     /// Truncates the log, removing all entries from `index` to the end.
     /// MUST perform a synchronous flush to disk.
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError>;
+
+    /// Truncates the log from the beginning up to (and including) the given
+    /// index. MUST perform a synchronous flush to disk.
+    fn truncate_log_front(&self, up_to_index: LogIndex) -> Result<(), LogStorageError>;
+
+    /// Persists the metadata for the latest state machine snapshot.
+    /// MUST perform a synchronous flush to disk.
+    fn save_snapshot_metadata(
+        &self,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+    ) -> Result<(), LogStorageError>;
+
+    /// Returns the last log index included in the latest snapshot.
+    fn last_included_index(&self) -> Result<LogIndex, LogStorageError>;
+
+    /// Returns the Raft term of the last entry included in the latest snapshot.
+    fn last_included_term(&self) -> Result<Term, LogStorageError>;
 }
 
 /// Persistent implementation of LogStorage using the `sled` database.
@@ -92,6 +111,8 @@ pub struct SledStorage {
 impl SledStorage {
     const KEY_HARD_STATE: &'static [u8] = b"hard_state";
     const KEY_LAST_COMMITTED: &'static [u8] = b"last_committed";
+    const KEY_SNAPSHOT_INDEX: &'static [u8] = b"snapshot_index";
+    const KEY_SNAPSHOT_TERM: &'static [u8] = b"snapshot_term";
     const TREE_LOG: &'static str = "log";
     const TREE_META: &'static str = "meta";
 
@@ -165,7 +186,8 @@ impl LogStorage for SledStorage {
         skip_all
     )]
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
-        self.log
+        let physical_last = self
+            .log
             .last()
             .map_err(|e| {
                 LogStorageError::persistence(format!("Failed to read last log entry: {}", e))
@@ -174,10 +196,13 @@ impl LogStorage for SledStorage {
                 let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
                     LogStorageError::deserialization("LogIndex byte conversion failed")
                 })?;
-                Ok(LogIndex::new(u64::from_be_bytes(bytes)))
+                Ok::<LogIndex, LogStorageError>(LogIndex::new(u64::from_be_bytes(bytes)))
             })
-            .transpose()
-            .map(|opt| opt.unwrap_or(LogIndex::ZERO))
+            .transpose()?
+            .unwrap_or(LogIndex::ZERO);
+
+        let snapshot_last = self.last_included_index()?;
+        Ok(cmp::max(physical_last, snapshot_last))
     }
 
     #[instrument(
@@ -187,7 +212,8 @@ impl LogStorage for SledStorage {
         skip_all
     )]
     fn last_log_term(&self) -> Result<Term, LogStorageError> {
-        self.log
+        let physical_last = self
+            .log
             .last()
             .map_err(|e| {
                 LogStorageError::persistence(format!("Failed to read last log entry: {}", e))
@@ -201,7 +227,13 @@ impl LogStorage for SledStorage {
                 })
             })
             .transpose()
-            .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))
+            .map(|opt| opt.map(|e| Term::new(e.term)).unwrap_or(Term::ZERO))?;
+
+        if physical_last > Term::ZERO {
+            Ok(physical_last)
+        } else {
+            self.last_included_term()
+        }
     }
 
     #[instrument(
@@ -360,6 +392,104 @@ impl LogStorage for SledStorage {
         })?;
         Ok(())
     }
+
+    #[instrument(name = "storage_write_truncate_front", target = "raft::replication", skip_all, fields(up_to_index = %up_to_index))]
+    fn truncate_log_front(&self, up_to_index: LogIndex) -> Result<(), LogStorageError> {
+        let mut batch = sled::Batch::default();
+        for i in 1..=up_to_index.as_u64() {
+            batch.remove(&i.to_be_bytes());
+        }
+        self.log.apply_batch(batch).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to apply front truncation batch: {}", e))
+        })?;
+        self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                error = %e,
+                "Sled flush failure after front truncation"
+            );
+            LogStorageError::persistence(format!(
+                "Sled flush failure after front truncation: {}",
+                e
+            ))
+        })?;
+        Ok(())
+    }
+
+    #[instrument(name = "storage_write_snapshot_meta", target = "raft::compaction", skip_all, fields(index = %last_included_index, term = %last_included_term))]
+    fn save_snapshot_metadata(
+        &self,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+    ) -> Result<(), LogStorageError> {
+        let mut batch = sled::Batch::default();
+        batch.insert(
+            Self::KEY_SNAPSHOT_INDEX,
+            &last_included_index.as_u64().to_be_bytes(),
+        );
+        batch.insert(
+            Self::KEY_SNAPSHOT_TERM,
+            &last_included_term.as_u64().to_be_bytes(),
+        );
+
+        self.meta.apply_batch(batch).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to apply snapshot metadata batch: {}", e))
+        })?;
+
+        self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                error = %e,
+                "Sled flush failure during snapshot metadata save"
+            );
+            LogStorageError::persistence(format!("Sled flush failure: {}", e))
+        })?;
+        Ok(())
+    }
+
+    #[instrument(
+        name = "storage_read_snapshot_index",
+        target = "raft::compaction",
+        level = "debug",
+        skip_all
+    )]
+    fn last_included_index(&self) -> Result<LogIndex, LogStorageError> {
+        self.meta
+            .get(Self::KEY_SNAPSHOT_INDEX)
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to read snapshot_index: {}", e))
+            })?
+            .map(|k| {
+                let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
+                    LogStorageError::deserialization("snapshot_index byte conversion failed")
+                })?;
+                Ok(LogIndex::new(u64::from_be_bytes(bytes)))
+            })
+            .transpose()
+            .map(|opt| opt.unwrap_or(LogIndex::ZERO))
+    }
+
+    #[instrument(
+        name = "storage_read_snapshot_term",
+        target = "raft::compaction",
+        level = "debug",
+        skip_all
+    )]
+    fn last_included_term(&self) -> Result<Term, LogStorageError> {
+        self.meta
+            .get(Self::KEY_SNAPSHOT_TERM)
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to read snapshot_term: {}", e))
+            })?
+            .map(|k| {
+                let bytes: [u8; 8] = k.as_ref().try_into().map_err(|_| {
+                    LogStorageError::deserialization("snapshot_term byte conversion failed")
+                })?;
+                Ok(Term::new(u64::from_be_bytes(bytes)))
+            })
+            .transpose()
+            .map(|opt| opt.unwrap_or(Term::ZERO))
+    }
 }
 
 /// In-memory implementation of LogStorage for testing and initial bootstrap.
@@ -375,6 +505,8 @@ struct MemoryState {
     current_term: Term,
     voted_for: Option<NodeId>,
     last_committed: LogIndex,
+    last_included_index: LogIndex,
+    last_included_term: Term,
     /// 1-indexed vector of consensus entries.
     ///
     /// Index 0 in the vector corresponds to LogIndex(1).
@@ -408,20 +540,27 @@ impl LogStorage for MemoryStorage {
 
     fn last_log_index(&self) -> Result<LogIndex, LogStorageError> {
         let state = self.state()?;
-        Ok(state
+        let physical_last = state
             .log
             .last()
             .map(|e| LogIndex::new(e.index))
-            .unwrap_or(LogIndex::ZERO))
+            .unwrap_or(LogIndex::ZERO);
+        Ok(cmp::max(physical_last, state.last_included_index))
     }
 
     fn last_log_term(&self) -> Result<Term, LogStorageError> {
         let state = self.state()?;
-        Ok(state
+        let physical_last = state
             .log
             .last()
             .map(|e| Term::new(e.term))
-            .unwrap_or(Term::ZERO))
+            .unwrap_or(Term::ZERO);
+
+        if physical_last > Term::ZERO {
+            Ok(physical_last)
+        } else {
+            Ok(state.last_included_term)
+        }
     }
 
     fn last_committed(&self) -> Result<LogIndex, LogStorageError> {
@@ -433,7 +572,18 @@ impl LogStorage for MemoryStorage {
             return Ok(None);
         }
         let state = self.state()?;
-        Ok(state.log.get((index.as_u64() - 1) as usize).cloned())
+        // MemoryStorage uses a simple Vec where LogIndex N is at index N-1.
+        // We must check if the index is within the bounds of the current (possibly
+        // truncated) log.
+        if let Some(first) = state.log.first() {
+            if index.as_u64() < first.index {
+                return Ok(None);
+            }
+            let offset = (index.as_u64() - first.index) as usize;
+            Ok(state.log.get(offset).cloned())
+        } else {
+            Ok(None)
+        }
     }
 
     fn read_entries(
@@ -452,13 +602,23 @@ impl LogStorage for MemoryStorage {
         }
 
         let state = self.state()?;
-        let start_idx = (start.as_u64() - 1) as usize;
-        let end_idx = (end.as_u64() - 1) as usize;
-        Ok(state
-            .log
-            .get(start_idx..=end_idx)
-            .map(|s| s.to_vec())
-            .unwrap_or_default())
+        if let Some(first) = state.log.first() {
+            if start.as_u64() < first.index {
+                return Err(LogStorageError::invariant(format!(
+                    "Log range [{}, {}] overlaps with truncated history (log starts at {})",
+                    start, end, first.index
+                )));
+            }
+            let start_offset = (start.as_u64() - first.index) as usize;
+            let end_offset = (end.as_u64() - first.index) as usize;
+            Ok(state
+                .log
+                .get(start_offset..=end_offset)
+                .map(|s| s.to_vec())
+                .unwrap_or_default())
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
@@ -481,7 +641,7 @@ impl LogStorage for MemoryStorage {
                 .log
                 .last()
                 .map(|e| LogIndex::new(e.index))
-                .unwrap_or(LogIndex::ZERO);
+                .unwrap_or(state.last_included_index);
             let expected_idx = (last_idx + 1)?;
             if LogIndex::new(entry.index) != expected_idx {
                 return Err(LogStorageError::invariant(format!(
@@ -496,12 +656,48 @@ impl LogStorage for MemoryStorage {
 
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
         let mut state = self.state()?;
-        if index == LogIndex::ZERO {
-            state.log.clear();
-        } else {
-            state.log.truncate((index.as_u64() - 1) as usize);
+        if let Some(first) = state.log.first() {
+            let first_idx = first.index;
+            if index.as_u64() <= first_idx {
+                state.log.clear();
+            } else {
+                let keep_count = (index.as_u64() - first_idx) as usize;
+                state.log.truncate(keep_count);
+            }
         }
         Ok(())
+    }
+
+    fn truncate_log_front(&self, up_to_index: LogIndex) -> Result<(), LogStorageError> {
+        let mut state = self.state()?;
+        if let Some(first) = state.log.first() {
+            let first_idx = first.index;
+            if up_to_index.as_u64() >= first_idx {
+                let remove_count = (up_to_index.as_u64() - first_idx + 1) as usize;
+                let actual_remove = cmp::min(remove_count, state.log.len());
+                state.log.drain(0..actual_remove);
+            }
+        }
+        Ok(())
+    }
+
+    fn save_snapshot_metadata(
+        &self,
+        last_included_index: LogIndex,
+        last_included_term: Term,
+    ) -> Result<(), LogStorageError> {
+        let mut state = self.state()?;
+        state.last_included_index = last_included_index;
+        state.last_included_term = last_included_term;
+        Ok(())
+    }
+
+    fn last_included_index(&self) -> Result<LogIndex, LogStorageError> {
+        Ok(self.state()?.last_included_index)
+    }
+
+    fn last_included_term(&self) -> Result<Term, LogStorageError> {
+        Ok(self.state()?.last_included_term)
     }
 }
 
@@ -611,6 +807,71 @@ mod tests {
                 assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
                 assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
                 assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_none());
+            }
+        }
+
+        mod truncate_log_front {
+            use super::*;
+            #[test]
+            fn removes_entries_up_to_given_index() {
+                let storage = setup_storage();
+                storage
+                    .append_entries(vec![
+                        LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
+                        LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
+                        LogEntry::new(LogIndex::new(3), Term::new(2), vec![]),
+                    ])
+                    .unwrap();
+
+                storage.truncate_log_front(LogIndex::new(2)).unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(3));
+                assert!(storage.read_entry(LogIndex::new(1)).unwrap().is_none());
+                assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+                assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_some());
+            }
+        }
+
+        mod snapshot_metadata {
+            use super::*;
+            #[test]
+            fn persists_and_retrieves_snapshot_coordinates() {
+                let storage = setup_storage();
+                let index = LogIndex::new(100);
+                let term = Term::new(5);
+
+                storage.save_snapshot_metadata(index, term).unwrap();
+
+                assert_eq!(storage.last_included_index().unwrap(), index);
+                assert_eq!(storage.last_included_term().unwrap(), term);
+            }
+
+            #[test]
+            fn last_log_coordinates_fallback_to_snapshot_when_log_is_empty() {
+                let storage = setup_storage();
+                let index = LogIndex::new(100);
+                let term = Term::new(5);
+
+                storage.save_snapshot_metadata(index, term).unwrap();
+
+                // Log is empty, should return snapshot values
+                assert_eq!(storage.last_log_index().unwrap(), index);
+                assert_eq!(storage.last_log_term().unwrap(), term);
+            }
+
+            #[test]
+            fn last_log_coordinates_prefer_log_over_snapshot() {
+                let storage = setup_storage();
+                storage
+                    .save_snapshot_metadata(LogIndex::new(10), Term::new(1))
+                    .unwrap();
+
+                storage
+                    .append_entries(vec![LogEntry::new(LogIndex::new(11), Term::new(2), vec![])])
+                    .unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(11));
+                assert_eq!(storage.last_log_term().unwrap(), Term::new(2));
             }
         }
 
@@ -749,6 +1010,55 @@ mod tests {
 
                 assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(1));
                 assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+            }
+        }
+
+        mod truncate_log_front {
+            use super::*;
+            #[test]
+            fn removes_entries_from_head() {
+                let storage = MemoryStorage::new();
+                storage
+                    .append_entries(vec![
+                        LogEntry::new(LogIndex::new(1), Term::new(1), vec![]),
+                        LogEntry::new(LogIndex::new(2), Term::new(1), vec![]),
+                        LogEntry::new(LogIndex::new(3), Term::new(2), vec![]),
+                    ])
+                    .unwrap();
+
+                storage.truncate_log_front(LogIndex::new(2)).unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), LogIndex::new(3));
+                assert!(storage.read_entry(LogIndex::new(1)).unwrap().is_none());
+                assert!(storage.read_entry(LogIndex::new(2)).unwrap().is_none());
+                assert!(storage.read_entry(LogIndex::new(3)).unwrap().is_some());
+            }
+        }
+
+        mod snapshot_metadata {
+            use super::*;
+            #[test]
+            fn persists_and_retrieves_snapshot_coordinates() {
+                let storage = MemoryStorage::new();
+                let index = LogIndex::new(100);
+                let term = Term::new(5);
+
+                storage.save_snapshot_metadata(index, term).unwrap();
+
+                assert_eq!(storage.last_included_index().unwrap(), index);
+                assert_eq!(storage.last_included_term().unwrap(), term);
+            }
+
+            #[test]
+            fn last_log_coordinates_fallback_to_snapshot_when_log_is_empty() {
+                let storage = MemoryStorage::new();
+                let index = LogIndex::new(100);
+                let term = Term::new(5);
+
+                storage.save_snapshot_metadata(index, term).unwrap();
+
+                assert_eq!(storage.last_log_index().unwrap(), index);
+                assert_eq!(storage.last_log_term().unwrap(), term);
             }
         }
     }

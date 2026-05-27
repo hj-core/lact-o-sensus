@@ -1810,6 +1810,26 @@ mod tests {
                     fn truncate_log(&self, _: LogIndex) -> Result<(), LogStorageError> {
                         Ok(())
                     }
+
+                    fn truncate_log_front(&self, _: LogIndex) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn save_snapshot_metadata(
+                        &self,
+                        _: LogIndex,
+                        _: Term,
+                    ) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn last_included_index(&self) -> Result<LogIndex, LogStorageError> {
+                        Ok(LogIndex::ZERO)
+                    }
+
+                    fn last_included_term(&self) -> Result<Term, LogStorageError> {
+                        Ok(Term::ZERO)
+                    }
                 }
 
                 async fn check_propagates_persistence_error_when_storage_fails<
@@ -2580,6 +2600,26 @@ mod tests {
 
                     fn truncate_log(&self, _: LogIndex) -> Result<(), LogStorageError> {
                         Ok(())
+                    }
+
+                    fn truncate_log_front(&self, _: LogIndex) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn save_snapshot_metadata(
+                        &self,
+                        _: LogIndex,
+                        _: Term,
+                    ) -> Result<(), LogStorageError> {
+                        Ok(())
+                    }
+
+                    fn last_included_index(&self) -> Result<LogIndex, LogStorageError> {
+                        Ok(LogIndex::ZERO)
+                    }
+
+                    fn last_included_term(&self) -> Result<Term, LogStorageError> {
+                        Ok(Term::ZERO)
                     }
                 }
 
