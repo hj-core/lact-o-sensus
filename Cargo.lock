@@ -1129,6 +1129,7 @@ dependencies = [
  "sled",
  "tempfile",
  "tokio",
+ "tonic-prost-build",
  "tracing",
 ]
 

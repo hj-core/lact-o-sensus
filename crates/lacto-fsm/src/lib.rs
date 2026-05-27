@@ -45,6 +45,12 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+mod internal {
+    include!(concat!(env!("OUT_DIR"), "/lacto_fsm.v1.rs"));
+}
+
+use internal::SnapshotData;
+
 /// Persistent implementation of the Lact-O-Sensus state machine using `sled`.
 ///
 /// This store satisfies the StateMachine trait by deserializing
@@ -70,6 +76,7 @@ pub struct LactoStore {
 impl LactoStore {
     const KEY_LAST_APPLIED: &'static [u8] = b"last_applied";
     const KEY_LAST_EFFECTIVE_TIME: &'static [u8] = b"last_effective_time";
+    const KEY_RESTORE_IN_PROGRESS: &'static [u8] = b"restore_in_progress";
     const TREE_INVENTORY: &'static str = "inventory";
     const TREE_META: &'static str = "meta";
     const TREE_SESSIONS: &'static str = "sessions";
@@ -85,12 +92,54 @@ impl LactoStore {
             .open_tree(Self::TREE_META)
             .map_err(|e| FsmError::persistence(format!("Failed to open meta tree: {}", e)))?;
 
-        Ok(Self {
+        let store = Self {
             db,
             inventory,
             sessions,
             meta,
-        })
+        };
+
+        // STARTUP SANITIZATION (ADR 011)
+        // If a crash happened during snapshot restoration, the dirty flag will
+        // be present. We must purge all data to ensure we don't start with a
+        // corrupted "Ghost State."
+        if store.is_restoration_stale()? {
+            warn!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                "HALT RECOVERY: Detected stale restoration attempt. Purging FSM to preserve integrity."
+            );
+            store.purge_all_data()?;
+        }
+
+        Ok(store)
+    }
+
+    /// Checks if a restoration flag was left behind from a previous crash.
+    fn is_restoration_stale(&self) -> Result<bool, FsmError> {
+        let flag = self
+            .meta
+            .get(Self::KEY_RESTORE_IN_PROGRESS)
+            .map_err(|e| FsmError::persistence(format!("Failed to read restore flag: {}", e)))?
+            .map(|v| v.as_ref() == b"true")
+            .unwrap_or(false);
+        Ok(flag)
+    }
+
+    /// Hard wipe of all FSM data trees and metadata.
+    fn purge_all_data(&self) -> Result<(), FsmError> {
+        self.inventory
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to purge inventory: {}", e)))?;
+        self.sessions
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to purge sessions: {}", e)))?;
+        self.meta
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to purge meta: {}", e)))?;
+        self.db
+            .flush()
+            .map_err(|e| FsmError::persistence(format!("Failed to flush after purge: {}", e)))?;
+        Ok(())
     }
 
     /// Retrieves the system-wide clinical time derived from the consensus log.
@@ -438,16 +487,149 @@ impl StateMachine for LactoStore {
         Ok(())
     }
 
+    /// Serializes the entire state machine into a contiguous byte vector.
+    ///
+    /// CONSISTENCY MANDATE (ADR 011):
+    /// This method performs multiple independent tree iterations. Consistency
+    /// is guaranteed by the Raft orchestrator, which MUST pause the `apply`
+    /// pipeline (Freeze-Apply) before calling this method, ensuring no
+    /// mutations occur during serialization.
+    #[tracing::instrument(name = "fsm_snapshot", target = "raft::compaction", skip_all)]
     async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-        todo!("Phase 7: Implement FSM serialization")
+        let inventory = self.get_inventory().await;
+
+        let mut sessions = Vec::new();
+        for res in self.sessions.iter() {
+            let (_, v) = res
+                .map_err(|e| FsmError::persistence(format!("Session iteration failure: {}", e)))?;
+            sessions.push(SessionRecord::decode(v.as_ref()).map_err(|e| {
+                FsmError::deserialization(format!("Failed to decode SessionRecord: {}", e))
+            })?);
+        }
+
+        let last_effective_time = Some(self.last_effective_time()?);
+
+        let data = SnapshotData {
+            inventory,
+            sessions,
+            last_effective_time,
+        };
+
+        Ok(data.encode_to_vec())
     }
 
+    /// Destructively restores the state machine from a snapshot.
+    ///
+    /// HALT MANDATE (ADR 009):
+    /// Any failure during restoration (deserialization or physical I/O)
+    /// indicates a corrupted node state and MUST return an error that
+    /// triggers a panic.
+    ///
+    /// CRASH RECOVERY (ADR 011):
+    /// Utilizes the "Restoration Tombstone" protocol to ensure atomicity
+    /// across multiple trees without full-DB transactions.
+    #[tracing::instrument(
+        name = "fsm_install_snapshot",
+        target = "raft::compaction",
+        skip_all,
+        fields(index = %last_included_index)
+    )]
     async fn install_snapshot(
         &self,
-        _last_included_index: LogIndex,
-        _data: &[u8],
+        last_included_index: LogIndex,
+        data: &[u8],
     ) -> Result<(), Self::Error> {
-        todo!("Phase 7: Implement FSM restoration")
+        let snapshot = SnapshotData::decode(data).map_err(|e| {
+            // HALT FORENSICS (Rule 15)
+            error!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                index = %last_included_index,
+                error = %e,
+                "HALT MANDATE (ADR 009/011): Snapshot deserialization failed. Physical integrity compromised."
+            );
+            FsmError::deserialization(format!("Failed to decode SnapshotData: {}", e))
+        })?;
+
+        // 1. Mark as Dirty (The Tombstone)
+        self.meta
+            .insert(Self::KEY_RESTORE_IN_PROGRESS, b"true")
+            .map_err(|e| FsmError::persistence(format!("Failed to set restore flag: {}", e)))?;
+        self.db.flush().map_err(|e| {
+            FsmError::persistence(format!("FSM flush failure during dirty-marking: {}", e))
+        })?;
+
+        // 2. Clear existing state
+        self.inventory
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to clear inventory: {}", e)))?;
+        self.sessions
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to clear sessions: {}", e)))?;
+        // We clear everything EXCEPT the dirty flag in meta
+        for res in self.meta.iter() {
+            let (k, _) = res.map_err(|e| {
+                FsmError::persistence(format!("Meta iteration failure during clear: {}", e))
+            })?;
+            if k.as_ref() != Self::KEY_RESTORE_IN_PROGRESS {
+                self.meta.remove(k).map_err(|e| {
+                    FsmError::persistence(format!("Failed to remove meta key: {}", e))
+                })?;
+            }
+        }
+
+        // 3. Restore Inventory in Batch
+        let mut inv_batch = sled::Batch::default();
+        for item in &snapshot.inventory {
+            inv_batch.insert(item.item_key.as_bytes(), item.encode_to_vec());
+        }
+        self.inventory.apply_batch(inv_batch).map_err(|e| {
+            FsmError::persistence(format!("Failed to apply inventory batch: {}", e))
+        })?;
+
+        // 4. Restore Sessions in Batch
+        let mut sess_batch = sled::Batch::default();
+        for record in &snapshot.sessions {
+            sess_batch.insert(record.client_id.as_bytes(), record.encode_to_vec());
+        }
+        self.sessions
+            .apply_batch(sess_batch)
+            .map_err(|e| FsmError::persistence(format!("Failed to apply session batch: {}", e)))?;
+
+        // 5. Finalize Metadata and Mark as Clean
+        let mut meta_batch = sled::Batch::default();
+        meta_batch.insert(
+            Self::KEY_LAST_APPLIED,
+            &last_included_index.as_u64().to_be_bytes(),
+        );
+
+        if let Some(time) = snapshot.last_effective_time {
+            meta_batch.insert(Self::KEY_LAST_EFFECTIVE_TIME, time.encode_to_vec());
+        }
+
+        // Remove the Tombstone
+        meta_batch.remove(Self::KEY_RESTORE_IN_PROGRESS);
+
+        self.meta
+            .apply_batch(meta_batch)
+            .map_err(|e| FsmError::persistence(format!("Failed to apply meta batch: {}", e)))?;
+
+        // 6. Synchronous flush (ADR 001)
+        self.db.flush().map_err(|e| {
+            FsmError::persistence(format!(
+                "FSM flush failure after snapshot restoration: {}",
+                e
+            ))
+        })?;
+
+        info!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            index = %last_included_index,
+            inventory_count = snapshot.inventory.len(),
+            session_count = snapshot.sessions.len(),
+            "State machine snapshot installed successfully."
+        );
+
+        Ok(())
     }
 }
 
@@ -872,6 +1054,101 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(record.moral_justification, "Vetoed justification");
+            }
+        }
+    }
+
+    mod snapshot_and_restoration {
+        use super::*;
+
+        mod round_trip {
+            use super::*;
+
+            #[tokio::test]
+            async fn restores_identical_state_from_snapshot() {
+                let store_a = setup_store();
+                let cid = ClientId::generate();
+
+                // 1. Populate Store A
+                let mut d1 = Vec::new();
+                mock_mutation(&cid, 1, MutationStatus::Committed)
+                    .encode(&mut d1)
+                    .unwrap();
+                store_a.apply(LogIndex::new(1), &d1).await.unwrap();
+
+                let mut d2 = Vec::new();
+                let mut m2 = mock_mutation(&cid, 2, MutationStatus::Committed);
+                m2.resolved_item_key = "bread".to_string();
+                m2.encode(&mut d2).unwrap();
+                store_a.apply(LogIndex::new(2), &d2).await.unwrap();
+
+                // 2. Take Snapshot
+                let snapshot_bytes = store_a.snapshot().await.unwrap();
+                let last_index = store_a.last_applied_index().unwrap();
+
+                // 3. Restore into Store B
+                let store_b = setup_store();
+                store_b
+                    .install_snapshot(last_index, &snapshot_bytes)
+                    .await
+                    .unwrap();
+
+                // 4. Verify Equality
+                assert_eq!(store_b.last_applied_index().unwrap(), last_index);
+                assert_eq!(store_b.get_inventory().await.len(), 2);
+
+                let session = store_b
+                    .check_session(&cid, SequenceId::new(2))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(session.last_sequence_id, 2);
+
+                assert_eq!(
+                    store_b.last_effective_time().unwrap().seconds,
+                    store_a.last_effective_time().unwrap().seconds
+                );
+            }
+        }
+
+        mod crash_recovery {
+            use super::*;
+
+            #[tokio::test]
+            async fn purges_dirty_state_on_startup_if_tombstone_present() {
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path();
+
+                // 1. Create a "Dirty" state manually
+                {
+                    let db = sled::open(db_path).unwrap();
+                    let store = LactoStore::new(db).unwrap();
+
+                    // Add some "Ghost" data
+                    let mut data = Vec::new();
+                    mock_mutation(&ClientId::generate(), 1, MutationStatus::Committed)
+                        .encode(&mut data)
+                        .unwrap();
+                    store.apply(LogIndex::new(1), &data).await.unwrap();
+
+                    // Manually insert the Tombstone
+                    store
+                        .meta
+                        .insert(LactoStore::KEY_RESTORE_IN_PROGRESS, b"true")
+                        .unwrap();
+                    store.db.flush().unwrap();
+                }
+
+                // 2. Initialize new LactoStore (Simulation of Reboot)
+                {
+                    let db = sled::open(db_path).unwrap();
+                    let store = LactoStore::new(db).unwrap();
+
+                    // 3. Verify Sanitization
+                    assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(0));
+                    assert!(store.get_inventory().await.is_empty());
+                    assert!(!store.is_restoration_stale().unwrap());
+                }
             }
         }
     }

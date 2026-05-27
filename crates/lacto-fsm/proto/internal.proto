@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package lacto_fsm.v1;
+
+import "google/protobuf/timestamp.proto";
+import "app.proto";
+
+message SnapshotData {
+    repeated lacto_sensus.v1.GroceryItem inventory = 1;
+    repeated lacto_sensus.v1.SessionRecord sessions = 2;
+    google.protobuf.Timestamp last_effective_time = 3;
+}

@@ -12,6 +12,9 @@ prost-types.workspace = true
 tracing.workspace = true
 serde.workspace = true
 
+[build-dependencies]
+tonic-prost-build.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile.workspace = true
