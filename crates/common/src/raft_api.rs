@@ -96,6 +96,29 @@ pub trait StateMachine: Send + Sync + Debug + 'static {
     /// This method is called sequentially by the Raft engine as the
     /// commit_index advances.
     async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error>;
+
+    /// Captures a consistent, serializable snapshot of the entire state
+    /// machine.
+    ///
+    /// The returned byte vector MUST contain all state required to reconstruct
+    /// the application to this exact point-in-time, including inventory and
+    /// session metadata (ADR 011).
+    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error>;
+
+    /// Restores the entire application state from a provided snapshot.
+    ///
+    /// This is an atomic operation; the implementation MUST clear all existing
+    /// state before restoring from the provided bytes. The given
+    /// `last_included_index` represents the logical horizon of the snapshot
+    /// and MUST be persisted as the new last_applied index (ADR 011).
+    ///
+    /// If restoration fails, the node MUST transition to a Poisoned state (ADR
+    /// 009).
+    async fn install_snapshot(
+        &self,
+        last_included_index: LogIndex,
+        data: &[u8],
+    ) -> Result<(), Self::Error>;
 }
 
 #[cfg(test)]

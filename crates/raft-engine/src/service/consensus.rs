@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use common::proto::v1::raft::AppendEntriesRequest;
 use common::proto::v1::raft::AppendEntriesResponse;
+use common::proto::v1::raft::InstallSnapshotRequest;
+use common::proto::v1::raft::InstallSnapshotResponse;
 use common::proto::v1::raft::LogEntry;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
@@ -246,6 +248,13 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
 
         Ok(response)
     }
+
+    async fn install_snapshot(
+        &self,
+        _request: Request<InstallSnapshotRequest>,
+    ) -> Result<Response<InstallSnapshotResponse>, Status> {
+        Err(Status::unimplemented("Not yet implemented"))
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +281,18 @@ mod tests {
         }
 
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+
+        async fn install_snapshot(
+            &self,
+            _index: LogIndex,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -815,6 +836,29 @@ mod tests {
             // unless we increment tick.
             // But let's verify it didn't CRASH at least.
             assert_eq!(updated_heartbeat, initial_heartbeat);
+        }
+
+        mod install_snapshot {
+            use common::proto::v1::raft::InstallSnapshotRequest;
+
+            use super::*;
+
+            #[tokio::test]
+            async fn should_return_unimplemented_status_when_called() {
+                let dispatcher = mock_dispatcher();
+                let request = make_request(InstallSnapshotRequest {
+                    term: 1,
+                    leader_id: "2".to_string(),
+                    last_included_index: 100,
+                    last_included_term: 1,
+                    data: vec![1, 2, 3],
+                });
+
+                let response = dispatcher.install_snapshot(request).await;
+
+                assert!(response.is_err());
+                assert_eq!(response.unwrap_err().code(), tonic::Code::Unimplemented);
+            }
         }
     }
 }

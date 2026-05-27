@@ -437,6 +437,18 @@ impl StateMachine for LactoStore {
 
         Ok(())
     }
+
+    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        todo!("Phase 7: Implement FSM serialization")
+    }
+
+    async fn install_snapshot(
+        &self,
+        _last_included_index: LogIndex,
+        _data: &[u8],
+    ) -> Result<(), Self::Error> {
+        todo!("Phase 7: Implement FSM restoration")
+    }
 }
 
 #[cfg(test)]

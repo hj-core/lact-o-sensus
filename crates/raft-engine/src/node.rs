@@ -906,6 +906,7 @@ impl Leader {
 
 #[cfg(test)]
 mod tests {
+    use std::result::Result;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
@@ -937,6 +938,18 @@ mod tests {
                 .lock()
                 .expect("Clinical Invariant: Mutex must be lockable")
                 .push(data.to_vec());
+            Ok(())
+        }
+
+        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+
+        async fn install_snapshot(
+            &self,
+            _last_included_index: LogIndex,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -1337,6 +1350,18 @@ mod tests {
                     ) -> Result<(), Self::Error> {
                         Err(FsmError::invariant("Simulated FSM failure"))
                     }
+
+                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                        Ok(vec![])
+                    }
+
+                    async fn install_snapshot(
+                        &self,
+                        _index: LogIndex,
+                        _data: &[u8],
+                    ) -> Result<(), Self::Error> {
+                        Ok(())
+                    }
                 }
 
                 async fn check_returns_error_when_state_machine_apply_fails<
@@ -1428,6 +1453,18 @@ mod tests {
                     }
 
                     async fn apply(
+                        &self,
+                        _index: LogIndex,
+                        _data: &[u8],
+                    ) -> Result<(), Self::Error> {
+                        Ok(())
+                    }
+
+                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                        Ok(vec![])
+                    }
+
+                    async fn install_snapshot(
                         &self,
                         _index: LogIndex,
                         _data: &[u8],
@@ -1914,6 +1951,18 @@ mod tests {
                     }
 
                     async fn apply(&self, _: LogIndex, _: &[u8]) -> Result<(), Self::Error> {
+                        Ok(())
+                    }
+
+                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                        Ok(vec![])
+                    }
+
+                    async fn install_snapshot(
+                        &self,
+                        _: LogIndex,
+                        _: &[u8],
+                    ) -> Result<(), Self::Error> {
                         Ok(())
                     }
                 }

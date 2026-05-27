@@ -1008,6 +1008,18 @@ mod tests {
         ) -> std::result::Result<(), Self::Error> {
             Ok(())
         }
+
+        async fn snapshot(&self) -> std::result::Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+
+        async fn install_snapshot(
+            &self,
+            _last_included_index: LogIndex,
+            _data: &[u8],
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     fn mock_config(min_ms: u64, max_ms: u64) -> Arc<Config> {

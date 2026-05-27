@@ -61,6 +61,8 @@ pub enum ClinicalTarget {
     RaftFoundation,
     /// Log maintenance and replication.
     RaftReplication,
+    /// Log truncation and snapshotting (ADR 011).
+    RaftCompaction,
     /// Ingress pipeline and defensive onion.
     ClinicalIngress,
     /// State machine physical mutations.
@@ -81,6 +83,7 @@ impl ClinicalTarget {
         match self {
             Self::RaftFoundation => "raft::foundation",
             Self::RaftReplication => "raft::replication",
+            Self::RaftCompaction => "raft::compaction",
             Self::ClinicalIngress => "clinical::ingress",
             Self::ClinicalFsm => "clinical::fsm",
             Self::ClinicalFoundation => "clinical::foundation",
@@ -151,6 +154,7 @@ mod tests {
             #[test]
             fn returns_correct_canonical_string_for_all_variants() {
                 assert_eq!(ClinicalTarget::RaftFoundation.as_str(), "raft::foundation");
+                assert_eq!(ClinicalTarget::RaftCompaction.as_str(), "raft::compaction");
                 assert_eq!(
                     ClinicalTarget::ClinicalIngress.as_str(),
                     "clinical::ingress"

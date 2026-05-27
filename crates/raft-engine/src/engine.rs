@@ -713,6 +713,18 @@ mod tests {
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
+
+        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+
+        async fn install_snapshot(
+            &self,
+            _last_included_index: LogIndex,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     fn test_identity(id: u64) -> Arc<NodeIdentity> {

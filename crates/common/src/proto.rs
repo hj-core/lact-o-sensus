@@ -90,6 +90,34 @@ pub mod v1 {
             }
         }
 
+        impl InstallSnapshotRequest {
+            /// Constructs a new InstallSnapshotRequest with proper NewType
+            /// conversion.
+            pub fn new(
+                term: Term,
+                leader_id: NodeId,
+                last_included_index: LogIndex,
+                last_included_term: Term,
+                data: Vec<u8>,
+            ) -> Self {
+                Self {
+                    term: term.as_u64(),
+                    leader_id: leader_id.to_string(),
+                    last_included_index: last_included_index.as_u64(),
+                    last_included_term: last_included_term.as_u64(),
+                    data,
+                }
+            }
+        }
+
+        impl InstallSnapshotResponse {
+            /// Constructs a new InstallSnapshotResponse with proper NewType
+            /// conversion.
+            pub fn new(term: u64) -> Self {
+                Self { term }
+            }
+        }
+
         impl HardState {
             /// Constructs a new HardState with proper NewType conversion.
             pub fn new(term: Term, vote: Option<NodeId>) -> Self {

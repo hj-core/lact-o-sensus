@@ -203,6 +203,18 @@ mod tests {
             self.applied_indices.lock().unwrap().push(index);
             Ok(())
         }
+
+        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+            Ok(vec![])
+        }
+
+        async fn install_snapshot(
+            &self,
+            _index: LogIndex,
+            _data: &[u8],
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
     }
 
     mod recover {

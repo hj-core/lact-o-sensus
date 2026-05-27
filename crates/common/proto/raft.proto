@@ -12,6 +12,8 @@ service ConsensusService {
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
     // Replication of log entries and heartbeat synchronization.
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    // Synchronize the full state machine snapshot to a follower.
+    rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }
 
 // Request to grant a vote for a candidate in the specified term.
@@ -50,6 +52,20 @@ message AppendEntriesResponse {
     uint64 term = 1;
     bool success = 2;
     uint64 last_log_index = 3; // Optimization for rapid log reconciliation
+}
+
+// Request to install a state machine snapshot on a follower.
+message InstallSnapshotRequest {
+    uint64 term = 1;
+    string leader_id = 2;
+    uint64 last_included_index = 3;
+    uint64 last_included_term = 4;
+    bytes data = 5; // The raw snapshot payload (ADR 011)
+}
+
+// Response to an InstallSnapshot request.
+message InstallSnapshotResponse {
+    uint64 term = 1;
 }
 
 // Persistent Hard State stored on disk (§5.1).
