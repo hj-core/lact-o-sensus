@@ -217,11 +217,93 @@ impl InstallSnapshotResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TermCheckResult {
+    Valid,
+    Stale,
+}
+
 // =============================================================================
 // Implementation: LogicalNode (High-Level Protocol Orchestrator)
 // =============================================================================
 
 impl<S: StateMachine> LogicalNode<S> {
+    /// Enforces Raft §5.1 term hygiene and rival leader protection for leader
+    /// RPCs.
+    ///
+    /// Returns `TermCheckResult::Stale` if the incoming request is older than
+    /// the current term. Otherwise, updates the current term, demotes if
+    /// necessary, updates the leader hint, and returns
+    /// `TermCheckResult::Valid`.
+    pub(crate) fn validate_leader_rpc_term(
+        &mut self,
+        req_term: Term,
+        leader_id: NodeId,
+        rpc_name: &str,
+    ) -> TermCheckResult {
+        let current_term = self.current_term();
+
+        // 1. Term check (§5.1)
+        if req_term < current_term {
+            debug!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                remote_leader = %leader_id,
+                req_term = %req_term,
+                local_term = %current_term,
+                "Rejecting {}: Stale Term",
+                rpc_name
+            );
+            return TermCheckResult::Stale;
+        }
+
+        // 2. High-level state transitions and demotions (§5.1, §5.2)
+        if req_term > current_term {
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                old_term = %current_term,
+                new_term = %req_term,
+                remote_leader = %leader_id,
+                "Role Transition: -> Follower (Term Discovery via {})",
+                rpc_name
+            );
+            self.into_follower(req_term, Some(leader_id));
+        } else if req_term == current_term {
+            match &mut self.state {
+                RoleState::Candidate(_) => {
+                    info!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        remote_leader = %leader_id,
+                        "Role Transition: -> Follower (Leader Recognized via {})",
+                        rpc_name
+                    );
+                    self.into_follower(req_term, Some(leader_id));
+                }
+                RoleState::Leader(_) => {
+                    error!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        rival_leader = %leader_id,
+                        "CRITICAL SAFETY VIOLATION: Rival leader detected during {}. Halting node.",
+                        rpc_name
+                    );
+                    let msg = format!(
+                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {} during \
+                         {}. Halting node.",
+                        leader_id, req_term, rpc_name
+                    );
+                    self.apply_fatal(NodeError::Protocol(msg));
+                }
+                RoleState::Follower(node) => {
+                    node.state_mut().set_leader_id(Some(leader_id));
+                }
+                _ => {}
+            }
+        }
+
+        TermCheckResult::Valid
+    }
+
     /// Creates a new LogicalNode in the Follower role.
     pub fn try_new(
         identity: Arc<NodeIdentity>,
@@ -298,15 +380,10 @@ impl<S: StateMachine> LogicalNode<S> {
     ) -> InstallSnapshotResult {
         let current_term = self.current_term();
 
-        // 1. Term check (§5.1)
-        if req_term < current_term {
-            debug!(
-                target: ClinicalTarget::RaftCompaction.as_str(),
-                remote_leader = %leader_id,
-                req_term = %req_term,
-                local_term = %current_term,
-                "Rejecting InstallSnapshot: Stale Term"
-            );
+        // 1. Term check & Role Transitions (§5.1, §5.2)
+        if self.validate_leader_rpc_term(req_term, leader_id, "InstallSnapshot")
+            == TermCheckResult::Stale
+        {
             return InstallSnapshotResult::rejected(current_term);
         }
 
@@ -321,48 +398,6 @@ impl<S: StateMachine> LogicalNode<S> {
                 "Ignoring InstallSnapshot: Redundant/Stale Index"
             );
             return InstallSnapshotResult::stale(current_term);
-        }
-
-        // 3. High-level state transitions and demotions (§5.1)
-        if req_term > current_term {
-            info!(
-                target: ClinicalTarget::RaftFoundation.as_str(),
-                old_term = %current_term,
-                new_term = %req_term,
-                remote_leader = %leader_id,
-                "Role Transition: -> Follower (Term Discovery via Snapshot)"
-            );
-            self.into_follower(req_term, Some(leader_id));
-        } else if req_term == current_term {
-            match &mut self.state {
-                RoleState::Candidate(_) => {
-                    info!(
-                        target: ClinicalTarget::RaftFoundation.as_str(),
-                        term = %req_term,
-                        remote_leader = %leader_id,
-                        "Role Transition: -> Follower (Leader Recognized via Snapshot)"
-                    );
-                    self.into_follower(req_term, Some(leader_id));
-                }
-                RoleState::Leader(_) => {
-                    error!(
-                        target: ClinicalTarget::RaftFoundation.as_str(),
-                        term = %req_term,
-                        rival_leader = %leader_id,
-                        "CRITICAL SAFETY VIOLATION: Rival leader detected during snapshot. Halting node."
-                    );
-                    let msg = format!(
-                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {} during \
-                         snapshot. Halting node.",
-                        leader_id, req_term
-                    );
-                    self.apply_fatal(NodeError::Protocol(msg));
-                }
-                RoleState::Follower(node) => {
-                    node.state_mut().set_leader_id(Some(leader_id));
-                }
-                _ => {}
-            }
         }
 
         self.reset_heartbeat();
@@ -415,63 +450,17 @@ impl<S: StateMachine> LogicalNode<S> {
     ) -> AppendEntriesResult {
         let current_term = self.current_term();
 
-        // 1. Term check (§5.1)
-        if req_term < current_term {
-            debug!(
-                target: ClinicalTarget::RaftReplication.as_str(),
-                remote_leader = %leader_id,
-                req_term = %req_term,
-                local_term = %current_term,
-                "Rejecting AppendEntries: Stale Term"
-            );
+        // 1. Term check & Role Transitions (§5.1, §5.2)
+        if self.validate_leader_rpc_term(req_term, leader_id, "AppendEntries")
+            == TermCheckResult::Stale
+        {
             return AppendEntriesResult::stale_term(current_term);
         }
 
-        // 2. High-level state transitions and demotions (§5.1, §5.2)
-        if req_term > current_term {
-            info!(
-                target: ClinicalTarget::RaftFoundation.as_str(),
-                old_term = %current_term,
-                new_term = %req_term,
-                remote_leader = %leader_id,
-                "Role Transition: -> Follower (Term Discovery)"
-            );
-            self.into_follower(req_term, Some(leader_id));
-        } else if req_term == current_term {
-            match &mut self.state {
-                RoleState::Candidate(_) => {
-                    info!(
-                        target: ClinicalTarget::RaftFoundation.as_str(),
-                        term = %req_term,
-                        remote_leader = %leader_id,
-                        "Role Transition: -> Follower (Leader Recognized)"
-                    );
-                    self.into_follower(req_term, Some(leader_id));
-                }
-                RoleState::Leader(_) => {
-                    error!(
-                        target: ClinicalTarget::RaftFoundation.as_str(),
-                        term = %req_term,
-                        rival_leader = %leader_id,
-                        "CRITICAL SAFETY VIOLATION: Rival leader detected for current term. Halting node."
-                    );
-                    let msg = format!(
-                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {}. Halting \
-                         node.",
-                        leader_id, req_term
-                    );
-                    self.apply_fatal(NodeError::Protocol(msg));
-                }
-                RoleState::Follower(node) => {
-                    node.state_mut().set_leader_id(Some(leader_id));
-                }
-                _ => {}
-            }
-        }
-
-        // 3. Delegation to physical reconciliation (§5.3)
+        // 2. Heartbeat reset (§5.2)
         self.reset_heartbeat();
 
+        // 3. Delegation to physical reconciliation (§5.3)
         match &mut self.state {
             RoleState::Follower(node) => {
                 let res = node
