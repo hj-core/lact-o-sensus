@@ -1,0 +1,40 @@
+# EditorConfig helps developers define and maintain consistent
+# coding styles between different editors and IDEs.
+# https://editorconfig.org
+
+root = true
+
+# Global settings for all files
+[*]
+charset = utf-8
+indent_style = space
+indent_size = 4
+max_line_length = 100
+end_of_line = lf
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+# Web development defaults (HTML, CSS, JS, TS, JSON, YAML)
+[*.{html,css,scss,js,jsx,ts,tsx,json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# Python specific rules (PEP 8 compliance)
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 79
+
+# Systems & Backend (C, C++, Java, C#, Rust, Go)
+[*.{c,h,cpp,hpp,java,cs,rs}]
+indent_style = space
+indent_size = 4
+
+# Go requires tabs instead of spaces
+[*.go]
+indent_style = tab
+indent_size = 4
+
+# Markdown files (trailing whitespace can mean a line break)
+[*.md]
+trim_trailing_whitespace = false
