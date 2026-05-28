@@ -66,6 +66,10 @@ pub struct RaftConfig {
     /// Maximum time to wait for a mutation to reach consensus quorum or be
     /// applied to the state machine (in milliseconds).
     pub consensus_timeout_ms: u64,
+
+    /// Number of log entries beyond the last included index that triggers
+    /// a new snapshot generation and log compaction.
+    pub snapshot_threshold: u64,
 }
 
 impl Default for RaftConfig {
@@ -77,6 +81,7 @@ impl Default for RaftConfig {
             election_timeout_max_ms: 300,
             rpc_timeout_ms: 40,
             consensus_timeout_ms: 30000,
+            snapshot_threshold: 10000,
         }
     }
 }
@@ -140,6 +145,21 @@ impl RaftConfig {
             return Err(ConfigError::TimingInvariant(
                 "consensus_timeout_ms must be greater than 0".to_string(),
             ));
+        }
+
+        if self.snapshot_threshold == 0 {
+            return Err(ConfigError::TimingInvariant(
+                "snapshot_threshold must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.snapshot_threshold < 100 {
+            warn!(
+                target: ClinicalTarget::ClinicalFoundation.as_str(),
+                threshold = %self.snapshot_threshold,
+                "Artificially low snapshot_threshold detected. Frequent compaction may impact \
+                 performance."
+            );
         }
 
         // The SLA Invariant: Consensus timeout must be at least as long as the
@@ -584,6 +604,43 @@ mod tests {
                     Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("SLA Invariant")
                 ));
             }
+
+            #[test]
+            fn reject_config_when_snapshot_threshold_is_zero() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                snapshot_threshold = 0
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                let result = config.validate();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::TimingInvariant(ref msg)) if msg.contains("snapshot_threshold")
+                ));
+            }
+
+            #[test]
+            fn accept_config_when_snapshot_threshold_is_positive() {
+                let toml_str = r#"
+                cluster_id = "test-cluster"
+                node_id = 1
+                listen_addr = "127.0.0.1:50051"
+                data_dir = "data/node_1"
+                [peers]
+                2 = "http://127.0.0.1:50052"
+                [raft]
+                snapshot_threshold = 1000
+            "#;
+                let config: Config = toml::from_str(toml_str).expect("valid toml");
+                assert!(config.validate().is_ok());
+                assert_eq!(config.raft.snapshot_threshold, 1000);
+            }
         }
 
         mod with_policy_violations {
@@ -643,6 +700,7 @@ mod tests {
                     election_timeout_max_ms: 300,
                     rpc_timeout_ms: 40,
                     consensus_timeout_ms: 30000,
+                    snapshot_threshold: 1000,
                 };
 
                 let thresholds = config.calculate_thresholds();
@@ -665,6 +723,7 @@ mod tests {
                     election_timeout_max_ms: 305,
                     rpc_timeout_ms: 40,
                     consensus_timeout_ms: 30000,
+                    snapshot_threshold: 1000,
                 };
 
                 let thresholds = config.calculate_thresholds();

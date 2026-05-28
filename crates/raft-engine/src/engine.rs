@@ -76,11 +76,26 @@ pub struct LogicalNode<S: StateMachine> {
     current_tick: Tick,
     thresholds: TickThresholds,
     rng: StdRng,
+    /// Freeze-Apply Flag (ADR 011): When true, mutations are committed to the
+    /// log but not applied to the FSM to ensure consistency during
+    /// snapshotting.
+    is_snapshotting: bool,
 }
 
 macro_rules! delegate_to_inner {
     ($self:ident, $method:ident $(, $args:expr)*) => {
         match &$self.state {
+            RoleState::Follower(n) => n.$method($($args),*),
+            RoleState::Candidate(n) => n.$method($($args),*),
+            RoleState::Leader(n) => n.$method($($args),*),
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+        }
+    };
+}
+
+macro_rules! delegate_mut_to_inner {
+    ($self:ident, $method:ident $(, $args:expr)*) => {
+        match &mut $self.state {
             RoleState::Follower(n) => n.$method($($args),*),
             RoleState::Candidate(n) => n.$method($($args),*),
             RoleState::Leader(n) => n.$method($($args),*),
@@ -160,6 +175,48 @@ impl RequestVoteResult {
     }
 }
 
+/// Decision outcomes from an InstallSnapshot request (§7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotAction {
+    /// Snapshot is accepted and the node should proceed with restoration.
+    Accepted,
+    /// Snapshot is rejected due to a stale term (§5.1).
+    Rejected,
+    /// Snapshot is ignored because it is redundant or older than the current
+    /// state (§7).
+    Stale,
+}
+
+/// Consolidated result of an InstallSnapshot processing attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallSnapshotResult {
+    pub term: Term,
+    pub action: SnapshotAction,
+}
+
+impl InstallSnapshotResult {
+    pub fn accepted(term: Term) -> Self {
+        Self {
+            term,
+            action: SnapshotAction::Accepted,
+        }
+    }
+
+    pub fn rejected(term: Term) -> Self {
+        Self {
+            term,
+            action: SnapshotAction::Rejected,
+        }
+    }
+
+    pub fn stale(term: Term) -> Self {
+        Self {
+            term,
+            action: SnapshotAction::Stale,
+        }
+    }
+}
+
 // =============================================================================
 // Implementation: LogicalNode (High-Level Protocol Orchestrator)
 // =============================================================================
@@ -184,6 +241,7 @@ impl<S: StateMachine> LogicalNode<S> {
             current_tick,
             thresholds,
             rng,
+            is_snapshotting: false,
         })
     }
 
@@ -219,6 +277,124 @@ impl<S: StateMachine> LogicalNode<S> {
             RoleState::Leader(node) => Some(node),
             _ => None,
         }
+    }
+
+    /// Processes an InstallSnapshot RPC (§7).
+    ///
+    /// HALT MANDATE (ADR 009/011):
+    /// This method validates the term and coordinates. The actual destructive
+    /// state machine restoration is offloaded by the orchestrator shell.
+    #[instrument(
+        name = "handle_install_snapshot",
+        target = "raft::compaction",
+        skip_all,
+        fields(leader = %leader_id, term = %req_term, index = %last_included_index)
+    )]
+    pub fn handle_install_snapshot(
+        &mut self,
+        leader_id: NodeId,
+        req_term: Term,
+        last_included_index: LogIndex,
+    ) -> InstallSnapshotResult {
+        let current_term = self.current_term();
+
+        // 1. Term check (§5.1)
+        if req_term < current_term {
+            debug!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                remote_leader = %leader_id,
+                req_term = %req_term,
+                local_term = %current_term,
+                "Rejecting InstallSnapshot: Stale Term"
+            );
+            return InstallSnapshotResult::rejected(current_term);
+        }
+
+        // 2. Horizon Check (§7): Ignore snapshots that don't move the state forward.
+        // We use last_applied() as the authoritative logical horizon.
+        if last_included_index <= self.last_applied() {
+            debug!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                remote_leader = %leader_id,
+                req_index = %last_included_index,
+                local_applied = %self.last_applied(),
+                "Ignoring InstallSnapshot: Redundant/Stale Index"
+            );
+            return InstallSnapshotResult::stale(current_term);
+        }
+
+        // 3. High-level state transitions and demotions (§5.1)
+        if req_term > current_term {
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                old_term = %current_term,
+                new_term = %req_term,
+                remote_leader = %leader_id,
+                "Role Transition: -> Follower (Term Discovery via Snapshot)"
+            );
+            self.into_follower(req_term, Some(leader_id));
+        } else if req_term == current_term {
+            match &mut self.state {
+                RoleState::Candidate(_) => {
+                    info!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        remote_leader = %leader_id,
+                        "Role Transition: -> Follower (Leader Recognized via Snapshot)"
+                    );
+                    self.into_follower(req_term, Some(leader_id));
+                }
+                RoleState::Leader(_) => {
+                    error!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        term = %req_term,
+                        rival_leader = %leader_id,
+                        "CRITICAL SAFETY VIOLATION: Rival leader detected during snapshot. Halting node."
+                    );
+                    let msg = format!(
+                        "CRITICAL SAFETY VIOLATION: Rival leader {} detected for term {} during \
+                         snapshot. Halting node.",
+                        leader_id, req_term
+                    );
+                    self.apply_fatal(NodeError::Protocol(msg));
+                }
+                RoleState::Follower(node) => {
+                    node.state_mut().set_leader_id(Some(leader_id));
+                }
+                _ => {}
+            }
+        }
+
+        self.reset_heartbeat();
+
+        // In the non-blocking handoff, the logical node acknowledges the
+        // snapshot metadata. The ConsensusShell is responsible for executing
+        // the restoration tombstone protocol.
+        InstallSnapshotResult::accepted(self.current_term())
+    }
+
+    /// Returns true if a snapshot is currently being generated.
+    pub fn is_snapshotting(&self) -> bool {
+        self.is_snapshotting
+    }
+
+    pub fn log_store(&self) -> Arc<dyn LogStorage> {
+        match &self.state {
+            RoleState::Follower(n) => n.log_store().clone(),
+            RoleState::Candidate(n) => n.log_store().clone(),
+            RoleState::Leader(n) => n.log_store().clone(),
+            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
+        }
+    }
+
+    /// Toggles the Freeze-Apply state for snapshot generation.
+    pub fn set_snapshotting(&mut self, active: bool) {
+        self.is_snapshotting = active;
+        info!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            active,
+            "Freeze-Apply state toggled."
+        );
     }
 
     /// Processes an AppendEntries RPC.
@@ -518,8 +694,25 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     /// Updates the commit index.
+    ///
+    /// FREEZE-APPLY (ADR 011):
+    /// If a snapshot is in progress, this method only advances the logical
+    /// commit index without applying entries to the FSM.
     pub async fn advance_last_committed(&mut self, index: LogIndex) {
+        if self.is_snapshotting {
+            self.update_commit_index_only(index);
+            return;
+        }
+
         match delegate_async_to_inner!(self, advance_last_committed, index) {
+            Ok(_) => {}
+            Err(e) => self.apply_fatal(e),
+        }
+    }
+
+    /// Updates the commit index without triggering FSM application.
+    pub fn update_commit_index_only(&mut self, index: LogIndex) {
+        match delegate_mut_to_inner!(self, update_commit_index_only, index) {
             Ok(_) => {}
             Err(e) => self.apply_fatal(e),
         }
@@ -551,6 +744,27 @@ impl<S: StateMachine> LogicalNode<S> {
     pub fn last_log_term(&mut self) -> Term {
         match delegate_to_inner!(self, last_log_term) {
             Ok(t) => t,
+            Err(e) => self.apply_fatal(e),
+        }
+    }
+
+    pub fn last_included_index(&mut self) -> LogIndex {
+        match delegate_to_inner!(self, last_included_index) {
+            Ok(idx) => idx,
+            Err(e) => self.apply_fatal(e),
+        }
+    }
+
+    pub fn last_included_term(&mut self) -> Term {
+        match delegate_to_inner!(self, last_included_term) {
+            Ok(t) => t,
+            Err(e) => self.apply_fatal(e),
+        }
+    }
+
+    pub fn save_snapshot_metadata(&mut self, index: LogIndex, term: Term) {
+        match delegate_mut_to_inner!(self, save_snapshot_metadata, index, term) {
+            Ok(_) => {}
             Err(e) => self.apply_fatal(e),
         }
     }
@@ -678,6 +892,20 @@ impl<S: StateMachine> LogicalNode<S> {
         delegate_to_inner!(self, identity)
     }
 
+    pub fn fsm(&self) -> Arc<S> {
+        delegate_to_inner!(self, fsm)
+    }
+
+    /// Returns the high-level role of the logical node.
+    pub fn node_role(&self) -> NodeRole {
+        match &self.state {
+            RoleState::Follower(_) => NodeRole::Follower,
+            RoleState::Candidate(_) => NodeRole::Candidate,
+            RoleState::Leader(_) => NodeRole::Leader,
+            RoleState::Poisoned => NodeRole::Poisoned,
+        }
+    }
+
     pub fn last_committed(&self) -> LogIndex {
         delegate_to_inner!(self, last_committed)
     }
@@ -701,13 +929,15 @@ mod tests {
     use crate::tick::TickDuration;
 
     #[derive(Debug, Default)]
-    struct MockFsm;
+    struct MockFsm {
+        applied: u64,
+    }
     #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
         fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
-            Ok(LogIndex::ZERO)
+            Ok(LogIndex::new(self.applied))
         }
 
         async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
@@ -735,7 +965,7 @@ mod tests {
     }
 
     fn setup_node(node_id: u64) -> LogicalNode<MockFsm> {
-        let fsm = Arc::new(MockFsm);
+        let fsm = Arc::new(MockFsm::default());
         let storage = Arc::new(MemoryStorage::new());
         let thresholds = TickThresholds {
             heartbeat_interval: TickDuration::new(10),
@@ -744,6 +974,103 @@ mod tests {
         };
         let rng = StdRng::seed_from_u64(node_id);
         LogicalNode::try_new(test_identity(node_id), fsm, storage, thresholds, rng).unwrap()
+    }
+
+    mod handle_install_snapshot {
+        use super::*;
+
+        mod term_safety {
+            use super::*;
+
+            #[tokio::test]
+            async fn rejects_stale_term() {
+                let mut node = setup_node(1);
+                node.into_follower(Term::new(5), None);
+
+                let result = node.handle_install_snapshot(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(1),
+                    LogIndex::new(10),
+                );
+
+                assert_eq!(result, InstallSnapshotResult::rejected(Term::new(5)));
+                assert_eq!(node.current_term(), Term::new(5));
+            }
+
+            #[tokio::test]
+            async fn demotes_on_higher_term() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+                node.into_leader(vec![]);
+
+                let result = node.handle_install_snapshot(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(10),
+                    LogIndex::new(100),
+                );
+
+                assert_eq!(result, InstallSnapshotResult::accepted(Term::new(10)));
+                assert_eq!(node.current_term(), Term::new(10));
+                assert!(matches!(node.state, RoleState::Follower(_)));
+            }
+        }
+
+        mod horizon_safety {
+            use super::*;
+
+            #[tokio::test]
+            async fn rejects_stale_snapshot_index() {
+                let id = test_identity(1);
+                let storage = Arc::new(MemoryStorage::new());
+                // 1. Establish persistent horizon at 50
+                storage
+                    .save_snapshot_metadata(LogIndex::new(50), Term::new(1))
+                    .unwrap();
+                storage.save_last_committed(LogIndex::new(50)).unwrap();
+
+                // 2. State machine also at 50
+                let fsm = Arc::new(MockFsm { applied: 50 });
+
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+
+                // 3. Initialize node (recovers to 50)
+                let mut node = LogicalNode::try_new(id, fsm, storage, thresholds, rng).unwrap();
+
+                // 4. Verification: Snapshot for index 40 is stale
+                let result = node.handle_install_snapshot(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(1),
+                    LogIndex::new(40),
+                );
+
+                // Note: The node starts at Term 0, so the returned current_term in the stale
+                // result is 0
+                assert_eq!(result, InstallSnapshotResult::stale(Term::ZERO));
+            }
+        }
+
+        mod rival_leader_protection {
+            use super::*;
+
+            #[tokio::test]
+            #[should_panic(expected = "CRITICAL SAFETY VIOLATION")]
+            async fn halts_on_rival_leader_same_term() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+                node.into_leader(vec![]);
+
+                node.handle_install_snapshot(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(1),
+                    LogIndex::new(50),
+                );
+            }
+        }
     }
 
     mod handle_append_entries {
@@ -1021,7 +1348,7 @@ mod tests {
 
             #[test]
             fn reports_poisoned_state_accurately() {
-                let fsm = Arc::new(MockFsm);
+                let fsm = Arc::new(MockFsm::default());
                 let storage = Arc::new(MemoryStorage::new());
                 let thresholds = TickThresholds {
                     heartbeat_interval: TickDuration::new(10),
@@ -1047,7 +1374,7 @@ mod tests {
             #[test]
             #[should_panic(expected = "Halt Mandate: Node is poisoned")]
             fn panics_on_propose_when_poisoned() {
-                let fsm = Arc::new(MockFsm);
+                let fsm = Arc::new(MockFsm::default());
                 let storage = Arc::new(MemoryStorage::new());
                 let thresholds = TickThresholds {
                     heartbeat_interval: TickDuration::new(10),
@@ -1064,7 +1391,7 @@ mod tests {
             #[test]
             #[should_panic(expected = "Halt Mandate: Node is poisoned")]
             fn panics_on_accessing_poisoned_node() {
-                let fsm = Arc::new(MockFsm);
+                let fsm = Arc::new(MockFsm::default());
                 let storage = Arc::new(MemoryStorage::new());
                 let thresholds = TickThresholds {
                     heartbeat_interval: TickDuration::new(10),

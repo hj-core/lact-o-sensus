@@ -169,6 +169,30 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         self.identity.clone()
     }
 
+    pub fn fsm(&self) -> Arc<S> {
+        self.fsm.clone()
+    }
+
+    pub fn log_store(&self) -> &Arc<dyn LogStorage> {
+        &self.log_store
+    }
+
+    pub fn save_snapshot_metadata(&mut self, index: LogIndex, term: Term) -> Result<(), NodeError> {
+        self.log_store
+            .save_snapshot_metadata(index, term)
+            .map_err(NodeError::from)
+    }
+
+    pub fn last_included_index(&self) -> Result<LogIndex, NodeError> {
+        self.log_store
+            .last_included_index()
+            .map_err(NodeError::from)
+    }
+
+    pub fn last_included_term(&self) -> Result<Term, NodeError> {
+        self.log_store.last_included_term().map_err(NodeError::from)
+    }
+
     pub fn current_term(&self) -> Result<Term, NodeError> {
         self.log_store.current_term().map_err(NodeError::from)
     }
@@ -222,11 +246,6 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
             .read_entries(start, end)
             .map_err(NodeError::from)
     }
-
-    #[cfg(test)]
-    pub(crate) fn log_store(&self) -> &dyn LogStorage {
-        self.log_store.as_ref()
-    }
 }
 
 // --- Implementation: Shared Physical Mutations ---
@@ -275,6 +294,14 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         fields(index = %index)
     )]
     pub async fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
+        self.update_commit_index_only(index)?;
+        self.apply_to_state_machine().await?;
+        Ok(())
+    }
+
+    /// Persists and updates the commit index without triggering FSM
+    /// application. Used by the Freeze-Apply mechanism (ADR 011).
+    pub fn update_commit_index_only(&mut self, index: LogIndex) -> Result<(), NodeError> {
         if index < self.last_committed {
             debug!(
                 target: ClinicalTarget::RaftReplication.as_str(),
@@ -304,10 +331,8 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
             info!(
                 target: ClinicalTarget::RaftReplication.as_str(),
                 index = %index,
-                "Commit Index Advanced"
+                "Commit Index Advanced (Logical Only)"
             );
-
-            self.apply_to_state_machine().await?;
         }
         Ok(())
     }

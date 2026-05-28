@@ -174,6 +174,14 @@ pub fn spawn_tick_loop<S: StateMachine>(
                 // 1. Fixed-interval pulse
                 sleep(interval).await;
 
+                // Capture parent span for compaction telemetry (ADR 010).
+                // On the first iteration current_session is None, so we fall
+                // back to the tick loop's outer span.
+                let parent_span = current_session
+                    .as_ref()
+                    .map(|(s, _, _)| s.clone())
+                    .unwrap_or_else(tracing::Span::current);
+
                 // 2. Drive the logical engine and capture the required action
                 // Perform state transitions (Atomic Handoff) while holding the lock.
                 let (action, role_name, term, campaign, replication) = {
@@ -184,6 +192,11 @@ pub fn spawn_tick_loop<S: StateMachine>(
 
                     let mut campaign_params = None;
                     let mut replication_params = None;
+
+                    // COMPACTION TRIGGER (ADR 011)
+                    if should_compact_log(&mut guard, &config) {
+                        initiate_snapshot_generation(state.clone(), &parent_span);
+                    }
 
                     match action {
                         TickAction::StartElection => {
@@ -280,6 +293,25 @@ pub fn spawn_tick_loop<S: StateMachine>(
         }
         .instrument(span),
     );
+}
+
+/// Determines whether the log length exceeds the configured compaction
+/// threshold.
+///
+/// Returns true when the number of un-snapshotted entries exceeds
+/// `snapshot_threshold` and no snapshot is currently in progress.
+fn should_compact_log<S: StateMachine>(guard: &mut LogicalNode<S>, config: &Config) -> bool {
+    if guard.is_snapshotting() {
+        return false;
+    }
+
+    let last_idx = guard.last_log_index();
+    let last_snap = guard.last_included_index();
+    let log_length = (last_idx - last_snap.as_u64())
+        .map(|i| i.as_u64())
+        .unwrap_or(0);
+
+    log_length > config.raft.snapshot_threshold
 }
 
 // =============================================================================
@@ -395,6 +427,111 @@ async fn initiate_election<S: StateMachine>(
     }
 
     Ok(())
+}
+
+/// Triggers an asynchronous snapshot generation and log compaction cycle.
+///
+/// FREEZE-APPLY (ADR 011):
+/// This orchestrator ensures the State Machine is logically frozen by
+/// toggling the `is_snapshotting` flag in the engine, which prevents the
+/// `apply` pipeline from advancing during serialization.
+pub fn initiate_snapshot_generation<S: StateMachine>(
+    state: Arc<ConsensusShell<S>>,
+    parent_span: &tracing::Span,
+) {
+    let span = info_span!(
+        target: ClinicalTarget::RaftCompaction.as_str(),
+        parent: parent_span,
+        "compaction_cycle",
+    );
+
+    tokio::spawn(
+        async move {
+            // 1. Capture snapshot target and freeze application
+            let (fsm, index, term) = {
+                let mut guard = state.write().await;
+                guard.set_snapshotting(true);
+
+                // We snapshot up to the last applied index to ensure
+                // physical-to-logical alignment.
+                let index = guard.last_applied();
+                let term = guard.get_term_at(index);
+
+                (guard.fsm(), index, term)
+            };
+
+            info!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                index = %index,
+                "Snapshot generation started (FSM Frozen)."
+            );
+
+            // 2. Perform heavy serialization (Unlocked)
+            // ADR 011: Use tokio::task::spawn_blocking for heavy I/O
+            let res = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(fsm.snapshot())
+            })
+            .await;
+
+            // 3. Finalize and compact (Locked)
+            let mut guard = state.write().await;
+            guard.set_snapshotting(false);
+
+            match res {
+                Ok(Ok(_data)) => {
+                    // Log Truncation & Metadata update
+                    guard.save_snapshot_metadata(index, term);
+
+                    // We only truncate up to the index we just snapshotted.
+                    // This is offloaded to a background thread to preserve the tick loop.
+                    let log_store = match guard.state() {
+                        RoleState::Follower(n) => n.log_store().clone(),
+                        RoleState::Candidate(n) => n.log_store().clone(),
+                        RoleState::Leader(n) => n.log_store().clone(),
+                        RoleState::Poisoned => return, // Shell already panics
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = log_store.truncate_log_front(index) {
+                            error!(
+                                target: ClinicalTarget::RaftCompaction.as_str(),
+                                error = %e,
+                                "Log truncation failure!"
+                            );
+                        }
+                    });
+
+                    // CATCH UP: Apply any entries committed during the freeze.
+                    let commit_idx = guard.last_committed();
+                    guard.advance_last_committed(commit_idx).await;
+
+                    info!(
+                        target: ClinicalTarget::RaftCompaction.as_str(),
+                        index = %index,
+                        "Snapshot generation and compaction successful."
+                    );
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        target: ClinicalTarget::RaftCompaction.as_str(),
+                        error = %e,
+                        "FSM Snapshot serialization failed."
+                    );
+                    // Halt Mandate: serialization failure suggests unrecoverable DB state.
+                    guard.apply_fatal(NodeError::Protocol(format!("Snapshot failure: {}", e)));
+                }
+                Err(e) => {
+                    error!(
+                        target: ClinicalTarget::RaftCompaction.as_str(),
+                        error = %e,
+                        "Snapshot task panicked or failed to join."
+                    );
+                    guard.apply_fatal(NodeError::Protocol(format!("Snapshot task panic: {}", e)));
+                }
+            }
+        }
+        .instrument(span),
+    );
 }
 
 /// Evaluates a single vote response and determines the immediate state

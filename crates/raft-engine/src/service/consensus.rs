@@ -91,6 +91,33 @@ impl AppendParams {
     }
 }
 
+/// Encapsulates the fully validated and parsed parameters for an
+/// InstallSnapshot RPC.
+pub struct SnapshotParams {
+    pub leader_id: NodeId,
+    pub term: Term,
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    pub data: Vec<u8>,
+}
+
+impl SnapshotParams {
+    /// Translates raw Protobuf types into strict domain NewTypes.
+    fn try_from_proto(req: InstallSnapshotRequest) -> Result<Self, Status> {
+        let leader_id = req.leader_id.parse::<NodeId>().map_err(|_| {
+            Status::invalid_argument(format!("Invalid NodeId: '{}'", req.leader_id))
+        })?;
+
+        Ok(Self {
+            leader_id,
+            term: Term::new(req.term),
+            last_included_index: LogIndex::new(req.last_included_index),
+            last_included_term: Term::new(req.last_included_term),
+            data: req.data,
+        })
+    }
+}
+
 // =============================================================================
 // 2. Public Orchestrators (ConsensusDispatcher)
 // =============================================================================
@@ -251,9 +278,36 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
 
     async fn install_snapshot(
         &self,
-        _request: Request<InstallSnapshotRequest>,
+        request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        // 1. Extraction: Enforce TraceId presence and parse domain parameters.
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+        let params = SnapshotParams::try_from_proto(request.into_inner())?;
+
+        // 2. Instrumentation: Establish the clinical boundary.
+        let span = info_span!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            "install_snapshot",
+            cluster_id = %self.identity.cluster_id(),
+            node_id = %self.identity.node_id(),
+            trace_id = %trace_id,
+            term = %params.term,
+            index = %params.last_included_index,
+            sender_id = %params.leader_id
+        );
+
+        // 3. Execution: Delegate to the internal shell for non-blocking handoff.
+        let term = self
+            .state
+            .handle_install_snapshot(params)
+            .instrument(span)
+            .await?;
+
+        // 4. Construction: Build the response and inject telemetry feedback.
+        let mut response = Response::new(InstallSnapshotResponse::new(term.as_u64()));
+        TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
+
+        Ok(response)
     }
 }
 
@@ -844,20 +898,47 @@ mod tests {
             use super::*;
 
             #[tokio::test]
-            async fn should_return_unimplemented_status_when_called() {
+            async fn should_return_current_term_on_success() {
                 let dispatcher = mock_dispatcher();
                 let request = make_request(InstallSnapshotRequest {
-                    term: 1,
+                    term: 1, // Follower starts at 0, so 1 is valid
                     leader_id: "2".to_string(),
                     last_included_index: 100,
                     last_included_term: 1,
                     data: vec![1, 2, 3],
                 });
 
-                let response = dispatcher.install_snapshot(request).await;
+                let response = dispatcher
+                    .install_snapshot(request)
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(response.term, 1);
+            }
 
-                assert!(response.is_err());
-                assert_eq!(response.unwrap_err().code(), tonic::Code::Unimplemented);
+            #[tokio::test]
+            async fn should_reject_stale_term() {
+                let dispatcher = mock_dispatcher();
+                // Pre-discovery higher term
+                {
+                    let mut guard = dispatcher.state.write().await;
+                    guard.into_follower(Term::new(5), None);
+                }
+
+                let request = make_request(InstallSnapshotRequest {
+                    term: 1, // Stale term
+                    leader_id: "2".to_string(),
+                    last_included_index: 100,
+                    last_included_term: 1,
+                    data: vec![1, 2, 3],
+                });
+
+                let response = dispatcher
+                    .install_snapshot(request)
+                    .await
+                    .unwrap()
+                    .into_inner();
+                assert_eq!(response.term, 5);
             }
         }
     }

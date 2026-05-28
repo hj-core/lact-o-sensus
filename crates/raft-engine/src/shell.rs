@@ -3,16 +3,20 @@ use std::ops::DerefMut;
 use std::sync::Arc;
 
 use common::raft_api::StateMachine;
+use common::types::Term;
 use common::types::errors::ConsensusError;
+use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::RwLockWriteGuard;
 use tokio::sync::watch;
+use tonic::Status;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
+use tracing::info;
 use tracing::info_span;
 use tracing::instrument;
 
@@ -22,7 +26,9 @@ use crate::consensus::initiate_replication;
 use crate::engine::ConsensusProgress;
 use crate::engine::LogicalNode;
 use crate::engine::NodeRole;
+use crate::engine::SnapshotAction;
 use crate::peer::PeerManager;
+use crate::service::consensus::SnapshotParams;
 
 /// The Imperative Shell for consensus signaling.
 ///
@@ -73,6 +79,87 @@ impl<S: StateMachine> ConsensusShell<S> {
     /// Provides a new subscription to the consensus progress stream.
     pub fn subscribe(&self) -> watch::Receiver<ConsensusProgress> {
         self.progress_tx.subscribe()
+    }
+
+    /// Orchestrates an InstallSnapshot request using a Non-Blocking Handoff.
+    ///
+    /// PHASE 1 (Locked): Validation and logical coordination.
+    /// PHASE 2 (Unlocked): Offloaded background state machine restoration.
+    /// PHASE 3 (Locked): Finalization and Freeze-Apply toggle.
+    #[instrument(
+        name = "shell_handle_install_snapshot",
+        target = "raft::compaction",
+        skip_all
+    )]
+    pub async fn handle_install_snapshot(
+        self: &Arc<Self>,
+        params: SnapshotParams,
+    ) -> Result<Term, Status> {
+        // Phase 1: Lock & Validate
+        let (action, current_term, fsm) = {
+            let mut guard = self.write().await;
+            let res = guard.handle_install_snapshot(
+                params.leader_id,
+                params.term,
+                params.last_included_index,
+            );
+
+            match res.action {
+                SnapshotAction::Rejected => return Ok(res.term),
+                SnapshotAction::Stale => return Ok(res.term),
+                SnapshotAction::Accepted => {}
+            }
+
+            // Snapshot Accepted: Set Freeze-Apply state
+            guard.set_snapshotting(true);
+            (res.action, res.term, guard.fsm())
+        };
+
+        // Phase 2: Background restoration (Unlocked)
+        if action == SnapshotAction::Accepted {
+            let shell_clone = self.clone();
+            let index = params.last_included_index;
+            let term = params.last_included_term;
+            let data = params.data;
+
+            // ADR 011: Use spawn_blocking for heavy FSM I/O to preserve the tick loop
+            tokio::task::spawn_blocking(move || {
+                let span = info_span!(
+                    target: ClinicalTarget::RaftCompaction.as_str(),
+                    "background_snapshot_install",
+                    index = %index
+                );
+                let _enter = span.enter();
+
+                info!("Starting background snapshot installation...");
+
+                let rt = tokio::runtime::Handle::current();
+                let res = rt.block_on(fsm.install_snapshot(index, &data));
+
+                // Phase 3: Lock & Finalize
+                rt.block_on(async move {
+                    let mut guard = shell_clone.write().await;
+                    guard.set_snapshotting(false);
+
+                    match res {
+                        Ok(_) => {
+                            info!(index = %index, "Background snapshot installation complete.");
+                            guard.save_snapshot_metadata(index, term);
+                            guard.update_commit_index_only(index);
+                        }
+                        Err(e) => {
+                            error!(index = %index, error = %e, "FATAL: Snapshot installation failed.");
+                            guard.apply_fatal(NodeError::Protocol(format!(
+                                "Background snapshot restoration failure: {}",
+                                e
+                            )));
+                        }
+                    }
+                });
+            });
+        }
+
+        Ok(current_term)
     }
 
     /// Performs a network-bound quorum check to verify leadership (§8).
@@ -429,6 +516,100 @@ mod tests {
 
                 let result = task.await.unwrap();
                 assert!(matches!(result, Err(ConsensusError::NotLeader)));
+            }
+        }
+    }
+
+    mod handle_install_snapshot {
+        use common::raft_api::StateMachine;
+        use tokio::sync::Barrier;
+
+        use super::*;
+
+        #[derive(Debug)]
+        struct MockDelayedFsm {
+            barrier: Arc<Barrier>,
+        }
+
+        #[async_trait::async_trait]
+        impl StateMachine for MockDelayedFsm {
+            type Error = FsmError;
+
+            fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+                Ok(LogIndex::ZERO)
+            }
+
+            async fn apply(&self, _idx: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                Ok(vec![])
+            }
+
+            async fn install_snapshot(
+                &self,
+                _idx: LogIndex,
+                _data: &[u8],
+            ) -> Result<(), Self::Error> {
+                // BLOCK here until the test signals we can continue
+                self.barrier.wait().await;
+                Ok(())
+            }
+        }
+
+        mod non_blocking_behavior {
+            use super::*;
+            use crate::engine::TickAction;
+
+            #[tokio::test]
+            async fn tick_loop_continues_during_heavy_restoration() {
+                let barrier = Arc::new(Barrier::new(2));
+                let fsm = Arc::new(MockDelayedFsm {
+                    barrier: barrier.clone(),
+                });
+
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = rand::rngs::StdRng::seed_from_u64(1);
+                let node = LogicalNode::try_new(id, fsm, storage, thresholds, rng).unwrap();
+                let shell = Arc::new(ConsensusShell::new(node));
+
+                let params = SnapshotParams {
+                    leader_id: NodeId::try_new(2).unwrap(),
+                    term: Term::new(1),
+                    last_included_index: LogIndex::new(100),
+                    last_included_term: Term::new(1),
+                    data: vec![1, 2, 3],
+                };
+
+                // 1. Trigger heavy restoration (which will block on the barrier in a background
+                //    task)
+                shell.handle_install_snapshot(params).await.unwrap();
+
+                // 2. Verify we can immediately acquire the lock and perform a tick.
+                // If it were blocking, we'd be stuck here because the background task
+                // would still be holding some resource or the shell would be in a blocked
+                // state.
+                let mut guard = shell.write().await;
+                let action = guard.tick();
+
+                // 3. Confirm the tick occurred (proving the shell is alive and responsive)
+                assert!(matches!(
+                    action,
+                    TickAction::None | TickAction::StartElection
+                ));
+
+                // 4. Release the background task so the test can exit cleanly
+                barrier.wait().await;
             }
         }
     }
