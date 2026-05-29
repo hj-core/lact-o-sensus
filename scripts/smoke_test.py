@@ -2,13 +2,15 @@
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Callable
+from typing import Dict, Optional, Tuple, Callable, List
 
 from cluster_harness import (
+    NodeConfig,
     NODES,
     ClusterManager,
     wait_for_leader,
@@ -31,6 +33,9 @@ from cluster_harness import (
 # Lact-O-Sensus: Consensus Verification Suite
 # Verifies the Raft "Consensus Heart" and AI Egress logic via isolated test cases.
 
+TMP_CONFIG_DIR = ".tmp_smoke_configs"
+
+
 # --- 1. Clinical Specifications (Test Cases) ---
 
 
@@ -41,6 +46,15 @@ class TestCase:
     name: str
     veto_mode: VetoMode
     func: Callable[[ClusterManager], None]
+    setup: Optional[Callable[[List[NodeConfig]], None]] = None
+
+
+def setup_snapshot_threshold(nodes: List[NodeConfig]) -> None:
+    """Specialized setup to force frequent log compaction."""
+    print("Action: Configuring snapshot_threshold = 20...")
+    for node in nodes:
+        with open(node["config"], "a", encoding="utf-8") as f:
+            f.write("\n[raft]\nsnapshot_threshold = 20\n")
 
 
 def test_leader_election(cluster: ClusterManager) -> None:
@@ -65,7 +79,8 @@ def test_leader_failover(cluster: ClusterManager) -> None:
     base_count = count_elections(cluster)
 
     log_offsets = {
-        n["id"]: (os.path.getsize(n["log"]) if os.path.exists(n["log"]) else 0) for n in NODES
+        n["id"]: (os.path.getsize(n["log"]) if os.path.exists(n["log"]) else 0)
+        for n in cluster.nodes
     }
     kill_time = cluster.kill_node(leader_id)
 
@@ -73,7 +88,7 @@ def test_leader_failover(cluster: ClusterManager) -> None:
 
     def new_leader_elected() -> Optional[Tuple[int, int]]:
         if count_elections(cluster) > base_count:
-            for node in NODES:
+            for node in cluster.nodes:
                 if node["id"] == leader_id:
                     continue
                 for line in get_complete_lines(node["log"], log_offsets.get(node["id"], 0)):
@@ -89,7 +104,9 @@ def test_leader_failover(cluster: ClusterManager) -> None:
 def test_identity_guard(cluster: ClusterManager) -> None:
     """Verifies that the Identity Guard (ADR 004) rejects unauthorized cluster IDs."""
     wait_for_leader(cluster)
-    if check_connectivity(1, 50051, cluster_id="wrong-cluster"):
+    # Use the first node in the dynamic cluster for the check
+    node = cluster.nodes[0]
+    if check_connectivity(node["id"], node["port"], cluster_id="wrong-cluster"):
         print("SUCCESS: Identity Guard correctly rejected unauthorized request.")
     else:
         raise RuntimeError("Identity Guard failed to reject unauthorized request.")
@@ -98,7 +115,7 @@ def test_identity_guard(cluster: ClusterManager) -> None:
 def test_ai_veto_egress(cluster: ClusterManager) -> None:
     """Verifies that the Leader can successfully call out to the AI Veto Node."""
     leader_id = wait_for_leader(cluster)
-    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+    leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
     item = Registry.TEST_ITEMS["MILK"]
 
     print(f"Action: Sending mutation to Leader (Node {leader_id}) on port {leader_port}...")
@@ -140,7 +157,7 @@ def test_ai_veto_egress(cluster: ClusterManager) -> None:
 def test_smart_client_success(cluster: ClusterManager) -> None:
     """Verifies that valid input is successfully committed and converged."""
     leader_id = wait_for_leader(cluster)
-    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
+    follower_port = next(n["port"] for n in cluster.nodes if n["id"] != leader_id)
     item = Registry.TEST_ITEMS["WATER"]
 
     print(f"Action: Sending VALID mutation ({item['key']})...")
@@ -160,7 +177,7 @@ def test_smart_client_success(cluster: ClusterManager) -> None:
 def test_smart_client_veto(cluster: ClusterManager) -> None:
     """Verifies that invalid input is correctly VETOED and converged."""
     leader_id = wait_for_leader(cluster)
-    follower_port = next(n["port"] for n in NODES if n["id"] != leader_id)
+    follower_port = next(n["port"] for n in cluster.nodes if n["id"] != leader_id)
     item = Registry.TEST_ITEMS["CIGARETTES"]
 
     print(f"Action: Sending INVALID mutation ({item['key']})...")
@@ -180,8 +197,8 @@ def test_smart_client_veto(cluster: ClusterManager) -> None:
 def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
     """Verifies that a non-leader node rejects query_state directly."""
     leader_id = wait_for_leader(cluster)
-    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
-    follower_port = next(n["port"] for n in NODES if n["id"] == follower_id)
+    follower_id = next(n["id"] for n in cluster.nodes if n["id"] != leader_id)
+    follower_port = next(n["port"] for n in cluster.nodes if n["id"] == follower_id)
 
     print(f"Action: Probing FOLLOWER (Node {follower_id}) for query_state...")
     cmd = [
@@ -204,7 +221,7 @@ def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
     try:
         response = json.loads(res.stdout)
         leader_hint = response.get("leaderHint")
-        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+        leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
         if (
             response.get("status") == "QUERY_STATUS_REJECTED"
             and leader_hint == f"http://127.0.0.1:{leader_port}"
@@ -219,7 +236,7 @@ def test_linearizable_query_rejection(cluster: ClusterManager) -> None:
 def test_persistence_restart(cluster: ClusterManager) -> None:
     """Verifies that inventory state survives a total cluster shutdown."""
     leader_id = wait_for_leader(cluster)
-    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+    leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
     item = Registry.TEST_ITEMS["APPLE"]
 
     print(f"Action: Adding test item ({item['key']})...")
@@ -236,7 +253,7 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
     cluster.start_all(veto_mode=VetoMode.REAL, wipe_data=False)
 
     new_leader_id = wait_for_leader(cluster)
-    new_leader_port = next(n["port"] for n in NODES if n["id"] == new_leader_id)
+    new_leader_port = next(n["port"] for n in cluster.nodes if n["id"] == new_leader_id)
     output = run_client_command(f"query {item['key']}", new_leader_port)
 
     if item["key"] in output.lower() and f"1 {item['unit']}" in output:
@@ -248,8 +265,8 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
 def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     """Verifies that a node can recover FSM state from log when FSM data is lost."""
     leader_id = wait_for_leader(cluster)
-    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
-    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+    follower_id = next(n["id"] for n in cluster.nodes if n["id"] != leader_id)
+    leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
     item = Registry.TEST_ITEMS["MILK"]
 
     run_client_command(f'add "{item["key"]}" 1 {item["unit"]} {item["category"]}', leader_port)
@@ -260,7 +277,7 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
     verify_convergence(cluster, version, "Committed")
 
     cluster.kill_node(follower_id)
-    log_path = next(n["log"] for n in NODES if n["id"] == follower_id)
+    log_path = next(n["log"] for n in cluster.nodes if n["id"] == follower_id)
     log_offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
 
     cluster.wipe_node_fsm(follower_id)
@@ -283,7 +300,7 @@ def test_cold_boot_recovery(cluster: ClusterManager) -> None:
 def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
     """Verify that queries block until the requested state version is reached."""
     leader_id = wait_for_leader(cluster)
-    leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+    leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
     item = Registry.TEST_ITEMS["BANANA"]
 
     output = run_client_command(
@@ -307,17 +324,9 @@ def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
 
 def test_snapshot_installation(cluster: ClusterManager) -> None:
     """Verifies that a lagging follower is caught up via InstallSnapshot."""
-    # 1. Setup artificially low threshold
-    print("Action: Configuring snapshot_threshold = 20...")
-    for node in NODES:
-        with open(node["config"], "a", encoding="utf-8") as f:
-            f.write("\n[raft]\nsnapshot_threshold = 20\n")
-
-    # 2. Restart cluster in MOCK mode to cross the threshold fast
-    cluster.cleanup()
-    cluster.start_all(veto_mode=VetoMode.MOCK, wipe_data=True)
+    # 1. Cluster is already started by main loop with the correct threshold
     leader_id = wait_for_leader(cluster)
-    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
+    follower_id = next(n["id"] for n in cluster.nodes if n["id"] != leader_id)
 
     print(f"Action: Partitioning Node {follower_id}...")
     cluster.kill_node(follower_id)
@@ -339,7 +348,7 @@ def test_snapshot_installation(cluster: ClusterManager) -> None:
     cluster.start_node(follower_id, wipe_data=False)
 
     # 3. Verification: Semantic Query
-    follower_port = next(n["port"] for n in NODES if n["id"] == follower_id)
+    follower_port = next(n["port"] for n in cluster.nodes if n["id"] == follower_id)
 
     def check_catchup() -> bool:
         try:
@@ -366,7 +375,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
     try:
         for i in range(1, 4):
             time.sleep(3)  # Let mutations flow
-            victim_id = random.choice([n["id"] for n in NODES])
+            victim_id = random.choice([n["id"] for n in cluster.nodes])
             print(f"\n--- Chaos Round {i}: Targeting Node {victim_id} ---")
             cluster.kill_node(victim_id)
             cluster.start_node(victim_id, wipe_data=False)
@@ -379,7 +388,7 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
 
         time.sleep(1)  # Final settlement
         leader_id = wait_for_leader(cluster)
-        leader_port = next(n["port"] for n in NODES if n["id"] == leader_id)
+        leader_port = next(n["port"] for n in cluster.nodes if n["id"] == leader_id)
         output = run_client_command("query", leader_port)
 
         missing = [
@@ -398,7 +407,44 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         flooder.stop()
 
 
-# --- 2. Main Runner ---
+# --- 2. Orchestration Helpers ---
+
+
+def prepare_test_configs(templates: Dict[int, str]) -> List[NodeConfig]:
+    """Creates fresh configuration files from templates in the shared temp directory."""
+    os.makedirs(TMP_CONFIG_DIR, exist_ok=True)
+
+    dynamic_nodes = []
+    for n in NODES:
+        conf_path = os.path.join(TMP_CONFIG_DIR, f"node_{n['id']}.toml")
+        with open(conf_path, "w", encoding="utf-8") as f:
+            f.write(templates[n["id"]])
+
+        dn = n.copy()
+        dn["config"] = conf_path
+        dynamic_nodes.append(dn)
+    return dynamic_nodes
+
+
+def run_single_test(test: TestCase, dynamic_nodes: List[NodeConfig]) -> bool:
+    """Orchestrates the lifecycle of a single clinical test case."""
+    if test.setup:
+        test.setup(dynamic_nodes)
+
+    cluster = ClusterManager(dynamic_nodes)
+    try:
+        cluster.start_all(veto_mode=test.veto_mode, wipe_data=True)
+        test.func(cluster)
+        return True
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"RESULT: FAILED -> {e}")
+        print_cluster_logs(dynamic_nodes)
+        return False
+    finally:
+        cluster.cleanup()
+
+
+# --- 3. Main Runner ---
 
 
 def main() -> None:
@@ -421,50 +467,42 @@ def main() -> None:
             "Inventory Durability (Restart Recovery)", VetoMode.REAL, test_persistence_restart
         ),
         TestCase("Cold-Boot Recovery (Log Replay)", VetoMode.REAL, test_cold_boot_recovery),
-        TestCase("Snapshot Installation", VetoMode.MOCK, test_snapshot_installation),
+        TestCase(
+            "Snapshot Installation",
+            VetoMode.MOCK,
+            test_snapshot_installation,
+            setup=setup_snapshot_threshold,
+        ),
         TestCase("Read-Your-Writes Consistency", VetoMode.REAL, test_read_your_writes_consistency),
         TestCase("Replication Chaos Audit", VetoMode.REAL, test_replication_chaos),
     ]
 
-    # Preserve original configs for restoration after tests
-    original_configs = {n["config"]: open(n["config"], "r", encoding="utf-8").read() for n in NODES}
+    # Pre-load config templates to ensure immutability
+    templates = {n["id"]: open(n["config"], "r", encoding="utf-8").read() for n in NODES}
 
-    passed = 0
-    total_run = 0
+    if os.path.exists(TMP_CONFIG_DIR):
+        shutil.rmtree(TMP_CONFIG_DIR)
+
+    passed, total_run = 0, 0
     try:
         for test in tests:
             if filter_arg and filter_arg not in test.name.lower():
                 continue
+
             total_run += 1
             print(f"\n[TEST] {test.name}")
 
-            # Clean start for every test
-            cluster = ClusterManager()
-            try:
-                # Specialized handling for snapshot test which manages its own start_all
-                if test.name == "Snapshot Installation":
-                    test.func(cluster)
-                else:
-                    cluster.start_all(veto_mode=test.veto_mode, wipe_data=True)
-                    test.func(cluster)
-
+            dynamic_nodes = prepare_test_configs(templates)
+            if run_single_test(test, dynamic_nodes):
                 passed += 1
-            except Exception as e:  # pylint: disable=broad-exception-caught
-                print(f"RESULT: FAILED -> {e}")
-                print_cluster_logs()
+            else:
                 break
-            finally:
-                cluster.cleanup()
-                # Restoration of config files between tests to prevent pollution
-                for path, content in original_configs.items():
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(content)
-                time.sleep(0.5)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nRESULT: ABORTED by user.")
     finally:
-        # Final safety restoration
-        for path, content in original_configs.items():
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+        # Note: Forensics are preserved in TMP_CONFIG_DIR (Rule 15).
+        pass
 
     print(f"\n=== Final Result: {passed}/{total_run} Tests Passed ===")
     if not filter_arg and passed < total_run:

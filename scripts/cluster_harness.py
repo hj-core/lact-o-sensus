@@ -208,7 +208,9 @@ class MutationFlooder(threading.Thread):
         item_name = self._generate_item_name()
 
         # Select a random living node as the seed to avoid stale connections
-        living_ports = [n["port"] for n in NODES if self.cluster.check_node_alive(n["id"])]
+        living_ports = [
+            n["port"] for n in self.cluster.nodes if self.cluster.check_node_alive(n["id"])
+        ]
         if not living_ports:
             time.sleep(0.5)
             return
@@ -238,9 +240,10 @@ class MutationFlooder(threading.Thread):
 class LogRegistry:
     """Manages in-memory log lines and disk offsets for the cluster."""
 
-    def __init__(self):
-        self.node_logs: Dict[int, List[str]] = {n["id"]: [] for n in NODES}
-        self.node_offsets: Dict[int, int] = {n["id"]: 0 for n in NODES}
+    def __init__(self, nodes: List[NodeConfig]):
+        self.nodes = nodes
+        self.node_logs: Dict[int, List[str]] = {n["id"]: [] for n in nodes}
+        self.node_offsets: Dict[int, int] = {n["id"]: 0 for n in nodes}
 
     def reset_node(self, node_id: int):
         self.node_logs[node_id] = []
@@ -248,7 +251,7 @@ class LogRegistry:
 
     def refresh(self):
         """Surgically reads new lines from all node logs."""
-        for node in NODES:
+        for node in self.nodes:
             self._refresh_node(node["id"], node["log"])
 
     def _refresh_node(self, nid: int, path: str):
@@ -266,12 +269,13 @@ class LogRegistry:
 class ClusterManager:
     """Orchestrator for local cluster lifecycle and diagnostic operations."""
 
-    def __init__(self) -> None:
+    def __init__(self, nodes: List[NodeConfig]) -> None:
+        self.nodes = nodes
         self.processes: Dict[int, subprocess.Popen] = {}
         self.log_files: Dict[int, IO] = {}
         self.veto_process: Optional[subprocess.Popen] = None
         self.veto_log: Optional[IO] = None
-        self.logs = LogRegistry()
+        self.logs = LogRegistry(nodes)
 
     # --- Lifecycle API ---
 
@@ -280,13 +284,13 @@ class ClusterManager:
         print(f"--- Starting cluster (Veto Mode: {veto_mode.name}, Wipe: {wipe_data}) ---")
         if veto_mode != VetoMode.DISABLED:
             self._start_veto_node(veto_mode)
-        for node in NODES:
+        for node in self.nodes:
             self.start_node(node["id"], wipe_data=wipe_data)
         self._wait_for_initialization(veto_mode)
 
     def start_node(self, node_id: int, wipe_data: bool = False) -> None:
         """Starts or restarts a specific Raft node."""
-        node = next(n for n in NODES if n["id"] == node_id)
+        node = next(n for n in self.nodes if n["id"] == node_id)
         if wipe_data:
             self._wipe_node_data(node_id)
 
@@ -368,7 +372,7 @@ class ClusterManager:
 
     def _wait_for_initialization(self, veto_mode: VetoMode):
         print("Action: Waiting for nodes to initialize...")
-        for node in NODES:
+        for node in self.nodes:
             poll_until(
                 lambda n=node: self.check_node_alive(n["id"]),
                 timeout=5,
@@ -377,7 +381,10 @@ class ClusterManager:
 
         if veto_mode != VetoMode.DISABLED:
             timeout = 60 if veto_mode == VetoMode.REAL else 30
-            print(f"Action: Waiting for AI Veto Node ({veto_mode.name}) to listen on port {VETO_PORT}...")
+            print(
+                f"Action: Waiting for AI Veto Node ({veto_mode.name})"
+                f"to listen on port {VETO_PORT}..."
+            )
             poll_until(
                 lambda: self._is_port_listening(VETO_PORT),
                 timeout=timeout,
@@ -391,7 +398,7 @@ class ClusterManager:
             return s.connect_ex(("127.0.0.1", port)) == 0
 
     def _wipe_node_data(self, node_id: int):
-        node = next(n for n in NODES if n["id"] == node_id)
+        node = next(n for n in self.nodes if n["id"] == node_id)
         if os.path.exists(node["log"]):
             os.remove(node["log"])
         self.logs.reset_node(node_id)
@@ -587,9 +594,9 @@ def extract_version(output: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-def print_cluster_logs(lines: int = 5) -> None:
+def print_cluster_logs(nodes: List[NodeConfig], lines: int = 5) -> None:
     print(f"\n--- Diagnostic Tail (Last {lines} lines) ---")
-    for n in NODES:
+    for n in nodes:
         if os.path.exists(n["log"]):
             print(f"\n--- Node {n['id']} ---")
             subprocess.run(["tail", "-n", str(lines), n["log"]], check=False)

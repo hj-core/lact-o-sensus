@@ -3,4 +3,5 @@ data/
 *.log
 .client_wal
 .tmp/
+.tmp_smoke_configs/
 __pycache__
