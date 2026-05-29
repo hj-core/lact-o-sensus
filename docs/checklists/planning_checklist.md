@@ -1,34 +1,89 @@
 # Lact-O-Sensus Implementation Planning Checklist
 
-This checklist defines the mandatory structure and quality standards for all implementation plans regarding major features or refactoring. Plans must be approved before any code is modified.
+## Instruction to the Planning LLM
 
-## 1. Task (Commit) Atomicity
+You will generate a directional, highly detailed engineering plan for a specific development phase or major feature. First, read this checklist completely. Every implementation plan you generate must strictly adhere to the requirements under these sections. For your output, structure the phase plan around these rules and explicitly cite the Rule IDs (e.g., `[EXEC-01]`, `[BDD-02]`) to prove compliance.
 
-- Every task in the plan must map directly to exactly **one atomic git commit**.
-- Each task should target a single logical change (ideally < 300 lines).
-- Tasks should be ordered foundationally (e.g., `common` -> `engine` -> `fsm`).
+---
 
-## 2. Task Detail Requirements
+## 1. Task Atomicity & Execution Sequence [EXEC]
 
-For every task (commit) in the plan, the following fields must be explicitly defined:
+### [EXEC-01] Atomic Task Chunking
 
-- **Goal**: A clear, concise statement of the clinical outcome of this commit.
-- **Affected Files**: A comprehensive list of files to be created or modified.
-- **Major Steps**: The specific implementation actions required.
-- **Acceptance Tests**:
-  - Specific new BDD-style test cases to be implemented.
-  - Identification of existing tests that must be modified to reflect new behavior.
-  - Expected "Green" state criteria.
-- **Consequences**: Impact on downstream components, architectural invariants, or public contracts.
-- **Caveats**: Known risks, assumptions, or transient state inconsistencies introduced by this commit.
+- **Target Scope**: Commit Structure
+- **Severity**: CRITICAL
+- **DO**: Map every task in the plan directly to exactly **one atomic git commit**. Design each task to target a single logical change (ideally < 300 lines of code).
+- **DO NOT**: Outline sprawling, multi-objective tasks that combine unrelated structural changes or violate atomic commit principles.
 
-## 3. Verification & Standards
+### [EXEC-02] Foundational Ordering
 
-- Every task must explicitly include running the full project-specific verification sequence (`fmt`, `test`, `clippy`, `smoke_test`).
-- Every task must include a draft commit message (e.g., `feat(raft): implement pre-vote handler`).
-- Every task must follow the orchestration pattern (delegating to sub-functions).
+- **Target Scope**: Implementation Sequence
+- **Severity**: STYLE
+- **DO**: Order tasks foundationally, building from inner architectural layers outward (e.g., `common` -> `raft-engine` -> `lacto-fsm` -> `gateway`).
+- **DO NOT**: Plan external delivery interfaces before defining, verifying, and testing the underlying domain contracts and consensus mechanisms.
 
-## 4. BDD Alignment
+---
 
-- The plan should ensure that new behaviors are defined via failing tests (Red) before implementation (Green).
-- The test structure should follow the mandatory nested module hierarchy.
+## 2. Task Detail Requirements [DETAIL]
+
+### [DETAIL-01] Comprehensive Task Specification
+
+- **Target Scope**: Task Definitions
+- **Severity**: CRITICAL
+- **DO**: Explicitly define the following fields for every task:
+  - **Goal**: A clear, concise statement of the clinical outcome.
+  - **Affected Files**: A comprehensive list of files to be created or modified.
+  - **Major Steps**: Specific implementation actions required.
+  - **Consequences**: Impact on downstream components, architectural invariants, or public contracts.
+  - **Caveats**: Known risks, assumptions, or transient state inconsistencies introduced.
+- **DO NOT**: Leave task definitions vague or omit the analysis of downstream consequences and architectural risks.
+
+---
+
+## 3. Verification & Clinical Standards [VERIFY]
+
+### [VERIFY-01] Mandatory CI Pipeline
+
+- **Target Scope**: Task Verification
+- **Severity**: CRITICAL
+- **DO**: Explicitly include the execution of the full clinical verification sequence (`cargo +nightly fmt`, `cargo test`, `cargo clippy`, `python3 scripts/smoke_test.py`) as a mandatory final step for every task.
+- **DO NOT**: Assume code correctness without running the established automated clinical checks.
+
+### [VERIFY-02] Draft Commit Messaging
+
+- **Target Scope**: Task Completion
+- **Severity**: WARNING
+- **DO**: Provide a draft Conventional Commit message (e.g., `feat(raft): implement pre-vote handler`) for each task.
+- **DO NOT**: Leave the git commit strategy ambiguous or unformatted.
+
+### [VERIFY-03] Orchestration Pattern
+
+- **Target Scope**: Implementation Strategy
+- **Severity**: WARNING
+- **DO**: Design tasks so that major functions follow the orchestration pattern, delegating implementation details to specialized sub-functions.
+- **DO NOT**: Plan monolithic functions that pack dense procedural logic into a single scope.
+
+---
+
+## 4. Behavior-Driven Development (BDD) Alignment [BDD]
+
+### [BDD-01] Red-Green Protocol
+
+- **Target Scope**: Testing Strategy
+- **Severity**: CRITICAL
+- **DO**: Plan to define new behaviors via failing tests (Red) _before_ implementing the structural solution (Green).
+- **DO NOT**: Defer test creation until after the feature logic is already written.
+
+### [BDD-02] Test Detail Matrix
+
+- **Target Scope**: Acceptance Tests
+- **Severity**: CRITICAL
+- **DO**: Specify the exact new BDD-style test cases to be implemented, identify existing tests that must be modified to reflect new behavior, and define the criteria for a "Green" state.
+- **DO NOT**: Provide generic testing goals like "write tests for this feature" without identifying the specific behavioral scenarios.
+
+### [BDD-03] Hierarchical Test Structure
+
+- **Target Scope**: Test Organization
+- **Severity**: WARNING
+- **DO**: Ensure planned test structures follow the mandatory nested BDD-style module hierarchy (`Target Method -> Specific Behavioral Scenario -> Expected Outcome Condition`).
+- **DO NOT**: Structure planned tests as flat, unorganized lists of independent statements.
