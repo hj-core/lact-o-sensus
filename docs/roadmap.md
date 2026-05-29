@@ -83,16 +83,18 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - **The Halt Mandate:** Implement the **Poison-then-Panic** sequence (ADR 009) to prevent "Zombie Node" behavior during state machine or session table divergence.
 - **Success Metric:** Idempotent recovery from the log with 100% linearizability and zero internal state disclosure in error responses.
 
-## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting) [IN PROGRESS]
+## 💾 Phase 7: The "Endless" Log (Log Compaction & Snapshotting) [DONE]
 
 - **Goal:** Implement state machine snapshots to manage log growth and accelerate recovery.
 - **Key Actions:**
   - Implement State Machine serialization and `InstallSnapshot` RPC.
   - Implement log truncation logic once a snapshot is persisted.
+  - **Asynchronous Offloading:** Implement ADR 011 to offload heavy I/O to background tasks, preserving heartbeat stability.
+  - **Restoration Tombstone:** Implement crash-safe state restoration protocol.
   - Verify: A new node can catch up to the cluster using a snapshot.
-- **Success Metric:** Successful log truncation and snapshot-based peer synchronization.
+- **Success Metric:** Successful log truncation and snapshot-based peer synchronization verified via deterministic smoke tests.
 
-## 🛡️ Phase 8: Pre-Vote Integrity (Election Safety)
+## 🛡️ Phase 8: Pre-Vote Integrity (Election Safety) [IN PROGRESS]
 
 - **Goal:** Implement the Pre-Vote phase to prevent disruptive elections from partitioned nodes.
 - **Key Actions:**
