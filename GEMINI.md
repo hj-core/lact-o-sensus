@@ -18,17 +18,17 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 
 ## 3. Architectural Decision Records
 
-- **3.1. Node Failure Model (ADR 001):** Implements a Crash-Recovery (CR) model for cluster nodes and treats the AI Veto as a Byzantine Oracle to preserve cluster determinism.
-- **3.2. Network Topology (ADR 002):** Enforces a Leader-Centric Hub-and-Spoke model for external interactions and a Full-Mesh for internal consensus.
+- **3.1. Node Failure Model (ADR 001):** Implements a Crash-Recovery (CR) model for cluster nodes and utilizes a client-side WAL for linearizable retries. Treats the AI Veto as a Byzantine Oracle to preserve cluster determinism.
+- **3.2. Network Topology (ADR 002):** Enforces a Leader-Centric Hub-and-Spoke model for external interactions (using `leader_hint` redirection) and a Full-Mesh for internal consensus.
 - **3.3. Timing & Synchrony (ADR 003):** 1:3–1:6 Heartbeat-to-Election ratio (50ms/150ms-300ms). Safety is independent of time; liveness is partially synchronous.
-- **3.4. Bootstrapping & Identity (ADR 004):** Identifies nodes by `(ClusterId, NodeId)` NewTypes. Prohibits cross-cluster contamination via Middleware identity guards.
-- **3.5. Logical Interface (ADR 005):** Strict separation between generic consensus (`raft.proto`) and application logic (`app.proto`).
+- **3.4. Bootstrapping & Identity (ADR 004):** Identifies nodes by `(ClusterId, NodeId)` NewTypes. Prohibits cross-cluster contamination via Middleware identity guards and enforces a Bootstrap Halt Mandate on identity mismatches.
+- **3.5. Logical Interface (ADR 005):** Strict separation between generic consensus (`raft.proto`) and application logic (`app.proto`). Logical Interface isolation is enforced via gRPC Metadata/Interceptors, keeping the protobuf payload definitions strictly focused on consensus and state.
 - **3.6. Exactly-Once Semantics (ADR 006):** Guarantees linearizability via a replicated Session Table. Every mutation outcome (Success or Veto) is a logged consensus event.
 - **3.7. Defensive Mutation Lifecycle (ADR 007):** A 5-layer "Defense Onion" pipeline: Structural Intent -> Syntactic Fortress -> Semantic Oracle -> Registry Firewall -> Consensus Commit.
 - **3.8. Universal Unit Registry (ADR 008):** Internal SI stabilization using `rust_decimal`. All physical state is normalized to `g` or `ml` using Banker's Rounding.
-- **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Implements **Poison-then-Panic** to handle invariant violations.
-- **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with mandatory PII redaction (Client ID truncation, TRACE-only justifications) to enable deterministic reconstruction of distributed events.
-- **3.11. Asynchronous Log Compaction (ADR 011):** Mitigates unbounded disk growth via state machine snapshotting. Offloads generation to prevent heartbeat starvation, and serializes all FSM state to preserve EOS.
+- **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Implements **Poison-then-Panic** via the `RoleState` enumeration managed within the `LogicalNode` struct to handle invariant violations.
+- **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with mandatory PII redaction (Client ID truncation, TRACE-only justifications) to enable deterministic reconstruction of distributed events. The Gateway acts as the authoritative generator of `trace_id`s for causal correlation.
+- **3.11. Asynchronous Log Compaction (ADR 011):** Mitigates unbounded disk growth via state machine snapshotting. Offloads generation to background threads to prevent heartbeat starvation, and employs a **Restoration Tombstone** protocol during snapshot installations to ensure crash-safety and preserve EOS.
 
 ## 4. Technical Standards
 
