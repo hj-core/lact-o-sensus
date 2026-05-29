@@ -1,0 +1,13 @@
+[package]
+name = "mock-veto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true

@@ -5,12 +5,16 @@
 //! support linearizable retries. It also maintains a recency-prioritized
 //! discovery list of known cluster node addresses.
 
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
 use common::types::ClientId;
 use common::types::ClusterId;
 use common::types::SequenceId;
+use common::types::errors::ArithmeticError;
+use common::types::errors::ConsensusError;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -22,7 +26,7 @@ pub const MAX_KNOWN_NODES: usize = 10;
 #[derive(Debug, Error)]
 pub enum ClientStateError {
     #[error("I/O failure during state persistence: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error("Serialization failure: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -37,10 +41,10 @@ pub enum ClientStateError {
     BootstrapMissingNodes,
 
     #[error("Invalid sequence ID operation: {0}")]
-    SequenceIdError(#[from] common::types::errors::ConsensusError),
+    SequenceIdError(#[from] ConsensusError),
 
     #[error("Arithmetic overflow in sequence ID: {0}")]
-    ArithmeticError(#[from] common::types::errors::ArithmeticError),
+    ArithmeticError(#[from] ArithmeticError),
 }
 
 /// Represents the persistent state of the Lact-O-Sensus client.
@@ -89,7 +93,7 @@ impl ClientState {
         overriding_nodes.truncate(MAX_KNOWN_NODES);
 
         if path_buf.exists() {
-            let data = std::fs::read_to_string(&path_buf)?;
+            let data = fs::read_to_string(&path_buf)?;
             let mut state: ClientState = serde_json::from_str(&data)?;
 
             if state.cluster_id != cluster_id {
@@ -201,13 +205,16 @@ impl ClientState {
 
     fn save(&self) -> Result<(), ClientStateError> {
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&self.path, data)?;
+        fs::write(&self.path, data)?;
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -365,13 +372,13 @@ mod tests {
                 let mut state =
                     ClientState::load_or_init(&path, cluster_id, vec!["node1".to_string()])?;
 
-                let metadata_before = std::fs::metadata(&path)?;
+                let metadata_before = fs::metadata(&path)?;
                 // Sleep to ensure potential mtime change is detectable
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                thread::sleep(time::Duration::from_millis(10));
 
                 state.record_success("node1")?;
 
-                let metadata_after = std::fs::metadata(&path)?;
+                let metadata_after = fs::metadata(&path)?;
                 assert_eq!(
                     metadata_before.modified()?,
                     metadata_after.modified()?,
@@ -411,7 +418,7 @@ mod tests {
                 };
                 // Use standard save logic to bypass truncate checks during struct construction
                 let data = serde_json::to_string_pretty(&state)?;
-                std::fs::write(&path, data)?;
+                fs::write(&path, data)?;
 
                 // 2. Load it - should be truncated to 10
                 let loaded = ClientState::load_or_init(&path, cluster_id, vec![])?;

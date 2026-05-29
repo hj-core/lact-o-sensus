@@ -273,7 +273,7 @@ impl LactoClient {
     where
         Req: Clone,
         F: Fn(IngressServiceClient<Channel>, Request<Req>) -> Fut,
-        Fut: Future<Output = std::result::Result<tonic::Response<Res>, tonic::Status>>,
+        Fut: Future<Output = Result<tonic::Response<Res>, tonic::Status>>,
         R: Fn(&Res) -> (bool, String),
     {
         let mut retry_count = 0;
@@ -507,6 +507,7 @@ impl LactoClient {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -527,8 +528,8 @@ mod tests {
     /// A programmable mock for the Ingress gRPC service.
     struct MockIngressService {
         /// A queue of responses to return for each call.
-        mutation_responses: Mutex<Vec<std::result::Result<ProposeMutationResponse, Status>>>,
-        query_responses: Mutex<Vec<std::result::Result<QueryStateResponse, Status>>>,
+        mutation_responses: Mutex<Vec<Result<ProposeMutationResponse, Status>>>,
+        query_responses: Mutex<Vec<Result<QueryStateResponse, Status>>>,
         /// Optional trace ID to return in headers.
         trace_id_to_return: Arc<Mutex<Option<TraceId>>>,
         /// Counter for tracking calls.
@@ -545,14 +546,11 @@ mod tests {
             }
         }
 
-        fn push_mutation_response(
-            &self,
-            res: std::result::Result<ProposeMutationResponse, Status>,
-        ) {
+        fn push_mutation_response(&self, res: Result<ProposeMutationResponse, Status>) {
             self.mutation_responses.lock().unwrap().push(res);
         }
 
-        fn push_query_response(&self, res: std::result::Result<QueryStateResponse, Status>) {
+        fn push_query_response(&self, res: Result<QueryStateResponse, Status>) {
             self.query_responses.lock().unwrap().push(res);
         }
 
@@ -566,7 +564,7 @@ mod tests {
         async fn propose_mutation(
             &self,
             _request: Request<ProposeMutationRequest>,
-        ) -> std::result::Result<Response<ProposeMutationResponse>, Status> {
+        ) -> Result<Response<ProposeMutationResponse>, Status> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             let mut queue = self.mutation_responses.lock().unwrap();
             if queue.is_empty() {
@@ -583,7 +581,7 @@ mod tests {
         async fn query_state(
             &self,
             _request: Request<QueryStateRequest>,
-        ) -> std::result::Result<Response<QueryStateResponse>, Status> {
+        ) -> Result<Response<QueryStateResponse>, Status> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             let mut queue = self.query_responses.lock().unwrap();
             if queue.is_empty() {
@@ -813,7 +811,7 @@ mod tests {
 
                 client.propose_mutation(test_intent()).await?;
 
-                let disk_state_data = std::fs::read_to_string(&path)?;
+                let disk_state_data = fs::read_to_string(&path)?;
                 let disk_state: serde_json::Value = serde_json::from_str(&disk_state_data)?;
                 assert_eq!(disk_state["sequence_id"], 1);
                 Ok(())

@@ -172,6 +172,7 @@ mod tests {
     use common::types::LogIndex;
     use common::types::Term;
     use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
 
     use super::*;
     use crate::storage::MemoryStorage;
@@ -212,6 +213,7 @@ mod tests {
             &self,
             _index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }

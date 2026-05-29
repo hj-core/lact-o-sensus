@@ -271,6 +271,7 @@ mod tests {
             &self,
             _index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }

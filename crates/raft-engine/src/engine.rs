@@ -408,6 +408,12 @@ impl<S: StateMachine> LogicalNode<S> {
         InstallSnapshotResult::accepted(self.current_term())
     }
 
+    /// Explicitly advances the logical state machine's horizon after a
+    /// snapshot.
+    pub fn advance_horizon_after_snapshot(&mut self, index: LogIndex) -> Result<(), NodeError> {
+        delegate_mut_to_inner!(self, advance_horizon_after_snapshot, index)
+    }
+
     /// Returns true if a snapshot is currently being generated.
     pub fn is_snapshotting(&self) -> bool {
         self.is_snapshotting
@@ -911,6 +917,7 @@ mod tests {
     use async_trait::async_trait;
     use common::raft_api::StateMachine;
     use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
     use rand::SeedableRng;
 
     use super::*;
@@ -941,6 +948,7 @@ mod tests {
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }

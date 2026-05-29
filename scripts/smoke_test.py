@@ -25,6 +25,7 @@ from cluster_harness import (
     poll_until,
     Registry,
     MutationFlooder,
+    VetoMode,
 )
 
 # Lact-O-Sensus: Consensus Verification Suite
@@ -38,7 +39,7 @@ class TestCase:
     """Structure for a clinical test specification."""
 
     name: str
-    needs_veto: bool
+    veto_mode: VetoMode
     func: Callable[[ClusterManager], None]
 
 
@@ -231,7 +232,8 @@ def test_persistence_restart(cluster: ClusterManager) -> None:
 
     cluster.cleanup()
     print("Action: Cluster is OFFLINE.")
-    cluster.start_all(start_veto=True, wipe_data=False)
+    # Standard boot for persistence recovery
+    cluster.start_all(veto_mode=VetoMode.REAL, wipe_data=False)
 
     new_leader_id = wait_for_leader(cluster)
     new_leader_port = next(n["port"] for n in NODES if n["id"] == new_leader_id)
@@ -303,6 +305,58 @@ def test_read_your_writes_consistency(cluster: ClusterManager) -> None:
     print("SUCCESS: Read-Your-Writes consistency verified.")
 
 
+def test_snapshot_installation(cluster: ClusterManager) -> None:
+    """Verifies that a lagging follower is caught up via InstallSnapshot."""
+    # 1. Setup artificially low threshold
+    print("Action: Configuring snapshot_threshold = 20...")
+    for node in NODES:
+        with open(node["config"], "a", encoding="utf-8") as f:
+            f.write("\n[raft]\nsnapshot_threshold = 20\n")
+
+    # 2. Restart cluster in MOCK mode to cross the threshold fast
+    cluster.cleanup()
+    cluster.start_all(veto_mode=VetoMode.MOCK, wipe_data=True)
+    leader_id = wait_for_leader(cluster)
+    follower_id = next(n["id"] for n in NODES if n["id"] != leader_id)
+
+    print(f"Action: Partitioning Node {follower_id}...")
+    cluster.kill_node(follower_id)
+
+    print("Action: Flooding mutations to trigger compaction (>20 entries)...")
+    flooder = MutationFlooder(cluster)
+    flooder.start()
+    poll_until(
+        lambda: len(flooder.successful_items) >= 25,
+        timeout=15.0,
+        desc="Mutation flooding (snapshot trigger)",
+    )
+    flooder.stop()
+
+    if flooder.exception:
+        raise flooder.exception
+
+    print(f"Action: Reconnecting Node {follower_id}...")
+    cluster.start_node(follower_id, wipe_data=False)
+
+    # 3. Verification: Semantic Query
+    follower_port = next(n["port"] for n in NODES if n["id"] == follower_id)
+
+    def check_catchup() -> bool:
+        try:
+            output = run_client_command("query", follower_port)
+            ver = extract_version(output)
+            print(f"DEBUG: Follower(Node {follower_id}) Version: {ver}")
+            return ver >= 20
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # ADR 010: Log transient failures during polling to aid forensics
+            print(f"DEBUG: Catch-up probe transient failure: {e}")
+            return False
+
+    print("Action: Waiting for Node convergence via Snapshot...")
+    poll_until(check_catchup, timeout=30.0, desc="Snapshot Catch-up")
+    print("SUCCESS: Follower caught up successfully via snapshot.")
+
+
 def test_replication_chaos(cluster: ClusterManager) -> None:
     """Verify data integrity after multiple SIGKILLs during active replication."""
     wait_for_leader(cluster)
@@ -353,40 +407,64 @@ def main() -> None:
     build_binaries()
 
     tests = [
-        TestCase("Leader Election", False, test_leader_election),
-        TestCase("Leadership Stability", False, test_leadership_stability),
-        TestCase("Chaos Failover", False, test_leader_failover),
-        TestCase("Identity Guard (ADR 004)", False, test_identity_guard),
-        TestCase("Linearizable Query Rejection", False, test_linearizable_query_rejection),
-        TestCase("AI Veto Egress", True, test_ai_veto_egress),
-        TestCase("Smart Client (Success Path)", True, test_smart_client_success),
-        TestCase("Smart Client (Veto Path)", True, test_smart_client_veto),
-        TestCase("Inventory Durability (Restart Recovery)", True, test_persistence_restart),
-        TestCase("Cold-Boot Recovery (Log Replay)", True, test_cold_boot_recovery),
-        TestCase("Read-Your-Writes Consistency", True, test_read_your_writes_consistency),
-        TestCase("Replication Chaos Audit", True, test_replication_chaos),
+        TestCase("Leader Election", VetoMode.DISABLED, test_leader_election),
+        TestCase("Leadership Stability", VetoMode.DISABLED, test_leadership_stability),
+        TestCase("Chaos Failover", VetoMode.DISABLED, test_leader_failover),
+        TestCase("Identity Guard (ADR 004)", VetoMode.DISABLED, test_identity_guard),
+        TestCase(
+            "Linearizable Query Rejection", VetoMode.DISABLED, test_linearizable_query_rejection
+        ),
+        TestCase("AI Veto Egress", VetoMode.REAL, test_ai_veto_egress),
+        TestCase("Smart Client (Success Path)", VetoMode.REAL, test_smart_client_success),
+        TestCase("Smart Client (Veto Path)", VetoMode.REAL, test_smart_client_veto),
+        TestCase(
+            "Inventory Durability (Restart Recovery)", VetoMode.REAL, test_persistence_restart
+        ),
+        TestCase("Cold-Boot Recovery (Log Replay)", VetoMode.REAL, test_cold_boot_recovery),
+        TestCase("Snapshot Installation", VetoMode.MOCK, test_snapshot_installation),
+        TestCase("Read-Your-Writes Consistency", VetoMode.REAL, test_read_your_writes_consistency),
+        TestCase("Replication Chaos Audit", VetoMode.REAL, test_replication_chaos),
     ]
+
+    # Preserve original configs for restoration after tests
+    original_configs = {n["config"]: open(n["config"], "r", encoding="utf-8").read() for n in NODES}
 
     passed = 0
     total_run = 0
-    for test in tests:
-        if filter_arg and filter_arg not in test.name.lower():
-            continue
-        total_run += 1
-        print(f"\n[TEST] {test.name}")
-        cluster = ClusterManager()
-        try:
-            cluster.start_all(start_veto=test.needs_veto)
-            test_func = test.func
-            test_func(cluster)
-            passed += 1
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            print(f"RESULT: FAILED -> {e}")
-            print_cluster_logs()
-            break
-        finally:
-            cluster.cleanup()
-            time.sleep(0.5)
+    try:
+        for test in tests:
+            if filter_arg and filter_arg not in test.name.lower():
+                continue
+            total_run += 1
+            print(f"\n[TEST] {test.name}")
+
+            # Clean start for every test
+            cluster = ClusterManager()
+            try:
+                # Specialized handling for snapshot test which manages its own start_all
+                if test.name == "Snapshot Installation":
+                    test.func(cluster)
+                else:
+                    cluster.start_all(veto_mode=test.veto_mode, wipe_data=True)
+                    test.func(cluster)
+
+                passed += 1
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"RESULT: FAILED -> {e}")
+                print_cluster_logs()
+                break
+            finally:
+                cluster.cleanup()
+                # Restoration of config files between tests to prevent pollution
+                for path, content in original_configs.items():
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                time.sleep(0.5)
+    finally:
+        # Final safety restoration
+        for path, content in original_configs.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
 
     print(f"\n=== Final Result: {passed}/{total_run} Tests Passed ===")
     if not filter_arg and passed < total_run:

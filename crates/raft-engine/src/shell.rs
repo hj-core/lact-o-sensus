@@ -121,20 +121,22 @@ impl<S: StateMachine> ConsensusShell<S> {
             let index = params.last_included_index;
             let term = params.last_included_term;
             let data = params.data;
+            let trace_id = params.trace_id;
 
             // ADR 011: Use spawn_blocking for heavy FSM I/O to preserve the tick loop
             tokio::task::spawn_blocking(move || {
                 let span = info_span!(
                     target: ClinicalTarget::RaftCompaction.as_str(),
                     "background_snapshot_install",
-                    index = %index
+                    index = %index,
+                    trace_id = %trace_id
                 );
                 let _enter = span.enter();
 
                 info!("Starting background snapshot installation...");
 
                 let rt = tokio::runtime::Handle::current();
-                let res = rt.block_on(fsm.install_snapshot(index, &data));
+                let res = rt.block_on(fsm.install_snapshot(index, &data, trace_id));
 
                 // Phase 3: Lock & Finalize
                 rt.block_on(async move {
@@ -145,7 +147,13 @@ impl<S: StateMachine> ConsensusShell<S> {
                         Ok(_) => {
                             info!(index = %index, "Background snapshot installation complete.");
                             guard.save_snapshot_metadata(index, term);
-                            guard.update_commit_index_only(index);
+
+                            // ADR 011: Advance BOTH commit_index and volatile last_applied
+                            // to ensure the next application loop starts after the snapshot.
+                            if let Err(e) = guard.advance_horizon_after_snapshot(index) {
+                                error!(index = %index, error = %e, "FATAL: Failed to advance logical horizon after snapshot.");
+                                guard.apply_fatal(e);
+                            }
                         }
                         Err(e) => {
                             error!(index = %index, error = %e, "FATAL: Snapshot installation failed.");
@@ -355,7 +363,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockFsm;
     #[async_trait::async_trait]
-    impl common::raft_api::StateMachine for MockFsm {
+    impl StateMachine for MockFsm {
         type Error = FsmError;
 
         fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
@@ -374,6 +382,7 @@ mod tests {
             &self,
             _index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -551,6 +560,7 @@ mod tests {
                 &self,
                 _idx: LogIndex,
                 _data: &[u8],
+                _trace_id: TraceId,
             ) -> Result<(), Self::Error> {
                 // BLOCK here until the test signals we can continue
                 self.barrier.wait().await;
@@ -589,6 +599,7 @@ mod tests {
                     last_included_index: LogIndex::new(100),
                     last_included_term: Term::new(1),
                     data: vec![1, 2, 3],
+                    trace_id: TraceId::generate(),
                 };
 
                 // 1. Trigger heavy restoration (which will block on the barrier in a background
@@ -608,8 +619,20 @@ mod tests {
                     TickAction::None | TickAction::StartElection
                 ));
 
-                // 4. Release the background task so the test can exit cleanly
+                // 4. Release the lock to allow the background task to complete and acquire it
+                drop(guard);
+
+                // 5. Release the background task so it can finish the InstallSnapshot phase
                 barrier.wait().await;
+
+                // Give the background task a tiny moment to acquire the lock and update the
+                // state
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // 6. Verify that the logical horizon was advanced correctly
+                let guard = shell.read().await;
+                assert_eq!(guard.last_committed(), LogIndex::new(100));
+                assert_eq!(guard.last_applied(), LogIndex::new(100));
             }
         }
     }

@@ -8,6 +8,7 @@ import socket
 import subprocess
 import threading
 import time
+from enum import Enum, auto
 from typing import (
     Dict,
     List,
@@ -21,6 +22,15 @@ from typing import (
 
 # Lact-O-Sensus: Cluster Test Harness
 # Provides the core infrastructure for managing local Raft clusters, AI Veto Nodes, and Clients.
+
+
+class VetoMode(Enum):
+    """Modes for the Clinical Oracle (AI Veto) service."""
+
+    DISABLED = auto()
+    REAL = auto()  # Real Ollama/LLM
+    MOCK = auto()  # Instant-Approve Mock
+
 
 # --- 1. Global Configuration & Registries ---
 
@@ -219,9 +229,10 @@ class MutationFlooder(threading.Thread):
 
             if "SUCCESS: Committed" in output:
                 self.successful_items.append(name)
-        except Exception:  # pylint: disable=broad-exception-caught
-            # Individual proposal failures are expected during chaos testing
-            pass
+            else:
+                print(f"DEBUG: Flooder failed to commit '{name}': {output.strip()}")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"DEBUG: Flooder RPC exception: {e}")
 
 
 class LogRegistry:
@@ -264,14 +275,14 @@ class ClusterManager:
 
     # --- Lifecycle API ---
 
-    def start_all(self, start_veto: bool = False, wipe_data: bool = True) -> None:
+    def start_all(self, veto_mode: VetoMode = VetoMode.DISABLED, wipe_data: bool = True) -> None:
         """High-level orchestrator for full cluster boot."""
-        print(f"--- Starting cluster (AI Veto: {start_veto}, Wipe: {wipe_data}) ---")
-        if start_veto:
-            self._start_veto_node()
+        print(f"--- Starting cluster (Veto Mode: {veto_mode.name}, Wipe: {wipe_data}) ---")
+        if veto_mode != VetoMode.DISABLED:
+            self._start_veto_node(veto_mode)
         for node in NODES:
             self.start_node(node["id"], wipe_data=wipe_data)
-        self._wait_for_initialization(check_veto=start_veto)
+        self._wait_for_initialization(veto_mode)
 
     def start_node(self, node_id: int, wipe_data: bool = False) -> None:
         """Starts or restarts a specific Raft node."""
@@ -334,18 +345,28 @@ class ClusterManager:
 
     # --- Internal Helpers ---
 
-    def _start_veto_node(self):
+    def _start_veto_node(self, veto_mode: VetoMode):
+        if veto_mode == VetoMode.DISABLED:
+            return
+
         if os.path.exists(VETO_LOG):
             os.remove(VETO_LOG)
         self.veto_log = open(VETO_LOG, "w", encoding="utf-8")
+
+        use_mock = veto_mode == VetoMode.MOCK
+        bin_path = os.path.join(TARGET_DIR, "mock-veto") if use_mock else AI_VETO_BIN
+        args = [bin_path, "--port", str(VETO_PORT)]
+        if veto_mode == VetoMode.REAL:
+            args.extend(["--model", "qwen3.5:4b"])
+
         self.veto_process = subprocess.Popen(
-            [AI_VETO_BIN, "--port", str(VETO_PORT), "--model", "qwen3.5:4b"],
+            args,
             stdout=self.veto_log,
             stderr=subprocess.STDOUT,
             env={"RUST_LOG": "info", **os.environ},
         )
 
-    def _wait_for_initialization(self, check_veto: bool):
+    def _wait_for_initialization(self, veto_mode: VetoMode):
         print("Action: Waiting for nodes to initialize...")
         for node in NODES:
             poll_until(
@@ -354,12 +375,13 @@ class ClusterManager:
                 desc=f"Node {node['id']} startup",
             )
 
-        if check_veto:
-            print(f"Action: Waiting for AI Veto Node to listen on port {VETO_PORT}...")
+        if veto_mode != VetoMode.DISABLED:
+            timeout = 60 if veto_mode == VetoMode.REAL else 30
+            print(f"Action: Waiting for AI Veto Node ({veto_mode.name}) to listen on port {VETO_PORT}...")
             poll_until(
                 lambda: self._is_port_listening(VETO_PORT),
-                timeout=30,
-                desc="AI Veto port readiness",
+                timeout=timeout,
+                desc=f"AI Veto ({veto_mode.name}) readiness",
             )
 
     def _is_port_listening(self, port: int) -> bool:
@@ -415,6 +437,8 @@ def build_binaries() -> None:
         "node-server",
         "-p",
         "ai-veto",
+        "-p",
+        "mock-veto",
         "-p",
         "client-cli",
     ]
@@ -559,7 +583,7 @@ def count_elections(cluster: ClusterManager) -> int:
 
 
 def extract_version(output: str) -> int:
-    match = re.search(r"version (\d+)", output)
+    match = re.search(r"version:?\s*(\d+)", output)
     return int(match.group(1)) if match else 0
 
 

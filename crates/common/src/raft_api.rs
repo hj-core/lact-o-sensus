@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use crate::types::LogIndex;
 use crate::types::errors::ConsensusError;
 use crate::types::errors::NodeError;
+use crate::types::trace::TraceId;
 
 /// Atomic snapshot of the node's consensus authority and cluster horizon.
 ///
@@ -118,6 +119,7 @@ pub trait StateMachine: Send + Sync + Debug + 'static {
         &self,
         last_included_index: LogIndex,
         data: &[u8],
+        trace_id: TraceId,
     ) -> Result<(), Self::Error>;
 }
 

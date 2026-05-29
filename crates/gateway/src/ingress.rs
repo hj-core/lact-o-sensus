@@ -566,7 +566,7 @@ impl IngressDispatcher {
         &self,
         client_id: ClientId,
         intent: &MutationIntent,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
+        current_inventory: &[GroceryItem],
         trace_id: TraceId,
     ) -> Result<(MutationStatus, StabilizedMutation), Status> {
         let mut stabilized_mutation = None;
@@ -898,7 +898,7 @@ impl IngressDispatcher {
         &self,
         client_id: ClientId,
         intent: &MutationIntent,
-        current_inventory: &[common::proto::v1::app::GroceryItem],
+        current_inventory: &[GroceryItem],
         trace_id: TraceId,
     ) -> Result<VetoOutcome, Status> {
         let span = info_span!(
@@ -1799,7 +1799,7 @@ mod tests {
                     &self,
                     _client_id: ClientId,
                     _intent: &MutationIntent,
-                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _current_inventory: &[GroceryItem],
                     _timeout: Duration,
                     _max_justification_len: usize,
                     _trace_id: TraceId,
@@ -2395,7 +2395,7 @@ mod tests {
                     &self,
                     _client_id: ClientId,
                     _intent: &MutationIntent,
-                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _current_inventory: &[GroceryItem],
                     _timeout: Duration,
                     _max_justification_len: usize,
                     _trace_id: TraceId,
@@ -2455,7 +2455,7 @@ mod tests {
                     &self,
                     _client_id: ClientId,
                     _intent: &MutationIntent,
-                    _current_inventory: &[common::proto::v1::app::GroceryItem],
+                    _current_inventory: &[GroceryItem],
                     _timeout: Duration,
                     _max_justification_len: usize,
                     _trace_id: TraceId,

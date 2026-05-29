@@ -113,8 +113,10 @@ pub mod v1 {
         impl InstallSnapshotResponse {
             /// Constructs a new InstallSnapshotResponse with proper NewType
             /// conversion.
-            pub fn new(term: u64) -> Self {
-                Self { term }
+            pub fn new(term: Term) -> Self {
+                Self {
+                    term: term.as_u64(),
+                }
             }
         }
 

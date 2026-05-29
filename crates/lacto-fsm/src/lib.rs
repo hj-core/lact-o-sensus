@@ -37,8 +37,11 @@ use common::types::LogIndex;
 use common::types::SequenceId;
 use common::types::errors::FsmError;
 use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use prost::Message;
+use sled::Db;
 use sled::Transactional;
+use sled::Tree;
 use sled::transaction::TransactionResult;
 use tracing::error;
 use tracing::info;
@@ -67,10 +70,10 @@ use internal::SnapshotData;
 ///    last_applied_index.
 #[derive(Debug)]
 pub struct LactoStore {
-    db: sled::Db,
-    inventory: sled::Tree,
-    sessions: sled::Tree,
-    meta: sled::Tree,
+    db: Db,
+    inventory: Tree,
+    sessions: Tree,
+    meta: Tree,
 }
 
 impl LactoStore {
@@ -81,7 +84,7 @@ impl LactoStore {
     const TREE_META: &'static str = "meta";
     const TREE_SESSIONS: &'static str = "sessions";
 
-    pub fn new(db: sled::Db) -> Result<Self, FsmError> {
+    pub fn new(db: Db) -> Result<Self, FsmError> {
         let inventory = db
             .open_tree(Self::TREE_INVENTORY)
             .map_err(|e| FsmError::persistence(format!("Failed to open inventory tree: {}", e)))?;
@@ -532,18 +535,20 @@ impl StateMachine for LactoStore {
         name = "fsm_install_snapshot",
         target = "raft::compaction",
         skip_all,
-        fields(index = %last_included_index)
+        fields(index = %last_included_index, trace_id = %trace_id)
     )]
     async fn install_snapshot(
         &self,
         last_included_index: LogIndex,
         data: &[u8],
+        trace_id: TraceId,
     ) -> Result<(), Self::Error> {
         let snapshot = SnapshotData::decode(data).map_err(|e| {
-            // HALT FORENSICS (Rule 15)
+            // HALT FORENSICS (Rule 15, ADR 010)
             error!(
-                target: ClinicalTarget::RaftCompaction.as_str(),
+                target: ClinicalTarget::ClinicalTelemetry.as_str(),
                 index = %last_included_index,
+                trace_id = %trace_id,
                 error = %e,
                 "HALT MANDATE (ADR 009/011): Snapshot deserialization failed. Physical integrity compromised."
             );
@@ -1089,7 +1094,7 @@ mod tests {
                 // 3. Restore into Store B
                 let store_b = setup_store();
                 store_b
-                    .install_snapshot(last_index, &snapshot_bytes)
+                    .install_snapshot(last_index, &snapshot_bytes, TraceId::generate())
                     .await
                     .unwrap();
 

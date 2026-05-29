@@ -11,11 +11,14 @@
 //! internal state mutations while propagating causal telemetry traces (ADR
 //! 010).
 
+use std::cmp;
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::proto::v1::raft::AppendEntriesRequest;
 use common::proto::v1::raft::AppendEntriesResponse;
+use common::proto::v1::raft::InstallSnapshotRequest;
+use common::proto::v1::raft::InstallSnapshotResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::raft_api::StateMachine;
@@ -54,10 +57,10 @@ use crate::shell::ConsensusShell;
 ///
 /// Distinguishes transient network or protocol errors (Status) from
 /// terminal system-level failures (NodeError).
-type RpcResult<T> = std::result::Result<T, Status>;
+type RpcResult<T> = Result<T, Status>;
 
 /// Standardized result type for consensus orchestration logic.
-type ConsensusResult<T> = std::result::Result<T, NodeError>;
+type ConsensusResult<T> = Result<T, NodeError>;
 
 // --- 1. The Election Cycle ---
 
@@ -112,10 +115,16 @@ enum VoteAction {
 /// allowing the Leader to reconcile its next_index and match_index logic
 /// deterministically (ADR 002).
 #[derive(Debug)]
-struct ReplicationOutcome {
-    sent_prev_index: LogIndex,
-    sent_entries_len: u64,
-    response: AppendEntriesResponse,
+enum ReplicationOutcome {
+    AppendEntries {
+        sent_prev_index: LogIndex,
+        sent_entries_len: u64,
+        response: AppendEntriesResponse,
+    },
+    InstallSnapshot {
+        last_included_index: LogIndex,
+        response: InstallSnapshotResponse,
+    },
 }
 
 /// DTO for Replication Round parameters, captured during the atomic tick
@@ -141,6 +150,17 @@ enum ReplicationAction {
     Demoted,
     /// Replication continues for other peers.
     Continue,
+}
+
+/// Logical strategy for a single peer replication attempt.
+enum ReplicationStrategy {
+    /// Follower is within the log horizon; send incremental updates.
+    AppendEntries(AppendEntriesRequest),
+    /// Follower is behind the horizon; send the full state machine.
+    InstallSnapshot {
+        last_included_index: LogIndex,
+        last_included_term: Term,
+    },
 }
 
 // =============================================================================
@@ -670,7 +690,7 @@ async fn replicate_to_peers<S: StateMachine>(
 
     // 2. Process responses as they arrive (Opportunistic demotion & index updates).
     while let Some((peer_id, res)) = response_stream.next().await {
-        if process_append_entries_response(&state, params.term, peer_id, res).await?
+        if process_replication_response(&state, params.term, peer_id, res).await?
             == ReplicationAction::Demoted
         {
             return Ok(());
@@ -696,7 +716,7 @@ async fn replicate_to_peers<S: StateMachine>(
     skip_all,
     fields(peer = %peer_id, term = %term)
 )]
-async fn process_append_entries_response<S: StateMachine>(
+async fn process_replication_response<S: StateMachine>(
     state: &ConsensusShell<S>,
     term: Term,
     peer_id: NodeId,
@@ -716,12 +736,12 @@ async fn process_append_entries_response<S: StateMachine>(
         }
     };
 
-    let sent_prev_index = outcome.sent_prev_index;
-    let sent_entries_len = outcome.sent_entries_len;
-    let resp = outcome.response;
-
     let mut guard = state.write().await;
-    let resp_term = Term::new(resp.term);
+
+    let resp_term = match &outcome {
+        ReplicationOutcome::AppendEntries { response, .. } => Term::new(response.term),
+        ReplicationOutcome::InstallSnapshot { response, .. } => Term::new(response.term),
+    };
 
     // 1. Term check and opportunistic demotion (§5.1)
     if resp_term > term {
@@ -746,44 +766,74 @@ async fn process_append_entries_response<S: StateMachine>(
             let quorum = (total_nodes / 2) + 1;
             node.state_mut().acknowledge_heartbeat(peer_id, quorum);
 
-            if resp.success {
-                let new_match = (sent_prev_index + sent_entries_len)?;
-                let new_next = (new_match + 1)?;
+            match outcome {
+                ReplicationOutcome::AppendEntries {
+                    sent_prev_index,
+                    sent_entries_len,
+                    response,
+                } => {
+                    if response.success {
+                        let new_match = (sent_prev_index + sent_entries_len)?;
+                        let new_next = (new_match + 1)?;
 
-                let current_match = *node
-                    .state()
-                    .match_index()
-                    .get(&peer_id)
-                    .unwrap_or(&LogIndex::ZERO);
+                        let current_match = *node
+                            .state()
+                            .match_index()
+                            .get(&peer_id)
+                            .unwrap_or(&LogIndex::ZERO);
 
-                if new_match > current_match {
+                        if new_match > current_match {
+                            node.state_mut().next_index_mut().insert(peer_id, new_next);
+                            node.state_mut()
+                                .match_index_mut()
+                                .insert(peer_id, new_match);
+                            last_committed_updated = true;
+                        }
+                    } else {
+                        let current_next = *node
+                            .state()
+                            .next_index()
+                            .get(&peer_id)
+                            .unwrap_or(&LogIndex::new(1));
+
+                        let last_log_index = LogIndex::new(response.last_log_index);
+                        let new_next = if last_log_index > LogIndex::ZERO {
+                            cmp::min(current_next, (last_log_index + 1)?)
+                        } else {
+                            (current_next - 1).map(|idx| idx.max(LogIndex::new(1)))?
+                        };
+
+                        node.state_mut().next_index_mut().insert(peer_id, new_next);
+                        debug!(
+                            target: ClinicalTarget::RaftReplication.as_str(),
+                            peer = %peer_id,
+                            new_next = %new_next,
+                            "Peer rejected AppendEntries (log mismatch). Retrying."
+                        );
+                    }
+                }
+                ReplicationOutcome::InstallSnapshot {
+                    last_included_index,
+                    ..
+                } => {
+                    // Upon successful InstallSnapshot, catch the peer up to the
+                    // snapshot horizon.
+                    let new_match = last_included_index;
+                    let new_next = (new_match + 1)?;
+
                     node.state_mut().next_index_mut().insert(peer_id, new_next);
                     node.state_mut()
                         .match_index_mut()
                         .insert(peer_id, new_match);
                     last_committed_updated = true;
+
+                    info!(
+                        target: ClinicalTarget::RaftReplication.as_str(),
+                        peer = %peer_id,
+                        index = %last_included_index,
+                        "Peer successfully caught up via InstallSnapshot."
+                    );
                 }
-            } else {
-                let current_next = *node
-                    .state()
-                    .next_index()
-                    .get(&peer_id)
-                    .unwrap_or(&LogIndex::new(1));
-
-                let last_log_index = LogIndex::new(resp.last_log_index);
-                let new_next = if last_log_index > LogIndex::ZERO {
-                    std::cmp::min(current_next, (last_log_index + 1)?)
-                } else {
-                    (current_next - 1).map(|idx| idx.max(LogIndex::new(1)))?
-                };
-
-                node.state_mut().next_index_mut().insert(peer_id, new_next);
-                debug!(
-                    target: ClinicalTarget::RaftReplication.as_str(),
-                    peer = %peer_id,
-                    new_next = %new_next,
-                    "Peer rejected AppendEntries (log mismatch). Retrying."
-                );
             }
         }
     }
@@ -908,45 +958,95 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
     params: ReplicationRoundParams,
     rpc_timeout: Duration,
 ) -> (NodeId, RpcResult<Option<ReplicationOutcome>>) {
-    // 1. Prepare the request for this specific peer (Synchronous locked phase)
-    let request = {
+    // 1. Decision Phase: Determine which strategy to use while holding the lock.
+    let strategy = {
         let mut guard = state.write().await;
-        match guard.state() {
-            RoleState::Leader(_) => {
-                match build_append_entries_request(
-                    &mut guard,
-                    peer_id,
-                    params.term,
-                    params.node_id,
-                    params.last_committed,
-                ) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        // If arithmetic fails here, it's a protocol violation.
-                        // We must poison and halt according to Rule 4.1.
-                        guard.poison();
-                        error!(
-                            target: ClinicalTarget::ClinicalFoundation.as_str(),
-                            error = %e,
-                            peer = %peer_id,
-                            "TERMINAL INVARIANT VIOLATION: Arithmetic failure during replication preparation. Halting."
-                        );
-                        panic!(
-                            "Secure Clinical: Terminal Invariant Violation during replication: {}",
-                            e
-                        );
-                    }
-                }
+        match determine_replication_strategy(&mut guard, peer_id, params) {
+            Ok(Some(s)) => s,
+            Ok(None) => return (peer_id, Ok(None)),
+            Err(e) => {
+                // If arithmetic fails here, it's a protocol violation.
+                // We must poison and halt according to Rule 4.1.
+                guard.apply_fatal(e);
             }
-            _ => return (peer_id, Ok(None)),
         }
     };
 
-    // 2. Execute RPC (Asynchronous network phase)
-    (
-        peer_id,
-        replicate_to_peer(peer_manager, peer_id, request, rpc_timeout, params.trace_id).await,
-    )
+    // 2. Execution Phase: Execute the chosen strategy outside the consensus lock.
+    // ADR 011: Heavy serialization or network I/O MUST NOT hold the consensus lock.
+    let res = match strategy {
+        ReplicationStrategy::AppendEntries(req) => {
+            replicate_to_peer(peer_manager, peer_id, req, rpc_timeout, params.trace_id).await
+        }
+        ReplicationStrategy::InstallSnapshot {
+            last_included_index,
+            last_included_term,
+        } => {
+            replicate_snapshot_to_peer(
+                state,
+                peer_manager,
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                rpc_timeout,
+            )
+            .await
+        }
+    };
+
+    (peer_id, res)
+}
+
+/// Orchestrates the heavy serialization and transmission of a state snapshot
+/// to a lagging peer.
+async fn replicate_snapshot_to_peer<S: StateMachine>(
+    state: Arc<ConsensusShell<S>>,
+    peer_manager: Arc<PeerManager>,
+    peer_id: NodeId,
+    params: ReplicationRoundParams,
+    last_included_index: LogIndex,
+    last_included_term: Term,
+    rpc_timeout: Duration,
+) -> RpcResult<Option<ReplicationOutcome>> {
+    let fsm = state.read().await.fsm();
+
+    // ADR 011: Use tokio::task::spawn_blocking for heavy FSM serialization
+    let res = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(fsm.snapshot())
+    })
+    .await;
+
+    let data = match res {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            // Trigger Poison-then-Panic with comprehensive forensics (Rule 15)
+            let mut guard = state.write().await;
+            guard.apply_fatal(NodeError::Protocol(format!(
+                "Snapshot serialization failed for peer {} at index {}: {}",
+                peer_id, last_included_index, e
+            )));
+        }
+        Err(e) => {
+            // Trigger Poison-then-Panic for task join failure
+            let mut guard = state.write().await;
+            guard.apply_fatal(NodeError::Protocol(format!(
+                "Snapshot task failed to join for peer {}: {}",
+                peer_id, e
+            )));
+        }
+    };
+
+    let request = InstallSnapshotRequest::new(
+        params.term,
+        params.node_id,
+        last_included_index,
+        last_included_term,
+        data,
+    );
+
+    install_snapshot_to_peer(peer_manager, peer_id, request, rpc_timeout, params.trace_id).await
 }
 
 /// Executes a single AppendEntries RPC with strict causal verification.
@@ -981,9 +1081,45 @@ async fn replicate_to_peer(
     // Causal Integrity Verification (ADR 010)
     verify_trace_integrity(&response, trace_id, peer_id)?;
 
-    Ok(Some(ReplicationOutcome {
+    Ok(Some(ReplicationOutcome::AppendEntries {
         sent_prev_index,
         sent_entries_len,
+        response: response.into_inner(),
+    }))
+}
+
+/// Executes a single InstallSnapshot RPC with strict causal verification.
+///
+/// Injects the current telemetry trace into the gRPC metadata and validates
+/// the returned trace ID back from the peer (ADR 010). Returns a
+/// 'ReplicationOutcome' DTO for leader reconciliation.
+async fn install_snapshot_to_peer(
+    peer_manager: Arc<PeerManager>,
+    peer_id: NodeId,
+    request: InstallSnapshotRequest,
+    rpc_timeout: Duration,
+    trace_id: TraceId,
+) -> RpcResult<Option<ReplicationOutcome>> {
+    let last_included_index = LogIndex::new(request.last_included_index);
+
+    let mut client = peer_manager
+        .get_client(peer_id)
+        .map_err(|e| Status::internal(e.to_string()))?;
+
+    let mut req = Request::new(request);
+    req.set_timeout(rpc_timeout);
+
+    // Explicit Outbound Propagation
+    TraceInterceptor::inject_trace_id_into_request(&mut req, trace_id)
+        .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
+
+    let response = client.install_snapshot(req).await?;
+
+    // Causal Integrity Verification (ADR 010)
+    verify_trace_integrity(&response, trace_id, peer_id)?;
+
+    Ok(Some(ReplicationOutcome::InstallSnapshot {
+        last_included_index,
         response: response.into_inner(),
     }))
 }
@@ -1006,6 +1142,50 @@ fn determine_node_role_name<S: StateMachine>(node: &LogicalNode<S>) -> &'static 
 
 // --- Replication & State Machine ---
 
+/// Dynamically determines the appropriate replication strategy for a specific
+/// peer.
+///
+/// REPLICATION STRATEGY (§5.3, §7):
+/// 1. Log-Based: If the follower's `next_index` is within the leader's physical
+///    log, send an `AppendEntries` RPC.
+/// 2. Snapshot-Based: If the follower has fallen behind the leader's truncation
+///    horizon, return the snapshot coordinates.
+fn determine_replication_strategy<S: StateMachine>(
+    node: &mut LogicalNode<S>,
+    peer_id: NodeId,
+    params: ReplicationRoundParams,
+) -> Result<Option<ReplicationStrategy>, NodeError> {
+    match node.state() {
+        RoleState::Leader(n) => {
+            let next_idx = *n
+                .state()
+                .next_index()
+                .get(&peer_id)
+                .unwrap_or(&LogIndex::new(1));
+            let last_included = node.last_included_index();
+
+            if next_idx <= last_included {
+                // FALLBACK (Raft §7): next_index is behind leader's horizon.
+                // We MUST send a snapshot instead.
+                Ok(Some(ReplicationStrategy::InstallSnapshot {
+                    last_included_index: last_included,
+                    last_included_term: node.last_included_term(),
+                }))
+            } else {
+                let req = build_append_entries_request(
+                    node,
+                    peer_id,
+                    params.term,
+                    params.node_id,
+                    params.last_committed,
+                )?;
+                Ok(Some(ReplicationStrategy::AppendEntries(req)))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Dynamically constructs an AppendEntries payload for a specific peer.
 ///
 /// Calculates the correct `prev_log_index` and `prev_log_term` based on the
@@ -1016,7 +1196,7 @@ fn build_append_entries_request<S: StateMachine>(
     term: Term,
     node_id: NodeId,
     last_committed: LogIndex,
-) -> std::result::Result<AppendEntriesRequest, NodeError> {
+) -> Result<AppendEntriesRequest, NodeError> {
     let next_idx = if let RoleState::Leader(n) = node.state() {
         *n.state()
             .next_index()
@@ -1115,6 +1295,7 @@ fn verify_trace_integrity<T>(
 mod tests {
     use std::collections::HashMap;
 
+    use common::proto::v1::raft::LogEntry;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
@@ -1134,19 +1315,15 @@ mod tests {
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
-        fn last_applied_index(&self) -> std::result::Result<LogIndex, Self::Error> {
+        fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(
-            &self,
-            _index: LogIndex,
-            _data: &[u8],
-        ) -> std::result::Result<(), Self::Error> {
+        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> std::result::Result<Vec<u8>, Self::Error> {
+        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
@@ -1154,7 +1331,8 @@ mod tests {
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
-        ) -> std::result::Result<(), Self::Error> {
+            _trace_id: TraceId,
+        ) -> Result<(), Self::Error> {
             Ok(())
         }
     }
@@ -1247,7 +1425,7 @@ mod tests {
         }
     }
 
-    mod process_append_entries_response {
+    mod process_replication_response {
         use super::*;
 
         mod successful_replication {
@@ -1261,12 +1439,12 @@ mod tests {
                     guard.into_candidate();
                     guard.into_leader(vec![peer_id]);
                 }
-                let res = Ok(Some(ReplicationOutcome {
+                let res = Ok(Some(ReplicationOutcome::AppendEntries {
                     sent_prev_index: LogIndex::new(0),
                     sent_entries_len: 1,
                     response: AppendEntriesResponse::new(Term::new(1), true, LogIndex::new(0)),
                 }));
-                process_append_entries_response(&state, Term::new(1), peer_id, res)
+                process_replication_response(&state, Term::new(1), peer_id, res)
                     .await
                     .unwrap();
                 let guard = state.read().await;
@@ -1301,12 +1479,12 @@ mod tests {
                             .insert(peer_id, LogIndex::new(11));
                     }
                 }
-                let res = Ok(Some(ReplicationOutcome {
+                let res = Ok(Some(ReplicationOutcome::AppendEntries {
                     sent_prev_index: LogIndex::new(10),
                     sent_entries_len: 0,
                     response: AppendEntriesResponse::new(Term::new(1), false, LogIndex::new(5)),
                 }));
-                process_append_entries_response(&state, Term::new(1), peer_id, res)
+                process_replication_response(&state, Term::new(1), peer_id, res)
                     .await
                     .unwrap();
                 let guard = state.read().await;
@@ -1318,6 +1496,85 @@ mod tests {
                 } else {
                     panic!("Should be leader");
                 }
+            }
+        }
+
+        mod successful_snapshot_installation {
+            use super::*;
+            #[tokio::test]
+            async fn should_advance_indices_to_snapshot_horizon() {
+                let (_, state, _) = setup().await;
+                let peer_id = NodeId::try_new(2).unwrap();
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![peer_id]);
+                }
+
+                let snapshot_index = LogIndex::new(50);
+                let res = Ok(Some(ReplicationOutcome::InstallSnapshot {
+                    last_included_index: snapshot_index,
+                    response: InstallSnapshotResponse::new(Term::new(1)),
+                }));
+
+                process_replication_response(&state, Term::new(1), peer_id, res)
+                    .await
+                    .unwrap();
+
+                let guard = state.read().await;
+                if let RoleState::Leader(node) = guard.state() {
+                    assert_eq!(
+                        *node.state().match_index().get(&peer_id).unwrap(),
+                        snapshot_index
+                    );
+                    assert_eq!(
+                        *node.state().next_index().get(&peer_id).unwrap(),
+                        LogIndex::new(51)
+                    );
+                } else {
+                    panic!("Should be leader");
+                }
+            }
+        }
+    }
+
+    mod replicate_snapshot_to_peer {
+        use super::*;
+
+        #[tokio::test]
+        async fn should_serialize_fsm_and_dispatch_rpc() {
+            let (_, state, _) = setup().await;
+
+            let last_included_index = LogIndex::new(10);
+            let last_included_term = Term::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
+            let params = ReplicationRoundParams {
+                term: Term::new(3),
+                node_id: NodeId::try_new(1).unwrap(),
+                last_committed: LogIndex::new(0),
+                trace_id: TraceId::generate(),
+            };
+
+            // This will fail at the RPC layer because there is no peer,
+            // but it proves the serialization path is active.
+            let res = replicate_snapshot_to_peer(
+                state.clone(),
+                Arc::new(
+                    PeerManager::try_new(state.read().await.identity(), &HashMap::new()).unwrap(),
+                ),
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                Duration::from_secs(1),
+            )
+            .await;
+
+            // We expect a network error (Connection refused/Node not found),
+            // NOT a serialization error.
+            match res {
+                Err(s) => assert_ne!(s.message(), "FSM Snapshot failed"),
+                _ => panic!("Expected network error"),
             }
         }
     }
@@ -1338,7 +1595,7 @@ mod tests {
                     guard.into_leader(vec![p2, p3]);
                     if let Some(leader) = guard.as_leader_mut() {
                         let entries: Vec<_> = (1..=5)
-                            .map(|i| common::proto::v1::raft::LogEntry {
+                            .map(|i| LogEntry {
                                 index: i,
                                 term: 1,
                                 data: vec![],
@@ -1409,6 +1666,68 @@ mod tests {
                 let res = verify_trace_integrity(&response, expected, NodeId::try_new(2).unwrap());
                 assert!(res.is_err());
                 assert_eq!(res.unwrap_err().code(), tonic::Code::DataLoss);
+            }
+        }
+    }
+
+    mod leader_replication_fallback {
+        use super::*;
+
+        mod lagging_follower {
+            use super::*;
+
+            #[tokio::test]
+            async fn should_fallback_to_install_snapshot_when_next_index_is_behind_horizon() {
+                let (_, state, _) = setup().await;
+                let peer_id = NodeId::try_new(2).unwrap();
+
+                // 1. Setup Leader with a compacted log
+                let params = {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![peer_id]);
+
+                    // Compact log up to index 10
+                    guard.save_snapshot_metadata(LogIndex::new(10), Term::new(1));
+
+                    // Set follower's next_index to 5 (behind the 10 horizon)
+                    if let Some(leader) = guard.as_leader_mut() {
+                        leader
+                            .state_mut()
+                            .next_index_mut()
+                            .insert(peer_id, LogIndex::new(5));
+                    }
+
+                    ReplicationRoundParams {
+                        term: Term::new(1),
+                        node_id: NodeId::try_new(1).unwrap(),
+                        last_committed: LogIndex::new(0),
+                        trace_id: TraceId::generate(),
+                    }
+                };
+
+                // 2. Verify intent identification logic (Locked phase)
+                let mut guard = state.write().await;
+                if let RoleState::Leader(_) = guard.state() {
+                    let strategy = determine_replication_strategy(&mut guard, peer_id, params)
+                        .unwrap()
+                        .unwrap();
+
+                    assert!(matches!(
+                        strategy,
+                        ReplicationStrategy::InstallSnapshot { .. }
+                    ));
+
+                    if let ReplicationStrategy::InstallSnapshot {
+                        last_included_index,
+                        ..
+                    } = strategy
+                    {
+                        assert_eq!(last_included_index, LogIndex::new(10));
+                    }
+                } else {
+                    panic!("Should be leader");
+                }
             }
         }
     }

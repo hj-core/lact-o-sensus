@@ -23,6 +23,7 @@ use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -99,11 +100,15 @@ pub struct SnapshotParams {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
     pub data: Vec<u8>,
+    pub trace_id: TraceId,
 }
 
 impl SnapshotParams {
     /// Translates raw Protobuf types into strict domain NewTypes.
-    fn try_from_proto(req: InstallSnapshotRequest) -> Result<Self, Status> {
+    fn try_from_proto(req: Request<InstallSnapshotRequest>) -> Result<Self, Status> {
+        let trace_id = TraceInterceptor::require_trace_id(&req)?;
+        let req = req.into_inner();
+
         let leader_id = req.leader_id.parse::<NodeId>().map_err(|_| {
             Status::invalid_argument(format!("Invalid NodeId: '{}'", req.leader_id))
         })?;
@@ -114,6 +119,7 @@ impl SnapshotParams {
             last_included_index: LogIndex::new(req.last_included_index),
             last_included_term: Term::new(req.last_included_term),
             data: req.data,
+            trace_id,
         })
     }
 }
@@ -281,8 +287,8 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
         request: Request<InstallSnapshotRequest>,
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         // 1. Extraction: Enforce TraceId presence and parse domain parameters.
-        let trace_id = TraceInterceptor::require_trace_id(&request)?;
-        let params = SnapshotParams::try_from_proto(request.into_inner())?;
+        let params = SnapshotParams::try_from_proto(request)?;
+        let trace_id = params.trace_id;
 
         // 2. Instrumentation: Establish the clinical boundary.
         let span = info_span!(
@@ -304,7 +310,7 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
             .await?;
 
         // 4. Construction: Build the response and inject telemetry feedback.
-        let mut response = Response::new(InstallSnapshotResponse::new(term.as_u64()));
+        let mut response = Response::new(InstallSnapshotResponse::new(term));
         TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
         Ok(response)
@@ -346,6 +352,7 @@ mod tests {
             &self,
             _index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }

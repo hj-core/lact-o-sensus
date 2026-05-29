@@ -337,6 +337,27 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         Ok(())
     }
 
+    /// Advances both the commit index and the volatile application cache
+    /// to a specific horizon after a successful snapshot installation.
+    ///
+    /// Effectively "jumps" the logical state forward to match the semantic
+    /// reality of the restored State Machine.
+    pub fn advance_horizon_after_snapshot(&mut self, index: LogIndex) -> Result<(), NodeError> {
+        // 1. Advance commit index (and persist to log storage)
+        self.update_commit_index_only(index)?;
+
+        // 2. Sync volatile cache
+        self.last_applied = index;
+
+        info!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            index = %index,
+            "Logical horizon advanced to match snapshot."
+        );
+
+        Ok(())
+    }
+
     /// Orchestrates the sequential application of committed log entries to the
     /// State Machine.
     #[instrument(
@@ -936,6 +957,7 @@ mod tests {
 
     use async_trait::async_trait;
     use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
 
     use super::*;
     use crate::storage::MemoryStorage;
@@ -974,6 +996,7 @@ mod tests {
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
+            _trace_id: TraceId,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -1384,6 +1407,7 @@ mod tests {
                         &self,
                         _index: LogIndex,
                         _data: &[u8],
+                        _trace_id: TraceId,
                     ) -> Result<(), Self::Error> {
                         Ok(())
                     }
@@ -1493,6 +1517,7 @@ mod tests {
                         &self,
                         _index: LogIndex,
                         _data: &[u8],
+                        _trace_id: TraceId,
                     ) -> Result<(), Self::Error> {
                         Ok(())
                     }
@@ -2007,6 +2032,7 @@ mod tests {
                         &self,
                         _: LogIndex,
                         _: &[u8],
+                        _: TraceId,
                     ) -> Result<(), Self::Error> {
                         Ok(())
                     }
