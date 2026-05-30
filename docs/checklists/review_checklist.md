@@ -10,6 +10,8 @@ You will code review a given subject. First, read this checklist completely. Eva
 - **Explanation**: A concise description of the issue.
 - **Suggested Fix**: Refactored code complying with the rule.
 
+If you discover a structural or behavioral issue that is NOT covered by the checklist below, still report it using the same ticket format with a descriptive placeholder Rule ID (e.g., `[CUSTOM-01]`). Clearly state that it falls outside the defined checklist.
+
 ---
 
 ## 1. Architecture & Structural Boundaries [ARCH]
@@ -134,21 +136,28 @@ You will code review a given subject. First, read this checklist completely. Eva
 - **DO**: Hold `MutationLock` sequentially during Layer 3 (AI Resolution) and Layer 4 (Postprocess) to maintain ordering [ADR 007].
 - **DO NOT**: Allow concurrent evaluation pipelines to interleave and regress the deterministic ordering of mutation intents.
 
-### [SAFE-08] Client Intent Durability
+### [SAFE-08] Async Temporary Guard Scoping
+
+- **Target Scope**: All async code holding `tokio::sync::RwLock` / `Mutex` guards
+- **Severity**: CRITICAL
+- **DO**: Extract lock guard dereferences into named local variables before passing them into async function calls that may re-acquire the same lock.
+- **DO NOT**: Inline expressions like `state.read().await.field()` inside the arguments of an async function that may re-acquire the same lock. The temporary `RwLockReadGuard` lives until the end of the enclosing statement (the semicolon), which spans the `.await` boundary of the outer call, causing a deadlock on a `current_thread` runtime.
+
+### [SAFE-09] Client Intent Durability
 
 - **Target Scope**: `client-cli`
 - **Severity**: CRITICAL
 - **DO**: Durably log client state mutations to the local WAL (`IntentWal`) prior to network dispatch to handle crash-recovery reliably [ADR 001].
 - **DO NOT**: Send mutations to the cluster while keeping them solely in volatile memory.
 
-### [SAFE-09] Opaque Clinical Reporting
+### [SAFE-10] Opaque Clinical Reporting
 
 - **Target Scope**: External APIs
 - **Severity**: CRITICAL
 - **DO**: Provide external error responses using a neutral "Statement of Fact" tone [ADR 006].
 - **DO NOT**: Expose fault attribution, stack traces, or internal state leaks in external API error payloads (Secure Clinical).
 
-### [SAFE-10] Client Redirection
+### [SAFE-11] Client Redirection
 
 - **Target Scope**: Follower/Candidate Nodes
 - **Severity**: CRITICAL
@@ -274,6 +283,13 @@ You will code review a given subject. First, read this checklist completely. Eva
 - **Severity**: CRITICAL
 - **DO**: Compile without clippy warnings and align perfectly with `cargo +nightly fmt`.
 - **DO NOT**: Merge code containing unresolved lint warnings or formatting diffs.
+
+### [ENG-07] Async Function Discipline
+
+- **Target Scope**: All Source Files
+- **Severity**: WARNING
+- **DO**: Declare functions `async fn` only when they contain at least one `.await` on a genuinely asynchronous operation (network I/O, tokio timer, channel, `RwLock`/`Mutex` acquisition).
+- **DO NOT**: Mark a function `async fn` if its body contains no `.await` calls, or if all its `.await` calls chain to functions that are themselves zero-async and perform only synchronous blocking I/O (sled operations, protobuf encoding, file I/O). Such functions should be synchronous (`fn`) and, when the calling context requires offloading, explicitly wrapped in `tokio::task::spawn_blocking` at the offload boundary.
 
 ---
 
