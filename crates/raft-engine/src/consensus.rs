@@ -1009,7 +1009,11 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     last_included_term: Term,
     rpc_timeout: Duration,
 ) -> RpcResult<Option<ReplicationOutcome>> {
-    let fsm = state.read().await.fsm();
+    let fsm = {
+        let mut guard = state.write().await;
+        guard.set_snapshotting(true);
+        guard.fsm()
+    };
 
     // ADR 011: Use tokio::task::spawn_blocking for heavy FSM serialization
     let res = tokio::task::spawn_blocking(move || {
@@ -1017,6 +1021,11 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
         rt.block_on(fsm.snapshot())
     })
     .await;
+
+    {
+        let mut guard = state.write().await;
+        guard.set_snapshotting(false);
+    }
 
     let data = match res {
         Ok(Ok(data)) => data,
@@ -1548,6 +1557,9 @@ mod tests {
             let last_included_index = LogIndex::new(10);
             let last_included_term = Term::new(2);
             let peer_id = NodeId::try_new(2).unwrap();
+            let pm = Arc::new(
+                PeerManager::try_new(state.read().await.identity(), &HashMap::new()).unwrap(),
+            );
             let params = ReplicationRoundParams {
                 term: Term::new(3),
                 node_id: NodeId::try_new(1).unwrap(),
@@ -1559,9 +1571,7 @@ mod tests {
             // but it proves the serialization path is active.
             let res = replicate_snapshot_to_peer(
                 state.clone(),
-                Arc::new(
-                    PeerManager::try_new(state.read().await.identity(), &HashMap::new()).unwrap(),
-                ),
+                pm,
                 peer_id,
                 params,
                 last_included_index,
@@ -1576,6 +1586,105 @@ mod tests {
                 Err(s) => assert_ne!(s.message(), "FSM Snapshot failed"),
                 _ => panic!("Expected network error"),
             }
+        }
+
+        #[tokio::test]
+        async fn should_toggle_is_snapshotting_flag_during_serialization() {
+            use std::sync::atomic::AtomicBool;
+            use std::sync::atomic::Ordering;
+
+            use tokio::sync::Mutex as TokioMutex;
+
+            #[derive(Debug)]
+            struct ObservantFsm {
+                shell: Arc<TokioMutex<Option<Arc<ConsensusShell<ObservantFsm>>>>>,
+                flag_during_snapshot: Arc<AtomicBool>,
+            }
+
+            #[async_trait]
+            impl StateMachine for ObservantFsm {
+                type Error = FsmError;
+
+                fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+                    Ok(LogIndex::ZERO)
+                }
+
+                async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+
+                async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    if let Some(shell) = self.shell.lock().await.as_ref() {
+                        let flag = shell.read().await.is_snapshotting();
+                        self.flag_during_snapshot.store(flag, Ordering::SeqCst);
+                    }
+                    Ok(vec![])
+                }
+
+                async fn install_snapshot(
+                    &self,
+                    _idx: LogIndex,
+                    _data: &[u8],
+                    _tid: TraceId,
+                ) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+            }
+
+            let id = Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::try_new(1).unwrap(),
+            ));
+            let flag_during_snapshot = Arc::new(AtomicBool::new(false));
+            let fsm = Arc::new(ObservantFsm {
+                shell: Arc::new(TokioMutex::new(None)),
+                flag_during_snapshot: flag_during_snapshot.clone(),
+            });
+
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let node =
+                LogicalNode::try_new(id.clone(), fsm.clone(), storage, thresholds, rng).unwrap();
+            let state = Arc::new(ConsensusShell::new(node));
+
+            fsm.shell.lock().await.replace(state.clone());
+
+            let last_included_index = LogIndex::new(10);
+            let last_included_term = Term::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
+            let params = ReplicationRoundParams {
+                term: Term::new(3),
+                node_id: NodeId::try_new(1).unwrap(),
+                last_committed: LogIndex::new(0),
+                trace_id: TraceId::generate(),
+            };
+
+            let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
+
+            let _ = replicate_snapshot_to_peer(
+                state.clone(),
+                pm,
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                Duration::from_secs(1),
+            )
+            .await;
+
+            assert!(
+                flag_during_snapshot.load(Ordering::SeqCst),
+                "Flag should be true during snapshot()"
+            );
+            assert!(
+                !state.read().await.is_snapshotting(),
+                "Flag should be false after snapshot completes"
+            );
         }
     }
 
