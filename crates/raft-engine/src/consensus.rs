@@ -357,16 +357,17 @@ fn start_election_campaign<S: StateMachine>(
         term = %params.term
     );
 
-    let state_clone = state.clone();
     let peer_manager_clone = peer_manager.clone();
     let config_clone = config.clone();
 
     tokio::spawn(
         async move {
             if let Err(e) =
-                initiate_election(config_clone, state_clone, peer_manager_clone, params).await
+                initiate_election(config_clone, state.clone(), peer_manager_clone, params).await
             {
                 error!( error = %e, "Failed to execute election campaign");
+                let mut guard = state.write().await;
+                guard.apply_fatal(e);
             }
         }
         .instrument(span),
@@ -659,8 +660,10 @@ pub(crate) fn initiate_replication<S: StateMachine>(
 
     tokio::spawn(
         async move {
-            if let Err(e) = replicate_to_peers(config, state, peer_manager, params).await {
+            if let Err(e) = replicate_to_peers(config, state.clone(), peer_manager, params).await {
                 error!( error = %e, "Failed to replicate to peers");
+                let mut guard = state.write().await;
+                guard.apply_fatal(e);
             }
         }
         .instrument(span),
@@ -773,8 +776,20 @@ async fn process_replication_response<S: StateMachine>(
                     response,
                 } => {
                     if response.success {
-                        let new_match = (sent_prev_index + sent_entries_len)?;
-                        let new_next = (new_match + 1)?;
+                        let new_match = (sent_prev_index + sent_entries_len).map_err(|e| {
+                            NodeError::Protocol(format!(
+                                "Arithmetic overflow calculating match_index for peer={} (prev={} \
+                                 len={}) in term={}: {}",
+                                peer_id, sent_prev_index, sent_entries_len, term, e
+                            ))
+                        })?;
+                        let new_next = (new_match + 1).map_err(|e| {
+                            NodeError::Protocol(format!(
+                                "Arithmetic overflow calculating next_index for peer={} \
+                                 (match={}) in term={}: {}",
+                                peer_id, new_match, term, e
+                            ))
+                        })?;
 
                         let current_match = *node
                             .state()
@@ -798,9 +813,26 @@ async fn process_replication_response<S: StateMachine>(
 
                         let last_log_index = LogIndex::new(response.last_log_index);
                         let new_next = if last_log_index > LogIndex::ZERO {
-                            cmp::min(current_next, (last_log_index + 1)?)
+                            cmp::min(
+                                current_next,
+                                (last_log_index + 1).map_err(|e| {
+                                    NodeError::Protocol(format!(
+                                        "Arithmetic overflow calculating next_index backoff for \
+                                         peer={} (last_log={}) in term={}: {}",
+                                        peer_id, last_log_index, term, e
+                                    ))
+                                })?,
+                            )
                         } else {
-                            (current_next - 1).map(|idx| idx.max(LogIndex::new(1)))?
+                            (current_next - 1)
+                                .map(|idx| idx.max(LogIndex::new(1)))
+                                .map_err(|e| {
+                                    NodeError::Protocol(format!(
+                                        "Arithmetic underflow calculating next_index backoff for \
+                                         peer={} (current_next={}) in term={}: {}",
+                                        peer_id, current_next, term, e
+                                    ))
+                                })?
                         };
 
                         node.state_mut().next_index_mut().insert(peer_id, new_next);
@@ -819,7 +851,13 @@ async fn process_replication_response<S: StateMachine>(
                     // Upon successful InstallSnapshot, catch the peer up to the
                     // snapshot horizon.
                     let new_match = last_included_index;
-                    let new_next = (new_match + 1)?;
+                    let new_next = (new_match + 1).map_err(|e| {
+                        NodeError::Protocol(format!(
+                            "Arithmetic overflow calculating next_index after snapshot for \
+                             peer={} (match={}) in term={}: {}",
+                            peer_id, new_match, term, e
+                        ))
+                    })?;
 
                     node.state_mut().next_index_mut().insert(peer_id, new_next);
                     node.state_mut()
@@ -966,8 +1004,12 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
             Ok(None) => return (peer_id, Ok(None)),
             Err(e) => {
                 // If arithmetic fails here, it's a protocol violation.
-                // We must poison and halt according to Rule 4.1.
-                guard.apply_fatal(e);
+                // We must poison and halt according to Rule 4.1 (ADR 009).
+                let last_idx = guard.last_log_index();
+                guard.apply_fatal(NodeError::Protocol(format!(
+                    "Replication strategy failed for peer={} at index={} in term={}: {}",
+                    peer_id, last_idx, params.term, e
+                )));
             }
         }
     };
@@ -1033,16 +1075,16 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
             // Trigger Poison-then-Panic with comprehensive forensics (Rule 15)
             let mut guard = state.write().await;
             guard.apply_fatal(NodeError::Protocol(format!(
-                "Snapshot serialization failed for peer {} at index {}: {}",
-                peer_id, last_included_index, e
+                "Snapshot serialization failed for peer={} at index={} in term={}: {}",
+                peer_id, last_included_index, params.term, e
             )));
         }
         Err(e) => {
-            // Trigger Poison-then-Panic for task join failure
+            // Trigger Poison-then-Panic for task join failure (ADR 009)
             let mut guard = state.write().await;
             guard.apply_fatal(NodeError::Protocol(format!(
-                "Snapshot task failed to join for peer {}: {}",
-                peer_id, e
+                "Snapshot task failed to join for peer={} at index={} in term={}: {}",
+                peer_id, last_included_index, params.term, e
             )));
         }
     };
@@ -1685,6 +1727,82 @@ mod tests {
                 !state.read().await.is_snapshotting(),
                 "Flag should be false after snapshot completes"
             );
+        }
+    }
+
+    mod prepare_and_replicate_to_peer {
+        use super::*;
+
+        #[tokio::test]
+        #[should_panic(expected = "Snapshot serialization failed for peer=2 at index=10 in \
+                                   term=3: Persistence failure: Simulated failure")]
+        async fn should_apply_fatal_with_rich_forensic_context_in_snapshot() {
+            #[derive(Debug)]
+            struct FailingFsm;
+            #[async_trait]
+            impl StateMachine for FailingFsm {
+                type Error = FsmError;
+
+                fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+                    Ok(LogIndex::ZERO)
+                }
+
+                async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+
+                async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    Err(FsmError::persistence("Simulated failure"))
+                }
+
+                async fn install_snapshot(
+                    &self,
+                    _idx: LogIndex,
+                    _data: &[u8],
+                    _tid: TraceId,
+                ) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+            }
+
+            let id = Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::try_new(1).unwrap(),
+            ));
+            let fsm = Arc::new(FailingFsm);
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let node =
+                LogicalNode::try_new(id.clone(), fsm.clone(), storage, thresholds, rng).unwrap();
+            let state = Arc::new(ConsensusShell::new(node));
+
+            let last_included_index = LogIndex::new(10);
+            let last_included_term = Term::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
+            let params = ReplicationRoundParams {
+                term: Term::new(3),
+                node_id: NodeId::try_new(1).unwrap(),
+                last_committed: LogIndex::new(0),
+                trace_id: TraceId::generate(),
+            };
+
+            let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
+
+            let _ = replicate_snapshot_to_peer(
+                state.clone(),
+                pm,
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                Duration::from_secs(1),
+            )
+            .await;
         }
     }
 
