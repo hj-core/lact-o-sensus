@@ -1958,4 +1958,170 @@ mod tests {
             }
         }
     }
+
+    // --- Orchestrator Behavioral Verification (ADR 009) ---
+
+    use std::sync::Mutex;
+
+    use common::proto::v1::raft::consensus_service_server::ConsensusService;
+    use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
+    use common::rpc::HEADER_TRACE_ID;
+    use futures::stream;
+    use tokio::sync::oneshot;
+    use tonic::Response;
+    use tonic::transport::Server;
+
+    struct MockConsensusService {
+        vote_response: Arc<Mutex<RequestVoteResponse>>,
+        append_response: Arc<Mutex<AppendEntriesResponse>>,
+    }
+
+    #[async_trait]
+    impl ConsensusService for MockConsensusService {
+        async fn request_vote(
+            &self,
+            request: Request<RequestVoteRequest>,
+        ) -> Result<Response<RequestVoteResponse>, Status> {
+            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+            let mut res = Response::new(*self.vote_response.lock().unwrap());
+            if let Some(val) = trace_id_header {
+                res.metadata_mut().insert(HEADER_TRACE_ID, val);
+            }
+            Ok(res)
+        }
+
+        async fn append_entries(
+            &self,
+            request: Request<AppendEntriesRequest>,
+        ) -> Result<Response<AppendEntriesResponse>, Status> {
+            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+            let mut res = Response::new(*self.append_response.lock().unwrap());
+            if let Some(val) = trace_id_header {
+                res.metadata_mut().insert(HEADER_TRACE_ID, val);
+            }
+            Ok(res)
+        }
+
+        async fn install_snapshot(
+            &self,
+            _request: Request<InstallSnapshotRequest>,
+        ) -> Result<Response<InstallSnapshotResponse>, Status> {
+            Ok(Response::new(InstallSnapshotResponse::new(Term::ZERO)))
+        }
+    }
+
+    mod initiate_election {
+        use super::*;
+        use futures::FutureExt;
+
+        mod when_invoked_by_candidate {
+            use super::*;
+
+            #[tokio::test]
+            async fn should_transition_to_leader_on_quorum() {
+                let (config, state, _) = setup().await;
+                let node_id = state.read().await.identity().node_id();
+
+                // 1. Setup Candidate state
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                }
+
+                let params = ElectionCampaignParams {
+                    term: Term::new(1),
+                    node_id,
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+
+                // 2. Start mock server
+                let service = Arc::new(MockConsensusService {
+                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
+                        Term::new(1),
+                        true,
+                    ))),
+                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
+                        Term::new(1),
+                        true,
+                        LogIndex::ZERO,
+                    ))),
+                });
+
+                let (tx, rx) = oneshot::channel::<()>();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bound_addr = listener.local_addr().unwrap();
+
+                let server_handle = tokio::spawn(async move {
+                    let incoming = stream::unfold(listener, |listener| async move {
+                        let res = listener.accept().await.map(|(s, _)| s);
+                        Some((res, listener))
+                    });
+
+                    Server::builder()
+                        .add_service(ConsensusServiceServer::from_arc(service))
+                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
+                        .await
+                        .unwrap();
+                });
+
+                // 3. Configure PeerManager with mock server
+                let mut peer_map = HashMap::new();
+                let peer_id = NodeId::try_new(2).unwrap();
+                peer_map.insert(peer_id, format!("http://{}", bound_addr));
+                let pm = Arc::new(
+                    PeerManager::try_new(state.read().await.identity(), &peer_map).unwrap(),
+                );
+
+                // 4. Run election
+                initiate_election(config, state.clone(), pm, params)
+                    .await
+                    .unwrap();
+
+                // 5. Verify transition
+                {
+                    let guard = state.read().await;
+                    assert!(matches!(guard.state(), RoleState::Leader(_)));
+                }
+
+                // Cleanup
+                let _ = tx.send(());
+                let _ = server_handle.await;
+            }
+        }
+    }
+
+    mod replicate_to_peers {
+        use super::*;
+
+        mod when_leader_has_multiple_peers {
+            use super::*;
+
+            #[tokio::test]
+            async fn should_fan_out_to_all_peers() {
+                let (config, state, _) = setup().await;
+                let p1 = NodeId::try_new(2).unwrap();
+                let p2 = NodeId::try_new(3).unwrap();
+
+                let mut peer_map = HashMap::new();
+                peer_map.insert(p1, "http://127.0.0.1:50091".to_string());
+                peer_map.insert(p2, "http://127.0.0.1:50092".to_string());
+
+                let pm = Arc::new(
+                    PeerManager::try_new(state.read().await.identity(), &peer_map).unwrap(),
+                );
+
+                let params = ReplicationRoundParams {
+                    term: Term::new(1),
+                    node_id: NodeId::try_new(1).unwrap(),
+                    last_committed: LogIndex::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+
+                let stream = broadcast_append_entries(&config, pm, state, params);
+                assert_eq!(stream.len(), 2);
+            }
+        }
+    }
 }
