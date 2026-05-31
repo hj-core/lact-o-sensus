@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
 
 use common::raft_api::StateMachine;
+use common::types::NodeId;
 use common::types::Term;
 use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
@@ -41,6 +43,8 @@ pub struct ConsensusShell<S: StateMachine> {
     inner: Arc<RwLock<LogicalNode<S>>>,
     progress_tx: watch::Sender<ConsensusProgress>,
     apply_lock: Mutex<()>,
+    /// Track peers with an active snapshot replication in flight.
+    in_flight_snapshots: Mutex<HashSet<NodeId>>,
 }
 
 impl<S: StateMachine> ConsensusShell<S> {
@@ -53,6 +57,27 @@ impl<S: StateMachine> ConsensusShell<S> {
             inner: Arc::new(RwLock::new(initial_state)),
             progress_tx,
             apply_lock: Mutex::new(()),
+            in_flight_snapshots: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Attempts to acquire a permit to initiate a snapshot replication for a
+    /// peer.
+    ///
+    /// Returns a RAII guard if successful, or None if a snapshot is already in
+    /// flight.
+    pub async fn try_acquire_snapshot_permit(
+        self: &Arc<Self>,
+        peer_id: NodeId,
+    ) -> Option<SnapshotPermit<S>> {
+        let mut in_flight = self.in_flight_snapshots.lock().await;
+        if in_flight.insert(peer_id) {
+            Some(SnapshotPermit {
+                shell: self.clone(),
+                peer_id,
+            })
+        } else {
+            None
         }
     }
 
@@ -437,6 +462,29 @@ impl<'a, S: StateMachine> Drop for MutationGuard<'a, S> {
     }
 }
 
+/// A RAII guard that tracks an in-flight snapshot replication.
+///
+/// When dropped, it removes the peer from the in-flight set, allowing
+/// subsequent snapshot attempts.
+#[derive(Debug)]
+pub struct SnapshotPermit<S: StateMachine> {
+    shell: Arc<ConsensusShell<S>>,
+    peer_id: NodeId,
+}
+
+impl<S: StateMachine> Drop for SnapshotPermit<S> {
+    fn drop(&mut self) {
+        // We use a background task here because Drop cannot be async.
+        // ADR 011: This is a lightweight set operation and is safe for the executor.
+        let shell = self.shell.clone();
+        let peer_id = self.peer_id;
+        tokio::spawn(async move {
+            let mut in_flight = shell.in_flight_snapshots.lock().await;
+            in_flight.remove(&peer_id);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -730,6 +778,46 @@ mod tests {
                 assert_eq!(guard.last_committed(), LogIndex::new(100));
                 assert_eq!(guard.last_applied(), LogIndex::new(100));
             }
+        }
+    }
+
+    mod snapshot_permits {
+        use super::*;
+
+        #[tokio::test]
+        async fn only_one_permit_can_be_held_per_peer() {
+            let shell = mock_shell();
+            let peer_id = NodeId::try_new(2).unwrap();
+
+            // 1. First permit acquisition succeeds
+            let permit1 = shell.try_acquire_snapshot_permit(peer_id).await;
+            assert!(permit1.is_some());
+
+            // 2. Second permit acquisition for the SAME peer fails
+            let permit2 = shell.try_acquire_snapshot_permit(peer_id).await;
+            assert!(permit2.is_none());
+
+            // 3. Acquisition for a DIFFERENT peer succeeds
+            let peer_id_other = NodeId::try_new(3).unwrap();
+            let permit3 = shell.try_acquire_snapshot_permit(peer_id_other).await;
+            assert!(permit3.is_some());
+        }
+
+        #[tokio::test]
+        async fn permit_is_released_when_dropped() {
+            let shell = mock_shell();
+            let peer_id = NodeId::try_new(2).unwrap();
+
+            {
+                let _permit = shell.try_acquire_snapshot_permit(peer_id).await;
+            }
+
+            // Drop is async (spawned), so give it a tiny moment
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            // Acquisition should succeed again
+            let permit2 = shell.try_acquire_snapshot_permit(peer_id).await;
+            assert!(permit2.is_some());
         }
     }
 }

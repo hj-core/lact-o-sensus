@@ -48,6 +48,7 @@ use crate::engine::RoleState;
 use crate::engine::TickAction;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;
+use crate::shell::SnapshotPermit;
 
 // =============================================================================
 // I. Semantic Vocabulary (Types & Enums)
@@ -115,7 +116,7 @@ enum VoteAction {
 /// allowing the Leader to reconcile its next_index and match_index logic
 /// deterministically (ADR 002).
 #[derive(Debug)]
-enum ReplicationOutcome {
+enum ReplicationOutcome<S: StateMachine> {
     AppendEntries {
         sent_prev_index: LogIndex,
         sent_entries_len: u64,
@@ -124,6 +125,9 @@ enum ReplicationOutcome {
     InstallSnapshot {
         last_included_index: LogIndex,
         response: InstallSnapshotResponse,
+        /// The permit held during snapshot replication (ADR 011).
+        /// This ensures the permit is only released AFTER index reconciliation.
+        _permit: SnapshotPermit<S>,
     },
 }
 
@@ -722,7 +726,7 @@ async fn process_replication_response<S: StateMachine>(
     state: &ConsensusShell<S>,
     term: Term,
     peer_id: NodeId,
-    res: RpcResult<Option<ReplicationOutcome>>,
+    res: RpcResult<Option<ReplicationOutcome<S>>>,
 ) -> ConsensusResult<ReplicationAction> {
     let outcome = match res {
         Ok(Some(val)) => val,
@@ -960,8 +964,9 @@ fn broadcast_append_entries<S: StateMachine>(
     peer_manager: Arc<PeerManager>,
     state: Arc<ConsensusShell<S>>,
     params: ReplicationRoundParams,
-) -> FuturesUnordered<impl futures::Future<Output = (NodeId, RpcResult<Option<ReplicationOutcome>>)>>
-{
+) -> FuturesUnordered<
+    impl futures::Future<Output = (NodeId, RpcResult<Option<ReplicationOutcome<S>>>)>,
+> {
     let rpc_timeout = config.raft.rpc_timeout();
 
     peer_manager
@@ -994,7 +999,7 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
     peer_id: NodeId,
     params: ReplicationRoundParams,
     rpc_timeout: Duration,
-) -> (NodeId, RpcResult<Option<ReplicationOutcome>>) {
+) -> (NodeId, RpcResult<Option<ReplicationOutcome<S>>>) {
     // 1. Decision Phase: Determine which strategy to use while holding the lock.
     let strategy = {
         let mut guard = state.write().await;
@@ -1023,16 +1028,44 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
             last_included_index,
             last_included_term,
         } => {
-            replicate_snapshot_to_peer(
-                state,
-                peer_manager,
-                peer_id,
-                params,
-                last_included_index,
-                last_included_term,
-                rpc_timeout,
-            )
-            .await
+            // If a snapshot is already in flight for this peer, we downgrade
+            // to a lightweight heartbeat to avoid redundant heavy work.
+            if let Some(permit) = state.try_acquire_snapshot_permit(peer_id).await {
+                replicate_snapshot_to_peer(
+                    state,
+                    peer_manager,
+                    peer_id,
+                    params,
+                    last_included_index,
+                    last_included_term,
+                    rpc_timeout,
+                    permit,
+                )
+                .await
+            } else {
+                debug!(
+                    target: ClinicalTarget::RaftReplication.as_str(),
+                    peer = %peer_id,
+                    "Snapshot already in flight. Downgrading to heartbeat probe."
+                );
+                let heartbeat = {
+                    let mut guard = state.write().await;
+                    build_append_entries_request(
+                        &mut guard,
+                        peer_id,
+                        params.term,
+                        params.node_id,
+                        params.last_committed,
+                    )
+                };
+                match heartbeat {
+                    Ok(req) => {
+                        replicate_to_peer(peer_manager, peer_id, req, rpc_timeout, params.trace_id)
+                            .await
+                    }
+                    Err(_) => Ok(None), // Should not fail for heartbeat construction
+                }
+            }
         }
     };
 
@@ -1041,6 +1074,7 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
 
 /// Orchestrates the heavy serialization and transmission of a state snapshot
 /// to a lagging peer.
+#[allow(clippy::too_many_arguments)]
 async fn replicate_snapshot_to_peer<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
@@ -1049,7 +1083,8 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     last_included_index: LogIndex,
     last_included_term: Term,
     rpc_timeout: Duration,
-) -> RpcResult<Option<ReplicationOutcome>> {
+    permit: SnapshotPermit<S>,
+) -> RpcResult<Option<ReplicationOutcome<S>>> {
     let fsm = {
         let mut guard = state.write().await;
         guard.set_snapshotting(true);
@@ -1096,7 +1131,15 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
         data,
     );
 
-    install_snapshot_to_peer(peer_manager, peer_id, request, rpc_timeout, params.trace_id).await
+    install_snapshot_to_peer(
+        peer_manager,
+        peer_id,
+        request,
+        rpc_timeout,
+        params.trace_id,
+        permit,
+    )
+    .await
 }
 
 /// Executes a single AppendEntries RPC with strict causal verification.
@@ -1105,13 +1148,13 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
 /// the returned trace ID back from the peer, guarding against Byzantine
 /// correlation failures (ADR 010). Returns a 'ReplicationOutcome' DTO for
 /// leader reconciliation.
-async fn replicate_to_peer(
+async fn replicate_to_peer<S: StateMachine>(
     peer_manager: Arc<PeerManager>,
     peer_id: NodeId,
     request: AppendEntriesRequest,
     rpc_timeout: Duration,
     trace_id: TraceId,
-) -> RpcResult<Option<ReplicationOutcome>> {
+) -> RpcResult<Option<ReplicationOutcome<S>>> {
     let sent_prev_index = LogIndex::new(request.prev_log_index);
     let sent_entries_len = request.entries.len() as u64;
 
@@ -1143,13 +1186,14 @@ async fn replicate_to_peer(
 /// Injects the current telemetry trace into the gRPC metadata and validates
 /// the returned trace ID back from the peer (ADR 010). Returns a
 /// 'ReplicationOutcome' DTO for leader reconciliation.
-async fn install_snapshot_to_peer(
+async fn install_snapshot_to_peer<S: StateMachine>(
     peer_manager: Arc<PeerManager>,
     peer_id: NodeId,
     request: InstallSnapshotRequest,
     rpc_timeout: Duration,
     trace_id: TraceId,
-) -> RpcResult<Option<ReplicationOutcome>> {
+    permit: SnapshotPermit<S>,
+) -> RpcResult<Option<ReplicationOutcome<S>>> {
     let last_included_index = LogIndex::new(request.last_included_index);
 
     let mut client = peer_manager
@@ -1171,6 +1215,7 @@ async fn install_snapshot_to_peer(
     Ok(Some(ReplicationOutcome::InstallSnapshot {
         last_included_index,
         response: response.into_inner(),
+        _permit: permit,
     }))
 }
 
@@ -1563,9 +1608,11 @@ mod tests {
                 }
 
                 let snapshot_index = LogIndex::new(50);
+                let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
                 let res = Ok(Some(ReplicationOutcome::InstallSnapshot {
                     last_included_index: snapshot_index,
                     response: InstallSnapshotResponse::new(Term::new(1)),
+                    _permit: permit,
                 }));
 
                 process_replication_response(&state, Term::new(1), peer_id, res)
@@ -1611,6 +1658,7 @@ mod tests {
 
             // This will fail at the RPC layer because there is no peer,
             // but it proves the serialization path is active.
+            let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let res = replicate_snapshot_to_peer(
                 state.clone(),
                 pm,
@@ -1619,6 +1667,7 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                permit,
             )
             .await;
 
@@ -1708,6 +1757,7 @@ mod tests {
 
             let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
 
+            let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let _ = replicate_snapshot_to_peer(
                 state.clone(),
                 pm,
@@ -1716,6 +1766,7 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                permit,
             )
             .await;
 
@@ -1793,6 +1844,7 @@ mod tests {
 
             let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
 
+            let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let _ = replicate_snapshot_to_peer(
                 state.clone(),
                 pm,
@@ -1801,6 +1853,7 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                permit,
             )
             .await;
         }
