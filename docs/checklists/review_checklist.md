@@ -254,37 +254,45 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **Target Scope**: Observability Layer
 - **Severity**: CRITICAL
 - **DO**: Use structured `tracing` spans and events. Truncate Client IDs and strictly redact sensitive AI payloads to `TRACE` levels. Act as the authoritative generator of `trace_id`s (UUIDv7) at the Gateway ingress. Utilize the `ClinicalTarget` registry for namespaces [ADR 010].
-- **DO NOT**: Rely on unstructured `println!` or raw string literals. Do not trust client-provided `x-trace-id` headers for correlation.
+- **DO**: Always propagate the current `trace_id` across thread, task, and RPC boundaries. Use `.instrument(span)` on every `tokio::spawn`, `spawn_blocking`, and cross-task handoff to preserve the causal chain.
+- **DO NOT**: Rely on unstructured `println!` or raw string literals. Do not trust client-provided `x-trace-id` headers for correlation. Do not drop the `trace_id` when spawning a new task.
 
-### [ENG-03] Clinical Documentation
+### [ENG-03] Single Decision, Single Span
+
+- **Target Scope**: All Source Files with `#[instrument]`
+- **Severity**: WARNING
+- **DO**: Instrument the Orchestrator (where semantic decisions happen), not the Implementer (mechanical side-effects of decisions). A span should represent a semantic choice or high-impact operation — not just a function call.
+- **DO NOT**: Create redundant nested spans that echo the parent (e.g., `transition:transition`). If a function is purely mechanical (disk write, serialization), do not `#[instrument]` it — let the caller's span provide context via `.in_current_span()`.
+
+### [ENG-04] Clinical Documentation
 
 - **Target Scope**: Source Code
 - **Severity**: STYLE
 - **DO**: Provide module-level docstrings with a concise architectural summary. Maintain a technically accurate, professional tone.
 - **DO NOT**: Submit functional code changes lacking rationale or inline documentation for edge cases.
 
-### [ENG-04] Behavioral Verification
+### [ENG-05] Behavioral Verification
 
 - **Target Scope**: All Source Files (`mod tests`)
 - **Severity**: WARNING
 - **DO**: Verify non-trivial logic via the mandatory nested BDD-style module hierarchy.
 - **DO NOT**: Structure test classes as a flat, unorganized list of testing assertions.
 
-### [ENG-05] Import Conventions
+### [ENG-06] Import Conventions
 
 - **Target Scope**: All Source Files
 - **Severity**: STYLE
 - **DO**: Prefer idiomatic `use` statements over fully-qualified names (FQN) to maintain brevity.
 - **DO NOT**: Clutter execution logic with deeply nested, repeated paths.
 
-### [ENG-06] Artifact Cleanliness
+### [ENG-07] Artifact Cleanliness
 
 - **Target Scope**: CI/CD Pipeline
 - **Severity**: CRITICAL
 - **DO**: Compile without clippy warnings and align perfectly with `cargo +nightly fmt`.
 - **DO NOT**: Merge code containing unresolved lint warnings or formatting diffs.
 
-### [ENG-07] Async Function Discipline
+### [ENG-08] Async Function Discipline
 
 - **Target Scope**: All Source Files
 - **Severity**: WARNING
