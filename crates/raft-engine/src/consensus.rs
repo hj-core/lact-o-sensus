@@ -222,9 +222,8 @@ pub fn spawn_tick_loop<S: StateMachine>(
 
                         let index = guard.last_applied();
                         let term = guard.get_term_at(index);
-                        let fsm = guard.fsm();
 
-                        initiate_snapshot_generation(state.clone(), fsm, index, term, &parent_span);
+                        initiate_log_compaction(state.clone(), index, term, &parent_span);
                     }
 
                     match action {
@@ -465,15 +464,16 @@ async fn initiate_election<S: StateMachine>(
     Ok(())
 }
 
-/// Triggers an asynchronous snapshot generation and log compaction cycle.
+/// Triggers an asynchronous log compaction cycle.
 ///
-/// FREEZE-APPLY (ADR 011):
-/// This orchestrator ensures the State Machine is logically frozen by
-/// toggling the `is_snapshotting` flag in the engine, which prevents the
-/// `apply` pipeline from advancing during serialization.
-pub fn initiate_snapshot_generation<S: StateMachine>(
+/// COMPACTION MECHANICS (ADR 011):
+/// In implementations with persistent State Machines, the durable database
+/// trees serve as the inherent snapshot. This orchestrator updates the
+/// logical horizon metadata and truncates physical log entries that have
+/// already been applied to the underlying storage. Peer nodes requiring
+/// catch-up will trigger on-demand serialization via StateMachine::snapshot().
+pub fn initiate_log_compaction<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
-    fsm: Arc<S>,
     index: LogIndex,
     term: Term,
     parent_span: &tracing::Span,
@@ -489,73 +489,66 @@ pub fn initiate_snapshot_generation<S: StateMachine>(
             info!(
                 target: ClinicalTarget::RaftCompaction.as_str(),
                 index = %index,
-                "Snapshot generation started (FSM Frozen)."
+                "Log compaction started (FSM Frozen)."
             );
 
-            // 1. Perform heavy serialization (Unlocked)
-            // ADR 011: Use tokio::task::spawn_blocking for heavy I/O
-            let res = tokio::task::spawn_blocking(move || {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(fsm.snapshot())
-            })
-            .await;
+            // 1. Capture snapshot target and update metadata (Locked)
+            // The Freeze-Apply state is already set by the Tick Loop.
+            let log_store = {
+                let mut guard = state.write().await;
+                guard.save_snapshot_metadata(index, term);
+                guard.log_store()
+            };
 
-            // 2. Finalize and compact (Locked)
-            let mut guard = state.write().await;
-            guard.set_snapshotting(false);
+            // 2. Perform heavy truncation (Unlocked)
+            // This is offloaded to a background thread to preserve the tick loop.
+            let truncation_res =
+                tokio::task::spawn_blocking(move || log_store.truncate_log_front(index)).await;
 
-            match res {
-                Ok(Ok(_data)) => {
-                    // Log Truncation & Metadata update
-                    guard.save_snapshot_metadata(index, term);
+            // 3. Unfreeze and catch up (Locked)
+            {
+                let mut guard = state.write().await;
+                guard.set_snapshotting(false);
 
-                    // We only truncate up to the index we just snapshotted.
-                    // This is offloaded to a background thread to preserve the tick loop.
-                    let log_store = match guard.state() {
-                        RoleState::Follower(n) => n.log_store().clone(),
-                        RoleState::Candidate(n) => n.log_store().clone(),
-                        RoleState::Leader(n) => n.log_store().clone(),
-                        RoleState::Poisoned => return, // Shell already panics
-                    };
-                    tokio::task::spawn_blocking(move || {
-                        if let Err(e) = log_store.truncate_log_front(index) {
-                            error!(
-                                target: ClinicalTarget::RaftCompaction.as_str(),
-                                error = %e,
-                                "Log truncation failure!"
-                            );
-                        }
-                    });
-
-                    // CATCH UP: Apply any entries committed during the freeze.
-                    let commit_idx = guard.last_committed();
-                    drop(guard);
-                    state.apply_committed().await;
-
-                    info!(
-                        target: ClinicalTarget::RaftCompaction.as_str(),
-                        index = %index,
-                        "Snapshot generation and compaction successful."
-                    );
-                }
-                Ok(Err(e)) => {
-                    error!(
-                        target: ClinicalTarget::RaftCompaction.as_str(),
-                        error = %e,
-                        "FSM Snapshot serialization failed."
-                    );
-                    // Halt Mandate: serialization failure suggests unrecoverable DB state.
-                    guard.apply_fatal(NodeError::Protocol(format!("Snapshot failure: {}", e)));
-                }
-                Err(e) => {
-                    error!(
-                        target: ClinicalTarget::RaftCompaction.as_str(),
-                        error = %e,
-                        "Snapshot task panicked or failed to join."
-                    );
-                    guard.apply_fatal(NodeError::Protocol(format!("Snapshot task panic: {}", e)));
+                // Halt Mandate: If physical truncation fails, the node is in a corrupt state
+                // and must poison itself.
+                match truncation_res {
+                    Ok(Err(e)) => {
+                        error!(
+                            target: ClinicalTarget::RaftCompaction.as_str(),
+                            error = %e,
+                            "Log truncation failure! Triggering Halt Mandate."
+                        );
+                        guard.apply_fatal(NodeError::Protocol(format!(
+                            "Log truncation failure at index {}: {}",
+                            index, e
+                        )));
+                    }
+                    Err(e) => {
+                        error!(
+                            target: ClinicalTarget::RaftCompaction.as_str(),
+                            error = %e,
+                            "Log truncation task panicked or failed to join."
+                        );
+                        guard.apply_fatal(NodeError::Protocol(format!(
+                            "Compaction task join failure: {}",
+                            e
+                        )));
+                    }
+                    Ok(Ok(_)) => {}
                 }
             }
+
+            // ADR 011: Catch up the State Machine by applying any entries
+            // committed during the freeze. This is performed outside the
+            // consensus lock to preserve heartbeat liveness.
+            state.apply_committed().await;
+
+            info!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                index = %index,
+                "Log compaction successful."
+            );
         }
         .instrument(span),
     );
@@ -1504,7 +1497,7 @@ mod tests {
                 }));
                 process_replication_response(&state, Term::new(1), peer_id, res)
                     .await
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
                 let guard = state.read().await;
                 if let RoleState::Leader(node) = guard.state() {
                     assert_eq!(
@@ -1544,7 +1537,7 @@ mod tests {
                 }));
                 process_replication_response(&state, Term::new(1), peer_id, res)
                     .await
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
                 let guard = state.read().await;
                 if let RoleState::Leader(node) = guard.state() {
                     assert_eq!(
@@ -1577,7 +1570,7 @@ mod tests {
 
                 process_replication_response(&state, Term::new(1), peer_id, res)
                     .await
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
 
                 let guard = state.read().await;
                 if let RoleState::Leader(node) = guard.state() {
@@ -1945,7 +1938,7 @@ mod tests {
                 if let RoleState::Leader(_) = guard.state() {
                     let strategy = determine_replication_strategy(&mut guard, peer_id, params)
                         .unwrap()
-                        .unwrap();
+                        .expect("Failed to advance horizon in test");
 
                     assert!(matches!(
                         strategy,
@@ -2071,7 +2064,7 @@ mod tests {
                         .add_service(ConsensusServiceServer::from_arc(service))
                         .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
                         .await
-                        .unwrap();
+                        .expect("Failed to advance horizon in test");
                 });
 
                 // 3. Configure PeerManager with mock server
@@ -2085,7 +2078,7 @@ mod tests {
                 // 4. Run election
                 initiate_election(config, state.clone(), pm, params)
                     .await
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
 
                 // 5. Verify transition
                 {
@@ -2160,7 +2153,7 @@ mod tests {
                 // Advance applied index forward to trigger compaction
                 guard
                     .advance_horizon_after_snapshot(LogIndex::new(21))
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
 
                 assert!(should_compact_log(&mut guard, &config));
             }
@@ -2178,7 +2171,7 @@ mod tests {
                 // applied = 5, last_included = 0. log_length = 5 <= 20.
                 guard
                     .advance_horizon_after_snapshot(LogIndex::new(5))
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
 
                 assert!(!should_compact_log(&mut guard, &config));
             }
@@ -2197,7 +2190,7 @@ mod tests {
                 append_dummy_entries(&mut guard, 100);
                 guard
                     .advance_horizon_after_snapshot(LogIndex::new(5))
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
 
                 assert!(!should_compact_log(&mut guard, &config));
             }
@@ -2214,7 +2207,7 @@ mod tests {
 
                 guard
                     .advance_horizon_after_snapshot(LogIndex::new(25))
-                    .unwrap();
+                    .expect("Failed to advance horizon in test");
                 guard.set_snapshotting(true);
 
                 assert!(!should_compact_log(&mut guard, &config));

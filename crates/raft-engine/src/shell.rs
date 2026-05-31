@@ -8,6 +8,7 @@ use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::RwLockWriteGuard;
@@ -39,6 +40,7 @@ use crate::service::consensus::SnapshotParams;
 pub struct ConsensusShell<S: StateMachine> {
     inner: Arc<RwLock<LogicalNode<S>>>,
     progress_tx: watch::Sender<ConsensusProgress>,
+    apply_lock: Mutex<()>,
 }
 
 impl<S: StateMachine> ConsensusShell<S> {
@@ -50,6 +52,7 @@ impl<S: StateMachine> ConsensusShell<S> {
         Self {
             inner: Arc::new(RwLock::new(initial_state)),
             progress_tx,
+            apply_lock: Mutex::new(()),
         }
     }
 
@@ -79,6 +82,99 @@ impl<S: StateMachine> ConsensusShell<S> {
     /// Provides a new subscription to the consensus progress stream.
     pub fn subscribe(&self) -> watch::Receiver<ConsensusProgress> {
         self.progress_tx.subscribe()
+    }
+
+    /// Orchestrates the non-blocking application of committed entries to the
+    /// State Machine.
+    ///
+    /// This method ensures that the primary consensus lock is NOT held across
+    /// the FSM application boundary, preventing heartbeat starvation (ADR 009).
+    #[instrument(
+        name = "apply_committed_orchestration",
+        target = "raft::replication",
+        skip(self)
+    )]
+    pub async fn apply_committed(self: &Arc<Self>) {
+        // [SERIALIZATION]: Ensure only one application loop runs at a time.
+        // This prevents the race condition where concurrent tasks try to apply
+        // the same log entry twice.
+        let _permit = self.apply_lock.lock().await;
+
+        let (fsm, log_store, mut applied, mut committed) = {
+            let guard = self.read().await;
+            (
+                guard.fsm(),
+                guard.log_store(),
+                guard.last_applied(),
+                guard.last_committed(),
+            )
+        };
+
+        // Fatal Invariant Violation: Application must never exceed commitment.
+        if applied > committed {
+            let mut guard = self.write().await;
+            guard.apply_fatal(NodeError::Protocol(format!(
+                "Causal Divergence: applied ({}) > committed ({})",
+                applied, committed
+            )));
+        }
+
+        // Sequential application loop
+        while applied < committed {
+            let next_idx = match applied + 1u64 {
+                Ok(idx) => idx,
+                Err(e) => {
+                    let mut guard = self.write().await;
+                    guard.apply_fatal(NodeError::Arithmetic(e));
+                }
+            };
+
+            // Phase 1: Read and Apply (Unlocked)
+            // We read directly from the persistent log store. Since committed entries
+            // are immutable, this is safe to do without the primary consensus lock.
+            let entry = match log_store.read_entries(next_idx, next_idx) {
+                Ok(entries) => entries.into_iter().next(),
+                Err(e) => {
+                    let mut guard = self.write().await;
+                    guard.apply_fatal(NodeError::from(e));
+                }
+            };
+
+            let apply_res = if let Some(entry) = entry {
+                // ADR 009: fsm.apply() is called WITHOUT the primary lock.
+                fsm.apply(next_idx, &entry.data).await
+            } else {
+                let mut guard = self.write().await;
+                guard.apply_fatal(NodeError::Protocol(format!(
+                    "Committed entry {} missing from log storage",
+                    next_idx
+                )));
+            };
+
+            // Phase 2: Advance Horizon (Locked)
+            {
+                let mut guard = self.write().await;
+                match apply_res {
+                    Ok(_) => {
+                        // Update volatile cache.
+                        match guard.advance_horizon_after_snapshot(next_idx) {
+                            Ok(_) => {
+                                applied = next_idx;
+                                committed = guard.last_committed();
+                            }
+                            Err(e) => {
+                                error!(index = %next_idx, error = %e, "Failed to advance horizon");
+                                guard.apply_fatal(e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(index = %next_idx, error = %e, "FSM Apply failed");
+                        guard.apply_fatal(NodeError::Protocol(format!("Apply failure: {}", e)));
+                    }
+                }
+            }
+        }
     }
 
     /// Orchestrates an InstallSnapshot request using a Non-Blocking Handoff.
