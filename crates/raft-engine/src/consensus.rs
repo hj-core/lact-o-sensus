@@ -215,7 +215,16 @@ pub fn spawn_tick_loop<S: StateMachine>(
 
                     // COMPACTION TRIGGER (ADR 011)
                     if should_compact_log(&mut guard, &config) {
-                        initiate_snapshot_generation(state.clone(), &parent_span);
+                        // We set the flag immediately within the locked boundary to
+                        // prevent the next tick (10ms later) from re-triggering while
+                        // the async task is being spawned.
+                        guard.set_snapshotting(true);
+
+                        let index = guard.last_applied();
+                        let term = guard.get_term_at(index);
+                        let fsm = guard.fsm();
+
+                        initiate_snapshot_generation(state.clone(), fsm, index, term, &parent_span);
                     }
 
                     match action {
@@ -315,19 +324,25 @@ pub fn spawn_tick_loop<S: StateMachine>(
     );
 }
 
-/// Determines whether the log length exceeds the configured compaction
-/// threshold.
+/// Determines whether the density of un-snapshotted applied entries exceeds
+/// the configured compaction threshold.
 ///
-/// Returns true when the number of un-snapshotted entries exceeds
+/// FREEZE-APPLY INVARIANCE (ADR 011):
+/// This check triggers based on `last_applied` rather than `last_log_index` to
+/// ensure that every snapshot actually advances the logical horizon of the
+/// persisted state. This prevents "Snapshot Storms" where a node repeatedly
+/// snapshots the same state when application is lagging behind replication.
+///
+/// Returns true when the number of un-snapshotted applied entries exceeds
 /// `snapshot_threshold` and no snapshot is currently in progress.
 fn should_compact_log<S: StateMachine>(guard: &mut LogicalNode<S>, config: &Config) -> bool {
     if guard.is_snapshotting() {
         return false;
     }
 
-    let last_idx = guard.last_log_index();
+    let applied = guard.last_applied();
     let last_snap = guard.last_included_index();
-    let log_length = (last_idx - last_snap.as_u64())
+    let log_length = (applied - last_snap.as_u64())
         .map(|i| i.as_u64())
         .unwrap_or(0);
 
@@ -458,6 +473,9 @@ async fn initiate_election<S: StateMachine>(
 /// `apply` pipeline from advancing during serialization.
 pub fn initiate_snapshot_generation<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
+    fsm: Arc<S>,
+    index: LogIndex,
+    term: Term,
     parent_span: &tracing::Span,
 ) {
     let span = info_span!(
@@ -468,26 +486,13 @@ pub fn initiate_snapshot_generation<S: StateMachine>(
 
     tokio::spawn(
         async move {
-            // 1. Capture snapshot target and freeze application
-            let (fsm, index, term) = {
-                let mut guard = state.write().await;
-                guard.set_snapshotting(true);
-
-                // We snapshot up to the last applied index to ensure
-                // physical-to-logical alignment.
-                let index = guard.last_applied();
-                let term = guard.get_term_at(index);
-
-                (guard.fsm(), index, term)
-            };
-
             info!(
                 target: ClinicalTarget::RaftCompaction.as_str(),
                 index = %index,
                 "Snapshot generation started (FSM Frozen)."
             );
 
-            // 2. Perform heavy serialization (Unlocked)
+            // 1. Perform heavy serialization (Unlocked)
             // ADR 011: Use tokio::task::spawn_blocking for heavy I/O
             let res = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
@@ -495,7 +500,7 @@ pub fn initiate_snapshot_generation<S: StateMachine>(
             })
             .await;
 
-            // 3. Finalize and compact (Locked)
+            // 2. Finalize and compact (Locked)
             let mut guard = state.write().await;
             guard.set_snapshotting(false);
 
@@ -524,7 +529,8 @@ pub fn initiate_snapshot_generation<S: StateMachine>(
 
                     // CATCH UP: Apply any entries committed during the freeze.
                     let commit_idx = guard.last_committed();
-                    guard.advance_last_committed(commit_idx).await;
+                    drop(guard);
+                    state.apply_committed().await;
 
                     info!(
                         target: ClinicalTarget::RaftCompaction.as_str(),
@@ -1399,6 +1405,7 @@ mod tests {
             [raft]
             election_timeout_min_ms = {}
             election_timeout_max_ms = {}
+            snapshot_threshold = 20
             [policy]
             veto_addr = "http://127.0.0.1:50060"
             veto_timeout_ms = 1000
@@ -2011,8 +2018,9 @@ mod tests {
     }
 
     mod initiate_election {
-        use super::*;
         use futures::FutureExt;
+
+        use super::*;
 
         mod when_invoked_by_candidate {
             use super::*;
@@ -2121,6 +2129,95 @@ mod tests {
 
                 let stream = broadcast_append_entries(&config, pm, state, params);
                 assert_eq!(stream.len(), 2);
+            }
+        }
+    }
+
+    mod should_compact_log {
+        use super::*;
+
+        fn append_dummy_entries<S: StateMachine>(guard: &mut LogicalNode<S>, count: u64) {
+            let entries: Vec<_> = (1..=count)
+                .map(|i| LogEntry {
+                    index: i,
+                    term: 1,
+                    data: vec![],
+                })
+                .collect();
+            guard.log_store().append_entries(entries).unwrap();
+        }
+
+        mod when_applied_entries_exceed_threshold {
+            use super::*;
+            #[tokio::test]
+            async fn should_trigger_compaction() {
+                let (config, state, _) = setup().await;
+                let mut guard = state.write().await;
+
+                // Threshold is 20 in mock_config.
+                append_dummy_entries(&mut guard, 21);
+
+                // Advance applied index forward to trigger compaction
+                guard
+                    .advance_horizon_after_snapshot(LogIndex::new(21))
+                    .unwrap();
+
+                assert!(should_compact_log(&mut guard, &config));
+            }
+        }
+
+        mod when_applied_index_is_below_threshold {
+            use super::*;
+            #[tokio::test]
+            async fn should_not_trigger_compaction() {
+                let (config, state, _) = setup().await;
+                let mut guard = state.write().await;
+
+                append_dummy_entries(&mut guard, 5);
+
+                // applied = 5, last_included = 0. log_length = 5 <= 20.
+                guard
+                    .advance_horizon_after_snapshot(LogIndex::new(5))
+                    .unwrap();
+
+                assert!(!should_compact_log(&mut guard, &config));
+            }
+        }
+
+        mod when_log_is_long_but_applied_is_low {
+            use super::*;
+            #[tokio::test]
+            async fn should_not_trigger_compaction() {
+                let (config, state, _) = setup().await;
+                let mut guard = state.write().await;
+
+                // log_index = 100, applied = 5. threshold = 20.
+                // Under previous logic (log_index based), this would trigger.
+                // Under new logic (applied based), it should NOT trigger.
+                append_dummy_entries(&mut guard, 100);
+                guard
+                    .advance_horizon_after_snapshot(LogIndex::new(5))
+                    .unwrap();
+
+                assert!(!should_compact_log(&mut guard, &config));
+            }
+        }
+
+        mod when_snapshot_in_progress {
+            use super::*;
+            #[tokio::test]
+            async fn should_inhibit_compaction() {
+                let (config, state, _) = setup().await;
+                let mut guard = state.write().await;
+
+                append_dummy_entries(&mut guard, 25);
+
+                guard
+                    .advance_horizon_after_snapshot(LogIndex::new(25))
+                    .unwrap();
+                guard.set_snapshotting(true);
+
+                assert!(!should_compact_log(&mut guard, &config));
             }
         }
     }
