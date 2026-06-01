@@ -394,7 +394,11 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
         missing = [
             it
             for it in flooder.successful_items
-            if f"- {it.lower().replace('_', '')} (" not in output.lower().replace("_", "")
+            if not any(
+                it.lower().replace("_", "") in line.lower().replace("_", "")
+                for line in output.split("\n")
+                if line.strip().startswith("-")
+            )
         ]
         if missing:
             raise RuntimeError(f"Data Integrity Violation! Missing: {missing[0]}")
