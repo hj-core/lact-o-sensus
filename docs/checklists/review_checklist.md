@@ -256,12 +256,12 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **DO**: Prefer idiomatic `use` statements over fully-qualified names (FQN) to maintain brevity.
 - **DO NOT**: Clutter execution logic with deeply nested, repeated paths.
 
-### [ENG-03] Async Function Discipline
+### [ENG-03] Magic Number Avoidance
 
 - **Target Scope**: All Source Files
-- **Severity**: WARNING
-- **DO**: Declare functions `async fn` only when they contain at least one `.await` on a genuinely asynchronous operation (network I/O, tokio timer, channel, `RwLock`/`Mutex` acquisition).
-- **DO NOT**: Mark a function `async fn` if its body contains no `.await` calls, or if all its `.await` calls chain to functions that are themselves zero-async and perform only synchronous blocking I/O (sled operations, protobuf encoding, file I/O). Such functions should be synchronous (`fn`) and, when the calling context requires offloading, explicitly wrapped in `tokio::task::spawn_blocking` at the offload boundary.
+- **Severity**: STYLE
+- **DO**: Formalize configuration constants (such as timeout multipliers, connection cushions, or retry limits) in the configuration layer or as named constants.
+- **DO NOT**: Use hardcoded numeric literals ("magic numbers") directly in orchestration or physical logic, as this reduces readability and makes the system's tuning opaque.
 
 ### [ENG-04] Clinical Documentation
 
@@ -277,14 +277,21 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **DO**: Limit cross-references within documentation files to the `docs/adrs/` directory only.
 - **DO NOT**: Reference other `docs/` content such as checklist items, roadmap phases, or other internal documentation files from within documentation files.
 
-### [ENG-06] Behavioral Verification
+### [ENG-06] Async Function Discipline
+
+- **Target Scope**: All Source Files
+- **Severity**: WARNING
+- **DO**: Declare functions `async fn` only when they contain at least one `.await` on a genuinely asynchronous operation (network I/O, tokio timer, channel, `RwLock`/`Mutex` acquisition).
+- **DO NOT**: Mark a function `async fn` if its body contains no `.await` calls, or if all its `.await` calls chain to functions that are themselves zero-async and perform only synchronous blocking I/O (sled operations, protobuf encoding, file I/O). Such functions should be synchronous (`fn`) and, when the calling context requires offloading, explicitly wrapped in `tokio::task::spawn_blocking` at the offload boundary.
+
+### [ENG-07] Behavioral Verification
 
 - **Target Scope**: All Source Files (`mod tests`)
 - **Severity**: WARNING
 - **DO**: Verify non-trivial logic via the mandatory nested BDD-style module hierarchy.
 - **DO NOT**: Structure test classes as a flat, unorganized list of testing assertions.
 
-### [ENG-07] Clinical Telemetry
+### [ENG-08] Clinical Telemetry
 
 - **Target Scope**: Observability Layer
 - **Severity**: CRITICAL
@@ -292,14 +299,14 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **DO**: Always propagate the current `trace_id` across thread, task, and RPC boundaries. Use `.instrument(span)` on every `tokio::spawn`, `spawn_blocking`, and cross-task handoff to preserve the causal chain.
 - **DO NOT**: Rely on unstructured `println!` or raw string literals. Do not trust client-provided `x-trace-id` headers for correlation. Do not drop the `trace_id` when spawning a new task.
 
-### [ENG-08] Single Decision, Single Span
+### [ENG-09] Single Decision, Single Span
 
 - **Target Scope**: All Source Files with `#[instrument]`
 - **Severity**: WARNING
 - **DO**: Instrument the Orchestrator (where semantic decisions happen), not the Implementer (mechanical side-effects of decisions). A span should represent a semantic choice or high-impact operation — not just a function call.
 - **DO NOT**: Create redundant nested spans that echo the parent (e.g., `transition:transition`). If a function is purely mechanical (disk write, serialization), do not `#[instrument]` it — let the caller's span provide context via `.in_current_span()`.
 
-### [ENG-09] Artifact Cleanliness
+### [ENG-10] Artifact Cleanliness
 
 - **Target Scope**: CI/CD Pipeline
 - **Severity**: CRITICAL
