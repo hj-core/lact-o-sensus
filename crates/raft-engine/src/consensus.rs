@@ -54,6 +54,10 @@ use crate::shell::SnapshotPermit;
 // I. Semantic Vocabulary (Types & Enums)
 // =============================================================================
 
+/// Multiplier applied to the base RPC timeout to allow for connection
+/// establishment (TCP/TLS/HTTP2 handshakes) on cold starts (Rule [ENG-03]).
+const CONNECTION_CUSHION_MULTIPLIER: u32 = 4;
+
 /// Standardized result type for internal Raft RPC operations.
 ///
 /// Distinguishes transient network or protocol errors (Status) from
@@ -968,6 +972,7 @@ fn broadcast_append_entries<S: StateMachine>(
     impl futures::Future<Output = (NodeId, RpcResult<Option<ReplicationOutcome<S>>>)>,
 > {
     let rpc_timeout = config.raft.rpc_timeout();
+    let consensus_timeout = config.raft.consensus_timeout();
 
     peer_manager
         .peer_ids()
@@ -979,6 +984,7 @@ fn broadcast_append_entries<S: StateMachine>(
                 peer_id,
                 params,
                 rpc_timeout,
+                consensus_timeout,
             )
         })
         .collect()
@@ -999,6 +1005,7 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
     peer_id: NodeId,
     params: ReplicationRoundParams,
     rpc_timeout: Duration,
+    consensus_timeout: Duration,
 ) -> (NodeId, RpcResult<Option<ReplicationOutcome<S>>>) {
     // 1. Decision Phase: Determine which strategy to use while holding the lock.
     let strategy = {
@@ -1039,6 +1046,7 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
                     last_included_index,
                     last_included_term,
                     rpc_timeout,
+                    consensus_timeout,
                     permit,
                 )
                 .await
@@ -1083,20 +1091,78 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     last_included_index: LogIndex,
     last_included_term: Term,
     rpc_timeout: Duration,
+    consensus_timeout: Duration,
     permit: SnapshotPermit<S>,
 ) -> RpcResult<Option<ReplicationOutcome<S>>> {
+    // Phase 1: Reachability Probe (Lightweight)
+    // We send a quiet heartbeat anchored at the snapshot horizon to verify
+    // the follower is alive before performing heavy FSM serialization.
+    let probe_req = AppendEntriesRequest::new(
+        params.term,
+        params.node_id,
+        last_included_index,
+        last_included_term,
+        vec![], // No entries
+        params.last_committed,
+    );
+
+    let probe_res = replicate_to_peer::<S>(
+        peer_manager.clone(),
+        peer_id,
+        probe_req,
+        rpc_timeout,
+        params.trace_id,
+    )
+    .await;
+
+    match probe_res {
+        Err(e) => {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                peer = %peer_id,
+                error = %e,
+                "Snapshot target unresponsive to probe. Aborting heavy serialization."
+            );
+            return Ok(None);
+        }
+        Ok(Some(outcome)) => {
+            // CLINICAL SAFETY (Raft §5.1): If the probe discovered a higher term,
+            // we MUST return the outcome immediately so the orchestrator can
+            // demote the leader. Proceeding to Phase 2 (Heavy Payload) in a stale
+            // term is a violation of the Stability Invariant.
+            let resp_term = match &outcome {
+                ReplicationOutcome::AppendEntries { response, .. } => Term::new(response.term),
+                ReplicationOutcome::InstallSnapshot { response, .. } => Term::new(response.term),
+            };
+
+            if resp_term > params.term {
+                info!(
+                    target: ClinicalTarget::RaftReplication.as_str(),
+                    peer = %peer_id,
+                    new_term = %resp_term,
+                    "Probe discovered higher term. Returning outcome for immediate demotion."
+                );
+                return Ok(Some(outcome));
+            }
+        }
+        Ok(None) => {
+            // Standard heartbeat logic might return Ok(None) if the strategy
+            // changed under lock, but for a manual probe we expect an outcome.
+        }
+    }
+
+    // Phase 2: Heavy Payload (Serialization)
     let fsm = {
         let mut guard = state.write().await;
         guard.set_snapshotting(true);
         guard.fsm()
     };
 
-    // ADR 011: Use tokio::task::spawn_blocking for heavy FSM serialization
-    let res = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(fsm.snapshot())
-    })
-    .await;
+    // ADR 011: Execute heavy serialization in the background.
+    // Note: Since StateMachine::snapshot is already async, we directly await it
+    // within the current task. Replication rounds are already spawned tasks,
+    // so this will not block the deterministic Tick Loop.
+    let res = fsm.snapshot().await;
 
     {
         let mut guard = state.write().await;
@@ -1104,20 +1170,12 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     }
 
     let data = match res {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => {
-            // Trigger Poison-then-Panic with comprehensive forensics (Rule 15)
+        Ok(data) => data,
+        Err(e) => {
+            // Trigger Poison-then-Panic with comprehensive forensics (Rule [SAFE-04])
             let mut guard = state.write().await;
             guard.apply_fatal(NodeError::Protocol(format!(
                 "Snapshot serialization failed for peer={} at index={} in term={}: {}",
-                peer_id, last_included_index, params.term, e
-            )));
-        }
-        Err(e) => {
-            // Trigger Poison-then-Panic for task join failure (ADR 009)
-            let mut guard = state.write().await;
-            guard.apply_fatal(NodeError::Protocol(format!(
-                "Snapshot task failed to join for peer={} at index={} in term={}: {}",
                 peer_id, last_included_index, params.term, e
             )));
         }
@@ -1135,7 +1193,7 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
         peer_manager,
         peer_id,
         request,
-        rpc_timeout,
+        consensus_timeout,
         params.trace_id,
         permit,
     )
@@ -1152,7 +1210,7 @@ async fn replicate_to_peer<S: StateMachine>(
     peer_manager: Arc<PeerManager>,
     peer_id: NodeId,
     request: AppendEntriesRequest,
-    rpc_timeout: Duration,
+    timeout: Duration,
     trace_id: TraceId,
 ) -> RpcResult<Option<ReplicationOutcome<S>>> {
     let sent_prev_index = LogIndex::new(request.prev_log_index);
@@ -1163,13 +1221,27 @@ async fn replicate_to_peer<S: StateMachine>(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     let mut req = Request::new(request);
-    req.set_timeout(rpc_timeout);
+    // ADR 003: We set the timeout on the request itself...
+    req.set_timeout(timeout);
 
-    // Explicit Outbound Propagation
+    // Explicit Outbound Propagation (ADR 010)
     TraceInterceptor::inject_trace_id_into_request(&mut req, trace_id)
         .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
 
-    let response = client.append_entries(req).await?;
+    // ...but for reachability probes or dead-end connections, we ALSO
+    // wrap the future in a tokio timeout to ensure we don't hang on
+    // connection establishment.
+    //
+    // CONNECTION CUSHION: We use a multiplier for the global liveness
+    // bound to allow the multi-stage gRPC handshake (TCP, TLS, HTTP/2) to
+    // complete on cold starts without starving the RPC's actual processing
+    // budget (Rule [ENG-03]).
+    let liveness_timeout = timeout * CONNECTION_CUSHION_MULTIPLIER;
+    let response_fut = tokio::time::timeout(liveness_timeout, client.append_entries(req));
+
+    let response = response_fut
+        .await
+        .map_err(|_| Status::deadline_exceeded("RPC connection timeout"))??;
 
     // Causal Integrity Verification (ADR 010)
     verify_trace_integrity(&response, trace_id, peer_id)?;
@@ -1190,7 +1262,7 @@ async fn install_snapshot_to_peer<S: StateMachine>(
     peer_manager: Arc<PeerManager>,
     peer_id: NodeId,
     request: InstallSnapshotRequest,
-    rpc_timeout: Duration,
+    timeout: Duration,
     trace_id: TraceId,
     permit: SnapshotPermit<S>,
 ) -> RpcResult<Option<ReplicationOutcome<S>>> {
@@ -1201,13 +1273,18 @@ async fn install_snapshot_to_peer<S: StateMachine>(
         .map_err(|e| Status::internal(e.to_string()))?;
 
     let mut req = Request::new(request);
-    req.set_timeout(rpc_timeout);
+    req.set_timeout(timeout);
 
-    // Explicit Outbound Propagation
+    // Explicit Outbound Propagation (ADR 010)
     TraceInterceptor::inject_trace_id_into_request(&mut req, trace_id)
         .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
 
-    let response = client.install_snapshot(req).await?;
+    // Apply global timeout wrapper (Rule 15)
+    let response_fut = tokio::time::timeout(timeout, client.install_snapshot(req));
+
+    let response = response_fut
+        .await
+        .map_err(|_| Status::deadline_exceeded("RPC connection timeout"))??;
 
     // Causal Integrity Verification (ADR 010)
     verify_trace_integrity(&response, trace_id, peer_id)?;
@@ -1389,19 +1466,118 @@ fn verify_trace_integrity<T>(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     use common::proto::v1::raft::LogEntry;
+    use common::proto::v1::raft::consensus_service_server::ConsensusService;
+    use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
+    use common::rpc::HEADER_TRACE_ID;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
+    use futures::FutureExt;
+    use futures::stream;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use tokio::sync::oneshot;
+    use tonic::Response;
     use tonic::async_trait;
+    use tonic::transport::Server;
 
     use super::*;
     use crate::storage::MemoryStorage;
     use crate::tick::TickDuration;
     use crate::tick::TickThresholds;
+
+    async fn setup_mock_peer<S: StateMachine>(
+        state: Arc<ConsensusShell<S>>,
+    ) -> (
+        Arc<PeerManager>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        std::net::SocketAddr,
+        Arc<MockConsensusService>,
+    ) {
+        let service = Arc::new(MockConsensusService {
+            vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(Term::ZERO, true))),
+            append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
+                Term::ZERO,
+                true,
+                LogIndex::ZERO,
+            ))),
+            snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(Term::ZERO))),
+        });
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let service_clone = service.clone();
+        let server_handle = tokio::spawn(async move {
+            let incoming = stream::unfold(listener, |listener| async move {
+                let res = listener.accept().await.map(|(s, _)| s);
+                Some((res, listener))
+            });
+
+            Server::builder()
+                .add_service(ConsensusServiceServer::from_arc(service_clone))
+                .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
+                .await
+                .expect("Mock server failed");
+        });
+
+        let mut peer_map = HashMap::new();
+        let peer_id = NodeId::try_new(2).unwrap();
+        peer_map.insert(peer_id, format!("http://{}", bound_addr));
+        let pm = Arc::new(PeerManager::try_new(state.read().await.identity(), &peer_map).unwrap());
+
+        (pm, tx, server_handle, bound_addr, service)
+    }
+
+    struct MockConsensusService {
+        vote_response: Arc<Mutex<RequestVoteResponse>>,
+        append_response: Arc<Mutex<AppendEntriesResponse>>,
+        snapshot_response: Arc<Mutex<InstallSnapshotResponse>>,
+    }
+
+    #[async_trait]
+    impl ConsensusService for MockConsensusService {
+        async fn request_vote(
+            &self,
+            request: Request<RequestVoteRequest>,
+        ) -> Result<Response<RequestVoteResponse>, Status> {
+            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+            let mut res = Response::new(*self.vote_response.lock().unwrap());
+            if let Some(val) = trace_id_header {
+                res.metadata_mut().insert(HEADER_TRACE_ID, val);
+            }
+            Ok(res)
+        }
+
+        async fn append_entries(
+            &self,
+            request: Request<AppendEntriesRequest>,
+        ) -> Result<Response<AppendEntriesResponse>, Status> {
+            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+            let mut res = Response::new(*self.append_response.lock().unwrap());
+            if let Some(val) = trace_id_header {
+                res.metadata_mut().insert(HEADER_TRACE_ID, val);
+            }
+            Ok(res)
+        }
+
+        async fn install_snapshot(
+            &self,
+            request: Request<InstallSnapshotRequest>,
+        ) -> Result<Response<InstallSnapshotResponse>, Status> {
+            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+            let mut res = Response::new(*self.snapshot_response.lock().unwrap());
+            if let Some(val) = trace_id_header {
+                res.metadata_mut().insert(HEADER_TRACE_ID, val);
+            }
+            Ok(res)
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MockFsm;
@@ -1640,24 +1816,25 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn should_serialize_fsm_and_dispatch_rpc() {
+        async fn should_abort_and_return_outcome_if_probe_discovers_higher_term() {
             let (_, state, _) = setup().await;
+            let (pm, tx, server, _, service) = setup_mock_peer(state.clone()).await;
+
+            // Simulate higher term on peer
+            let higher_term = Term::new(10);
+            *service.append_response.lock().unwrap() =
+                AppendEntriesResponse::new(higher_term, false, LogIndex::ZERO);
 
             let last_included_index = LogIndex::new(10);
             let last_included_term = Term::new(2);
             let peer_id = NodeId::try_new(2).unwrap();
-            let pm = Arc::new(
-                PeerManager::try_new(state.read().await.identity(), &HashMap::new()).unwrap(),
-            );
             let params = ReplicationRoundParams {
-                term: Term::new(3),
+                term: Term::new(3), // Current term is 3, peer is 10
                 node_id: NodeId::try_new(1).unwrap(),
                 last_committed: LogIndex::new(0),
                 trace_id: TraceId::generate(),
             };
 
-            // This will fail at the RPC layer because there is no peer,
-            // but it proves the serialization path is active.
             let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let res = replicate_snapshot_to_peer(
                 state.clone(),
@@ -1667,16 +1844,62 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                Duration::from_secs(30),
                 permit,
             )
             .await;
 
-            // We expect a network error (Connection refused/Node not found),
-            // NOT a serialization error.
-            match res {
-                Err(s) => assert_ne!(s.message(), "FSM Snapshot failed"),
-                _ => panic!("Expected network error"),
+            // Verify: Returns Ok(Some(Outcome)) with the higher term
+            assert!(res.is_ok());
+            let outcome = res.unwrap().expect("Should return outcome");
+            if let ReplicationOutcome::AppendEntries { response, .. } = outcome {
+                assert_eq!(Term::new(response.term), higher_term);
+            } else {
+                panic!("Expected AppendEntries outcome from probe");
             }
+
+            // Verify: FSM serialization was never triggered (flag is false)
+            assert!(!state.read().await.is_snapshotting());
+
+            let _ = tx.send(());
+            let _ = server.await;
+        }
+
+        #[tokio::test]
+        async fn should_proceed_if_probe_is_successful_with_current_term() {
+            let (_, state, _) = setup().await;
+            let (pm, tx, server, _, _) = setup_mock_peer(state.clone()).await;
+
+            let last_included_index = LogIndex::new(10);
+            let last_included_term = Term::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
+            let params = ReplicationRoundParams {
+                term: Term::new(3),
+                node_id: NodeId::try_new(1).unwrap(),
+                last_committed: LogIndex::new(0),
+                trace_id: TraceId::generate(),
+            };
+
+            let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
+            let res = replicate_snapshot_to_peer(
+                state.clone(),
+                pm,
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                permit,
+            )
+            .await;
+
+            // Verify: Successfully completed Phase 1 and Phase 2
+            assert!(res.is_ok());
+            assert!(res.unwrap().is_some());
+
+            let _ = tx.send(());
+            let _ = server.await;
         }
 
         #[tokio::test]
@@ -1745,6 +1968,8 @@ mod tests {
 
             fsm.shell.lock().await.replace(state.clone());
 
+            let (pm, tx, server, _, _) = setup_mock_peer(state.clone()).await;
+
             let last_included_index = LogIndex::new(10);
             let last_included_term = Term::new(2);
             let peer_id = NodeId::try_new(2).unwrap();
@@ -1755,8 +1980,6 @@ mod tests {
                 trace_id: TraceId::generate(),
             };
 
-            let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
-
             let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let _ = replicate_snapshot_to_peer(
                 state.clone(),
@@ -1766,6 +1989,7 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                Duration::from_secs(30),
                 permit,
             )
             .await;
@@ -1778,6 +2002,9 @@ mod tests {
                 !state.read().await.is_snapshotting(),
                 "Flag should be false after snapshot completes"
             );
+
+            let _ = tx.send(());
+            let _ = server.await;
         }
     }
 
@@ -1832,6 +2059,8 @@ mod tests {
                 LogicalNode::try_new(id.clone(), fsm.clone(), storage, thresholds, rng).unwrap();
             let state = Arc::new(ConsensusShell::new(node));
 
+            let (pm, tx, server, _, _) = setup_mock_peer(state.clone()).await;
+
             let last_included_index = LogIndex::new(10);
             let last_included_term = Term::new(2);
             let peer_id = NodeId::try_new(2).unwrap();
@@ -1842,8 +2071,6 @@ mod tests {
                 trace_id: TraceId::generate(),
             };
 
-            let pm = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
-
             let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
             let _ = replicate_snapshot_to_peer(
                 state.clone(),
@@ -1853,9 +2080,13 @@ mod tests {
                 last_included_index,
                 last_included_term,
                 Duration::from_secs(1),
+                Duration::from_secs(30),
                 permit,
             )
             .await;
+
+            let _ = tx.send(());
+            let _ = server.await;
         }
     }
 
@@ -2012,60 +2243,7 @@ mod tests {
         }
     }
 
-    // --- Orchestrator Behavioral Verification (ADR 009) ---
-
-    use std::sync::Mutex;
-
-    use common::proto::v1::raft::consensus_service_server::ConsensusService;
-    use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
-    use common::rpc::HEADER_TRACE_ID;
-    use futures::stream;
-    use tokio::sync::oneshot;
-    use tonic::Response;
-    use tonic::transport::Server;
-
-    struct MockConsensusService {
-        vote_response: Arc<Mutex<RequestVoteResponse>>,
-        append_response: Arc<Mutex<AppendEntriesResponse>>,
-    }
-
-    #[async_trait]
-    impl ConsensusService for MockConsensusService {
-        async fn request_vote(
-            &self,
-            request: Request<RequestVoteRequest>,
-        ) -> Result<Response<RequestVoteResponse>, Status> {
-            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
-            let mut res = Response::new(*self.vote_response.lock().unwrap());
-            if let Some(val) = trace_id_header {
-                res.metadata_mut().insert(HEADER_TRACE_ID, val);
-            }
-            Ok(res)
-        }
-
-        async fn append_entries(
-            &self,
-            request: Request<AppendEntriesRequest>,
-        ) -> Result<Response<AppendEntriesResponse>, Status> {
-            let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
-            let mut res = Response::new(*self.append_response.lock().unwrap());
-            if let Some(val) = trace_id_header {
-                res.metadata_mut().insert(HEADER_TRACE_ID, val);
-            }
-            Ok(res)
-        }
-
-        async fn install_snapshot(
-            &self,
-            _request: Request<InstallSnapshotRequest>,
-        ) -> Result<Response<InstallSnapshotResponse>, Status> {
-            Ok(Response::new(InstallSnapshotResponse::new(Term::ZERO)))
-        }
-    }
-
     mod initiate_election {
-        use futures::FutureExt;
-
         use super::*;
 
         mod when_invoked_by_candidate {
@@ -2090,48 +2268,12 @@ mod tests {
                     trace_id: TraceId::generate(),
                 };
 
-                // 2. Start mock server
-                let service = Arc::new(MockConsensusService {
-                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
-                        Term::new(1),
-                        true,
-                    ))),
-                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
-                        Term::new(1),
-                        true,
-                        LogIndex::ZERO,
-                    ))),
-                });
-
-                let (tx, rx) = oneshot::channel::<()>();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let bound_addr = listener.local_addr().unwrap();
-
-                let server_handle = tokio::spawn(async move {
-                    let incoming = stream::unfold(listener, |listener| async move {
-                        let res = listener.accept().await.map(|(s, _)| s);
-                        Some((res, listener))
-                    });
-
-                    Server::builder()
-                        .add_service(ConsensusServiceServer::from_arc(service))
-                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
-                        .await
-                        .expect("Failed to advance horizon in test");
-                });
-
-                // 3. Configure PeerManager with mock server
-                let mut peer_map = HashMap::new();
-                let peer_id = NodeId::try_new(2).unwrap();
-                peer_map.insert(peer_id, format!("http://{}", bound_addr));
-                let pm = Arc::new(
-                    PeerManager::try_new(state.read().await.identity(), &peer_map).unwrap(),
-                );
+                let (pm, tx, server, _, _) = setup_mock_peer(state.clone()).await;
 
                 // 4. Run election
                 initiate_election(config, state.clone(), pm, params)
                     .await
-                    .expect("Failed to advance horizon in test");
+                    .expect("Failed to run election in test");
 
                 // 5. Verify transition
                 {
@@ -2141,7 +2283,7 @@ mod tests {
 
                 // Cleanup
                 let _ = tx.send(());
-                let _ = server_handle.await;
+                let _ = server.await;
             }
         }
     }
@@ -2265,6 +2407,67 @@ mod tests {
 
                 assert!(!should_compact_log(&mut guard, &config));
             }
+        }
+    }
+
+    mod reachability_first_snapshotting {
+        use super::*;
+
+        #[tokio::test]
+        async fn should_abort_snapshot_if_reachability_probe_fails() {
+            let (_, state, _) = setup().await;
+            let peer_id = NodeId::try_new(2).unwrap();
+
+            // 1. Setup Leader with lagging peer
+            let params = {
+                let mut guard = state.write().await;
+                guard.into_candidate();
+                guard.into_leader(vec![peer_id]);
+                guard.save_snapshot_metadata(LogIndex::new(10), Term::new(1));
+                if let Some(leader) = guard.as_leader_mut() {
+                    leader
+                        .state_mut()
+                        .next_index_mut()
+                        .insert(peer_id, LogIndex::new(5));
+                }
+                ReplicationRoundParams {
+                    term: Term::new(1),
+                    node_id: NodeId::try_new(1).unwrap(),
+                    last_committed: LogIndex::new(0),
+                    trace_id: TraceId::generate(),
+                }
+            };
+
+            // 2. Configure PeerManager with a dead-end address (will trigger hang/error)
+            let mut peer_map = HashMap::new();
+            peer_map.insert(peer_id, "http://127.0.0.1:1".to_string()); // Invalid port
+            let pm =
+                Arc::new(PeerManager::try_new(state.read().await.identity(), &peer_map).unwrap());
+
+            // 3. Execute snapshot task
+            let permit = state.try_acquire_snapshot_permit(peer_id).await.unwrap();
+            let res = replicate_snapshot_to_peer(
+                state.clone(),
+                pm,
+                peer_id,
+                params,
+                LogIndex::new(10),
+                Term::new(1),
+                Duration::from_millis(10), // Short timeout
+                Duration::from_secs(30),   // Long snapshot timeout
+                permit,
+            )
+            .await;
+
+            // 4. Verify: No error returned, but no snapshot outcome either
+            assert!(res.is_ok());
+            assert!(
+                res.unwrap().is_none(),
+                "Should have aborted before heavy work"
+            );
+
+            // 5. Verify: FSM was never frozen
+            assert!(!state.read().await.is_snapshotting());
         }
     }
 }
