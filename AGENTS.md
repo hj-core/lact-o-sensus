@@ -45,3 +45,4 @@ Implementation must adhere to the [Lact-O-Sensus Review Checklist](docs/checklis
   - `python3 scripts/smoke_test.py`
 - **5.4. Clinical Review:** Evaluate verified changes against the [Review Checklist](docs/checklists/review_checklist.md) and resolve all violations.
 - **5.5. Atomic Commits:** Finalize changes as atomic units following [Conventional Commits](https://www.conventionalcommits.org/). Ensure the commit message body briefly describes the context and the major works that have been done.
+- **5.6. Documentation Boundary Discipline:** Limit cross-references within documentation files, commit messages, and other textual artifacts to the `docs/adrs/` directory only. Do not reference other `docs/` content (e.g., checklists, roadmaps) from within documentation files or commit messages.
