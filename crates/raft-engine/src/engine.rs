@@ -76,10 +76,11 @@ pub struct LogicalNode<S: StateMachine> {
     current_tick: Tick,
     thresholds: TickThresholds,
     rng: StdRng,
-    /// Freeze-Apply Flag (ADR 011): When true, mutations are committed to the
-    /// log but not applied to the FSM to ensure consistency during
-    /// snapshotting.
-    is_snapshotting: bool,
+    /// Freeze-Apply Counter (ADR 011): The FSM is frozen for application as
+    /// long as this counter is greater than zero. This allows overlapping
+    /// tasks (e.g., compaction + replication) to safely manage the freeze
+    /// state.
+    snapshot_count: u32,
 }
 
 macro_rules! delegate_to_inner {
@@ -323,7 +324,7 @@ impl<S: StateMachine> LogicalNode<S> {
             current_tick,
             thresholds,
             rng,
-            is_snapshotting: false,
+            snapshot_count: 0,
         })
     }
 
@@ -416,7 +417,7 @@ impl<S: StateMachine> LogicalNode<S> {
 
     /// Returns true if a snapshot is currently being generated.
     pub fn is_snapshotting(&self) -> bool {
-        self.is_snapshotting
+        self.snapshot_count > 0
     }
 
     pub fn log_store(&self) -> Arc<dyn LogStorage> {
@@ -430,10 +431,28 @@ impl<S: StateMachine> LogicalNode<S> {
 
     /// Toggles the Freeze-Apply state for snapshot generation.
     pub fn set_snapshotting(&mut self, active: bool) {
-        self.is_snapshotting = active;
+        if active {
+            match self.snapshot_count.checked_add(1) {
+                Some(new_count) => self.snapshot_count = new_count,
+                None => self.apply_fatal(NodeError::Protocol(
+                    "Structural Invariant Violation: snapshot_count overflow".to_string(),
+                )),
+            }
+        } else {
+            match self.snapshot_count.checked_sub(1) {
+                Some(new_count) => self.snapshot_count = new_count,
+                None => self.apply_fatal(NodeError::Protocol(
+                    "Structural Invariant Violation: snapshot_count underflow (unfreeze without \
+                     freeze)"
+                        .to_string(),
+                )),
+            }
+        }
+
         info!(
             target: ClinicalTarget::RaftCompaction.as_str(),
             active,
+            snapshot_count = self.snapshot_count,
             "Freeze-Apply state toggled."
         );
     }
@@ -694,7 +713,7 @@ impl<S: StateMachine> LogicalNode<S> {
     /// If a snapshot is in progress, this method only advances the logical
     /// commit index without applying entries to the FSM.
     pub async fn advance_last_committed(&mut self, index: LogIndex) {
-        if self.is_snapshotting {
+        if self.is_snapshotting() {
             self.update_commit_index_only(index);
             return;
         }
@@ -1531,6 +1550,42 @@ mod tests {
                 let mut node = setup_node(1);
                 node.poison();
                 assert_eq!(node.tick(), TickAction::Stop);
+            }
+        }
+    }
+
+    mod snapshot_safety {
+        use super::*;
+
+        mod overlapping_tasks {
+            use super::*;
+
+            #[tokio::test]
+            async fn remains_frozen_until_all_tasks_finish() {
+                let mut node = setup_node(1);
+                assert!(!node.is_snapshotting());
+
+                // Task 1 starts
+                node.set_snapshotting(true);
+                assert!(node.is_snapshotting());
+
+                // Task 2 starts
+                node.set_snapshotting(true);
+                assert!(node.is_snapshotting());
+
+                // Task 1 finishes
+                node.set_snapshotting(false);
+
+                // With the reference-counted implementation, the node SHOULD
+                // remain in the snapshotting state because Task 2 is still active.
+                assert!(
+                    node.is_snapshotting(),
+                    "FSM unfrozen while Task 2 is still active!"
+                );
+
+                // Task 2 finishes
+                node.set_snapshotting(false);
+                assert!(!node.is_snapshotting());
             }
         }
     }
