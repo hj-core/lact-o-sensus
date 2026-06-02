@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Consensus Reliability and Physical Storage
 - **Primary Goal:** Mitigate unbounded log growth via state machine snapshotting while preserving the Stability Invariant.
-- **Last Updated:** 2026-05-27
+- **Last Updated:** 2026-06-02
 
 ## Context
 
@@ -14,27 +14,29 @@ As the Lact-O-Sensus cluster operates, the Raft consensus log grows indefinitely
 
 To address this, we must implement log compaction and snapshotting as defined in §7 of the Raft consensus algorithm. However, this implementation must adhere to our existing architectural mandates:
 
-1. **The Tri-Layer Onion (ADR 009):** The separation between physical log storage (`sled`), logical consensus orchestration, and the application state machine (`lacto-fsm`) must be maintained.
-2. **The Stability Invariant (ADR 003):** Generating a snapshot must not block the deterministic `tick` loop, as this would cause heartbeat starvation and trigger disruptive, false-positive leader elections.
+1. **The Tri-Layer Onion (ADR 009):** The separation between physical log storage (`sled`), logical consensus orchestration, and the application state machine (`lacto-fsm`) must be maintained. Furthermore, the FSM and logical layers are strictly synchronous.
+2. **The Stability Invariant (ADR 003):** Generating a snapshot involves heavy, blocking disk I/O. This must not block the deterministic `tick` loop, as this would cause heartbeat starvation and trigger disruptive, false-positive leader elections on the tokio worker threads.
 3. **The Halt Mandate (ADR 009):** State restoration is a destructive action; failures during this process compromise physical integrity.
 
 ## Decision
 
-We will implement asynchronous snapshot generation and asymmetric log compaction using unified state serialization.
+We will implement background snapshot generation and asymmetric log compaction using unified state serialization, utilizing thread-pool offloading.
 
 ### 1. Unified State Serialization (Non-Streaming Prototype)
 
 We will serialize the entire application state (Inventory, Session Deduplication Table, and Clinical Clock) into a single, contiguous byte array (`Vec<u8>`) using a new Protobuf message (`SnapshotData`).
 
-### 2. Asynchronous Snapshot Generation
+### 2. Background Snapshot Generation
 
-When a node determines its log size exceeds the configurable `snapshot_threshold`, the Raft orchestrator must offload the `StateMachine::snapshot()` execution to a background worker pool (e.g., `tokio::task::spawn_blocking`).
+When a node determines its log size exceeds the configurable `snapshot_threshold`, the `ConsensusShell` must offload the synchronous `StateMachine::snapshot()` execution to a background worker pool (`tokio::task::spawn_blocking`).
 
 To guarantee **Point-in-Time Consistency** without relying on database-level locking or high-overhead transactions, the orchestrator MUST implement a **"Freeze-Apply" mechanism**:
 
 - **Phase 1:** The main Raft event loop pauses the application of new log entries to the `StateMachine`. New entries continue to be appended to the physical log to preserve cluster liveness.
-- **Phase 2:** The `StateMachine::snapshot()` method is called in the background. Since the `apply()` method is not being called, the FSM state is logically frozen.
+- **Phase 2:** The `StateMachine::snapshot()` method is executed in the background thread. Since the `apply()` method is not being called, the FSM state is logically frozen.
 - **Phase 3:** Once the snapshot is complete, the orchestrator resumes the application of the buffered log entries.
+
+*Note: The background task uses `blocking_read`/`blocking_write` primitives provided by the `ConsensusShell` to interact with the core state without attempting to re-enter the async executor.*
 
 ### 3. Asymmetric Compaction Safety
 

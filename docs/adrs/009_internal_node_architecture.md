@@ -6,48 +6,47 @@
 - **Status:** Proposed
 - **Scope:** Internal Raft Node Structure and Concurrency
 - **Primary Goal:** Define the structural hierarchy of the Raft node to ensure strict isolation between protocol logic, concurrency management, and reactive signaling.
-- **Last Updated:** 2026-05-26
+- **Last Updated:** 2026-06-02
 
 ## Context
 
 Raft implementations frequently suffer from "God Object" syndrome, where protocol rules, state persistence, log I/O, and thread synchronization (mutexes/locks) are tightly coupled. This coupling complicates testing, obscures the "Halt Mandate" (ADR 001) implementation, and makes it difficult to reason about the logical epoch of the node.
 
-Furthermore, the choice of `tokio::sync::RwLock` for concurrency introduces a safety risk: unlike `std::sync::RwLock`, the Tokio implementation does not poison itself on panic. If a task panics while holding a write lock, the lock is released, and the potentially corrupted state remains accessible to other tasks.
+Furthermore, mixing asynchronous concurrency models (`async/await`) with blocking physical storage operations (like `sled::flush`) introduces significant liveness hazards (e.g., executor thread starvation).
 
 ## Decision
 
-We will implement a tri-layered "Onion" architecture for the internal Raft node, strictly separating the Physical, Logical, and Execution domains.
+We will implement a tri-layered "Onion" architecture for the internal Raft node, strictly separating the Physical, Logical, and Execution domains. A core mandate of this architecture is the **Synchronous Core**: Layers 1 and 2 MUST be completely devoid of asynchronous (`async/await`) constructs.
 
 ### 1. Layer 1: The Physical Foundation (Isolated Persistence)
 
 - **Nature:** Pure Data Mutator.
 - **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
 - **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application, Snapshot Metadata and Truncation).
-- **Constraint:** This layer must be synchronous and deterministic. It is the "Silent State Machine," containing only the logical state and transitions necessary for protocol correctness, independent of any specific concurrency or signaling primitives. It uses dedicated `sled` database handles (`log`, `fsm`, `system`) to ensure component isolation.
+- **Constraint:** This layer must be strictly synchronous (`fn`) and deterministic. It is the "Silent State Machine," containing only the logical state and transitions necessary for protocol correctness. It uses dedicated `sled` database handles to ensure component isolation.
 
 ### 2. Layer 2: The Logical Orchestrator (Safety Barrier)
 
 - **Nature:** Protocol Dispatcher and Safety Barrier.
 - **Abstractions:** `LogicalNode` enum (Follower, Candidate, Leader, Poisoned).
 - **Responsibility:** Mapping high-level RPC intents (AppendEntries, RequestVote) to Physical mutations, managing role transitions, and enforcing protocol invariants.
+- **Constraint:** This layer must be strictly synchronous (`fn`). All decisions are evaluated deterministically without yielding to an async executor.
 - **The Halt Mandate (Poison-then-Panic):** To mitigate the lack of lock poisoning in Tokio, any terminal failure or invariant violation MUST follow a strict sequence:
     1. **Detect** the violation (e.g., sequence gap in log, rival leader detection).
     2. **Transition** the `LogicalNode` state to `Poisoned` (utilizing `std::mem::replace`).
-    3. **Panic** to halt the current task.
-  This ensures that once a node is compromised, all subsequent attempts to acquire the lock and access the node (via the `delegate_to_inner!` macro) will trigger an immediate panic, preventing "Zombie Node" behavior.
+    3. **Panic** to halt the current thread.
 
 ### 3. Layer 3: The Execution Shell (Signaling Hub)
 
-- **Nature:** Imperative Shell and Signaling Hub.
+- **Nature:** Imperative Shell, Async/Sync Bridge, and Signaling Hub.
 - **Abstractions:** `ConsensusShell` wrapping `Arc<RwLock<LogicalNode>>` and a `tokio::sync::watch` signaling channel.
-- **Responsibility:** Providing thread-safe access, managing async coordination (including offloading heavy operations like Snapshot Generation), and broadcasting state changes to reactive observers.
-- **Atomic Invariant:** The **Lock-Signal Atomicity** rule. A signal containing the current `ConsensusProgress` MUST be broadcast after a mutation is complete but *before* the write lock is released.
+- **Responsibility:** Providing thread-safe access, managing async coordination, bridging the `async` gRPC world to the `sync` core, offloading heavy synchronous operations (like Snapshotting) via `spawn_blocking`, and broadcasting state changes to reactive observers.
+- **Atomic Invariant:** The **Lock-Signal Atomicity** rule. A signal containing the current `ConsensusProgress` MUST be broadcast after a mutation is complete but _before_ the write lock is released.
 
 ## Rationale
 
-- **Mitigation of Non-Poisoning Locks:** Explicitly poisoning the `LogicalNode` variant provides a manual safety mechanism that the underlying lock primitive lacks.
-- **Decoupled Determinism:** Isolating protocol logic in the Physical layer enables exhaustive unit testing without async overhead.
-- **Reactive Consistency:** Using a rich `ConsensusProgress` snapshot (containing Term, Role, Log Index, Commit Index, and Applied Index) allows the Execution shell and its observers to detect state changes through structural equality, ensuring that external components are notified of every significant event without relying on a volatile, non-persistent counter.
+- **Decoupled Determinism:** Isolating protocol logic in synchronous Physical/Logical layers enables exhaustive unit testing without async executor overhead or mock runtimes.
+- **Executor Safety:** By forcing the core to be synchronous, we prevent accidental "blocking-in-async" anti-patterns. The Execution Shell (Layer 3) is forced to explicitly offload heavy I/O using `spawn_blocking` when interfacing with the core.
 
 ## Consequences
 

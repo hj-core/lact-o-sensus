@@ -282,16 +282,23 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **Target Scope**: All Source Files
 - **Severity**: WARNING
 - **DO**: Declare functions `async fn` only when they contain at least one `.await` on a genuinely asynchronous operation (network I/O, tokio timer, channel, `RwLock`/`Mutex` acquisition).
-- **DO NOT**: Mark a function `async fn` if its body contains no `.await` calls, or if all its `.await` calls chain to functions that are themselves zero-async and perform only synchronous blocking I/O (sled operations, protobuf encoding, file I/O). Such functions should be synchronous (`fn`) and, when the calling context requires offloading, explicitly wrapped in `tokio::task::spawn_blocking` at the offload boundary.
+- **DO NOT**: Mark a function `async fn` if its body contains no `.await` calls, or if all its `.await` calls chain to functions that are themselves zero-async and perform only synchronous blocking I/O (sled operations, protobuf encoding, file I/O). Such functions should be synchronous (`fn`).
 
-### [ENG-07] Behavioral Verification
+### [ENG-07] Synchronous Core Mandate
+
+- **Target Scope**: `crates/raft-engine/src/engine.rs`, `crates/raft-engine/src/node.rs`, `crates/lacto-fsm/src/lib.rs`
+- **Severity**: CRITICAL
+- **DO**: Ensure all logic within the Physical Foundation (`RaftNode`) and Logical Orchestrator (`LogicalNode`), as well as the `StateMachine` implementation, is strictly synchronous. Offload heavy operations explicitly via `tokio::task::spawn_blocking` at the Execution Shell boundary.
+- **DO NOT**: Introduce any `async` functions or `.await` calls within the core consensus or state machine implementations (ADR 009).
+
+### [ENG-08] Behavioral Verification
 
 - **Target Scope**: All Source Files (`mod tests`)
 - **Severity**: WARNING
 - **DO**: Verify non-trivial logic via the mandatory nested BDD-style module hierarchy.
 - **DO NOT**: Structure test classes as a flat, unorganized list of testing assertions.
 
-### [ENG-08] Clinical Telemetry
+### [ENG-09] Clinical Telemetry
 
 - **Target Scope**: Observability Layer
 - **Severity**: CRITICAL
@@ -299,14 +306,14 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **DO**: Always propagate the current `trace_id` across thread, task, and RPC boundaries. Use `.instrument(span)` on every `tokio::spawn`, `spawn_blocking`, and cross-task handoff to preserve the causal chain.
 - **DO NOT**: Rely on unstructured `println!` or raw string literals. Do not trust client-provided `x-trace-id` headers for correlation. Do not drop the `trace_id` when spawning a new task.
 
-### [ENG-09] Single Decision, Single Span
+### [ENG-10] Single Decision, Single Span
 
 - **Target Scope**: All Source Files with `#[instrument]`
 - **Severity**: WARNING
 - **DO**: Instrument the Orchestrator (where semantic decisions happen), not the Implementer (mechanical side-effects of decisions). A span should represent a semantic choice or high-impact operation — not just a function call.
 - **DO NOT**: Create redundant nested spans that echo the parent (e.g., `transition:transition`). If a function is purely mechanical (disk write, serialization), do not `#[instrument]` it — let the caller's span provide context via `.in_current_span()`.
 
-### [ENG-10] Artifact Cleanliness
+### [ENG-11] Artifact Cleanliness
 
 - **Target Scope**: CI/CD Pipeline
 - **Severity**: CRITICAL
