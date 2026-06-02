@@ -1,4 +1,11 @@
+//! Shared behavioral specifications for the RaftNode.
+//!
+//! This module contains tests for logic that is common across all roles,
+//! ensuring consistent invariant protection regardless of the current
+//! Type-State.
+
 use std::sync::Arc;
+
 use common::proto::v1::raft::LogEntry;
 use common::raft_api::StateMachine;
 use common::types::LogIndex;
@@ -6,13 +13,12 @@ use common::types::NodeId;
 use common::types::Term;
 use common::types::errors::NodeError;
 
+use super::test_utils::*;
+use super::*;
 use crate::storage::LogStorage;
 use crate::storage::MemoryStorage;
 use crate::tick::Tick;
 use crate::tick::TickDuration;
-
-use super::test_utils::*;
-use super::*;
 
 #[cfg(test)]
 mod tests {
@@ -406,8 +412,9 @@ mod tests {
             }
 
             mod on_fsm_failure {
-                use super::*;
                 use common::types::errors::FsmError;
+
+                use super::*;
 
                 #[derive(Debug, Default)]
                 struct PoisonFsm;
@@ -509,8 +516,9 @@ mod tests {
         }
 
         mod apply_to_state_machine {
-            use super::*;
             use common::types::errors::FsmError;
+
+            use super::*;
 
             mod on_fsm_regression {
                 use super::*;

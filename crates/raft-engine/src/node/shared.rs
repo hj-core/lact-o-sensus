@@ -1,3 +1,9 @@
+//! Shared RaftNode foundation and core data types.
+//!
+//! This module implements the "Physical Foundation" of the Tri-Layer
+//! Onion architecture (ADR 009). It defines the `RaftNode` container,
+//! shared accessors, and foundational types used across all roles.
+
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -12,11 +18,10 @@ use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use tracing::info;
 
+use super::Follower;
 use crate::storage::LogStorage;
 use crate::tick::Tick;
 use crate::tick::TickDuration;
-
-use super::Follower;
 
 // =============================================================================
 // 1. Public Snapshots & Types
