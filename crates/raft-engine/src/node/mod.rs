@@ -21,10 +21,7 @@ use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
-use tracing::debug;
-use tracing::error;
 use tracing::info;
-use tracing::instrument;
 
 use crate::storage::LogStorage;
 use crate::tick::Tick;
@@ -32,6 +29,7 @@ use crate::tick::TickDuration;
 
 pub mod candidate;
 pub mod follower;
+pub mod fsm_ops;
 pub mod leader;
 
 #[cfg(test)]
@@ -116,14 +114,14 @@ pub trait NodeState: Debug {}
 /// high-level orchestrator shell.
 #[derive(Debug)]
 pub struct RaftNode<R: NodeState, S: StateMachine> {
-    identity: Arc<NodeIdentity>,
-    fsm: Arc<S>,
-    log_store: Arc<dyn LogStorage>,
+    pub(super) identity: Arc<NodeIdentity>,
+    pub(super) fsm: Arc<S>,
+    pub(super) log_store: Arc<dyn LogStorage>,
 
     // --- Volatile State ---
-    last_committed: LogIndex,
-    last_applied: LogIndex,
-    state: R,
+    pub(super) last_committed: LogIndex,
+    pub(super) last_applied: LogIndex,
+    pub(super) state: R,
 }
 
 // --- Implementation: Shared Accessors ---
@@ -281,127 +279,6 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         );
 
         Ok(node)
-    }
-
-    /// Updates the commit index and triggers the application of entries to the
-    /// FSM.
-    #[instrument(
-        name = "advance_commit_index",
-        target = "raft::replication",
-        skip_all,
-        fields(index = %index)
-    )]
-    pub fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
-        self.update_commit_index_only(index)?;
-        self.apply_to_state_machine()?;
-        Ok(())
-    }
-
-    /// Persists and updates the commit index without triggering FSM
-    /// application. Used by the Freeze-Apply mechanism (ADR 011).
-    pub fn update_commit_index_only(&mut self, index: LogIndex) -> Result<(), NodeError> {
-        if index < self.last_committed {
-            debug!(
-                target: ClinicalTarget::RaftReplication.as_str(),
-                "Ignoring stale last_committed update: {} < current {}",
-                index, self.last_committed
-            );
-            return Ok(());
-        }
-
-        let last_idx = self.last_log_index()?;
-        if index > last_idx {
-            return Err(NodeError::Protocol(format!(
-                "Attempted to commit index {} but last_log_index is {}",
-                index, last_idx
-            )));
-        }
-
-        if index > self.last_committed {
-            // Persist last_committed BEFORE applying to FSM to ensure safety
-            // across crashes.
-            self.log_store
-                .save_last_committed(index)
-                .map_err(NodeError::from)?;
-
-            self.last_committed = index;
-
-            info!(
-                target: ClinicalTarget::RaftReplication.as_str(),
-                index = %index,
-                "Commit Index Advanced (Logical Only)"
-            );
-        }
-        Ok(())
-    }
-
-    /// Advances both the commit index and the volatile application cache
-    /// to a specific horizon after a successful snapshot installation.
-    ///
-    /// Effectively "jumps" the logical state forward to match the semantic
-    /// reality of the restored State Machine.
-    pub fn advance_horizon_after_snapshot(&mut self, index: LogIndex) -> Result<(), NodeError> {
-        // 1. Advance commit index (and persist to log storage)
-        self.update_commit_index_only(index)?;
-
-        // 2. Sync volatile cache
-        self.last_applied = index;
-
-        info!(
-            target: ClinicalTarget::RaftCompaction.as_str(),
-            index = %index,
-            "Logical horizon advanced to match snapshot."
-        );
-
-        Ok(())
-    }
-
-    /// Orchestrates the sequential application of committed log entries to the
-    /// State Machine.
-    #[instrument(
-        name = "fsm_application",
-        target = "clinical::fsm",
-        skip_all,
-        fields(last_committed = %self.last_committed)
-    )]
-    fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
-        // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
-        let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
-        if fsm_last > self.last_committed {
-            return Err(NodeError::Protocol(format!(
-                "FSM index {} is ahead of last_committed {}. Possible log regression.",
-                fsm_last, self.last_committed
-            )));
-        }
-
-        while self.last_applied < self.last_committed {
-            let apply_idx = (self.last_applied + 1)?;
-            let entry = self.log_store.read_entry(apply_idx)?.ok_or_else(|| {
-                NodeError::Protocol(format!(
-                    "Committed entry {} missing from log during apply",
-                    apply_idx
-                ))
-            })?;
-
-            if let Err(e) = self.fsm.apply(apply_idx, &entry.data) {
-                error!(
-                    target: ClinicalTarget::ClinicalFsm.as_str(),
-                    index = %apply_idx,
-                    error = %e,
-                    "State machine failed to apply index. Triggering Halt Mandate."
-                );
-                return Err(e.into());
-            }
-
-            debug!(
-                target: ClinicalTarget::ClinicalFsm.as_str(),
-                index = %apply_idx,
-                "Physical Mutation Resolved"
-            );
-
-            self.last_applied = apply_idx;
-        }
-        Ok(())
     }
 
     /// Updates the current term and resets voting state if the term increased.
