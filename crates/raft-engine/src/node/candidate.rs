@@ -121,3 +121,97 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
         Ok(node)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::test_utils::*;
+    use crate::storage::LogStorage;
+    use crate::storage::MemoryStorage;
+    use common::proto::v1::raft::LogEntry;
+    use common::types::LogIndex;
+    use std::sync::Arc;
+
+    mod on_election_restart {
+        use super::*;
+
+        #[test]
+        fn should_increment_term_and_vote_for_self_on_election_restart() {
+            let fsm = Arc::new(MockFsm::default());
+            let log_store = Arc::new(MemoryStorage::new());
+            let node = setup_node_as_candidate(fsm, log_store);
+            let initial_term = node.current_term().unwrap();
+
+            let restarted = node
+                .try_into_restarted_candidate(Tick::new(0), TickDuration::new(150))
+                .unwrap();
+
+            assert_eq!(
+                restarted.current_term().unwrap(),
+                (initial_term + 1).unwrap()
+            );
+            assert_eq!(restarted.voted_for().unwrap(), Some(restarted.node_id()));
+            assert_eq!(restarted.state().vote_count(), 1);
+        }
+    }
+
+    mod on_election_victory {
+        use super::*;
+
+        #[test]
+        fn should_initialize_leader_state_with_next_index_at_end_of_log() {
+            let fsm = Arc::new(MockFsm::default());
+            let log_store = Arc::new(MemoryStorage::new());
+            // Append some entries to the log
+            log_store
+                .append_entries(vec![
+                    LogEntry {
+                        index: 1,
+                        term: 1,
+                        data: vec![],
+                    },
+                    LogEntry {
+                        index: 2,
+                        term: 1,
+                        data: vec![],
+                    },
+                ])
+                .unwrap();
+
+            let node = setup_node_as_candidate(fsm, log_store);
+            let peer_ids = vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()];
+
+            let leader = node
+                .try_into_leader(peer_ids.clone(), Tick::new(0))
+                .unwrap();
+
+            assert_eq!(leader.last_log_index().unwrap(), LogIndex::new(2));
+            for peer_id in peer_ids {
+                assert_eq!(
+                    *leader.state().next_index().get(&peer_id).unwrap(),
+                    LogIndex::new(3)
+                );
+                assert_eq!(
+                    *leader.state().match_index().get(&peer_id).unwrap(),
+                    LogIndex::ZERO
+                );
+            }
+        }
+    }
+
+    mod vote_counting {
+        use super::*;
+
+        #[test]
+        fn should_be_idempotent_when_adding_vote_per_peer() {
+            let fsm = Arc::new(MockFsm::default());
+            let log_store = Arc::new(MemoryStorage::new());
+            let mut node = setup_node_as_candidate(fsm, log_store);
+
+            node.state_mut().add_vote(NodeId::try_new(2).unwrap());
+            node.state_mut().add_vote(NodeId::try_new(2).unwrap()); // Duplicate
+
+            assert_eq!(node.state().vote_count(), 2); // Self (from setup) + Node 2
+        }
+    }
+}
