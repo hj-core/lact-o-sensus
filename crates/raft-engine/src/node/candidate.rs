@@ -1,3 +1,9 @@
+//! Candidate role implementation for the Raft engine.
+//!
+//! This module defines the behavior of nodes during leadership campaigns,
+//! including vote solicitation, quorum tracking, and role transitions
+//! (ADR 002).
+
 use std::collections::HashSet;
 
 use common::raft_api::StateMachine;
@@ -6,13 +12,12 @@ use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use tracing::info;
 
-use crate::tick::Tick;
-use crate::tick::TickDuration;
-
 use super::Leader;
 use super::NodeState;
 use super::RaftNode;
 use super::TickAction;
+use crate::tick::Tick;
+use crate::tick::TickDuration;
 
 /// Active role during leadership campaigns.
 ///
@@ -107,13 +112,15 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use common::proto::v1::raft::LogEntry;
+    use common::types::LogIndex;
+
     use super::*;
     use crate::node::test_utils::*;
     use crate::storage::LogStorage;
     use crate::storage::MemoryStorage;
-    use common::proto::v1::raft::LogEntry;
-    use common::types::LogIndex;
-    use std::sync::Arc;
 
     mod on_election_restart {
         use super::*;

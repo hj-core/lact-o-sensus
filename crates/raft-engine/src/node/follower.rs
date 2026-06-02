@@ -1,3 +1,9 @@
+//! Follower role implementation for the Raft engine.
+//!
+//! This module defines the passive behavior of nodes, including log
+//! reconciliation (§5.3), heartbeat monitoring (ADR 003), and vote
+//! evaluation (§5.2).
+
 use std::cmp;
 use std::sync::Arc;
 
@@ -14,15 +20,14 @@ use tracing::error;
 use tracing::info;
 use tracing::instrument;
 
-use crate::storage::LogStorage;
-use crate::tick::Tick;
-use crate::tick::TickDuration;
-
 use super::Candidate;
 use super::NodeState;
 use super::RaftNode;
 use super::ReconciliationResult;
 use super::TickAction;
+use crate::storage::LogStorage;
+use crate::tick::Tick;
+use crate::tick::TickDuration;
 
 /// Passive role responsible for log reconciliation and heartbeat tracking.
 ///
@@ -261,7 +266,10 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         Ok(true)
     }
 
-    pub(crate) fn reconcile_last_committed(&mut self, leader_commit: LogIndex) -> Result<(), NodeError> {
+    pub(crate) fn reconcile_last_committed(
+        &mut self,
+        leader_commit: LogIndex,
+    ) -> Result<(), NodeError> {
         if leader_commit > self.last_committed() {
             let last_new_idx = self.last_log_index()?;
             let new_commit = cmp::min(leader_commit, last_new_idx);
@@ -289,20 +297,24 @@ impl<S: StateMachine> RaftNode<Follower, S> {
             Ok(candidate_last_log_index >= local_last_index)
         }
     }
-    }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use crate::node::test_utils::*;
-        use crate::storage::MemoryStorage;
-        use common::raft_api::StateMachine;
-        use common::types::LogIndex;
-        use common::types::NodeId;
-        use common::types::Term;
-        use common::types::errors::FsmError;
-        use common::proto::v1::raft::LogEntry;
-        use std::sync::Arc;    mod try_new {
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use common::proto::v1::raft::LogEntry;
+    use common::raft_api::StateMachine;
+    use common::types::LogIndex;
+    use common::types::NodeId;
+    use common::types::Term;
+    use common::types::errors::FsmError;
+
+    use super::*;
+    use crate::node::test_utils::*;
+    use crate::storage::MemoryStorage;
+
+    mod try_new {
         use super::*;
         use crate::storage::SledStorage;
 
@@ -341,8 +353,9 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         }
 
         mod on_causal_divergence {
-            use super::*;
             use common::types::trace::TraceId;
+
+            use super::*;
 
             #[derive(Debug, Default)]
             struct AheadFsm;
@@ -707,10 +720,7 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         mod on_log_up_to_date_check {
             use super::*;
 
-            fn setup_node_with_log(
-                last_idx: u64,
-                last_term: u64,
-            ) -> RaftNode<Follower, MockFsm> {
+            fn setup_node_with_log(last_idx: u64, last_term: u64) -> RaftNode<Follower, MockFsm> {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = MemoryStorage::new();
                 let mut entries = Vec::new();
@@ -810,5 +820,4 @@ impl<S: StateMachine> RaftNode<Follower, S> {
             }
         }
     }
-    }
-
+}

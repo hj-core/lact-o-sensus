@@ -1,3 +1,9 @@
+//! State Machine (FSM) and Compaction operations for the Raft engine.
+//!
+//! This module isolates the "State Materialization" layer, managing the
+//! application of committed log entries to the business logic and
+//! advancing logical horizons after snapshot restoration (ADR 011).
+
 use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::errors::NodeError;

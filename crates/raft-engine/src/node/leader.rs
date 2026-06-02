@@ -1,3 +1,9 @@
+//! Leader role implementation for the Raft engine.
+//!
+//! This module defines the authoritative behavior of nodes, including
+//! mutation ingestion, log replication (§5.3), and Read Index protocol
+//! management for linearizable queries (§8).
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -8,12 +14,11 @@ use common::types::NodeId;
 use common::types::errors::NodeError;
 use tracing::instrument;
 
-use crate::tick::Tick;
-use crate::tick::TickDuration;
-
 use super::NodeState;
 use super::RaftNode;
 use super::TickAction;
+use crate::tick::Tick;
+use crate::tick::TickDuration;
 
 /// Authoritative role responsible for mutation ingestion and log replication.
 ///
@@ -144,14 +149,16 @@ impl<S: StateMachine> RaftNode<Leader, S> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use common::proto::v1::raft::LogEntry;
+    use common::types::LogIndex;
+    use common::types::Term;
+
     use super::*;
     use crate::node::test_utils::*;
     use crate::storage::LogStorage;
     use crate::storage::MemoryStorage;
-    use common::proto::v1::raft::LogEntry;
-    use common::types::LogIndex;
-    use common::types::Term;
-    use std::sync::Arc;
 
     mod propose {
         use super::*;

@@ -1,3 +1,9 @@
+//! Clinical verification utilities for the Node module.
+//!
+//! Provides shared mock implementations and setup helpers to ensure
+//! consistent behavioral verification across role-specific and shared
+//! test suites.
+
 use std::sync::Arc;
 use std::sync::Mutex;
 
