@@ -142,14 +142,14 @@ impl NodeState for Leader {}
 /// high-level orchestrator shell.
 #[derive(Debug)]
 pub struct RaftNode<R: NodeState, S: StateMachine> {
-    identity: Arc<NodeIdentity>,
-    fsm: Arc<S>,
-    log_store: Arc<dyn LogStorage>,
+    pub(super) identity: Arc<NodeIdentity>,
+    pub(super) fsm: Arc<S>,
+    pub(super) log_store: Arc<dyn LogStorage>,
 
     // --- Volatile State ---
-    last_committed: LogIndex,
-    last_applied: LogIndex,
-    state: R,
+    pub(super) last_committed: LogIndex,
+    pub(super) last_applied: LogIndex,
+    pub(super) state: R,
 }
 
 // --- Implementation: Shared Accessors ---
