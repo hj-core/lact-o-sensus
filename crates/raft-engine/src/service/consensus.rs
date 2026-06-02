@@ -204,16 +204,14 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
         let mut guard = self.state.write().await;
         self.verify_node_integrity(&mut guard)?;
 
-        Ok(guard
-            .handle_append_entries(
-                params.leader_id,
-                params.term,
-                params.prev_log_index,
-                params.prev_log_term,
-                params.entries,
-                params.leader_commit,
-            )
-            .await)
+        Ok(guard.handle_append_entries(
+            params.leader_id,
+            params.term,
+            params.prev_log_index,
+            params.prev_log_term,
+            params.entries,
+            params.leader_commit,
+        ))
     }
 }
 
@@ -319,7 +317,6 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
     use common::raft_api::StateMachine;
     use common::types::ClusterId;
     use common::types::errors::FsmError;
@@ -332,7 +329,6 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -340,15 +336,15 @@ mod tests {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _index: LogIndex,
             _data: &[u8],

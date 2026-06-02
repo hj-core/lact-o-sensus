@@ -885,7 +885,7 @@ async fn process_replication_response<S: StateMachine>(
 
     // 3. Opportunistically advance commit index if progress was made
     if last_committed_updated {
-        update_leader_last_committed(&mut guard).await;
+        update_leader_last_committed(&mut guard);
     }
 
     Ok(ReplicationAction::Continue)
@@ -1159,10 +1159,7 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     };
 
     // ADR 011: Execute heavy serialization in the background.
-    // Note: Since StateMachine::snapshot is already async, we directly await it
-    // within the current task. Replication rounds are already spawned tasks,
-    // so this will not block the deterministic Tick Loop.
-    let res = fsm.snapshot().await;
+    let res = tokio::task::spawn_blocking(move || fsm.snapshot()).await;
 
     {
         let mut guard = state.write().await;
@@ -1170,14 +1167,17 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     }
 
     let data = match res {
-        Ok(data) => data,
-        Err(e) => {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
             // Trigger Poison-then-Panic with comprehensive forensics (Rule [SAFE-04])
             let mut guard = state.write().await;
             guard.apply_fatal(NodeError::Protocol(format!(
                 "Snapshot serialization failed for peer={} at index={} in term={}: {}",
                 peer_id, last_included_index, params.term, e
             )));
+        }
+        Err(e) => {
+            return Err(Status::internal(format!("Snapshot spawn failure: {}", e)));
         }
     };
 
@@ -1398,7 +1398,7 @@ fn build_append_entries_request<S: StateMachine>(
 ///
 /// Implements the commit-at-majority logic from §5.3, ensuring that the
 /// commit index only advances for the current term to maintain safety.
-async fn update_leader_last_committed<S: StateMachine>(node: &mut LogicalNode<S>) {
+fn update_leader_last_committed<S: StateMachine>(node: &mut LogicalNode<S>) {
     let last_idx = node.last_log_index();
     let current_term = node.current_term();
     let (median_idx, commit_idx) = if let RoleState::Leader(n) = node.state() {
@@ -1420,7 +1420,7 @@ async fn update_leader_last_committed<S: StateMachine>(node: &mut LogicalNode<S>
             term = %current_term,
             "Quorum reached. Advancing Leader commit index."
         );
-        node.advance_last_committed(median_idx).await;
+        node.advance_last_committed(median_idx);
     }
 }
 
@@ -1642,7 +1642,6 @@ mod tests {
     #[derive(Debug, Default)]
     struct MockFsm;
     use common::types::errors::FsmError;
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -1650,15 +1649,15 @@ mod tests {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
@@ -2070,7 +2069,6 @@ mod tests {
                     flag_during_snapshot: Arc<AtomicBool>,
                 }
 
-                #[async_trait]
                 impl StateMachine for ObservantFsm {
                     type Error = FsmError;
 
@@ -2078,23 +2076,19 @@ mod tests {
                         Ok(LogIndex::ZERO)
                     }
 
-                    async fn apply(
-                        &self,
-                        _index: LogIndex,
-                        _data: &[u8],
-                    ) -> Result<(), Self::Error> {
+                    fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
                         Ok(())
                     }
 
-                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-                        if let Some(shell) = self.shell.lock().await.as_ref() {
-                            let flag = shell.read().await.is_snapshotting();
+                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                        if let Some(shell) = self.shell.blocking_lock().as_ref() {
+                            let flag = shell.blocking_read().is_snapshotting();
                             self.flag_during_snapshot.store(flag, Ordering::SeqCst);
                         }
                         Ok(vec![])
                     }
 
-                    async fn install_snapshot(
+                    fn install_snapshot(
                         &self,
                         _idx: LogIndex,
                         _data: &[u8],
@@ -2166,7 +2160,6 @@ mod tests {
             async fn should_apply_fatal_with_rich_forensic_context_when_snapshot_fails() {
                 #[derive(Debug)]
                 struct FailingFsm;
-                #[async_trait]
                 impl StateMachine for FailingFsm {
                     type Error = FsmError;
 
@@ -2174,19 +2167,15 @@ mod tests {
                         Ok(LogIndex::ZERO)
                     }
 
-                    async fn apply(
-                        &self,
-                        _index: LogIndex,
-                        _data: &[u8],
-                    ) -> Result<(), Self::Error> {
+                    fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
                         Ok(())
                     }
 
-                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                         Err(FsmError::persistence("Simulated failure"))
                     }
 
-                    async fn install_snapshot(
+                    fn install_snapshot(
                         &self,
                         _idx: LogIndex,
                         _data: &[u8],
@@ -2268,7 +2257,7 @@ mod tests {
                                 .match_index_mut()
                                 .insert(p3, LogIndex::new(1));
                         }
-                        update_leader_last_committed(&mut guard).await;
+                        update_leader_last_committed(&mut guard);
                         assert_eq!(guard.last_committed(), LogIndex::new(4));
                     }
                 }

@@ -62,8 +62,7 @@ impl<S: StateMachine> RecoveryManager<S> {
                 return Ok(());
             }
 
-            self.replay_committed_entries(last_applied, last_committed)
-                .await?;
+            self.replay_committed_entries(last_applied, last_committed)?;
 
             Ok(())
         }
@@ -102,7 +101,7 @@ impl<S: StateMachine> RecoveryManager<S> {
 
     /// Iterates through the consensus log and applies all missing committed
     /// entries to the FSM.
-    async fn replay_committed_entries(
+    fn replay_committed_entries(
         &self,
         last_applied: LogIndex,
         last_committed: LogIndex,
@@ -139,7 +138,6 @@ impl<S: StateMachine> RecoveryManager<S> {
 
             self.fsm
                 .apply(apply_idx, &entry.data)
-                .await
                 .map_err(|e| e.into())?;
             current = apply_idx;
 
@@ -167,7 +165,6 @@ impl<S: StateMachine> RecoveryManager<S> {
 mod tests {
     use std::sync::Mutex;
 
-    use async_trait::async_trait;
     use common::proto::v1::raft::LogEntry;
     use common::types::LogIndex;
     use common::types::Term;
@@ -184,7 +181,6 @@ mod tests {
         fail_apply: Mutex<bool>,
     }
 
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -192,7 +188,7 @@ mod tests {
             Ok(*self.last_applied.lock().unwrap())
         }
 
-        async fn apply(&self, index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             if *self.fail_apply.lock().unwrap() {
                 return Err(FsmError::invariant("FSM simulated failure"));
             }
@@ -205,11 +201,11 @@ mod tests {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _index: LogIndex,
             _data: &[u8],

@@ -105,17 +105,6 @@ macro_rules! delegate_mut_to_inner {
     };
 }
 
-macro_rules! delegate_async_to_inner {
-    ($self:ident, $method:ident $(, $args:expr)*) => {
-        match &mut $self.state {
-            RoleState::Follower(n) => n.$method($($args),*).await,
-            RoleState::Candidate(n) => n.$method($($args),*).await,
-            RoleState::Leader(n) => n.$method($($args),*).await,
-            RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
-        }
-    };
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendEntriesResult {
     pub term: Term,
@@ -464,7 +453,7 @@ impl<S: StateMachine> LogicalNode<S> {
         skip_all,
         fields(leader = %leader_id, term = %req_term)
     )]
-    pub async fn handle_append_entries(
+    pub fn handle_append_entries(
         &mut self,
         leader_id: NodeId,
         req_term: Term,
@@ -488,14 +477,12 @@ impl<S: StateMachine> LogicalNode<S> {
         // 3. Delegation to physical reconciliation (§5.3)
         match &mut self.state {
             RoleState::Follower(node) => {
-                let res = node
-                    .reconcile_log(
-                        req_prev_log_index,
-                        req_prev_log_term,
-                        entries,
-                        req_leader_commit,
-                    )
-                    .await;
+                let res = node.reconcile_log(
+                    req_prev_log_index,
+                    req_prev_log_term,
+                    entries,
+                    req_leader_commit,
+                );
 
                 match res {
                     Ok(result) => {
@@ -712,13 +699,13 @@ impl<S: StateMachine> LogicalNode<S> {
     /// FREEZE-APPLY (ADR 011):
     /// If a snapshot is in progress, this method only advances the logical
     /// commit index without applying entries to the FSM.
-    pub async fn advance_last_committed(&mut self, index: LogIndex) {
+    pub fn advance_last_committed(&mut self, index: LogIndex) {
         if self.is_snapshotting() {
             self.update_commit_index_only(index);
             return;
         }
 
-        match delegate_async_to_inner!(self, advance_last_committed, index) {
+        match delegate_mut_to_inner!(self, advance_last_committed, index) {
             Ok(_) => {}
             Err(e) => self.apply_fatal(e),
         }
@@ -933,7 +920,6 @@ impl<S: StateMachine> LogicalNode<S> {
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use common::raft_api::StateMachine;
     use common::types::errors::FsmError;
     use common::types::trace::TraceId;
@@ -947,7 +933,6 @@ mod tests {
     struct MockFsm {
         applied: u64,
     }
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -955,15 +940,15 @@ mod tests {
             Ok(LogIndex::new(self.applied))
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
@@ -1103,16 +1088,14 @@ mod tests {
                     let mut state = setup_node(1);
                     state.into_follower(Term::new(5), None);
 
-                    let result = state
-                        .handle_append_entries(
-                            NodeId::try_new(2).unwrap(),
-                            Term::new(1), // Stale term
-                            LogIndex::ZERO,
-                            Term::ZERO,
-                            vec![],
-                            LogIndex::ZERO,
-                        )
-                        .await;
+                    let result = state.handle_append_entries(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(1), // Stale term
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    );
 
                     assert!(!result.success);
                     assert_eq!(result.term, Term::new(5));
@@ -1128,16 +1111,14 @@ mod tests {
                     state.into_candidate();
 
                     // AppendEntries from leader of same term
-                    let result = state
-                        .handle_append_entries(
-                            NodeId::try_new(2).unwrap(),
-                            Term::new(1),
-                            LogIndex::ZERO,
-                            Term::ZERO,
-                            vec![],
-                            LogIndex::ZERO,
-                        )
-                        .await;
+                    let result = state.handle_append_entries(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(1),
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    );
 
                     assert!(result.success);
                     assert_eq!(result.term, Term::new(1));
@@ -1154,16 +1135,14 @@ mod tests {
                     state.into_candidate();
                     state.into_leader(vec![]);
 
-                    let result = state
-                        .handle_append_entries(
-                            NodeId::try_new(2).unwrap(),
-                            Term::new(10), // Higher term
-                            LogIndex::ZERO,
-                            Term::ZERO,
-                            vec![],
-                            LogIndex::ZERO,
-                        )
-                        .await;
+                    let result = state.handle_append_entries(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(10), // Higher term
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    );
 
                     assert!(result.success);
                     assert_eq!(result.term, Term::new(10));
@@ -1185,16 +1164,14 @@ mod tests {
                     state.into_candidate();
                     state.into_leader(vec![]);
 
-                    state
-                        .handle_append_entries(
-                            NodeId::try_new(2).unwrap(),
-                            Term::new(1), // Same term as local leader
-                            LogIndex::ZERO,
-                            Term::ZERO,
-                            vec![],
-                            LogIndex::ZERO,
-                        )
-                        .await;
+                    state.handle_append_entries(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(1), // Same term as local leader
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                        vec![],
+                        LogIndex::ZERO,
+                    );
                 }
             }
         }

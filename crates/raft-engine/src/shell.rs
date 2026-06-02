@@ -86,6 +86,13 @@ impl<S: StateMachine> ConsensusShell<S> {
         self.inner.read().await
     }
 
+    /// Acquires a synchronous read lock on the consensus state.
+    ///
+    /// Should only be called within `spawn_blocking` contexts.
+    pub fn blocking_read(&self) -> RwLockReadGuard<'_, LogicalNode<S>> {
+        self.inner.blocking_read()
+    }
+
     /// Acquires a mutation guard that atomically broadcasts any changes
     /// upon being dropped.
     ///
@@ -96,6 +103,19 @@ impl<S: StateMachine> ConsensusShell<S> {
     #[instrument(name = "acquire_mutation_lock", target = "raft::foundation", skip_all)]
     pub async fn write(&self) -> MutationGuard<'_, S> {
         let mut guard = self.inner.write().await;
+        let before = guard.consensus_progress();
+        MutationGuard {
+            shell: self,
+            guard,
+            before,
+        }
+    }
+
+    /// Acquires a synchronous mutation guard.
+    ///
+    /// Should only be called within `spawn_blocking` contexts.
+    pub fn blocking_write(&self) -> MutationGuard<'_, S> {
+        let mut guard = self.inner.blocking_write();
         let before = guard.consensus_progress();
         MutationGuard {
             shell: self,
@@ -167,7 +187,7 @@ impl<S: StateMachine> ConsensusShell<S> {
 
             let apply_res = if let Some(entry) = entry {
                 // ADR 009: fsm.apply() is called WITHOUT the primary lock.
-                fsm.apply(next_idx, &entry.data).await
+                fsm.apply(next_idx, &entry.data)
             } else {
                 let mut guard = self.write().await;
                 guard.apply_fatal(NodeError::Protocol(format!(
@@ -256,35 +276,32 @@ impl<S: StateMachine> ConsensusShell<S> {
 
                 info!("Starting background snapshot installation...");
 
-                let rt = tokio::runtime::Handle::current();
-                let res = rt.block_on(fsm.install_snapshot(index, &data, trace_id));
+                let res = fsm.install_snapshot(index, &data, trace_id);
 
                 // Phase 3: Lock & Finalize
-                rt.block_on(async move {
-                    let mut guard = shell_clone.write().await;
-                    guard.set_snapshotting(false);
+                let mut guard = shell_clone.blocking_write();
+                guard.set_snapshotting(false);
 
-                    match res {
-                        Ok(_) => {
-                            info!(index = %index, "Background snapshot installation complete.");
-                            guard.save_snapshot_metadata(index, term);
+                match res {
+                    Ok(_) => {
+                        info!(index = %index, "Background snapshot installation complete.");
+                        guard.save_snapshot_metadata(index, term);
 
-                            // ADR 011: Advance BOTH commit_index and volatile last_applied
-                            // to ensure the next application loop starts after the snapshot.
-                            if let Err(e) = guard.advance_horizon_after_snapshot(index) {
-                                error!(index = %index, error = %e, "FATAL: Failed to advance logical horizon after snapshot.");
-                                guard.apply_fatal(e);
-                            }
-                        }
-                        Err(e) => {
-                            error!(index = %index, error = %e, "FATAL: Snapshot installation failed.");
-                            guard.apply_fatal(NodeError::Protocol(format!(
-                                "Background snapshot restoration failure: {}",
-                                e
-                            )));
+                        // ADR 011: Advance BOTH commit_index and volatile last_applied
+                        // to ensure the next application loop starts after the snapshot.
+                        if let Err(e) = guard.advance_horizon_after_snapshot(index) {
+                            error!(index = %index, error = %e, "FATAL: Failed to advance logical horizon after snapshot.");
+                            guard.apply_fatal(e);
                         }
                     }
-                });
+                    Err(e) => {
+                        error!(index = %index, error = %e, "FATAL: Snapshot installation failed.");
+                        guard.apply_fatal(NodeError::Protocol(format!(
+                            "Background snapshot restoration failure: {}",
+                            e
+                        )));
+                    }
+                }
             });
         }
 
@@ -506,7 +523,6 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
-    #[async_trait::async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -514,15 +530,15 @@ mod tests {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _index: LogIndex,
             _data: &[u8],
@@ -674,8 +690,9 @@ mod tests {
     }
 
     mod handle_install_snapshot {
+        use std::sync::Barrier;
+
         use common::raft_api::StateMachine;
-        use tokio::sync::Barrier;
 
         use super::*;
 
@@ -684,7 +701,6 @@ mod tests {
             barrier: Arc<Barrier>,
         }
 
-        #[async_trait::async_trait]
         impl StateMachine for MockDelayedFsm {
             type Error = FsmError;
 
@@ -692,22 +708,24 @@ mod tests {
                 Ok(LogIndex::ZERO)
             }
 
-            async fn apply(&self, _idx: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+            fn apply(&self, _idx: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
                 Ok(())
             }
 
-            async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+            fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                 Ok(vec![])
             }
 
-            async fn install_snapshot(
+            fn install_snapshot(
                 &self,
                 _idx: LogIndex,
                 _data: &[u8],
                 _trace_id: TraceId,
             ) -> Result<(), Self::Error> {
                 // BLOCK here until the test signals we can continue
-                self.barrier.wait().await;
+                // ADR 011: This is safe to do in a synchronous block because
+                // the shell calls this method within tokio::task::spawn_blocking.
+                self.barrier.wait();
                 Ok(())
             }
         }
@@ -767,7 +785,7 @@ mod tests {
                 drop(guard);
 
                 // 5. Release the background task so it can finish the InstallSnapshot phase
-                barrier.wait().await;
+                barrier.wait();
 
                 // Give the background task a tiny moment to acquire the lock and update the
                 // state

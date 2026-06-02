@@ -24,11 +24,9 @@ use common::types::NodeIdentity;
 use common::types::Term;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
-use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
-use tracing::info_span;
 use tracing::instrument;
 
 use crate::storage::LogStorage;
@@ -304,9 +302,9 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         skip_all,
         fields(index = %index)
     )]
-    pub async fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
+    pub fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
         self.update_commit_index_only(index)?;
-        self.apply_to_state_machine().await?;
+        self.apply_to_state_machine()?;
         Ok(())
     }
 
@@ -377,7 +375,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         skip_all,
         fields(last_committed = %self.last_committed)
     )]
-    async fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
+    fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
         let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
         if fsm_last > self.last_committed {
@@ -396,7 +394,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
                 ))
             })?;
 
-            if let Err(e) = self.fsm.apply(apply_idx, &entry.data).await {
+            if let Err(e) = self.fsm.apply(apply_idx, &entry.data) {
                 error!(
                     target: ClinicalTarget::ClinicalFsm.as_str(),
                     index = %apply_idx,
@@ -504,34 +502,29 @@ impl<S: StateMachine> RaftNode<Follower, S> {
 
     /// Following Raft §5.3, reconciles the local log with entries from the
     /// leader.
-    pub async fn reconcile_log(
+    #[instrument(
+        name = "log_reconciliation",
+        target = "raft::replication",
+        skip_all,
+        fields(prev_index = %prev_log_index, entry_count = entries.len())
+    )]
+    pub fn reconcile_log(
         &mut self,
         prev_log_index: LogIndex,
         prev_log_term: Term,
         entries: Vec<LogEntry>,
         leader_commit: LogIndex,
     ) -> Result<ReconciliationResult, NodeError> {
-        let span = info_span!(
-            target: ClinicalTarget::RaftReplication.as_str(),
-            "log_reconciliation",
-            prev_index = %prev_log_index,
-            entry_count = entries.len()
-        );
-
-        async {
-            if !self.verify_log_consistency(prev_log_index, prev_log_term)? {
-                return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
-            }
-
-            if !self.append_entries_with_reconciliation(entries)? {
-                return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
-            }
-
-            self.reconcile_last_committed(leader_commit).await?;
-            Ok(ReconciliationResult::success(self.last_log_index()?))
+        if !self.verify_log_consistency(prev_log_index, prev_log_term)? {
+            return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
         }
-        .instrument(span)
-        .await
+
+        if !self.append_entries_with_reconciliation(entries)? {
+            return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
+        }
+
+        self.reconcile_last_committed(leader_commit)?;
+        Ok(ReconciliationResult::success(self.last_log_index()?))
     }
 
     /// Evaluates if a vote can be granted to a candidate for the given term.
@@ -675,11 +668,11 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         Ok(true)
     }
 
-    async fn reconcile_last_committed(&mut self, leader_commit: LogIndex) -> Result<(), NodeError> {
+    fn reconcile_last_committed(&mut self, leader_commit: LogIndex) -> Result<(), NodeError> {
         if leader_commit > self.last_committed {
             let last_new_idx = self.last_log_index()?;
             let new_commit = cmp::min(leader_commit, last_new_idx);
-            self.advance_last_committed(new_commit).await?;
+            self.advance_last_committed(new_commit)?;
             debug!(
                 target: ClinicalTarget::RaftReplication.as_str(),
                 index = %new_commit,
@@ -966,7 +959,6 @@ mod tests {
     use std::result::Result;
     use std::sync::Mutex;
 
-    use async_trait::async_trait;
     use common::types::errors::FsmError;
     use common::types::trace::TraceId;
 
@@ -979,7 +971,6 @@ mod tests {
         applied_data: Mutex<Vec<Vec<u8>>>,
     }
 
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -987,7 +978,7 @@ mod tests {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
             self.applied_indices
                 .lock()
                 .expect("Clinical Invariant: Mutex must be lockable")
@@ -999,11 +990,11 @@ mod tests {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _last_included_index: LogIndex,
             _data: &[u8],
@@ -1214,7 +1205,7 @@ mod tests {
                         }])
                         .unwrap();
 
-                    node.advance_last_committed(LogIndex::new(1)).await.unwrap();
+                    node.advance_last_committed(LogIndex::new(1)).unwrap();
 
                     assert_eq!(log_store.last_committed().unwrap(), LogIndex::new(1));
                 }
@@ -1256,7 +1247,7 @@ mod tests {
                         }])
                         .unwrap();
 
-                    node.advance_last_committed(LogIndex::new(1)).await.unwrap();
+                    node.advance_last_committed(LogIndex::new(1)).unwrap();
 
                     assert_eq!(node.last_committed(), LogIndex::new(1));
                     assert_eq!(fsm.applied_indices.lock().unwrap().len(), 1);
@@ -1304,7 +1295,7 @@ mod tests {
                     }
                     log_store.append_entries(entries).unwrap();
 
-                    node.advance_last_committed(LogIndex::new(3)).await.unwrap();
+                    node.advance_last_committed(LogIndex::new(3)).unwrap();
 
                     let applied = fsm.applied_indices.lock().unwrap();
                     assert_eq!(
@@ -1368,9 +1359,9 @@ mod tests {
                             data: vec![],
                         }])
                         .unwrap();
-                    node.advance_last_committed(LogIndex::new(1)).await.unwrap();
+                    node.advance_last_committed(LogIndex::new(1)).unwrap();
 
-                    node.advance_last_committed(LogIndex::ZERO).await.unwrap();
+                    node.advance_last_committed(LogIndex::ZERO).unwrap();
 
                     assert_eq!(node.last_committed(), LogIndex::new(1));
                 }
@@ -1409,7 +1400,7 @@ mod tests {
                 >(
                     mut node: RaftNode<R, S>,
                 ) {
-                    let result = node.advance_last_committed(LogIndex::new(1)).await;
+                    let result = node.advance_last_committed(LogIndex::new(1));
                     assert!(result.is_err());
                     assert!(result.unwrap_err().to_string().contains("last_log_index"));
                 }
@@ -1444,7 +1435,6 @@ mod tests {
 
                 #[derive(Debug, Default)]
                 struct PoisonFsm;
-                #[async_trait]
                 impl StateMachine for PoisonFsm {
                     type Error = FsmError;
 
@@ -1452,19 +1442,15 @@ mod tests {
                         Ok(LogIndex::ZERO)
                     }
 
-                    async fn apply(
-                        &self,
-                        _index: LogIndex,
-                        _data: &[u8],
-                    ) -> Result<(), Self::Error> {
+                    fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
                         Err(FsmError::invariant("Simulated FSM failure"))
                     }
 
-                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                         Ok(vec![])
                     }
 
-                    async fn install_snapshot(
+                    fn install_snapshot(
                         &self,
                         _index: LogIndex,
                         _data: &[u8],
@@ -1489,7 +1475,7 @@ mod tests {
                         }])
                         .unwrap();
 
-                    let result = node.advance_last_committed(LogIndex::new(1)).await;
+                    let result = node.advance_last_committed(LogIndex::new(1));
                     assert!(result.is_err());
                     let err = result.unwrap_err();
                     assert!(
@@ -1554,7 +1540,6 @@ mod tests {
 
                 #[derive(Debug, Default)]
                 struct RegressionFsm;
-                #[async_trait]
                 impl StateMachine for RegressionFsm {
                     type Error = FsmError;
 
@@ -1562,19 +1547,15 @@ mod tests {
                         Ok(LogIndex::new(100))
                     }
 
-                    async fn apply(
-                        &self,
-                        _index: LogIndex,
-                        _data: &[u8],
-                    ) -> Result<(), Self::Error> {
+                    fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
                         Ok(())
                     }
 
-                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                         Ok(vec![])
                     }
 
-                    async fn install_snapshot(
+                    fn install_snapshot(
                         &self,
                         _index: LogIndex,
                         _data: &[u8],
@@ -1590,7 +1571,7 @@ mod tests {
                 >(
                     mut node: RaftNode<R, S>,
                 ) {
-                    let result = node.apply_to_state_machine().await;
+                    let result = node.apply_to_state_machine();
                     assert!(result.is_err());
                     assert!(
                         result
@@ -1652,7 +1633,7 @@ mod tests {
                     mut node: RaftNode<R, S>,
                 ) {
                     node.last_committed = LogIndex::new(5);
-                    let result = node.apply_to_state_machine().await;
+                    let result = node.apply_to_state_machine();
                     assert!(result.is_err());
                     assert!(result.unwrap_err().to_string().contains("missing from log"));
                 }
@@ -2076,7 +2057,6 @@ mod tests {
 
                 #[derive(Debug, Default)]
                 struct AheadFsm;
-                #[async_trait]
                 impl StateMachine for AheadFsm {
                     type Error = FsmError;
 
@@ -2084,15 +2064,15 @@ mod tests {
                         Ok(LogIndex::new(100))
                     }
 
-                    async fn apply(&self, _: LogIndex, _: &[u8]) -> Result<(), Self::Error> {
+                    fn apply(&self, _: LogIndex, _: &[u8]) -> Result<(), Self::Error> {
                         Ok(())
                     }
 
-                    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                         Ok(vec![])
                     }
 
-                    async fn install_snapshot(
+                    fn install_snapshot(
                         &self,
                         _: LogIndex,
                         _: &[u8],
@@ -2146,7 +2126,6 @@ mod tests {
                     .unwrap();
                     let result = node
                         .reconcile_log(LogIndex::new(1), Term::new(1), vec![], LogIndex::ZERO)
-                        .await
                         .unwrap();
                     assert!(!result.success);
                 }
@@ -2194,7 +2173,6 @@ mod tests {
                             vec![new_entry],
                             LogIndex::ZERO,
                         )
-                        .await
                         .unwrap();
 
                     assert!(result.success);
@@ -2236,7 +2214,6 @@ mod tests {
                             vec![new_entry],
                             LogIndex::ZERO,
                         )
-                        .await
                         .unwrap();
 
                     assert!(result.success);
@@ -2270,7 +2247,6 @@ mod tests {
 
                     let result = node
                         .reconcile_log(LogIndex::ZERO, Term::ZERO, vec![entry], LogIndex::ZERO)
-                        .await
                         .unwrap();
 
                     assert!(result.success);
@@ -2311,7 +2287,6 @@ mod tests {
                             vec![entry2, entry3],
                             LogIndex::ZERO,
                         )
-                        .await
                         .unwrap();
 
                     assert!(!result.success);
@@ -2346,7 +2321,6 @@ mod tests {
 
                     let result = node
                         .reconcile_log(LogIndex::new(1), Term::new(1), vec![entry3], LogIndex::ZERO)
-                        .await
                         .unwrap();
 
                     assert!(!result.success);
@@ -2384,14 +2358,14 @@ mod tests {
                         data: vec![],
                     };
 
-                    node.reconcile_log(
-                        LogIndex::new(1),
-                        Term::new(1),
-                        vec![entry2],
-                        LogIndex::new(10),
-                    )
-                    .await
-                    .unwrap();
+                    let _result = node
+                        .reconcile_log(
+                            LogIndex::new(1),
+                            Term::new(1),
+                            vec![entry2],
+                            LogIndex::new(10),
+                        )
+                        .unwrap();
 
                     assert_eq!(node.last_committed(), LogIndex::new(2));
                 }

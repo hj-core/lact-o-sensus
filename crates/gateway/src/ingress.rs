@@ -192,7 +192,7 @@ impl IngressDispatcher {
         let _enter = span.enter();
 
         // 1. Verifies that this node is the authorized leader.
-        let status = match self.authorize_mutation().await {
+        let status = match self.authorize_mutation() {
             AuthorityOutcome::Authorized(s) => s,
             AuthorityOutcome::Redirect(r) => return Ok(r),
             AuthorityOutcome::Fatal(e) => return Err(e),
@@ -233,7 +233,7 @@ impl IngressDispatcher {
             self.normalize_intent(&mut intent)?;
 
             // 5. Fetches the authoritative linearizable state for context (ADR 007).
-            let current_inventory = self.inventory_reader.get_inventory().await;
+            let current_inventory = self.inventory_reader.get_inventory();
 
             // 6. Resolves semantic metadata and stabilizes physical quantities via the AI
             //    resolution loop.
@@ -286,7 +286,7 @@ impl IngressDispatcher {
         let _enter = span.enter();
 
         // 1. Verifies that this node is the authorized leader.
-        let status = match self.authorize_query().await {
+        let status = match self.authorize_query() {
             AuthorityOutcome::Authorized(s) => s,
             AuthorityOutcome::Redirect(r) => return Ok(r),
             AuthorityOutcome::Fatal(e) => return Err(e),
@@ -329,9 +329,9 @@ impl IngressDispatcher {
         }
 
         // 4. Fetches the consolidated inventory from the State Machine.
-        let items = self.inventory_reader.get_inventory().await;
+        let items = self.inventory_reader.get_inventory();
 
-        let version = self.inventory_reader.current_version().await;
+        let version = self.inventory_reader.current_version();
 
         // 5. Redacts or filters results if a query filter was provided.
         let filtered_items = if let Some(ref filter) = req.query_filter {
@@ -357,8 +357,8 @@ impl IngressDispatcher {
     // --- Implementation Detail Helpers ---
 
     /// Orchestrates the authority check for mutation requests.
-    async fn authorize_mutation(&self) -> AuthorityOutcome<ProposeMutationResponse> {
-        let status = self.raft_handle.authority().await;
+    fn authorize_mutation(&self) -> AuthorityOutcome<ProposeMutationResponse> {
+        let status = self.raft_handle.authority();
         if status.is_poisoned {
             return AuthorityOutcome::Fatal(self.poisoned_node_error());
         }
@@ -369,8 +369,8 @@ impl IngressDispatcher {
     }
 
     /// Orchestrates the authority check for query requests.
-    async fn authorize_query(&self) -> AuthorityOutcome<QueryStateResponse> {
-        let status = self.raft_handle.authority().await;
+    fn authorize_query(&self) -> AuthorityOutcome<QueryStateResponse> {
+        let status = self.raft_handle.authority();
         if status.is_poisoned {
             return AuthorityOutcome::Fatal(self.poisoned_node_error());
         }
@@ -429,7 +429,6 @@ impl IngressDispatcher {
         let last_session = self
             .session_provider
             .check_session(client_id, SequenceId::new(0))
-            .await
             .map_err(|e| self.invalid_argument(format!("Session lookup failed: {}", e)))?;
 
         if let Some(record) = last_session {
@@ -1093,7 +1092,7 @@ mod tests {
             Ok(())
         }
 
-        async fn authority(&self) -> ConsensusAuthority {
+        fn authority(&self) -> ConsensusAuthority {
             ConsensusAuthority {
                 is_leader: self.is_leader,
                 is_poisoned: self.is_poisoned,
@@ -1240,9 +1239,8 @@ mod tests {
         version: LogIndex,
     }
 
-    #[async_trait]
     impl SessionProvider for MockInventorySource {
-        async fn check_session(
+        fn check_session(
             &self,
             _client_id: &ClientId,
             _sequence_id: SequenceId,
@@ -1251,13 +1249,12 @@ mod tests {
         }
     }
 
-    #[async_trait]
     impl InventoryReader for MockInventorySource {
-        async fn get_inventory(&self) -> Vec<GroceryItem> {
+        fn get_inventory(&self) -> Vec<GroceryItem> {
             self.items.clone()
         }
 
-        async fn current_version(&self) -> LogIndex {
+        fn current_version(&self) -> LogIndex {
             self.version
         }
     }
@@ -1379,8 +1376,8 @@ mod tests {
                     self.mock.await_apply(index).await
                 }
 
-                async fn authority(&self) -> ConsensusAuthority {
-                    self.mock.authority().await
+                fn authority(&self) -> ConsensusAuthority {
+                    self.mock.authority()
                 }
 
                 async fn verify_leadership(&self) -> Result<(), ConsensusError> {
@@ -1392,9 +1389,8 @@ mod tests {
             struct DuplicateSource {
                 committed_index: LogIndex,
             }
-            #[async_trait]
             impl SessionProvider for DuplicateSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     cid: &ClientId,
                     _sid: SequenceId,
@@ -1409,13 +1405,12 @@ mod tests {
                     )))
                 }
             }
-            #[async_trait]
             impl InventoryReader for DuplicateSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -2094,7 +2089,7 @@ mod tests {
                     Ok(())
                 }
 
-                async fn authority(&self) -> ConsensusAuthority {
+                fn authority(&self) -> ConsensusAuthority {
                     ConsensusAuthority {
                         is_leader: true,
                         is_poisoned: false,
@@ -2758,9 +2753,8 @@ mod tests {
             struct MockSource {
                 record: Option<SessionRecord>,
             }
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
@@ -2768,13 +2762,12 @@ mod tests {
                     Ok(self.record.clone())
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -2811,9 +2804,8 @@ mod tests {
             struct MockSource {
                 record: Option<SessionRecord>,
             }
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
@@ -2821,13 +2813,12 @@ mod tests {
                     Ok(self.record.clone())
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -2860,9 +2851,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource;
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     cid: &ClientId,
                     _sid: SequenceId,
@@ -2877,13 +2867,12 @@ mod tests {
                     )))
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -2912,9 +2901,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource;
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     cid: &ClientId,
                     _sid: SequenceId,
@@ -2929,13 +2917,12 @@ mod tests {
                     )))
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -2964,9 +2951,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource; // Returns None for check_session
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
@@ -2974,13 +2960,12 @@ mod tests {
                     Ok(None)
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -3015,9 +3000,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource;
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
@@ -3025,13 +3009,12 @@ mod tests {
                     Ok(None) // New client
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -3061,9 +3044,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource;
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     cid: &ClientId,
                     _sid: SequenceId,
@@ -3078,13 +3060,12 @@ mod tests {
                     )))
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -3114,9 +3095,8 @@ mod tests {
             let raft = successful_raft();
             #[derive(Debug, Default)]
             struct MockSource;
-            #[async_trait]
             impl SessionProvider for MockSource {
-                async fn check_session(
+                fn check_session(
                     &self,
                     _cid: &ClientId,
                     _sid: SequenceId,
@@ -3124,13 +3104,12 @@ mod tests {
                     Ok(None)
                 }
             }
-            #[async_trait]
             impl InventoryReader for MockSource {
-                async fn get_inventory(&self) -> Vec<GroceryItem> {
+                fn get_inventory(&self) -> Vec<GroceryItem> {
                     vec![]
                 }
 
-                async fn current_version(&self) -> LogIndex {
+                fn current_version(&self) -> LogIndex {
                     LogIndex::ZERO
                 }
             }
@@ -3309,7 +3288,7 @@ mod tests {
                     Err(ConsensusError::Poisoned)
                 }
 
-                async fn authority(&self) -> ConsensusAuthority {
+                fn authority(&self) -> ConsensusAuthority {
                     ConsensusAuthority {
                         is_leader: true,
                         is_poisoned: false,

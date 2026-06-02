@@ -6,8 +6,6 @@
 
 use std::fmt::Debug;
 
-use async_trait::async_trait;
-
 use crate::proto::v1::app::GroceryItem;
 use crate::proto::v1::app::SessionRecord;
 use crate::types::ClientId;
@@ -16,13 +14,12 @@ use crate::types::SequenceId;
 use crate::types::errors::FsmError;
 
 /// Trait for Exactly-Once session validation (ADR 006).
-#[async_trait]
 pub trait SessionProvider: Send + Sync + Debug {
     /// Checks the local session table for Exactly-Once deduplication.
     ///
     /// Providing a `sequence_id` of `0` returns the most recent record for the
     /// client, which allows the Gateway to validate sequence continuity.
-    async fn check_session(
+    fn check_session(
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
@@ -30,11 +27,10 @@ pub trait SessionProvider: Send + Sync + Debug {
 }
 
 /// Trait for authoritative business state retrieval.
-#[async_trait]
 pub trait InventoryReader: Send + Sync + Debug {
     /// Returns the current list of items in the inventory.
-    async fn get_inventory(&self) -> Vec<GroceryItem>;
+    fn get_inventory(&self) -> Vec<GroceryItem>;
 
     /// Returns the version (LogIndex) that this snapshot represents.
-    async fn current_version(&self) -> LogIndex;
+    fn current_version(&self) -> LogIndex;
 }

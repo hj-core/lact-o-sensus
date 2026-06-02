@@ -64,7 +64,7 @@ pub trait ConsensusHandle: Send + Sync + Debug {
     /// Returns a lock-free snapshot of the node's current consensus authority.
     ///
     /// This is the "Pre-flight Check" used to authorize external requests.
-    async fn authority(&self) -> ConsensusAuthority;
+    fn authority(&self) -> ConsensusAuthority;
 
     /// Verifies that this node is still the current cluster leader.
     ///
@@ -79,7 +79,6 @@ pub trait ConsensusHandle: Send + Sync + Debug {
 ///
 /// Implementations are responsible for deserializing the opaque bytes and
 /// applying the mutation to their internal state.
-#[async_trait]
 pub trait StateMachine: Send + Sync + Debug + 'static {
     /// The clinical error type returned by the state machine.
     ///
@@ -96,7 +95,7 @@ pub trait StateMachine: Send + Sync + Debug + 'static {
     ///
     /// This method is called sequentially by the Raft engine as the
     /// commit_index advances.
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error>;
+    fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error>;
 
     /// Captures a consistent, serializable snapshot of the entire state
     /// machine.
@@ -104,7 +103,7 @@ pub trait StateMachine: Send + Sync + Debug + 'static {
     /// The returned byte vector MUST contain all state required to reconstruct
     /// the application to this exact point-in-time, including inventory and
     /// session metadata (ADR 011).
-    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error>;
+    fn snapshot(&self) -> Result<Vec<u8>, Self::Error>;
 
     /// Restores the entire application state from a provided snapshot.
     ///
@@ -115,7 +114,7 @@ pub trait StateMachine: Send + Sync + Debug + 'static {
     ///
     /// If restoration fails, the node MUST transition to a Poisoned state (ADR
     /// 009).
-    async fn install_snapshot(
+    fn install_snapshot(
         &self,
         last_included_index: LogIndex,
         data: &[u8],

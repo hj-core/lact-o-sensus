@@ -202,7 +202,7 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
     }
 
     #[instrument(name = "authority_check", target = "raft::foundation", skip_all)]
-    async fn authority(&self) -> ConsensusAuthority {
+    fn authority(&self) -> ConsensusAuthority {
         let progress = *self.state.subscribe().borrow();
 
         let (leader_hint, rejection_reason) =
@@ -251,7 +251,6 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockFsm;
-    #[async_trait]
     impl StateMachine for MockFsm {
         type Error = FsmError;
 
@@ -259,15 +258,15 @@ mod tests {
             Ok(LogIndex::ZERO)
         }
 
-        async fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+        fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
             Ok(())
         }
 
-        async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
             Ok(vec![])
         }
 
-        async fn install_snapshot(
+        fn install_snapshot(
             &self,
             _index: LogIndex,
             _data: &[u8],
@@ -356,7 +355,7 @@ mod tests {
         #[tokio::test]
         async fn reports_correctly_for_follower_without_leader() {
             let (handle, _) = setup();
-            let status = handle.authority().await;
+            let status = handle.authority();
 
             assert!(!status.is_leader);
             assert!(status.leader_hint.is_empty());
@@ -371,7 +370,7 @@ mod tests {
                 guard.into_candidate();
                 guard.into_leader(vec![]);
             }
-            let status = handle.authority().await;
+            let status = handle.authority();
 
             assert!(status.is_leader);
             assert!(status.leader_hint.is_empty());
@@ -428,7 +427,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
                 if guard.as_leader_mut().is_some() {
-                    guard.advance_last_committed(index).await;
+                    guard.advance_last_committed(index);
                 }
             });
 
@@ -451,7 +450,7 @@ mod tests {
             {
                 let mut guard = state.write().await;
                 if guard.as_leader_mut().is_some() {
-                    guard.advance_last_committed(index).await;
+                    guard.advance_last_committed(index);
                 }
             }
 
@@ -514,7 +513,7 @@ mod tests {
                     node.log_store().append_entries(entries).unwrap();
                 }
 
-                guard.advance_last_committed(index).await;
+                guard.advance_last_committed(index);
             });
 
             let result = handle.await_apply(index).await;
@@ -536,7 +535,7 @@ mod tests {
                     }
                     node.log_store().append_entries(entries).unwrap();
                 }
-                guard.advance_last_committed(index).await;
+                guard.advance_last_committed(index);
             }
 
             let result = handle.await_apply(index).await;
@@ -574,7 +573,7 @@ mod tests {
                 guard.poison();
             }
 
-            let status = handle.authority().await;
+            let status = handle.authority();
             assert!(!status.is_leader);
             assert_eq!(status.rejection_reason, "Node is in a poisoned state.");
         }

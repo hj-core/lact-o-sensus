@@ -24,7 +24,6 @@
 
 use std::str::FromStr;
 
-use async_trait::async_trait;
 use common::app_api::InventoryReader;
 use common::app_api::SessionProvider;
 use common::proto::v1::app::CommittedMutation;
@@ -237,9 +236,8 @@ impl LactoStore {
     }
 }
 
-#[async_trait]
 impl SessionProvider for LactoStore {
-    async fn check_session(
+    fn check_session(
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
@@ -255,21 +253,19 @@ impl SessionProvider for LactoStore {
     }
 }
 
-#[async_trait]
 impl InventoryReader for LactoStore {
-    async fn get_inventory(&self) -> Vec<GroceryItem> {
+    fn get_inventory(&self) -> Vec<GroceryItem> {
         self.inventory
             .iter()
             .filter_map(Self::decode_inventory_entry)
             .collect()
     }
 
-    async fn current_version(&self) -> LogIndex {
+    fn current_version(&self) -> LogIndex {
         StateMachine::last_applied_index(self).unwrap_or(LogIndex::ZERO)
     }
 }
 
-#[async_trait]
 impl StateMachine for LactoStore {
     type Error = FsmError;
 
@@ -298,7 +294,7 @@ impl StateMachine for LactoStore {
             seq = tracing::field::Empty,
         )
     )]
-    async fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
+    fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
         let mutation = CommittedMutation::decode(data).map_err(|e| {
             FsmError::deserialization(format!(
                 "Failed to deserialize mutation at index {}: {}",
@@ -498,8 +494,8 @@ impl StateMachine for LactoStore {
     /// pipeline (Freeze-Apply) before calling this method, ensuring no
     /// mutations occur during serialization.
     #[tracing::instrument(name = "fsm_snapshot", target = "raft::compaction", skip_all)]
-    async fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-        let inventory = self.get_inventory().await;
+    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+        let inventory = self.get_inventory();
 
         let mut sessions = Vec::new();
         for res in self.sessions.iter() {
@@ -537,7 +533,7 @@ impl StateMachine for LactoStore {
         skip_all,
         fields(index = %last_included_index, trace_id = %trace_id)
     )]
-    async fn install_snapshot(
+    fn install_snapshot(
         &self,
         last_included_index: LogIndex,
         data: &[u8],
@@ -677,8 +673,8 @@ mod tests {
 
         mod physical_log_continuity {
             use super::*;
-            #[tokio::test]
-            async fn returns_invariant_error_when_log_index_skips_ahead() {
+            #[test]
+            fn returns_invariant_error_when_log_index_skips_ahead() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -687,10 +683,10 @@ mod tests {
                     .unwrap();
 
                 // 1. Success: Apply Index 1
-                store.apply(LogIndex::new(1), &data).await.unwrap();
+                store.apply(LogIndex::new(1), &data).unwrap();
 
                 // 2. Failure: Try to apply Index 3 (skipping Index 2)
-                let result = store.apply(LogIndex::new(3), &data).await;
+                let result = store.apply(LogIndex::new(3), &data);
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Non-sequential")),
                     "Expected Invariant error for non-sequential apply, got {:?}",
@@ -702,8 +698,8 @@ mod tests {
         mod exactly_once_semantics {
             use super::*;
 
-            #[tokio::test]
-            async fn advances_last_applied_when_sequence_is_duplicate() {
+            #[test]
+            fn advances_last_applied_when_sequence_is_duplicate() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -711,15 +707,15 @@ mod tests {
                     .encode(&mut data)
                     .unwrap();
 
-                store.apply(LogIndex::new(1), &data).await.unwrap();
-                store.apply(LogIndex::new(2), &data).await.unwrap();
+                store.apply(LogIndex::new(1), &data).unwrap();
+                store.apply(LogIndex::new(2), &data).unwrap();
 
                 assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(2));
-                assert_eq!(store.get_inventory().await.len(), 1);
+                assert_eq!(store.get_inventory().len(), 1);
             }
 
-            #[tokio::test]
-            async fn advances_last_applied_when_sequence_is_stale() {
+            #[test]
+            fn advances_last_applied_when_sequence_is_stale() {
                 let store = setup_store();
                 let cid = ClientId::generate();
 
@@ -732,16 +728,16 @@ mod tests {
                     .encode(&mut data2)
                     .unwrap();
 
-                store.apply(LogIndex::new(1), &data1).await.unwrap();
-                store.apply(LogIndex::new(2), &data2).await.unwrap();
+                store.apply(LogIndex::new(1), &data1).unwrap();
+                store.apply(LogIndex::new(2), &data2).unwrap();
 
                 // Late arrival of seq 1 at Index 3
-                store.apply(LogIndex::new(3), &data1).await.unwrap();
+                store.apply(LogIndex::new(3), &data1).unwrap();
                 assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(3));
             }
 
-            #[tokio::test]
-            async fn returns_invariant_error_when_sequence_gap_detected() {
+            #[test]
+            fn returns_invariant_error_when_sequence_gap_detected() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -749,7 +745,7 @@ mod tests {
                     .encode(&mut data)
                     .unwrap();
 
-                let result = store.apply(LogIndex::new(1), &data).await;
+                let result = store.apply(LogIndex::new(1), &data);
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Sequence gap")),
                     "Expected Invariant error for sequence gap, got {:?}",
@@ -757,8 +753,8 @@ mod tests {
                 );
             }
 
-            #[tokio::test]
-            async fn maintains_independent_sequences_when_multiple_clients_active() {
+            #[test]
+            fn maintains_independent_sequences_when_multiple_clients_active() {
                 let store = setup_store();
                 let cid1 = ClientId::generate();
                 let cid2 = ClientId::generate();
@@ -772,18 +768,18 @@ mod tests {
                     .encode(&mut d2)
                     .unwrap();
 
-                store.apply(LogIndex::new(1), &d1).await.unwrap();
-                store.apply(LogIndex::new(2), &d2).await.unwrap();
+                store.apply(LogIndex::new(1), &d1).unwrap();
+                store.apply(LogIndex::new(2), &d2).unwrap();
 
-                assert_eq!(store.get_inventory().await.len(), 2);
+                assert_eq!(store.get_inventory().len(), 2);
             }
         }
 
         mod inventory_mutations {
             use super::*;
 
-            #[tokio::test]
-            async fn updates_inventory_when_status_is_committed() {
+            #[test]
+            fn updates_inventory_when_status_is_committed() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -791,12 +787,12 @@ mod tests {
                     .encode(&mut data)
                     .unwrap();
 
-                store.apply(LogIndex::new(1), &data).await.unwrap();
-                assert_eq!(store.get_inventory().await.len(), 1);
+                store.apply(LogIndex::new(1), &data).unwrap();
+                assert_eq!(store.get_inventory().len(), 1);
             }
 
-            #[tokio::test]
-            async fn does_not_update_inventory_when_status_is_vetoed() {
+            #[test]
+            fn does_not_update_inventory_when_status_is_vetoed() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -804,12 +800,12 @@ mod tests {
                     .encode(&mut data)
                     .unwrap();
 
-                store.apply(LogIndex::new(1), &data).await.unwrap();
-                assert!(store.get_inventory().await.is_empty());
+                store.apply(LogIndex::new(1), &data).unwrap();
+                assert!(store.get_inventory().is_empty());
             }
 
-            #[tokio::test]
-            async fn deletes_item_when_is_delete_is_true() {
+            #[test]
+            fn deletes_item_when_is_delete_is_true() {
                 let store = setup_store();
                 let cid = ClientId::generate();
 
@@ -817,22 +813,22 @@ mod tests {
                 mock_mutation(&cid, 1, MutationStatus::Committed)
                     .encode(&mut d1)
                     .unwrap();
-                store.apply(LogIndex::new(1), &d1).await.unwrap();
+                store.apply(LogIndex::new(1), &d1).unwrap();
 
                 let mut d2 = Vec::new();
                 let mut m2 = mock_mutation(&cid, 2, MutationStatus::Committed);
                 m2.is_delete = true;
                 m2.encode(&mut d2).unwrap();
 
-                store.apply(LogIndex::new(2), &d2).await.unwrap();
-                assert!(store.get_inventory().await.is_empty());
+                store.apply(LogIndex::new(2), &d2).unwrap();
+                assert!(store.get_inventory().is_empty());
             }
         }
 
         mod persistence {
             use super::*;
-            #[tokio::test]
-            async fn recovers_consistent_state_when_restarted_from_disk() {
+            #[test]
+            fn recovers_consistent_state_when_restarted_from_disk() {
                 let dir = tempdir().unwrap();
                 let db_path = dir.path();
                 let cid = ClientId::generate();
@@ -843,13 +839,13 @@ mod tests {
                     mock_mutation(&cid, 1, MutationStatus::Committed)
                         .encode(&mut data)
                         .unwrap();
-                    store.apply(LogIndex::new(1), &data).await.unwrap();
+                    store.apply(LogIndex::new(1), &data).unwrap();
                 }
                 {
                     let db = sled::open(db_path).unwrap();
                     let store = LactoStore::new(db).unwrap();
                     assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(1));
-                    assert_eq!(store.get_inventory().await.len(), 1);
+                    assert_eq!(store.get_inventory().len(), 1);
                 }
             }
         }
@@ -857,12 +853,12 @@ mod tests {
         mod safety_mandates {
             use super::*;
 
-            #[tokio::test]
-            async fn returns_error_on_corrupt_mutation_bytes() {
+            #[test]
+            fn returns_error_on_corrupt_mutation_bytes() {
                 let store = setup_store();
                 let data = vec![0xFF, 0xFF, 0xFF]; // Invalid protobuf bytes
 
-                let result = store.apply(LogIndex::new(1), &data).await;
+                let result = store.apply(LogIndex::new(1), &data);
                 assert!(
                     matches!(result, Err(FsmError::Deserialization(ref msg)) if msg.contains("deserialize mutation")),
                     "Expected Deserialization error, got {:?}",
@@ -870,8 +866,8 @@ mod tests {
                 );
             }
 
-            #[tokio::test]
-            async fn returns_error_when_mutation_missing_event_time() {
+            #[test]
+            fn returns_error_when_mutation_missing_event_time() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut mutation = mock_mutation(&cid, 1, MutationStatus::Committed);
@@ -880,7 +876,7 @@ mod tests {
                 let mut data = Vec::new();
                 mutation.encode(&mut data).unwrap();
 
-                let result = store.apply(LogIndex::new(1), &data).await;
+                let result = store.apply(LogIndex::new(1), &data);
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("mandatory event_time")),
                     "Expected Invariant error for missing event_time, got {:?}",
@@ -888,8 +884,8 @@ mod tests {
                 );
             }
 
-            #[tokio::test]
-            async fn returns_invariant_error_on_unknown_mutation_status() {
+            #[test]
+            fn returns_invariant_error_on_unknown_mutation_status() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut mutation = mock_mutation(&cid, 1, MutationStatus::Committed);
@@ -898,7 +894,7 @@ mod tests {
                 let mut data = Vec::new();
                 mutation.encode(&mut data).unwrap();
 
-                let result = store.apply(LogIndex::new(1), &data).await;
+                let result = store.apply(LogIndex::new(1), &data);
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Unknown MutationStatus")),
                     "Expected Invariant error for unknown status, got {:?}",
@@ -906,8 +902,8 @@ mod tests {
                 );
             }
 
-            #[tokio::test]
-            async fn returns_invariant_error_on_invalid_client_id() {
+            #[test]
+            fn returns_invariant_error_on_invalid_client_id() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut mutation = mock_mutation(&cid, 1, MutationStatus::Committed);
@@ -916,7 +912,7 @@ mod tests {
                 let mut data = Vec::new();
                 mutation.encode(&mut data).unwrap();
 
-                let result = store.apply(LogIndex::new(1), &data).await;
+                let result = store.apply(LogIndex::new(1), &data);
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Invalid client_id")),
                     "Expected Invariant error for invalid client_id, got {:?}",
@@ -930,8 +926,8 @@ mod tests {
 
             use super::*;
 
-            #[tokio::test]
-            async fn advances_global_clinical_time_monotonically() {
+            #[test]
+            fn advances_global_clinical_time_monotonically() {
                 let store = setup_store();
                 let cid = ClientId::generate();
 
@@ -943,7 +939,7 @@ mod tests {
                 });
                 let mut d1 = Vec::new();
                 m1.encode(&mut d1).unwrap();
-                store.apply(LogIndex::new(1), &d1).await.unwrap();
+                store.apply(LogIndex::new(1), &d1).unwrap();
                 assert_eq!(store.last_effective_time().unwrap().seconds, 100);
 
                 // 2. Apply mutation at T=200
@@ -954,7 +950,7 @@ mod tests {
                 });
                 let mut d2 = Vec::new();
                 m2.encode(&mut d2).unwrap();
-                store.apply(LogIndex::new(2), &d2).await.unwrap();
+                store.apply(LogIndex::new(2), &d2).unwrap();
                 assert_eq!(store.last_effective_time().unwrap().seconds, 200);
 
                 // 3. Apply mutation at T=150 (Stale Log Clock)
@@ -966,12 +962,12 @@ mod tests {
                 });
                 let mut d3 = Vec::new();
                 m3.encode(&mut d3).unwrap();
-                store.apply(LogIndex::new(3), &d3).await.unwrap();
+                store.apply(LogIndex::new(3), &d3).unwrap();
                 assert_eq!(store.last_effective_time().unwrap().seconds, 200);
             }
 
-            #[tokio::test]
-            async fn persists_per_session_activity_timestamp() {
+            #[test]
+            fn persists_per_session_activity_timestamp() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let event_time = Timestamp {
@@ -984,11 +980,10 @@ mod tests {
                 let mut data = Vec::new();
                 mutation.encode(&mut data).unwrap();
 
-                store.apply(LogIndex::new(1), &data).await.unwrap();
+                store.apply(LogIndex::new(1), &data).unwrap();
 
                 let record = store
                     .check_session(&cid, SequenceId::new(1))
-                    .await
                     .unwrap()
                     .unwrap();
 
@@ -1002,8 +997,8 @@ mod tests {
 
         mod wildcard_queries {
             use super::*;
-            #[tokio::test]
-            async fn returns_latest_record_when_sequence_id_is_zero() {
+            #[test]
+            fn returns_latest_record_when_sequence_id_is_zero() {
                 let store = setup_store();
                 let cid = ClientId::generate();
 
@@ -1012,19 +1007,18 @@ mod tests {
                 mock_mutation(&cid, 1, MutationStatus::Committed)
                     .encode(&mut data1)
                     .unwrap();
-                store.apply(LogIndex::new(1), &data1).await.unwrap();
+                store.apply(LogIndex::new(1), &data1).unwrap();
 
                 // 2. Apply sequence 2
                 let mut data2 = Vec::new();
                 mock_mutation(&cid, 2, MutationStatus::Committed)
                     .encode(&mut data2)
                     .unwrap();
-                store.apply(LogIndex::new(2), &data2).await.unwrap();
+                store.apply(LogIndex::new(2), &data2).unwrap();
 
                 // 3. Query with seq 0 (wildcard) returns the latest (2)
                 let record = store
                     .check_session(&cid, SequenceId::new(0))
-                    .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(record.last_sequence_id, 2);
@@ -1033,18 +1027,17 @@ mod tests {
 
         mod session_lookup {
             use super::*;
-            #[tokio::test]
-            async fn returns_none_when_session_does_not_exist() {
+            #[test]
+            fn returns_none_when_session_does_not_exist() {
                 let store = setup_store();
                 let result = store
                     .check_session(&ClientId::generate(), SequenceId::new(1))
-                    .await
                     .unwrap();
                 assert!(result.is_none());
             }
 
-            #[tokio::test]
-            async fn returns_accurate_replay_data_when_session_retrieved() {
+            #[test]
+            fn returns_accurate_replay_data_when_session_retrieved() {
                 let store = setup_store();
                 let cid = ClientId::generate();
                 let mut data = Vec::new();
@@ -1052,10 +1045,9 @@ mod tests {
                 m.moral_justification = "Vetoed justification".to_string();
                 m.encode(&mut data).unwrap();
 
-                store.apply(LogIndex::new(1), &data).await.unwrap();
+                store.apply(LogIndex::new(1), &data).unwrap();
                 let record = store
                     .check_session(&cid, SequenceId::new(1))
-                    .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(record.moral_justification, "Vetoed justification");
@@ -1069,8 +1061,8 @@ mod tests {
         mod round_trip {
             use super::*;
 
-            #[tokio::test]
-            async fn restores_identical_state_from_snapshot() {
+            #[test]
+            fn restores_identical_state_from_snapshot() {
                 let store_a = setup_store();
                 let cid = ClientId::generate();
 
@@ -1079,32 +1071,30 @@ mod tests {
                 mock_mutation(&cid, 1, MutationStatus::Committed)
                     .encode(&mut d1)
                     .unwrap();
-                store_a.apply(LogIndex::new(1), &d1).await.unwrap();
+                store_a.apply(LogIndex::new(1), &d1).unwrap();
 
                 let mut d2 = Vec::new();
                 let mut m2 = mock_mutation(&cid, 2, MutationStatus::Committed);
                 m2.resolved_item_key = "bread".to_string();
                 m2.encode(&mut d2).unwrap();
-                store_a.apply(LogIndex::new(2), &d2).await.unwrap();
+                store_a.apply(LogIndex::new(2), &d2).unwrap();
 
                 // 2. Take Snapshot
-                let snapshot_bytes = store_a.snapshot().await.unwrap();
+                let snapshot_bytes = store_a.snapshot().unwrap();
                 let last_index = store_a.last_applied_index().unwrap();
 
                 // 3. Restore into Store B
                 let store_b = setup_store();
                 store_b
                     .install_snapshot(last_index, &snapshot_bytes, TraceId::generate())
-                    .await
                     .unwrap();
 
                 // 4. Verify Equality
                 assert_eq!(store_b.last_applied_index().unwrap(), last_index);
-                assert_eq!(store_b.get_inventory().await.len(), 2);
+                assert_eq!(store_b.get_inventory().len(), 2);
 
                 let session = store_b
                     .check_session(&cid, SequenceId::new(2))
-                    .await
                     .unwrap()
                     .unwrap();
                 assert_eq!(session.last_sequence_id, 2);
@@ -1119,8 +1109,8 @@ mod tests {
         mod crash_recovery {
             use super::*;
 
-            #[tokio::test]
-            async fn purges_dirty_state_on_startup_if_tombstone_present() {
+            #[test]
+            fn purges_dirty_state_on_startup_if_tombstone_present() {
                 let dir = tempfile::tempdir().unwrap();
                 let db_path = dir.path();
 
@@ -1134,7 +1124,7 @@ mod tests {
                     mock_mutation(&ClientId::generate(), 1, MutationStatus::Committed)
                         .encode(&mut data)
                         .unwrap();
-                    store.apply(LogIndex::new(1), &data).await.unwrap();
+                    store.apply(LogIndex::new(1), &data).unwrap();
 
                     // Manually insert the Tombstone
                     store
@@ -1151,7 +1141,7 @@ mod tests {
 
                     // 3. Verify Sanitization
                     assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(0));
-                    assert!(store.get_inventory().await.is_empty());
+                    assert!(store.get_inventory().is_empty());
                     assert!(!store.is_restoration_stale().unwrap());
                 }
             }
