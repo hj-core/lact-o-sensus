@@ -18,17 +18,17 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 
 ## 3. Architectural Decision Records
 
-- **3.1. Node Failure Model (ADR 001):** Implements a Crash-Recovery (CR) model for cluster nodes and utilizes a client-side WAL for linearizable retries. Treats the AI Veto as a Byzantine Oracle to preserve cluster determinism.
-- **3.2. Network Topology (ADR 002):** Enforces a Leader-Centric Hub-and-Spoke model for external interactions (using `leader_hint` redirection) and a Full-Mesh for internal consensus.
-- **3.3. Timing & Synchrony (ADR 003):** 1:3–1:6 Heartbeat-to-Election ratio (50ms/150ms-300ms). Safety is independent of time; liveness is partially synchronous.
-- **3.4. Bootstrapping & Identity (ADR 004):** Identifies nodes by `(ClusterId, NodeId)` NewTypes. Prohibits cross-cluster contamination via Middleware identity guards and enforces a Bootstrap Halt Mandate on identity mismatches.
-- **3.5. Logical Interface (ADR 005):** Strict separation between generic consensus (`raft.proto`) and application logic (`app.proto`). Logical Interface isolation is enforced via gRPC Metadata/Interceptors, keeping the protobuf payload definitions strictly focused on consensus and state.
-- **3.6. Exactly-Once Semantics (ADR 006):** Guarantees linearizability via a replicated Session Table. Every mutation outcome (Success or Veto) is a logged consensus event.
-- **3.7. Defensive Mutation Lifecycle (ADR 007):** A 5-layer "Defense Onion" pipeline: Structural Intent -> Syntactic Fortress -> Semantic Oracle -> Registry Firewall -> Consensus Commit.
-- **3.8. Universal Unit Registry (ADR 008):** Internal SI stabilization using `rust_decimal`. All physical state is normalized to `g` or `ml` using Banker's Rounding.
-- **3.9. Internal Node Architecture (ADR 009):** The "Tri-Layer Onion" (Physical Foundation -> Logical Orchestrator -> Execution Shell). Mandates a **strictly synchronous core (Layers 1 & 2)** to prevent "blocking-in-async" hazards. Implements **Poison-then-Panic** via the `RoleState` enumeration managed within the `LogicalNode` struct to handle invariant violations.
-- **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with mandatory PII redaction (Client ID truncation, TRACE-only justifications) to enable deterministic reconstruction of distributed events. The Gateway acts as the authoritative generator of `trace_id`s for causal correlation.
-- **3.11. Asynchronous Log Compaction (ADR 011):** Mitigates unbounded disk growth via state machine snapshotting. Offloads generation to background threads to prevent heartbeat starvation, and employs a **Restoration Tombstone** protocol during snapshot installations to ensure crash-safety and preserve EOS.
+- **3.1. Node Failure Model (ADR 001):** Adopts a Crash-Recovery (CR) model supported by a client-side WAL for linearizable retries and treats the AI Veto as a Byzantine Oracle.
+- **3.2. Network Topology (ADR 002):** Enforces a Leader-Centric Hub-and-Spoke model for external clients and a Full-Mesh network for internal cluster consensus.
+- **3.3. Timing & Synchrony (ADR 003):** Sets a 1:3–1:6 Heartbeat-to-Election ratio to ensure liveness while maintaining safety independence from timing assumptions.
+- **3.4. Bootstrapping & Identity (ADR 004):** Mandates strict identity validation via `(ClusterId, NodeId)` NewTypes and enforces a Bootstrap Halt on configuration mismatches.
+- **3.5. Logical Interface (ADR 005):** Strictly separates generic consensus payloads from application domain logic through gRPC metadata and interceptors.
+- **3.6. Exactly-Once Semantics (ADR 006):** Guarantees linearizability by recording every mutation outcome in a replicated Session Table.
+- **3.7. Defensive Mutation Lifecycle (ADR 007):** Implements a 5-layer "Defense Onion" pipeline to scrub, resolve, and validate mutation intents before they reach consensus.
+- **3.8. Universal Unit Registry (ADR 008):** Normalizes all physical quantities to SI base units using `rust_decimal` and Banker's Rounding for stability.
+- **3.9. Internal Node Architecture (ADR 009):** Mandates a strictly synchronous core (Physical and Logical layers) protected by a "Poison-then-Panic" protocol within an asynchronous Execution Shell.
+- **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with authoritative Gateway `trace_id` generation and mandatory PII redaction.
+- **3.11. Asynchronous Log Compaction (ADR 011):** Offloads state machine snapshot generation and restoration to background threads using a "Restoration Tombstone" protocol to preserve heartbeat stability and crash-safety.
 
 ## 4. Technical Standards
 
@@ -45,4 +45,4 @@ Implementation must adhere to the [Lact-O-Sensus Review Checklist](docs/checklis
   - `python3 scripts/smoke_test.py`
 - **5.4. Clinical Review:** Evaluate verified changes against the [Review Checklist](docs/checklists/review_checklist.md) and resolve all violations.
 - **5.5. Atomic Commits:** Finalize changes as atomic units following [Conventional Commits](https://www.conventionalcommits.org/). Ensure the commit message body briefly describes the context and the major works that have been done.
-- **5.6. Documentation Boundary Discipline:** Limit cross-references within documentation files, commit messages, and other textual artifacts to the `docs/adrs/` directory only. Do not reference other `docs/` content (e.g., checklists, roadmaps) from within documentation files or commit messages.
+- **5.6. Documentation Boundary Discipline:** Restricts cross-references in textual artifacts to the `docs/adrs/` directory only.
