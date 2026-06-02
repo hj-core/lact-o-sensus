@@ -31,9 +31,9 @@ use super::TickAction;
 /// Candidate role to initiate an election.
 #[derive(Debug)]
 pub struct Follower {
-    pub(super) leader_id: Option<NodeId>,
-    pub(super) last_heartbeat: Tick,
-    pub(super) timeout: TickDuration,
+    leader_id: Option<NodeId>,
+    last_heartbeat: Tick,
+    timeout: TickDuration,
 }
 
 impl Follower {
@@ -142,8 +142,8 @@ impl<S: StateMachine> RaftNode<Follower, S> {
     ) -> Result<bool, NodeError> {
         // §5.2, §5.4: Only grant vote if votedFor is null or candidateId,
         // and candidate’s log is at least as up-to-date as receiver’s log.
-        let current_term = self.log_store.current_term()?;
-        let voted_for = self.log_store.voted_for()?;
+        let current_term = self.current_term()?;
+        let voted_for = self.voted_for()?;
 
         if req_term == current_term
             && (voted_for.is_none() || voted_for == Some(candidate_id))
@@ -161,18 +161,10 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         election_start: Tick,
         timeout: TickDuration,
     ) -> Result<RaftNode<Candidate, S>, NodeError> {
-        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
+        let current_term = self.current_term()?;
+        let mut node = self.transition(Candidate::new(election_start, timeout));
 
-        let mut node = RaftNode {
-            identity,
-            fsm,
-            log_store,
-            last_committed,
-            last_applied,
-            state: Candidate::new(election_start, timeout),
-        };
-
-        let new_term = (node.current_term()? + 1)?;
+        let new_term = (current_term + 1)?;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
@@ -237,9 +229,7 @@ impl<S: StateMachine> RaftNode<Follower, S> {
                     index = %entry_index,
                     "Log conflict detected. Truncating log."
                 );
-                self.log_store
-                    .truncate_log(entry_index)
-                    .map_err(NodeError::from)?;
+                self.truncate_log(entry_index)?;
                 break;
             }
         }
@@ -265,16 +255,14 @@ impl<S: StateMachine> RaftNode<Follower, S> {
         }
 
         if !to_append.is_empty() {
-            self.log_store
-                .append_entries(to_append)
-                .map_err(NodeError::from)?;
+            self.append_entries(to_append)?;
         }
 
         Ok(true)
     }
 
     pub(crate) fn reconcile_last_committed(&mut self, leader_commit: LogIndex) -> Result<(), NodeError> {
-        if leader_commit > self.last_committed {
+        if leader_commit > self.last_committed() {
             let last_new_idx = self.last_log_index()?;
             let new_commit = cmp::min(leader_commit, last_new_idx);
             self.advance_last_committed(new_commit)?;

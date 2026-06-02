@@ -21,9 +21,9 @@ use super::TickAction;
 /// is reached, the term is incremented and a new campaign is initiated.
 #[derive(Debug)]
 pub struct Candidate {
-    pub(super) votes_received: HashSet<NodeId>,
-    pub(super) election_start: Tick,
-    pub(super) timeout: TickDuration,
+    votes_received: HashSet<NodeId>,
+    election_start: Tick,
+    timeout: TickDuration,
 }
 
 impl Candidate {
@@ -68,18 +68,10 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
         election_start: Tick,
         timeout: TickDuration,
     ) -> Result<RaftNode<Candidate, S>, NodeError> {
-        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
+        let current_term = self.current_term()?;
+        let mut node = self.transition(Candidate::new(election_start, timeout));
 
-        let mut node = RaftNode {
-            identity,
-            fsm,
-            log_store,
-            last_committed,
-            last_applied,
-            state: Candidate::new(election_start, timeout),
-        };
-
-        let new_term = (node.current_term()? + 1)?;
+        let new_term = (current_term + 1)?;
         node.advance_term(new_term)?;
         let node_id = node.node_id();
         node.persist_vote(node_id)?;
@@ -101,16 +93,7 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
     ) -> Result<RaftNode<Leader, S>, NodeError> {
         let last_log_index = self.last_log_index()?;
         let term = self.current_term()?;
-        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
-
-        let node = RaftNode {
-            identity,
-            fsm,
-            log_store,
-            last_committed,
-            last_applied,
-            state: Leader::new(peer_ids, last_log_index, last_heartbeat)?,
-        };
+        let node = self.transition(Leader::new(peer_ids, last_log_index, last_heartbeat)?);
 
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),

@@ -22,16 +22,16 @@ use super::TickAction;
 /// acknowledged reception (§5.3).
 #[derive(Debug)]
 pub struct Leader {
-    pub(super) next_index: HashMap<NodeId, LogIndex>,
-    pub(super) match_index: HashMap<NodeId, LogIndex>,
-    pub(super) last_heartbeat: Tick,
+    next_index: HashMap<NodeId, LogIndex>,
+    match_index: HashMap<NodeId, LogIndex>,
+    last_heartbeat: Tick,
 
     /// The epoch of the latest heartbeat round initiated (§8).
-    pub(super) current_read_epoch: u64,
+    current_read_epoch: u64,
     /// The highest epoch acknowledged by a majority (§8).
-    pub(super) confirmed_read_epoch: u64,
+    confirmed_read_epoch: u64,
     /// Peers who have acknowledged the current_read_epoch.
-    pub(super) heartbeat_acks: HashSet<NodeId>,
+    heartbeat_acks: HashSet<NodeId>,
 }
 
 impl Leader {
@@ -137,9 +137,7 @@ impl<S: StateMachine> RaftNode<Leader, S> {
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, NodeError> {
         let index = (self.last_log_index()? + 1)?;
         let entry = LogEntry::new(index, self.current_term()?, command);
-        self.log_store
-            .append_entries(vec![entry])
-            .map_err(NodeError::from)?;
+        self.append_entries(vec![entry])?;
         Ok(index)
     }
 }

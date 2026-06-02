@@ -116,14 +116,14 @@ pub trait NodeState: Debug {}
 /// high-level orchestrator shell.
 #[derive(Debug)]
 pub struct RaftNode<R: NodeState, S: StateMachine> {
-    pub(super) identity: Arc<NodeIdentity>,
-    pub(super) fsm: Arc<S>,
-    pub(super) log_store: Arc<dyn LogStorage>,
+    identity: Arc<NodeIdentity>,
+    fsm: Arc<S>,
+    log_store: Arc<dyn LogStorage>,
 
     // --- Volatile State ---
-    pub(super) last_committed: LogIndex,
-    pub(super) last_applied: LogIndex,
-    pub(super) state: R,
+    last_committed: LogIndex,
+    last_applied: LogIndex,
+    state: R,
 }
 
 // --- Implementation: Shared Accessors ---
@@ -189,6 +189,20 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         &mut self.state
     }
 
+    /// Internal helper to transition between roles by recomposing the node
+    /// with a new state marker while preserving physical invariants.
+    pub(crate) fn transition<Next: NodeState>(self, next_state: Next) -> RaftNode<Next, S> {
+        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
+        RaftNode {
+            identity,
+            fsm,
+            log_store,
+            last_committed,
+            last_applied,
+            state: next_state,
+        }
+    }
+
     // --- Log Queries ---
 
     pub fn last_log_index(&self) -> Result<LogIndex, NodeError> {
@@ -229,6 +243,16 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
             .read_entries(start, end)
             .map_err(NodeError::from)
     }
+
+    pub(crate) fn truncate_log(&mut self, index: LogIndex) -> Result<(), NodeError> {
+        self.log_store.truncate_log(index).map_err(NodeError::from)
+    }
+
+    pub(crate) fn append_entries(&mut self, entries: Vec<LogEntry>) -> Result<(), NodeError> {
+        self.log_store
+            .append_entries(entries)
+            .map_err(NodeError::from)
+    }
 }
 
 // --- Implementation: Shared Physical Mutations ---
@@ -245,16 +269,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         last_heartbeat: Tick,
         timeout: TickDuration,
     ) -> Result<RaftNode<Follower, S>, NodeError> {
-        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
-
-        let mut node = RaftNode {
-            identity,
-            fsm,
-            log_store,
-            last_committed,
-            last_applied,
-            state: Follower::new(leader_id, last_heartbeat, timeout),
-        };
+        let mut node = self.transition(Follower::new(leader_id, last_heartbeat, timeout));
 
         // Transition to next term if higher (§5.1)
         node.advance_term(term)?;
