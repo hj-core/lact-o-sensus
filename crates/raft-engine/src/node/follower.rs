@@ -328,6 +328,55 @@ mod tests {
     use crate::node::test_utils::*;
     use crate::storage::MemoryStorage;
 
+    mod evaluate_tick {
+        use super::*;
+        use crate::tick::Tick;
+        use crate::tick::TickDuration;
+
+        mod on_heartbeat_fresh {
+            use super::*;
+            #[test]
+            fn should_return_none_when_timeout_not_reached() {
+                let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
+                assert_eq!(follower.evaluate_tick(Tick::new(149)), TickAction::None);
+            }
+        }
+
+        mod on_timeout_expiry {
+            use super::*;
+            #[test]
+            fn should_trigger_election_when_timeout_reached() {
+                let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
+                assert_eq!(
+                    follower.evaluate_tick(Tick::new(150)),
+                    TickAction::StartElection
+                );
+            }
+
+            #[test]
+            fn should_trigger_election_when_timeout_exceeded() {
+                let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
+                assert_eq!(
+                    follower.evaluate_tick(Tick::new(200)),
+                    TickAction::StartElection
+                );
+            }
+        }
+
+        mod on_clock_regression {
+            use super::*;
+            #[test]
+            fn should_return_none_when_now_is_before_last_heartbeat() {
+                let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
+                // This is the "Red" test for Task 6.
+                // Currently it might return StartElection due to saturating subtraction
+                // if Tick - Tick behaves that way, or it might panic if it's not saturating.
+                // If it's Tick(now) - Tick(last), it depends on Tick's Sub impl.
+                assert_eq!(follower.evaluate_tick(Tick::new(50)), TickAction::None);
+            }
+        }
+    }
+
     mod try_new {
         use super::*;
         use crate::storage::SledStorage;
