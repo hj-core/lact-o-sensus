@@ -18,7 +18,6 @@ use common::types::trace::ClinicalTarget;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
-use tracing::instrument;
 
 use super::Candidate;
 use super::NodeState;
@@ -134,12 +133,6 @@ impl<S: StateMachine> RaftNode<Follower, S> {
 
     /// Following Raft §5.3, reconciles the local log with entries from the
     /// leader.
-    #[instrument(
-        name = "log_reconciliation",
-        target = "raft::replication",
-        skip_all,
-        fields(prev_index = %prev_log_index, entry_count = entries.len())
-    )]
     pub fn reconcile_log(
         &mut self,
         prev_log_index: LogIndex,
