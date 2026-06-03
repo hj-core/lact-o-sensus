@@ -77,9 +77,8 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
         let mut node = self.transition(Candidate::new(election_start, timeout));
 
         let new_term = (current_term + 1)?;
-        node.advance_term(new_term)?;
         let node_id = node.node_id();
-        node.persist_vote(node_id)?;
+        node.advance_term_and_vote(new_term, node_id)?;
         node.state_mut().add_vote(node_id);
 
         info!(

@@ -250,6 +250,35 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         Ok(())
     }
 
+    /// Updates the current term and persists a vote in a single atomic write.
+    pub(crate) fn advance_term_and_vote(
+        &mut self,
+        term: Term,
+        vote: NodeId,
+    ) -> Result<(), NodeError> {
+        let current = self.log_store.current_term()?;
+        if term < current {
+            return Err(NodeError::Protocol(format!(
+                "Term regression detected! current={} new={}",
+                current, term
+            )));
+        }
+
+        self.log_store
+            .save_hard_state(term, Some(vote))
+            .map_err(NodeError::from)?;
+
+        if term > current {
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                current_term = %current,
+                new_term = %term,
+                "Term Advanced"
+            );
+        }
+        Ok(())
+    }
+
     pub fn persist_vote(&mut self, candidate_id: NodeId) -> Result<(), NodeError> {
         let term = self.log_store.current_term()?;
         self.log_store
