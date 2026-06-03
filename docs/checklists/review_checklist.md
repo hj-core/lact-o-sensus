@@ -238,6 +238,13 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **DO**: Guard any destructive wipe of physical state during snapshot installation with the 'Restoration Tombstone' protocol (`KEY_RESTORE_IN_PROGRESS`), explicitly flushed to disk prior to deletion [ADR 011].
 - **DO NOT**: Delete foundational state files without writing a recovery tombstone.
 
+### [RAFT-11] Atomic I/O Consolidation
+
+- **Target Scope**: Storage Layer, Role Transitions
+- **Severity**: STYLE
+- **DO**: Utilize atomic batching or consolidated persistence methods (e.g., `LogStorage::save_hard_state` for both term and vote) to perform grouped state updates in a single synchronous disk write.
+- **DO NOT**: Perform separate, sequential synchronous writes (e.g., updating term, then vote, then commit index) during a single logical transition, as this multiplies I/O latency and risks intermediate inconsistent states.
+
 ---
 
 ## 5. Engineering Standards & Observability [ENG]
