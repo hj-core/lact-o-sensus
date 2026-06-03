@@ -23,7 +23,6 @@ use tracing::instrument;
 use super::Candidate;
 use super::NodeState;
 use super::RaftNode;
-use super::ReconciliationResult;
 use super::TickAction;
 use crate::storage::LogStorage;
 use crate::tick::Tick;
@@ -39,6 +38,29 @@ pub struct Follower {
     leader_id: Option<NodeId>,
     last_heartbeat: Tick,
     timeout: TickDuration,
+}
+
+/// The result of a physical log reconciliation operation (§5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciliationResult {
+    pub success: bool,
+    pub last_index: LogIndex,
+}
+
+impl ReconciliationResult {
+    pub fn success(last_index: LogIndex) -> Self {
+        Self {
+            success: true,
+            last_index,
+        }
+    }
+
+    pub fn mismatch(last_index: LogIndex) -> Self {
+        Self {
+            success: false,
+            last_index,
+        }
+    }
 }
 
 impl Follower {
