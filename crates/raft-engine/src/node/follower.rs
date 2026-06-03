@@ -92,7 +92,7 @@ impl Follower {
     }
 
     pub fn evaluate_tick(&self, now: Tick) -> TickAction {
-        if now - self.last_heartbeat >= self.timeout {
+        if now >= self.last_heartbeat && now - self.last_heartbeat >= self.timeout {
             TickAction::StartElection
         } else {
             TickAction::None
