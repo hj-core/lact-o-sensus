@@ -428,8 +428,8 @@ mod tests {
         mod on_consistency_mismatch {
             use super::*;
 
-            #[tokio::test]
-            async fn should_reject_append_entries_when_prev_index_is_inconsistent() {
+            #[test]
+            fn should_reject_append_entries_when_prev_index_is_inconsistent() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
                 let mut node = RaftNode::<Follower, MockFsm>::try_new(
@@ -450,8 +450,8 @@ mod tests {
         mod on_conflicting_entries {
             use super::*;
 
-            #[tokio::test]
-            async fn should_detect_conflicts_and_truncate_log() {
+            #[test]
+            fn should_detect_conflicts_and_truncate_log() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = MemoryStorage::new();
                 log_store
@@ -496,8 +496,8 @@ mod tests {
                 assert_eq!(node.get_term_at(LogIndex::new(2)).unwrap(), Term::new(2));
             }
 
-            #[tokio::test]
-            async fn should_truncate_conflicting_suffix() {
+            #[test]
+            fn should_truncate_conflicting_suffix() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = MemoryStorage::new();
                 let mut entries = Vec::new();
@@ -542,8 +542,8 @@ mod tests {
         mod on_duplicate_entries {
             use super::*;
 
-            #[tokio::test]
-            async fn should_be_idempotent_when_duplicate_entries_received() {
+            #[test]
+            fn should_be_idempotent_when_duplicate_entries_received() {
                 let fsm = Arc::new(MockFsm::default());
                 let entry = LogEntry {
                     index: 1,
@@ -573,8 +573,8 @@ mod tests {
         mod on_non_contiguous_append {
             use super::*;
 
-            #[tokio::test]
-            async fn should_reject_non_contiguous_append() {
+            #[test]
+            fn should_reject_non_contiguous_append() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
                 let mut node = RaftNode::<Follower, MockFsm>::try_new(
@@ -609,8 +609,8 @@ mod tests {
                 assert_eq!(node.last_log_index().unwrap(), LogIndex::ZERO);
             }
 
-            #[tokio::test]
-            async fn should_reject_append_when_gap_exists_between_prev_index_and_entries() {
+            #[test]
+            fn should_reject_append_when_gap_exists_between_prev_index_and_entries() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = MemoryStorage::new();
                 log_store
@@ -646,8 +646,8 @@ mod tests {
         mod on_commit_advancement {
             use super::*;
 
-            #[tokio::test]
-            async fn should_cap_last_committed_at_local_log_length() {
+            #[test]
+            fn should_cap_last_committed_at_local_log_length() {
                 let fsm = Arc::new(MockFsm::default());
                 let log_store = MemoryStorage::new();
                 log_store
