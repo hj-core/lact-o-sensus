@@ -222,11 +222,13 @@ pub fn spawn_tick_loop<S: StateMachine>(
                     let mut replication_params = None;
 
                     // COMPACTION TRIGGER (ADR 011)
-                    if should_compact_log(&mut guard, &config) {
+                    if should_compact_log(&mut guard, &config, state.is_frozen()) {
                         // We set the flag immediately within the locked boundary to
                         // prevent the next tick (10ms later) from re-triggering while
                         // the async task is being spawned.
-                        guard.set_snapshotting(true);
+                        if let Err(e) = state.freeze() {
+                            guard.apply_fatal(NodeError::Protocol(e.0.to_string()));
+                        }
 
                         let index = guard.last_applied();
                         let term = guard.get_term_at(index);
@@ -355,7 +357,7 @@ pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) 
             // During snapshot freeze (compaction, serialization, or install),
             // skip applying. The applier will be woken again when the snapshot
             // completes via the MutationGuard broadcast.
-            if state.read().await.is_snapshotting() {
+            if state.is_frozen() {
                 continue;
             }
 
@@ -376,8 +378,12 @@ pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) 
 ///
 /// Returns true when the number of un-snapshotted applied entries exceeds
 /// `snapshot_threshold` and no snapshot is currently in progress.
-fn should_compact_log<S: StateMachine>(guard: &mut LogicalNode<S>, config: &Config) -> bool {
-    if guard.is_snapshotting() {
+fn should_compact_log<S: StateMachine>(
+    guard: &mut LogicalNode<S>,
+    config: &Config,
+    is_frozen: bool,
+) -> bool {
+    if is_frozen {
         return false;
     }
 
@@ -550,7 +556,9 @@ pub fn initiate_log_compaction<S: StateMachine>(
             // 3. Unfreeze and catch up (Locked)
             {
                 let mut guard = state.write().await;
-                guard.set_snapshotting(false);
+                if let Err(e) = state.thaw() {
+                    guard.apply_fatal(NodeError::Protocol(e.0.to_string()));
+                }
 
                 // Halt Mandate: If physical truncation fails, the node is in a corrupt state
                 // and must poison itself.
@@ -1188,7 +1196,9 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
     // Phase 2: Heavy Payload (Serialization)
     let fsm = {
         let mut guard = state.write().await;
-        guard.set_snapshotting(true);
+        if let Err(e) = state.freeze() {
+            guard.apply_fatal(NodeError::Protocol(e.0.to_string()));
+        }
         guard.fsm()
     };
 
@@ -1197,7 +1207,9 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
 
     {
         let mut guard = state.write().await;
-        guard.set_snapshotting(false);
+        if let Err(e) = state.thaw() {
+            guard.apply_fatal(NodeError::Protocol(e.0.to_string()));
+        }
     }
 
     let data = match res {
@@ -2046,7 +2058,7 @@ mod tests {
                     }
 
                     // Verify: FSM serialization was never triggered (flag is false)
-                    assert!(!ctx.state.read().await.is_snapshotting());
+                    assert!(!ctx.state.is_frozen());
                 }
             }
         }
@@ -2092,7 +2104,7 @@ mod tests {
             }
 
             #[tokio::test]
-            async fn should_toggle_is_snapshotting_flag_during_serialization() {
+            async fn should_toggle_freeze_flag_during_serialization() {
                 use std::sync::atomic::AtomicBool;
                 use std::sync::atomic::Ordering;
 
@@ -2117,7 +2129,7 @@ mod tests {
 
                     fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
                         if let Some(shell) = self.shell.blocking_lock().as_ref() {
-                            let flag = shell.blocking_read().is_snapshotting();
+                            let flag = shell.is_frozen();
                             self.flag_during_snapshot.store(flag, Ordering::SeqCst);
                         }
                         Ok(vec![])
@@ -2176,7 +2188,7 @@ mod tests {
                         "Flag should be true during snapshot()"
                     );
                     assert!(
-                        !ctx.state.read().await.is_snapshotting(),
+                        !ctx.state.is_frozen(),
                         "Flag should be false after snapshot completes"
                     );
                 }
@@ -2443,7 +2455,7 @@ mod tests {
                         .advance_horizon_after_snapshot(LogIndex::new(21))
                         .expect("Failed to advance horizon in test");
 
-                    assert!(should_compact_log(&mut guard, &ctx.config));
+                    assert!(should_compact_log(&mut guard, &ctx.config, false));
                 }
             }
 
@@ -2460,7 +2472,7 @@ mod tests {
                         .advance_horizon_after_snapshot(LogIndex::new(5))
                         .expect("Failed to advance horizon in test");
 
-                    assert!(!should_compact_log(&mut guard, &ctx.config));
+                    assert!(!should_compact_log(&mut guard, &ctx.config, false));
                 }
             }
 
@@ -2478,7 +2490,7 @@ mod tests {
                         .advance_horizon_after_snapshot(LogIndex::new(5))
                         .expect("Failed to advance horizon in test");
 
-                    assert!(!should_compact_log(&mut guard, &ctx.config));
+                    assert!(!should_compact_log(&mut guard, &ctx.config, false));
                 }
             }
 
@@ -2493,9 +2505,9 @@ mod tests {
                     guard
                         .advance_horizon_after_snapshot(LogIndex::new(25))
                         .expect("Failed to advance horizon in test");
-                    guard.set_snapshotting(true);
+                    ctx.state.freeze().unwrap();
 
-                    assert!(!should_compact_log(&mut guard, &ctx.config));
+                    assert!(!should_compact_log(&mut guard, &ctx.config, true));
                 }
             }
         }
@@ -2567,7 +2579,7 @@ mod tests {
                     );
 
                     // 5. Verify: FSM was never frozen
-                    assert!(!ctx.state.read().await.is_snapshotting());
+                    assert!(!ctx.state.is_frozen());
                 }
             }
         }

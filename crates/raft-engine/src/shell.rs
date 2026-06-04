@@ -333,7 +333,12 @@ impl<S: StateMachine> ConsensusShell<S> {
             }
 
             // Snapshot Accepted: Set Freeze-Apply state
-            guard.set_snapshotting(true);
+            if let Err(e) = self.freeze() {
+                guard.apply_fatal(NodeError::Protocol(format!(
+                    "Structural Invariant Violation: {}",
+                    e.0
+                )));
+            }
             (res.action, res.term, guard.fsm())
         };
 
@@ -361,7 +366,12 @@ impl<S: StateMachine> ConsensusShell<S> {
 
                 // Phase 3: Lock & Finalize
                 let mut guard = shell_clone.blocking_write();
-                guard.set_snapshotting(false);
+                if let Err(e) = shell_clone.thaw() {
+                    guard.apply_fatal(NodeError::Protocol(format!(
+                        "Structural Invariant Violation: {}",
+                        e.0
+                    )));
+                }
 
                 match res {
                     Ok(_) => {

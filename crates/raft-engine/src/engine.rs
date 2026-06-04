@@ -76,11 +76,6 @@ pub struct LogicalNode<S: StateMachine> {
     current_tick: Tick,
     thresholds: TickThresholds,
     rng: StdRng,
-    /// Freeze-Apply Counter (ADR 011): The FSM is frozen for application as
-    /// long as this counter is greater than zero. This allows overlapping
-    /// tasks (e.g., compaction + replication) to safely manage the freeze
-    /// state.
-    snapshot_count: u32,
 }
 
 macro_rules! delegate_to_inner {
@@ -313,7 +308,6 @@ impl<S: StateMachine> LogicalNode<S> {
             current_tick,
             thresholds,
             rng,
-            snapshot_count: 0,
         })
     }
 
@@ -404,11 +398,6 @@ impl<S: StateMachine> LogicalNode<S> {
         delegate_mut_to_inner!(self, advance_horizon_after_snapshot, index)
     }
 
-    /// Returns true if a snapshot is currently being generated.
-    pub fn is_snapshotting(&self) -> bool {
-        self.snapshot_count > 0
-    }
-
     pub fn log_store(&self) -> Arc<dyn LogStorage> {
         match &self.state {
             RoleState::Follower(n) => n.log_store().clone(),
@@ -416,34 +405,6 @@ impl<S: StateMachine> LogicalNode<S> {
             RoleState::Leader(n) => n.log_store().clone(),
             RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
         }
-    }
-
-    /// Toggles the Freeze-Apply state for snapshot generation.
-    pub fn set_snapshotting(&mut self, active: bool) {
-        if active {
-            match self.snapshot_count.checked_add(1) {
-                Some(new_count) => self.snapshot_count = new_count,
-                None => self.apply_fatal(NodeError::Protocol(
-                    "Structural Invariant Violation: snapshot_count overflow".to_string(),
-                )),
-            }
-        } else {
-            match self.snapshot_count.checked_sub(1) {
-                Some(new_count) => self.snapshot_count = new_count,
-                None => self.apply_fatal(NodeError::Protocol(
-                    "Structural Invariant Violation: snapshot_count underflow (unfreeze without \
-                     freeze)"
-                        .to_string(),
-                )),
-            }
-        }
-
-        info!(
-            target: ClinicalTarget::RaftCompaction.as_str(),
-            active,
-            snapshot_count = self.snapshot_count,
-            "Freeze-Apply state toggled."
-        );
     }
 
     /// Processes an AppendEntries RPC.
@@ -1522,42 +1483,6 @@ mod tests {
                 let mut node = setup_node(1);
                 node.poison();
                 assert_eq!(node.tick(), TickAction::Stop);
-            }
-        }
-    }
-
-    mod snapshot_safety {
-        use super::*;
-
-        mod overlapping_tasks {
-            use super::*;
-
-            #[tokio::test]
-            async fn remains_frozen_until_all_tasks_finish() {
-                let mut node = setup_node(1);
-                assert!(!node.is_snapshotting());
-
-                // Task 1 starts
-                node.set_snapshotting(true);
-                assert!(node.is_snapshotting());
-
-                // Task 2 starts
-                node.set_snapshotting(true);
-                assert!(node.is_snapshotting());
-
-                // Task 1 finishes
-                node.set_snapshotting(false);
-
-                // With the reference-counted implementation, the node SHOULD
-                // remain in the snapshotting state because Task 2 is still active.
-                assert!(
-                    node.is_snapshotting(),
-                    "FSM unfrozen while Task 2 is still active!"
-                );
-
-                // Task 2 finishes
-                node.set_snapshotting(false);
-                assert!(!node.is_snapshotting());
             }
         }
     }
