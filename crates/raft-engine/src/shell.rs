@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 
 use common::raft_api::StateMachine;
 use common::types::NodeId;
@@ -43,9 +45,20 @@ pub struct ConsensusShell<S: StateMachine> {
     inner: Arc<RwLock<LogicalNode<S>>>,
     progress_tx: watch::Sender<ConsensusProgress>,
     apply_lock: Mutex<()>,
+    /// Reference-counted freeze depth (ADR 011). The FSM is considered frozen
+    /// for application as long as this counter is greater than zero. Managed
+    /// via `freeze()` / `thaw()`; read via `is_frozen()`.
+    fsm_freeze_depth: AtomicU32,
     /// Track peers with an active snapshot replication in flight.
     in_flight_snapshots: Mutex<HashSet<NodeId>>,
 }
+
+/// Returned by `freeze()` / `thaw()` when the freeze-depth invariant is
+/// violated (overflow on freeze, underflow on thaw). This is a local
+/// caller-contract error — the holder of the `MutationGuard` should pass it
+/// to `apply_fatal` to poison the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreezeInvariantError(pub &'static str);
 
 impl<S: StateMachine> ConsensusShell<S> {
     /// Creates a new consensus state shell and initializes the signal channel.
@@ -57,6 +70,7 @@ impl<S: StateMachine> ConsensusShell<S> {
             inner: Arc::new(RwLock::new(initial_state)),
             progress_tx,
             apply_lock: Mutex::new(()),
+            fsm_freeze_depth: AtomicU32::new(0),
             in_flight_snapshots: Mutex::new(HashSet::new()),
         }
     }
@@ -127,6 +141,63 @@ impl<S: StateMachine> ConsensusShell<S> {
     /// Provides a new subscription to the consensus progress stream.
     pub fn subscribe(&self) -> watch::Receiver<ConsensusProgress> {
         self.progress_tx.subscribe()
+    }
+
+    /// Increments the FSM freeze depth.
+    ///
+    /// Returns `Err(FreezeInvariantError)` on overflow (more than u32::MAX
+    /// concurrent freezes). The caller (who holds the `MutationGuard`) should
+    /// pass the error to `apply_fatal` to poison the node.
+    pub fn freeze(&self) -> Result<(), FreezeInvariantError> {
+        let prev = self.fsm_freeze_depth.fetch_add(1, Ordering::AcqRel);
+        if prev == u32::MAX {
+            self.fsm_freeze_depth.fetch_sub(1, Ordering::Release);
+            error!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                depth = prev + 1,
+                "FATAL: fsm_freeze_depth overflow"
+            );
+            return Err(FreezeInvariantError(
+                "fsm_freeze_depth overflow (u32::MAX concurrent freezes)",
+            ));
+        }
+        info!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            depth = prev + 1,
+            "FSM frozen."
+        );
+        Ok(())
+    }
+
+    /// Decrements the FSM freeze depth.
+    ///
+    /// Returns `Err(FreezeInvariantError)` on underflow (thaw without matching
+    /// freeze). The caller should pass the error to `apply_fatal` to poison
+    /// the node.
+    pub fn thaw(&self) -> Result<(), FreezeInvariantError> {
+        let prev = self.fsm_freeze_depth.fetch_sub(1, Ordering::AcqRel);
+        if prev == 0 {
+            self.fsm_freeze_depth.fetch_add(1, Ordering::Release);
+            error!(
+                target: ClinicalTarget::RaftCompaction.as_str(),
+                depth = prev,
+                "FATAL: fsm_freeze_depth underflow (thaw without matching freeze)"
+            );
+            return Err(FreezeInvariantError(
+                "fsm_freeze_depth underflow (thaw without matching freeze)",
+            ));
+        }
+        info!(
+            target: ClinicalTarget::RaftCompaction.as_str(),
+            depth = prev - 1,
+            "FSM thawed."
+        );
+        Ok(())
+    }
+
+    /// Returns true when the FSM is currently frozen (freeze depth > 0).
+    pub fn is_frozen(&self) -> bool {
+        self.fsm_freeze_depth.load(Ordering::Acquire) > 0
     }
 
     /// Orchestrates the non-blocking application of committed entries to the
@@ -846,6 +917,79 @@ mod tests {
             // Acquisition should succeed again
             let permit2 = shell.try_acquire_snapshot_permit(peer_id).await;
             assert!(permit2.is_some());
+        }
+    }
+
+    mod fsm_freeze_depth {
+        use super::*;
+
+        #[test]
+        fn initially_not_frozen() {
+            let shell = mock_shell();
+
+            assert!(!shell.is_frozen());
+        }
+
+        #[test]
+        fn freeze_makes_frozen() {
+            let shell = mock_shell();
+
+            shell.freeze().unwrap();
+
+            assert!(shell.is_frozen());
+        }
+
+        #[test]
+        fn freeze_then_thaw_returns_to_unfrozen() {
+            let shell = mock_shell();
+
+            shell.freeze().unwrap();
+            shell.thaw().unwrap();
+
+            assert!(!shell.is_frozen());
+        }
+
+        #[test]
+        fn freeze_depth_tracks_nesting() {
+            let shell = mock_shell();
+
+            shell.freeze().unwrap();
+            shell.freeze().unwrap();
+            assert!(shell.is_frozen());
+
+            shell.thaw().unwrap();
+            assert!(shell.is_frozen());
+
+            shell.thaw().unwrap();
+            assert!(!shell.is_frozen());
+        }
+
+        /// Overflow path (`freeze` called u32::MAX times) is not directly
+        /// testable without internal access to the `AtomicU32` field.
+        #[test]
+        fn thaw_underflow_returns_error() {
+            let shell = mock_shell();
+
+            let err = shell.thaw().unwrap_err();
+
+            assert!(err.0.contains("underflow"));
+        }
+
+        #[test]
+        fn multiple_freezes_keep_depth_nonzero() {
+            let shell = mock_shell();
+
+            shell.freeze().unwrap();
+            shell.freeze().unwrap();
+            shell.freeze().unwrap();
+
+            assert!(shell.is_frozen());
+
+            shell.thaw().unwrap();
+            shell.thaw().unwrap();
+            shell.thaw().unwrap();
+
+            assert!(!shell.is_frozen());
         }
     }
 }
