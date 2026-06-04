@@ -30,6 +30,7 @@ use gateway::ingress::IngressDispatcher;
 use gateway::veto::GrpcVetoRelay;
 use lacto_fsm::LactoStore;
 use raft_engine::config::Config;
+use raft_engine::consensus::spawn_background_applier;
 use raft_engine::consensus::spawn_tick_loop;
 use raft_engine::engine::LogicalNode;
 use raft_engine::identity::initialize_node_identity;
@@ -366,6 +367,9 @@ async fn run_server(
     async move {
         // Spawn the unified deterministic Tick Loop
         spawn_tick_loop(config.clone(), shared_state.clone(), peer_manager.clone());
+
+        // Spawn the continuous background FSM applier
+        spawn_background_applier(shared_state.clone());
 
         info!(
             target: ClinicalTarget::ClinicalFoundation.as_str(),

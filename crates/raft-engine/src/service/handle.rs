@@ -502,9 +502,9 @@ mod tests {
                 sleep(Duration::from_millis(10)).await;
                 let mut guard = state_clone.write().await;
 
-                // Advance last_committed (which triggers FSM apply and updates last_applied)
-                // LogicalNode::advance_last_committed is role-agnostic.
-                // We first need to ensure the log contains the entries we are committing.
+                // Advance last_committed (which no longer applies FSM inline).
+                // Use advance_horizon_after_snapshot to simulate what the
+                // background applier would do.
                 if let Some(node) = guard.as_follower_mut() {
                     let mut entries = Vec::new();
                     for i in 1..=index.as_u64() {
@@ -514,6 +514,7 @@ mod tests {
                 }
 
                 guard.advance_last_committed(index);
+                let _ = guard.advance_horizon_after_snapshot(index);
             });
 
             let result = handle.await_apply(index).await;
@@ -536,6 +537,7 @@ mod tests {
                     node.log_store().append_entries(entries).unwrap();
                 }
                 guard.advance_last_committed(index);
+                let _ = guard.advance_horizon_after_snapshot(index);
             }
 
             let result = handle.await_apply(index).await;

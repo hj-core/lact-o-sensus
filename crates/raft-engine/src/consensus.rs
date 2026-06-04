@@ -331,6 +331,40 @@ pub fn spawn_tick_loop<S: StateMachine>(
     );
 }
 
+/// Spawns a background task that continuously applies committed log entries
+/// to the State Machine.
+///
+/// This replaces the synchronous `fsm.apply()` call that was previously in
+/// `advance_last_committed`. By deferring FSM application to a background
+/// loop, the consensus write lock is never held across slow I/O, preventing
+/// heartbeat starvation.
+pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) {
+    tokio::spawn(async move {
+        let mut progress_rx = state.subscribe();
+
+        // Initial catch-up: apply any entries committed before we started.
+        state.apply_committed().await;
+
+        loop {
+            // Wait for the next progress signal.
+            if progress_rx.changed().await.is_err() {
+                // The sender was dropped — node is shutting down.
+                return;
+            }
+
+            // During snapshot freeze (compaction, serialization, or install),
+            // skip applying. The applier will be woken again when the snapshot
+            // completes via the MutationGuard broadcast.
+            if state.read().await.is_snapshotting() {
+                continue;
+            }
+
+            // Apply any pending committed entries outside the consensus lock.
+            state.apply_committed().await;
+        }
+    });
+}
+
 /// Determines whether the density of un-snapshotted applied entries exceeds
 /// the configured compaction threshold.
 ///
@@ -1485,6 +1519,7 @@ mod tests {
     use tonic::transport::Server;
 
     use super::*;
+    use crate::storage::LogStorage;
     use crate::storage::MemoryStorage;
     use crate::tick::TickDuration;
     use crate::tick::TickThresholds;
@@ -2534,6 +2569,88 @@ mod tests {
                     // 5. Verify: FSM was never frozen
                     assert!(!ctx.state.read().await.is_snapshotting());
                 }
+            }
+        }
+
+        mod spawn_background_applier {
+            use super::*;
+
+            #[derive(Debug)]
+            struct PoisonApplyFsm;
+
+            impl StateMachine for PoisonApplyFsm {
+                type Error = FsmError;
+
+                fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+                    Ok(LogIndex::ZERO)
+                }
+
+                fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+                    Err(FsmError::invariant("Simulated FSM apply failure"))
+                }
+
+                fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                    Ok(vec![])
+                }
+
+                fn install_snapshot(
+                    &self,
+                    _index: LogIndex,
+                    _data: &[u8],
+                    _trace_id: common::types::trace::TraceId,
+                ) -> Result<(), Self::Error> {
+                    Ok(())
+                }
+            }
+
+            #[tokio::test]
+            async fn should_poison_node_when_fsm_apply_fails_via_background_applier() {
+                let fsm = Arc::new(PoisonApplyFsm);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage.clone(), thresholds, rng)
+                    .unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Append and commit an entry so apply_committed has work to do.
+                storage
+                    .append_entries(vec![common::proto::v1::raft::LogEntry {
+                        index: 1,
+                        term: 1,
+                        data: vec![1],
+                    }])
+                    .unwrap();
+
+                {
+                    let mut guard = state.write().await;
+                    guard.advance_last_committed(LogIndex::new(1));
+                }
+
+                // Spawn apply_committed in a separate task to catch the panic
+                // from apply_fatal.
+                let state_clone = state.clone();
+                let handle = tokio::spawn(async move {
+                    state_clone.apply_committed().await;
+                });
+
+                let result = handle.await;
+                assert!(
+                    result.is_err(),
+                    "Expected apply_committed to panic on FSM failure"
+                );
+
+                // Node should be poisoned after the fatal error.
+                let guard = state.read().await;
+                assert!(guard.is_poisoned());
             }
         }
     }

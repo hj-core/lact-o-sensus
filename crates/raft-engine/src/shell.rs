@@ -186,8 +186,18 @@ impl<S: StateMachine> ConsensusShell<S> {
             };
 
             let apply_res = if let Some(entry) = entry {
-                // ADR 009: fsm.apply() is called WITHOUT the primary lock.
-                fsm.apply(next_idx, &entry.data)
+                let fsm = fsm.clone();
+                let data = entry.data.clone();
+                match tokio::task::spawn_blocking(move || fsm.apply(next_idx, &data)).await {
+                    Ok(result) => result,
+                    Err(join_err) => {
+                        let mut guard = self.write().await;
+                        guard.apply_fatal(NodeError::Protocol(format!(
+                            "spawn_blocking join error: {}",
+                            join_err
+                        )));
+                    }
+                }
             } else {
                 let mut guard = self.write().await;
                 guard.apply_fatal(NodeError::Protocol(format!(

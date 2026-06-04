@@ -11,7 +11,6 @@ use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
-use common::types::errors::NodeError;
 
 use super::test_utils::*;
 use super::*;
@@ -215,7 +214,10 @@ mod tests {
                     check_persists_to_log_store_when_index_is_valid(node, log_store).await;
                 }
 
-                async fn check_applies_to_fsm_when_index_is_valid<R: NodeState, S: StateMachine>(
+                async fn check_does_not_apply_to_fsm_when_index_is_valid<
+                    R: NodeState,
+                    S: StateMachine,
+                >(
                     mut node: RaftNode<R, S>,
                     fsm: Arc<MockFsm>,
                     log_store: Arc<MemoryStorage>,
@@ -230,35 +232,38 @@ mod tests {
 
                     node.advance_last_committed(LogIndex::new(1)).unwrap();
 
+                    // Verify commit index is advanced, but FSM is NOT applied
+                    // synchronously (deferred to background applier).
                     assert_eq!(node.last_committed(), LogIndex::new(1));
-                    assert_eq!(fsm.applied_indices.lock().unwrap().len(), 1);
+                    assert_eq!(fsm.applied_indices.lock().unwrap().len(), 0);
+                    assert_eq!(node.last_applied(), LogIndex::ZERO);
                 }
 
                 #[tokio::test]
-                async fn should_apply_to_fsm_when_index_is_valid_as_follower() {
+                async fn should_not_apply_to_fsm_when_index_is_valid_as_follower() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_follower(fsm.clone(), log_store.clone());
-                    check_applies_to_fsm_when_index_is_valid(node, fsm, log_store).await;
+                    check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
                 #[tokio::test]
-                async fn should_apply_to_fsm_when_index_is_valid_as_candidate() {
+                async fn should_not_apply_to_fsm_when_index_is_valid_as_candidate() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_candidate(fsm.clone(), log_store.clone());
-                    check_applies_to_fsm_when_index_is_valid(node, fsm, log_store).await;
+                    check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
                 #[tokio::test]
-                async fn should_apply_to_fsm_when_index_is_valid_as_leader() {
+                async fn should_not_apply_to_fsm_when_index_is_valid_as_leader() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_leader(fsm.clone(), log_store.clone());
-                    check_applies_to_fsm_when_index_is_valid(node, fsm, log_store).await;
+                    check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
-                async fn check_applies_multiple_entries_sequentially_when_index_jumps_ahead<
+                async fn check_does_not_apply_multiple_entries_when_index_jumps_ahead<
                     R: NodeState,
                     S: StateMachine,
                 >(
@@ -278,45 +283,41 @@ mod tests {
 
                     node.advance_last_committed(LogIndex::new(3)).unwrap();
 
-                    let applied = fsm.applied_indices.lock().unwrap();
-                    assert_eq!(
-                        applied.as_slice(),
-                        &[LogIndex::new(1), LogIndex::new(2), LogIndex::new(3)]
-                    );
-                    assert_eq!(node.last_applied(), LogIndex::new(3));
+                    // Verify commit index is advanced, but none of the entries
+                    // are synchronously applied (deferred to background applier).
+                    assert_eq!(node.last_committed(), LogIndex::new(3));
+                    assert_eq!(fsm.applied_indices.lock().unwrap().len(), 0);
+                    assert_eq!(node.last_applied(), LogIndex::ZERO);
                 }
 
                 #[tokio::test]
-                async fn should_apply_multiple_entries_sequentially_when_index_jumps_ahead_as_follower()
-                 {
+                async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_follower() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_follower(fsm.clone(), log_store.clone());
-                    check_applies_multiple_entries_sequentially_when_index_jumps_ahead(
+                    check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
                     .await;
                 }
 
                 #[tokio::test]
-                async fn should_apply_multiple_entries_sequentially_when_index_jumps_ahead_as_candidate()
-                 {
+                async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_candidate() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_candidate(fsm.clone(), log_store.clone());
-                    check_applies_multiple_entries_sequentially_when_index_jumps_ahead(
+                    check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
                     .await;
                 }
 
                 #[tokio::test]
-                async fn should_apply_multiple_entries_sequentially_when_index_jumps_ahead_as_leader()
-                 {
+                async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_leader() {
                     let (fsm, log_store) =
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_leader(fsm.clone(), log_store.clone());
-                    check_applies_multiple_entries_sequentially_when_index_jumps_ahead(
+                    check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
                     .await;
@@ -408,109 +409,6 @@ mod tests {
                         (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
                     let node = setup_node_as_leader(fsm, log_store);
                     check_returns_error_when_index_exceeds_last_log_index(node).await;
-                }
-            }
-
-            mod on_fsm_failure {
-                use common::types::errors::FsmError;
-
-                use super::*;
-
-                #[derive(Debug, Default)]
-                struct PoisonFsm;
-                impl StateMachine for PoisonFsm {
-                    type Error = FsmError;
-
-                    fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
-                        Ok(LogIndex::ZERO)
-                    }
-
-                    fn apply(&self, _index: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
-                        Err(FsmError::invariant("Simulated FSM failure"))
-                    }
-
-                    fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-                        Ok(vec![])
-                    }
-
-                    fn install_snapshot(
-                        &self,
-                        _index: LogIndex,
-                        _data: &[u8],
-                        _trace_id: common::types::trace::TraceId,
-                    ) -> Result<(), Self::Error> {
-                        Ok(())
-                    }
-                }
-
-                async fn check_returns_error_when_state_machine_apply_fails<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
-                    log_store: Arc<MemoryStorage>,
-                ) {
-                    log_store
-                        .append_entries(vec![LogEntry {
-                            index: 1,
-                            term: 1,
-                            data: vec![1],
-                        }])
-                        .unwrap();
-
-                    let result = node.advance_last_committed(LogIndex::new(1));
-                    assert!(result.is_err());
-                    let err = result.unwrap_err();
-                    assert!(
-                        matches!(err, NodeError::Protocol(_)),
-                        "Expected NodeError::Protocol, got {:?}",
-                        err
-                    );
-                    assert!(err.to_string().contains("Simulated FSM failure"));
-                }
-
-                #[tokio::test]
-                async fn should_return_error_when_state_machine_apply_fails_as_follower() {
-                    let (fsm, log_store) = (Arc::new(PoisonFsm), Arc::new(MemoryStorage::new()));
-                    let node = RaftNode::<Follower, PoisonFsm>::try_new(
-                        test_identity(1),
-                        fsm,
-                        log_store.clone(),
-                        Tick::new(0),
-                        TickDuration::new(100),
-                    )
-                    .unwrap();
-                    check_returns_error_when_state_machine_apply_fails(node, log_store).await;
-                }
-
-                #[tokio::test]
-                async fn should_return_error_when_state_machine_apply_fails_as_candidate() {
-                    let fsm = Arc::new(PoisonFsm);
-                    let log_store = Arc::new(MemoryStorage::new());
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm,
-                        log_store: log_store.clone(),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
-                    };
-                    check_returns_error_when_state_machine_apply_fails(node, log_store).await;
-                }
-
-                #[tokio::test]
-                async fn should_return_error_when_state_machine_apply_fails_as_leader() {
-                    let fsm = Arc::new(PoisonFsm);
-                    let log_store = Arc::new(MemoryStorage::new());
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm,
-                        log_store: log_store.clone(),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
-                    };
-                    check_returns_error_when_state_machine_apply_fails(node, log_store).await;
                 }
             }
         }

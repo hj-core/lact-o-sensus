@@ -9,7 +9,6 @@ use common::types::LogIndex;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::instrument;
 
@@ -17,8 +16,10 @@ use super::NodeState;
 use super::RaftNode;
 
 impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
-    /// Updates the commit index and triggers the application of entries to the
-    /// FSM.
+    /// Updates the commit index without triggering FSM application.
+    ///
+    /// FSM application is deferred to the background applier loop to prevent
+    /// heartbeat starvation (ADR 009/RAFT-01).
     #[instrument(
         name = "advance_commit_index",
         target = "raft::replication",
@@ -27,7 +28,6 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
     )]
     pub fn advance_last_committed(&mut self, index: LogIndex) -> Result<(), NodeError> {
         self.update_commit_index_only(index)?;
-        self.apply_to_state_machine()?;
         Ok(())
     }
 
@@ -92,6 +92,10 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
 
     /// Orchestrates the sequential application of committed log entries to the
     /// State Machine.
+    ///
+    /// NOTE: This method is only used by tests. Production code now uses the
+    /// background applier loop via `shell.apply_committed()`.
+    #[cfg(test)]
     #[instrument(
         name = "fsm_application",
         target = "clinical::fsm",
@@ -99,6 +103,8 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         fields(last_committed = %self.last_committed)
     )]
     pub(super) fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
+        use tracing::error;
+
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
         let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
         if fsm_last > self.last_committed {

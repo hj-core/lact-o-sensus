@@ -694,17 +694,12 @@ impl<S: StateMachine> LogicalNode<S> {
         }
     }
 
-    /// Updates the commit index.
+    /// Advances the commit index without applying entries to the FSM.
     ///
-    /// FREEZE-APPLY (ADR 011):
-    /// If a snapshot is in progress, this method only advances the logical
-    /// commit index without applying entries to the FSM.
+    /// FSM application is deferred to the background applier loop. The
+    /// Freeze-Apply gating is no longer needed since no synchronous FSM apply
+    /// occurs in this path.
     pub fn advance_last_committed(&mut self, index: LogIndex) {
-        if self.is_snapshotting() {
-            self.update_commit_index_only(index);
-            return;
-        }
-
         match delegate_mut_to_inner!(self, advance_last_committed, index) {
             Ok(_) => {}
             Err(e) => self.apply_fatal(e),
