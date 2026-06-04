@@ -1202,8 +1202,15 @@ async fn replicate_snapshot_to_peer<S: StateMachine>(
         guard.fsm()
     };
 
-    // ADR 011: Execute heavy serialization in the background.
-    let res = tokio::task::spawn_blocking(move || fsm.snapshot()).await;
+    // Serialize FSM I/O with the background applier (ADR 009).
+    // The lock is acquired inside spawn_blocking via blocking_lock()
+    // to avoid lifetime conflicts with the 'static closure bound.
+    let state_clone = state.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let _fsm_guard = state_clone.fsm_lock.blocking_lock();
+        fsm.snapshot()
+    })
+    .await;
 
     {
         let mut guard = state.write().await;

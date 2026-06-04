@@ -44,7 +44,10 @@ use crate::service::consensus::SnapshotParams;
 pub struct ConsensusShell<S: StateMachine> {
     inner: Arc<RwLock<LogicalNode<S>>>,
     progress_tx: watch::Sender<ConsensusProgress>,
-    apply_lock: Mutex<()>,
+    /// Guards all FSM I/O (`apply`, `snapshot`, `install_snapshot`) to
+    /// prevent concurrent state machine access from overlapping tasks
+    /// (ADR 009, ADR 011).
+    pub(crate) fsm_lock: Mutex<()>,
     /// Reference-counted freeze depth (ADR 011). The FSM is considered frozen
     /// for application as long as this counter is greater than zero. Managed
     /// via `freeze()` / `thaw()`; read via `is_frozen()`.
@@ -69,7 +72,7 @@ impl<S: StateMachine> ConsensusShell<S> {
         Self {
             inner: Arc::new(RwLock::new(initial_state)),
             progress_tx,
-            apply_lock: Mutex::new(()),
+            fsm_lock: Mutex::new(()),
             fsm_freeze_depth: AtomicU32::new(0),
             in_flight_snapshots: Mutex::new(HashSet::new()),
         }
@@ -214,7 +217,7 @@ impl<S: StateMachine> ConsensusShell<S> {
         // [SERIALIZATION]: Ensure only one application loop runs at a time.
         // This prevents the race condition where concurrent tasks try to apply
         // the same log entry twice.
-        let _permit = self.apply_lock.lock().await;
+        let _permit = self.fsm_lock.lock().await;
 
         let (fsm, log_store, mut applied, mut committed) = {
             let guard = self.read().await;
@@ -362,7 +365,9 @@ impl<S: StateMachine> ConsensusShell<S> {
 
                 info!("Starting background snapshot installation...");
 
+                let _fsm_guard = shell_clone.fsm_lock.blocking_lock();
                 let res = fsm.install_snapshot(index, &data, trace_id);
+                drop(_fsm_guard);
 
                 // Phase 3: Lock & Finalize
                 let mut guard = shell_clone.blocking_write();
