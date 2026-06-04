@@ -219,10 +219,15 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 
 ### [RAFT-08] Freeze-Apply Invariance
 
-- **Target Scope**: Snapshot Generation
+- **Target Scope**: Snapshot Generation, `ConsensusShell`
 - **Severity**: CRITICAL
-- **DO**: Explicitly toggle the `is_snapshotting` flag (or equivalent structural lock) before initiating FSM serialization to prevent concurrent mutations from the apply pipeline [ADR 011].
-- **DO NOT**: Serialize the state machine for background snapshotting or peer replication without ensuring the state is "frozen" against logical mutations.
+- **DO**: Use the two-tier freeze mechanism (`fsm_freeze_depth` atomic for fast-path
+  skip checks, `fsm_lock` mutex for mutual exclusion) before initiating FSM
+  serialization to prevent concurrent mutations from the apply pipeline [ADR 011].
+- **DO NOT**: Serialize the state machine for background snapshotting or peer
+  replication without first acquiring `fsm_lock` (via `.blocking_lock()` in blocking
+  contexts, `.lock().await` in async contexts) and ensuring the freeze depth is
+  non-zero.
 
 ### [RAFT-09] Asynchronous Compaction
 
@@ -244,6 +249,13 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **Severity**: STYLE
 - **DO**: Utilize atomic batching or consolidated persistence methods (e.g., `LogStorage::save_hard_state` for both term and vote) to perform grouped state updates in a single synchronous disk write.
 - **DO NOT**: Perform separate, sequential synchronous writes (e.g., updating term, then vote, then commit index) during a single logical transition, as this multiplies I/O latency and risks intermediate inconsistent states.
+
+### [RAFT-12] FSM I/O Boundary
+
+- **Target Scope**: `ConsensusShell`, Background Applier
+- **Severity**: WARNING
+- **DO**: Offload synchronous FSM I/O (`StateMachine::apply`, `StateMachine::snapshot`, `StateMachine::install_snapshot`) to blocking thread pools (`tokio::task::spawn_blocking`) when called from async contexts, to prevent starving the tokio worker threads of heartbeat and election loops.
+- **DO NOT**: Call synchronous FSM methods directly inside `tokio::spawn`-ed async tasks without wrapping them in `spawn_blocking`.
 
 ---
 
@@ -326,6 +338,13 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 - **Severity**: CRITICAL
 - **DO**: Compile without clippy warnings and align perfectly with `cargo +nightly fmt`.
 - **DO NOT**: Merge code containing unresolved lint warnings or formatting diffs.
+
+### [ENG-12] Test Coverage Equivalence
+
+- **Target Scope**: All Source Files (`mod tests`)
+- **Severity**: WARNING
+- **DO**: Preserve behavioral equivalence when refactoring. If a code path moves (e.g., from synchronous inline to async background loop), migrate or recreate the tests that exercise that path with equivalent coverage for the new location.
+- **DO NOT**: Delete test modules that verify safety-critical behavior (FSM failure handling, invariant enforcement) without providing replacement tests at the new abstraction boundary.
 
 ---
 
