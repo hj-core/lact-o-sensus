@@ -1016,4 +1016,83 @@ mod tests {
             assert!(!shell.is_frozen());
         }
     }
+
+    mod rwlock_contention {
+        use super::*;
+
+        mod under_rapid_short_writes_followed_by_long_write {
+            use super::*;
+
+            #[tokio::test]
+            async fn subsequent_write_lock_acquires_within_timeout() {
+                let shell = mock_shell();
+
+                // Phase 1: 200 rapid short write-lock acquisitions (like a tick loop)
+                for _ in 0..200 {
+                    let mut guard = shell.write().await;
+                    guard.tick();
+                    drop(guard);
+                }
+
+                // Phase 2: One longer write-lock acquisition (simulating sled flush)
+                {
+                    let guard = shell.write().await;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(2) {
+                        std::hint::spin_loop();
+                    }
+                    drop(guard);
+                }
+
+                // Phase 3: Verify the next writer can acquire within a short timeout.
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut guard = shell.write().await;
+                    guard.tick();
+                })
+                .await;
+
+                assert!(
+                    result.is_ok(),
+                    "Write lock permanently stalled after contention pattern"
+                );
+            }
+
+            #[tokio::test]
+            async fn concurrent_readers_are_not_starved() {
+                let shell = mock_shell();
+
+                // Phase 1: Same contention pattern
+                for _ in 0..200 {
+                    let mut guard = shell.write().await;
+                    guard.tick();
+                    drop(guard);
+                }
+
+                // Phase 2: Hold write lock briefly
+                {
+                    let guard = shell.write().await;
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < Duration::from_millis(2) {
+                        std::hint::spin_loop();
+                    }
+                    drop(guard);
+                }
+
+                // Phase 3: Spawn concurrent readers, all must complete within timeout
+                let mut handles = Vec::new();
+                for _ in 0..10 {
+                    let shell = shell.clone();
+                    handles.push(tokio::spawn(async move {
+                        let guard = shell.read().await;
+                        assert!(guard.try_current_term().is_ok());
+                    }));
+                }
+                for handle in handles {
+                    let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+                    assert!(result.is_ok(), "Concurrent reader was starved");
+                    assert!(result.unwrap().is_ok(), "Concurrent reader task failed");
+                }
+            }
+        }
+    }
 }
