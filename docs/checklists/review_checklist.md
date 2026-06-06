@@ -138,10 +138,10 @@ If you discover a structural or behavioral issue that is NOT covered by the chec
 
 ### [SAFE-08] Async Temporary Guard Scoping
 
-- **Target Scope**: All async code holding `tokio::sync::RwLock` / `Mutex` guards
+- **Target Scope**: All async code holding lock guards (any RwLock/Mutex)
 - **Severity**: CRITICAL
 - **DO**: Extract lock guard dereferences into named local variables before passing them into async function calls that may re-acquire the same lock.
-- **DO NOT**: Inline expressions like `state.read().await.field()` inside the arguments of an async function that may re-acquire the same lock. The temporary `RwLockReadGuard` lives until the end of the enclosing statement (the semicolon), which spans the `.await` boundary of the outer call, causing a deadlock on a `current_thread` runtime.
+- **DO NOT**: Inline expressions like `state.read().await.field()` inside the arguments of an async function that may re-acquire the same lock. The temporary guard lives until the end of the enclosing statement (the semicolon), which spans the `.await` boundary of the outer call. With `tokio::sync` locks this causes a permanent deadlock; with `parking_lot` + yield-spin (see retro) this causes an infinite yield loop.
 
 ### [SAFE-09] Client Intent Durability
 
