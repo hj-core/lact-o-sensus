@@ -496,7 +496,7 @@ async fn initiate_election<S: StateMachine>(
     // Loop finished without reaching quorum or being demoted.
     let still_candidate = {
         let guard = state.read().await;
-        let current = guard.try_current_term().unwrap_or(Term::ZERO);
+        let current = guard.try_current_term()?;
         matches!(guard.state(), RoleState::Candidate(_) if current == params.term)
     };
 
@@ -1784,6 +1784,43 @@ mod tests {
                         assert!(matches!(guard.state(), RoleState::Leader(_)));
                     }
                 }
+            }
+        }
+
+        mod when_storage_fails_during_term_check {
+            use super::*;
+            use crate::test_utils::FailingTermStorage;
+
+            #[tokio::test]
+            async fn returns_error_propagated_to_start_election_campaign() {
+                let config = mock_config(50, 100);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(FailingTermStorage::with_succeed_count(1));
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let node =
+                    LogicalNode::try_new(id.clone(), Arc::new(MockFsm), storage, thresholds, rng)
+                        .unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+                let peer_manager = Arc::new(PeerManager::try_new(id, &HashMap::new()).unwrap());
+                let params = ElectionCampaignParams {
+                    term: Term::new(1),
+                    node_id: NodeId::try_new(1).unwrap(),
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+
+                let result = initiate_election(config, state, peer_manager, params).await;
+
+                assert!(result.is_err(), "Expected Err from storage failure");
             }
         }
     }
