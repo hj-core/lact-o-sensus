@@ -1115,7 +1115,15 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
                         replicate_to_peer(peer_manager, peer_id, req, rpc_timeout, params.trace_id)
                             .await
                     }
-                    Err(_) => Ok(None), // Should not fail for heartbeat construction
+                    Err(e) => {
+                        warn!(
+                            target: ClinicalTarget::RaftFoundation.as_str(),
+                            peer = %peer_id,
+                            error = %e,
+                            "Heartbeat construction failed; downgrading to empty probe"
+                        );
+                        Ok(None)
+                    }
                 }
             }
         }
