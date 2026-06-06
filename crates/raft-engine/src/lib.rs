@@ -3,6 +3,7 @@ pub mod consensus;
 pub mod engine;
 pub mod identity;
 pub mod node;
+pub mod orchestration;
 pub mod peer;
 pub mod recovery;
 pub mod service;

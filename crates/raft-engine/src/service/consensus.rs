@@ -300,10 +300,8 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
             sender_id = %params.leader_id
         );
 
-        // 3. Execution: Delegate to the internal shell for non-blocking handoff.
-        let term = self
-            .state
-            .handle_install_snapshot(params)
+        // 3. Execution: Delegate to the internal orchestrator for non-blocking handoff.
+        let term = crate::orchestration::handle_install_snapshot(&self.state, params)
             .instrument(span)
             .await?;
 

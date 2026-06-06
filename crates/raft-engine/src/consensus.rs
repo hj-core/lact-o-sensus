@@ -345,7 +345,7 @@ pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) 
         let mut progress_rx = state.subscribe();
 
         // Initial catch-up: apply any entries committed before we started.
-        state.apply_committed().await;
+        crate::orchestration::apply_committed(&state).await;
 
         loop {
             // Wait for the next progress signal.
@@ -362,7 +362,7 @@ pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) 
             }
 
             // Apply any pending committed entries outside the consensus lock.
-            state.apply_committed().await;
+            crate::orchestration::apply_committed(&state).await;
         }
     });
 }
@@ -592,7 +592,7 @@ pub fn initiate_log_compaction<S: StateMachine>(
             // ADR 011: Catch up the State Machine by applying any entries
             // committed during the freeze. This is performed outside the
             // consensus lock to preserve heartbeat liveness.
-            state.apply_committed().await;
+            crate::orchestration::apply_committed(&state).await;
 
             info!(
                 target: ClinicalTarget::RaftCompaction.as_str(),
@@ -2658,7 +2658,7 @@ mod tests {
                 // from apply_fatal.
                 let state_clone = state.clone();
                 let handle = tokio::spawn(async move {
-                    state_clone.apply_committed().await;
+                    crate::orchestration::apply_committed(&state_clone).await;
                 });
 
                 let result = handle.await;

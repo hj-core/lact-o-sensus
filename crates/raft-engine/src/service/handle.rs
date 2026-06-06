@@ -223,14 +223,14 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
             "verify_leadership"
         );
 
-        self.state
-            .verify_leadership_quorum(
-                self.config.clone(),
-                self.peer_manager.clone(),
-                TraceId::generate(),
-            )
-            .instrument(span)
-            .await
+        crate::orchestration::verify_leadership_quorum(
+            &self.state,
+            self.config.clone(),
+            self.peer_manager.clone(),
+            TraceId::generate(),
+        )
+        .instrument(span)
+        .await
     }
 }
 
