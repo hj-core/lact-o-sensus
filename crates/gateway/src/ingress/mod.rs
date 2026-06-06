@@ -6,7 +6,6 @@
 //! Oracle, and linearizable consensus proposal.
 
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +33,6 @@ use common_rpc::TraceInterceptor;
 use prost::Message;
 use raft_engine::ConsensusAuthority;
 use raft_engine::ConsensusHandle;
-use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tonic::Request;
 use tonic::Response;
@@ -49,6 +47,8 @@ use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
 
+pub(crate) mod scrubber;
+pub(crate) mod sequencer;
 pub(crate) mod stabilizer;
 
 /// Configuration for the Ingress Layer.
@@ -407,156 +407,20 @@ impl IngressDispatcher {
         })
     }
 
-    /// Enforces Exactly-Once Semantics by validating request sequences against
-    /// the authoritative session table.
-    ///
-    /// Returns a cached response if the request is a duplicate, or a logical
-    /// rejection if it violates session continuity.
+    /// Delegates to the sequencer submodule for exactly-once semantics
+    /// enforcement.
     async fn enforce_sequence_firewall(
         &self,
         client_id: &ClientId,
         sequence_id: SequenceId,
     ) -> Result<Option<Response<ProposeMutationResponse>>, Status> {
-        if sequence_id.as_u64() == 0 {
-            return Ok(Some(Response::new(ProposeMutationResponse {
-                status: MutationStatus::Rejected as i32,
-                state_version: 0,
-                leader_hint: String::new(),
-                error_message: "Secure Clinical: Protocol Violation (Sequence ID 0)".to_string(),
-            })));
-        }
-
-        let last_session = self
-            .session_provider
-            .check_session(client_id, SequenceId::new(0))
-            .map_err(|e| self.invalid_argument(format!("Session lookup failed: {}", e)))?;
-
-        if let Some(record) = last_session {
-            if sequence_id.as_u64() == record.last_sequence_id {
-                info!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    client_id = %client_id.truncated(),
-                    seq = %sequence_id,
-                    "Deduplicating request. Returning cached outcome."
-                );
-                return Ok(Some(Response::new(ProposeMutationResponse {
-                    status: record.status,
-                    state_version: record.log_index,
-                    leader_hint: String::new(),
-                    error_message: if record.status == MutationStatus::Vetoed as i32 {
-                        record.moral_justification
-                    } else {
-                        String::new()
-                    },
-                })));
-            }
-
-            if sequence_id.as_u64() < record.last_sequence_id {
-                warn!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    client_id = %client_id.truncated(),
-                    seq = %sequence_id,
-                    cluster_seq = %record.last_sequence_id,
-                    "Rejecting stale request."
-                );
-                return Ok(Some(Response::new(ProposeMutationResponse {
-                    status: MutationStatus::Rejected as i32,
-                    state_version: record.log_index,
-                    leader_hint: String::new(),
-                    error_message: "Secure Clinical: Stale Sequence".to_string(),
-                })));
-            }
-
-            if sequence_id.as_u64() > record.last_sequence_id + 1 {
-                warn!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    client_id = %client_id.truncated(),
-                    seq = %sequence_id,
-                    expected_seq = %(record.last_sequence_id + 1),
-                    "Rejecting sequence gap."
-                );
-                return Ok(Some(Response::new(ProposeMutationResponse {
-                    status: MutationStatus::Rejected as i32,
-                    state_version: 0,
-                    leader_hint: String::new(),
-                    error_message: "Secure Clinical: Sequence Continuity Violation".to_string(),
-                })));
-            }
-        } else if sequence_id.as_u64() != 1 {
-            // New client must start with sequence 1
-            warn!(
-                target: ClinicalTarget::ClinicalIngress.as_str(),
-                client_id = %client_id.truncated(),
-                seq = %sequence_id,
-                expected_seq = 1,
-                "Rejecting session bootstrap gap."
-            );
-            return Ok(Some(Response::new(ProposeMutationResponse {
-                status: MutationStatus::Rejected as i32,
-                state_version: 0,
-                leader_hint: String::new(),
-                error_message: "Secure Clinical: Session Initialization Violation".to_string(),
-            })));
-        }
-
-        Ok(None)
+        sequencer::enforce_sequence_firewall(&*self.session_provider, client_id, sequence_id).await
     }
 
-    /// Normalizes user intents and enforces clinical taxonomy constraints
-    /// before semantic resolution.
+    /// Delegates to the scrubber submodule for syntactic/taxonomic
+    /// normalization.
     fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
-        intent.item_key = intent.item_key.trim().to_lowercase();
-
-        if let Some(q) = intent.quantity.as_mut() {
-            let trimmed = q.trim();
-            if trimmed.is_empty() {
-                intent.quantity = None;
-            } else {
-                let val = Decimal::from_str(trimmed).map_err(|_| {
-                    self.invalid_argument(format!("Invalid quantity format: '{}'", trimmed))
-                })?;
-                if val.is_sign_negative() {
-                    return Err(self.invalid_argument(
-                        "quantity cannot be negative. Use SUBTRACT or DELETE for removals.",
-                    ));
-                }
-                *q = trimmed.to_string();
-            }
-        }
-
-        if let Some(unit) = intent.unit.as_mut() {
-            *unit = unit.trim().to_lowercase();
-        }
-
-        // --- Taxonomy Guard (ADR 007 Layer 2) ---
-        if let Some(category) = intent.category.as_mut() {
-            let trimmed = category.trim();
-            if !trimmed.is_empty() {
-                GroceryCategory::from_str(trimmed).map_err(|_| {
-                    self.invalid_argument(format!(
-                        "Invalid category hint: '{}'. Must be one of the 12 clinical categories.",
-                        trimmed
-                    ))
-                })?;
-                *category = trimmed.to_string();
-            }
-        }
-
-        if intent.item_key.is_empty() {
-            return Err(self.invalid_argument("item_key cannot be empty"));
-        }
-
-        if intent.operation == OperationType::Delete as i32 && intent.quantity.is_some() {
-            return Err(
-                self.invalid_argument("DELETE operations must not contain a quantity string")
-            );
-        }
-
-        if intent.operation != OperationType::Delete as i32 && intent.quantity.is_none() {
-            return Err(self.invalid_argument("quantity is required for this operation"));
-        }
-
-        Ok(())
+        scrubber::normalize_intent(intent)
     }
 
     /// Orchestrates the semantic resolution loop, managing AI policy evaluation
@@ -743,26 +607,9 @@ impl IngressDispatcher {
         stabilizer::validate_and_stabilize(intent, veto, current_inventory)
     }
 
-    /// Captures the raw human intent for audit logging.
+    /// Delegates to the scrubber submodule for raw input formatting.
     fn format_raw_input(&self, intent: &MutationIntent) -> String {
-        let op = match OperationType::try_from(intent.operation) {
-            Ok(OperationType::Add) => "Add",
-            Ok(OperationType::Subtract) => "Sub",
-            Ok(OperationType::Set) => "Set",
-            Ok(OperationType::Delete) => "Delete",
-            _ => "Unknown",
-        };
-
-        format!(
-            "{} {} {} {}",
-            op,
-            intent.quantity.as_deref().unwrap_or(""),
-            intent.unit.as_deref().unwrap_or(""),
-            intent.item_key
-        )
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        scrubber::format_raw_input(intent)
     }
 
     /// Executes the AI policy evaluation with timeout and error handling.
