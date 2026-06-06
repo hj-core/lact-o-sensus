@@ -811,9 +811,10 @@ async fn process_replication_response<S: StateMachine>(
     // 2. Process replication success/failure if we are still the leader for this
     //    term
     let mut last_committed_updated = false;
+    let current_term = guard.current_term();
     #[allow(clippy::collapsible_if)]
     if let Some(node) = guard.as_leader_mut() {
-        if node.current_term().unwrap_or(Term::ZERO) == term {
+        if current_term == term {
             // Acknowledge read quorums (§8)
             let total_nodes = node.state().next_index().len() + 1;
             let quorum = (total_nodes / 2) + 1;
@@ -1984,6 +1985,59 @@ mod tests {
 
     mod process_replication_response {
         use super::*;
+
+        mod when_storage_fails_during_term_check {
+            use super::*;
+            use crate::test_utils::FailingTermStorage;
+
+            #[tokio::test]
+            async fn triggers_halt_mandate() {
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let failing = Arc::new(FailingTermStorage::with_succeed_count(10));
+                let storage: Arc<dyn LogStorage> = failing.clone();
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let node =
+                    LogicalNode::try_new(id.clone(), Arc::new(MockFsm), storage, thresholds, rng)
+                        .unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Transition to leader (so as_leader_mut returns Some)
+                let peer_id = NodeId::try_new(2).unwrap();
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![peer_id]);
+                }
+
+                // Arm the failure: the next current_term() call will fail
+                failing.set_succeed_count(0);
+
+                let res = Ok(Some(ReplicationOutcome::AppendEntries {
+                    sent_prev_index: LogIndex::new(0),
+                    sent_entries_len: 1,
+                    response: AppendEntriesResponse::new(Term::new(1), true, LogIndex::new(0)),
+                }));
+
+                let state_clone = state.clone();
+                let handle = tokio::spawn(async move {
+                    process_replication_response(&state_clone, Term::new(1), peer_id, res).await
+                });
+
+                let result = handle.await;
+                assert!(result.is_err(), "Expected panic (Halt Mandate)");
+
+                let guard = state.read().await;
+                assert!(matches!(guard.state(), RoleState::Poisoned));
+            }
+        }
 
         mod successful_replication {
             use super::*;
