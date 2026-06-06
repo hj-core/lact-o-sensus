@@ -38,4 +38,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 rand = "0.10.1"
 futures = "0.3.32"
+parking_lot = "0.12"
 tempfile = "3.27.0"

@@ -12,10 +12,10 @@ use common::types::errors::ConsensusError;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use parking_lot::RwLock;
+use parking_lot::RwLockReadGuard;
+use parking_lot::RwLockWriteGuard;
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
-use tokio::sync::RwLockReadGuard;
-use tokio::sync::RwLockWriteGuard;
 use tokio::sync::watch;
 use tonic::Status;
 use tracing::Instrument;
@@ -100,14 +100,19 @@ impl<S: StateMachine> ConsensusShell<S> {
 
     /// Acquires a read lock on the consensus state.
     pub async fn read(&self) -> RwLockReadGuard<'_, LogicalNode<S>> {
-        self.inner.read().await
+        loop {
+            if let Some(guard) = self.inner.try_read() {
+                return guard;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     /// Acquires a synchronous read lock on the consensus state.
     ///
     /// Should only be called within `spawn_blocking` contexts.
     pub fn blocking_read(&self) -> RwLockReadGuard<'_, LogicalNode<S>> {
-        self.inner.blocking_read()
+        self.inner.read()
     }
 
     /// Acquires a mutation guard that atomically broadcasts any changes
@@ -119,12 +124,16 @@ impl<S: StateMachine> ConsensusShell<S> {
     /// observers before the write lock is released.
     #[instrument(name = "acquire_mutation_lock", target = "raft::foundation", skip_all)]
     pub async fn write(&self) -> MutationGuard<'_, S> {
-        let mut guard = self.inner.write().await;
-        let before = guard.consensus_progress();
-        MutationGuard {
-            shell: self,
-            guard,
-            before,
+        loop {
+            if let Some(mut guard) = self.inner.try_write() {
+                let before = guard.consensus_progress();
+                return MutationGuard {
+                    shell: self,
+                    guard,
+                    before,
+                };
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -132,7 +141,7 @@ impl<S: StateMachine> ConsensusShell<S> {
     ///
     /// Should only be called within `spawn_blocking` contexts.
     pub fn blocking_write(&self) -> MutationGuard<'_, S> {
-        let mut guard = self.inner.blocking_write();
+        let mut guard = self.inner.write();
         let before = guard.consensus_progress();
         MutationGuard {
             shell: self,
