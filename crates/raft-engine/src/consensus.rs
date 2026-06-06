@@ -190,7 +190,7 @@ pub fn spawn_tick_loop<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let interval = config.raft.tick_interval();
     let span = tracing::Span::current();
 
@@ -216,7 +216,7 @@ pub fn spawn_tick_loop<S: StateMachine>(
                     let mut guard = state.write().await;
                     let action = guard.tick();
                     let role = determine_node_role_name(&guard);
-                    let term = guard.try_current_term().unwrap_or(Term::ZERO);
+                    let term = guard.current_term();
 
                     let mut campaign_params = None;
                     let mut replication_params = None;
@@ -330,7 +330,7 @@ pub fn spawn_tick_loop<S: StateMachine>(
             }
         }
         .instrument(span),
-    );
+    )
 }
 
 /// Spawns a background task that continuously applies committed log entries
