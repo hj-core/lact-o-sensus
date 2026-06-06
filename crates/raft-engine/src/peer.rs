@@ -32,6 +32,12 @@ pub enum PeerError {
     InvalidUri { node_id: NodeId, uri: String },
 }
 
+impl From<PeerError> for tonic::Status {
+    fn from(err: PeerError) -> Self {
+        tonic::Status::internal(err.to_string())
+    }
+}
+
 /// Represents a persistent connection to a peer node.
 #[derive(Debug, Clone)]
 struct PeerConnection {

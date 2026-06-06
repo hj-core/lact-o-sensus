@@ -978,9 +978,7 @@ async fn request_vote_from_peer(
     peer_id: NodeId,
     params: VoteRequestParams,
 ) -> RpcResult<RequestVoteResponse> {
-    let mut client = peer_manager
-        .get_client(peer_id)
-        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut client = peer_manager.get_client(peer_id)?;
 
     let mut request = Request::new(RequestVoteRequest::new(
         params.term,
@@ -1279,9 +1277,7 @@ async fn replicate_to_peer<S: StateMachine>(
     let sent_prev_index = LogIndex::new(request.prev_log_index);
     let sent_entries_len = request.entries.len() as u64;
 
-    let mut client = peer_manager
-        .get_client(peer_id)
-        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut client = peer_manager.get_client(peer_id)?;
 
     let mut req = Request::new(request);
     // ADR 003: We set the timeout on the request itself...
@@ -1331,9 +1327,7 @@ async fn install_snapshot_to_peer<S: StateMachine>(
 ) -> RpcResult<Option<ReplicationOutcome<S>>> {
     let last_included_index = LogIndex::new(request.last_included_index);
 
-    let mut client = peer_manager
-        .get_client(peer_id)
-        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut client = peer_manager.get_client(peer_id)?;
 
     let mut req = Request::new(request);
     req.set_timeout(timeout);
