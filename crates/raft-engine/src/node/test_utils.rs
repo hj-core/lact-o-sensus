@@ -69,13 +69,9 @@ pub fn test_identity(id: u64) -> Arc<NodeIdentity> {
     ))
 }
 
-pub fn setup_node_as_follower(
-    fsm: Arc<MockFsm>,
-    log_store: Arc<MemoryStorage>,
-) -> RaftNode<Follower, MockFsm> {
+pub fn setup_node_as_follower(log_store: Arc<MemoryStorage>) -> RaftNode<Follower> {
     RaftNode::try_new(
         test_identity(1),
-        fsm,
         log_store,
         Tick::new(0),
         TickDuration::new(100),
@@ -83,20 +79,14 @@ pub fn setup_node_as_follower(
     .unwrap()
 }
 
-pub fn setup_node_as_candidate(
-    fsm: Arc<MockFsm>,
-    log_store: Arc<MemoryStorage>,
-) -> RaftNode<Candidate, MockFsm> {
-    setup_node_as_follower(fsm, log_store)
+pub fn setup_node_as_candidate(log_store: Arc<MemoryStorage>) -> RaftNode<Candidate> {
+    setup_node_as_follower(log_store)
         .try_into_candidate(Tick::new(0), TickDuration::new(150))
         .unwrap()
 }
 
-pub fn setup_node_as_leader(
-    fsm: Arc<MockFsm>,
-    log_store: Arc<MemoryStorage>,
-) -> RaftNode<Leader, MockFsm> {
-    setup_node_as_candidate(fsm, log_store)
+pub fn setup_node_as_leader(log_store: Arc<MemoryStorage>) -> RaftNode<Leader> {
+    setup_node_as_candidate(log_store)
         .try_into_leader(vec![], Tick::new(0))
         .unwrap()
 }

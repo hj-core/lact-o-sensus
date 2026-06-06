@@ -8,7 +8,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use common::proto::v1::raft::LogEntry;
-use common::raft_api::StateMachine;
 use common::types::ClusterId;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -58,9 +57,8 @@ pub trait NodeState: Debug {}
 /// signaling channels or perform I/O. Signaling is the responsibility of the
 /// high-level orchestrator shell.
 #[derive(Debug)]
-pub struct RaftNode<R: NodeState, S: StateMachine> {
+pub struct RaftNode<R: NodeState> {
     pub(super) identity: Arc<NodeIdentity>,
-    pub(super) fsm: Arc<S>,
     pub(super) log_store: Arc<dyn LogStorage>,
 
     // --- Volatile State ---
@@ -71,7 +69,7 @@ pub struct RaftNode<R: NodeState, S: StateMachine> {
 
 // --- Implementation: Shared Accessors ---
 
-impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
+impl<R: NodeState> RaftNode<R> {
     pub fn cluster_id(&self) -> &ClusterId {
         self.identity.cluster_id()
     }
@@ -82,10 +80,6 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
 
     pub fn identity(&self) -> Arc<NodeIdentity> {
         self.identity.clone()
-    }
-
-    pub fn fsm(&self) -> Arc<S> {
-        self.fsm.clone()
     }
 
     pub fn log_store(&self) -> &Arc<dyn LogStorage> {
@@ -134,11 +128,10 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
 
     /// Internal helper to transition between roles by recomposing the node
     /// with a new state marker while preserving physical invariants.
-    pub(crate) fn transition<Next: NodeState>(self, next_state: Next) -> RaftNode<Next, S> {
-        let (identity, fsm, log_store, last_committed, last_applied) = self.into_parts();
+    pub(crate) fn transition<Next: NodeState>(self, next_state: Next) -> RaftNode<Next> {
+        let (identity, log_store, last_committed, last_applied) = self.into_parts();
         RaftNode {
             identity,
-            fsm,
             log_store,
             last_committed,
             last_applied,
@@ -200,7 +193,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
 
 // --- Implementation: Shared Physical Mutations ---
 
-impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
+impl<R: NodeState> RaftNode<R> {
     /// Consumes the current node and returns it in a Follower role.
     /// This is the primary mechanism for demotion and term updates.
     ///
@@ -211,7 +204,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         leader_id: Option<NodeId>,
         last_heartbeat: Tick,
         timeout: TickDuration,
-    ) -> Result<RaftNode<Follower, S>, NodeError> {
+    ) -> Result<RaftNode<Follower>, NodeError> {
         let mut node = self.transition(Follower::new(leader_id, last_heartbeat, timeout));
 
         // Transition to next term if higher (§5.1)
@@ -287,19 +280,9 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
         Ok(())
     }
 
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Arc<NodeIdentity>,
-        Arc<S>,
-        Arc<dyn LogStorage>,
-        LogIndex,
-        LogIndex,
-    ) {
+    pub(crate) fn into_parts(self) -> (Arc<NodeIdentity>, Arc<dyn LogStorage>, LogIndex, LogIndex) {
         (
             self.identity,
-            self.fsm,
             self.log_store,
             self.last_committed,
             self.last_applied,

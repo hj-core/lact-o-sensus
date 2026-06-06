@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use common::proto::v1::raft::LogEntry;
-use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::errors::NodeError;
@@ -130,7 +129,7 @@ impl Leader {
 
 impl NodeState for Leader {}
 
-impl<S: StateMachine> RaftNode<Leader, S> {
+impl RaftNode<Leader> {
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
     #[instrument(
@@ -165,9 +164,8 @@ mod tests {
 
         #[test]
         fn should_increment_log_length_and_use_current_term() {
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(MemoryStorage::new());
-            let mut node = setup_node_as_leader(fsm, log_store);
+            let mut node = setup_node_as_leader(log_store);
             let current_term = node.current_term().unwrap();
 
             let index = node.propose(vec![42]).unwrap();
@@ -259,11 +257,9 @@ mod tests {
                 }
             }
 
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(FailingAppendStorage);
             let mut node = RaftNode {
                 identity: test_identity(1),
-                fsm,
                 log_store,
                 last_committed: LogIndex::ZERO,
                 last_applied: LogIndex::ZERO,
@@ -281,9 +277,8 @@ mod tests {
 
         #[test]
         fn should_advance_epoch_when_quorum_is_reached() {
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(MemoryStorage::new());
-            let mut node = setup_node_as_candidate(fsm, log_store)
+            let mut node = setup_node_as_candidate(log_store)
                 .try_into_leader(
                     vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()],
                     Tick::new(0),

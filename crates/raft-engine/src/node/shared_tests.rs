@@ -31,15 +31,13 @@ mod tests {
 
             #[test]
             fn should_return_zero_when_index_is_zero() {
-                let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
-                let node = setup_node_as_follower(fsm, log_store);
+                let node = setup_node_as_follower(log_store);
                 assert_eq!(node.get_term_at(LogIndex::ZERO).unwrap(), Term::ZERO);
             }
 
             #[test]
             fn should_return_term_from_snapshot_when_index_is_truncated() {
-                let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
 
                 // Setup snapshot at index 10, term 2
@@ -49,7 +47,7 @@ mod tests {
                     .save_snapshot_metadata(snapshot_index, snapshot_term)
                     .unwrap();
 
-                let node = setup_node_as_follower(fsm, log_store);
+                let node = setup_node_as_follower(log_store);
 
                 // Authority check (§7): Should return snapshot term even if log is empty
                 assert_eq!(node.get_term_at(snapshot_index).unwrap(), snapshot_term);
@@ -57,7 +55,6 @@ mod tests {
 
             #[test]
             fn should_return_term_from_log_when_index_is_recent() {
-                let fsm = Arc::new(MockFsm::default());
                 let log_store = Arc::new(MemoryStorage::new());
 
                 // Append an entry at index 1, term 1
@@ -69,7 +66,7 @@ mod tests {
                     }])
                     .unwrap();
 
-                let node = setup_node_as_follower(fsm, log_store);
+                let node = setup_node_as_follower(log_store);
 
                 assert_eq!(node.get_term_at(LogIndex::new(1)).unwrap(), Term::new(1));
             }
@@ -86,11 +83,9 @@ mod tests {
 
                     #[test]
                     fn should_update_timer_when_invoked() {
-                        let fsm = Arc::new(MockFsm::default());
                         let log_store = Arc::new(MemoryStorage::new());
-                        let mut node = RaftNode::<Follower, MockFsm>::try_new(
+                        let mut node = RaftNode::<Follower>::try_new(
                             test_identity(1),
-                            fsm,
                             log_store,
                             Tick::new(0),
                             TickDuration::new(100),
@@ -115,14 +110,12 @@ mod tests {
 
                 #[test]
                 fn should_reset_voting_state_when_demoted_on_new_term() {
-                    let fsm = Arc::new(MockFsm::default());
                     let log_store = MemoryStorage::new();
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::try_new(1).unwrap()))
                         .unwrap();
-                    let node = RaftNode::<Follower, MockFsm>::try_new(
+                    let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
-                        fsm,
                         Arc::new(log_store),
                         Tick::new(0),
                         TickDuration::new(100),
@@ -139,14 +132,12 @@ mod tests {
 
                 #[test]
                 fn should_preserve_vote_when_demoted_on_same_term() {
-                    let fsm = Arc::new(MockFsm::default());
                     let log_store = MemoryStorage::new();
                     log_store
                         .save_hard_state(Term::new(1), Some(NodeId::try_new(3).unwrap()))
                         .unwrap();
-                    let node = RaftNode::<Follower, MockFsm>::try_new(
+                    let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
-                        fsm,
                         Arc::new(log_store),
                         Tick::new(0),
                         TickDuration::new(100),
@@ -170,11 +161,8 @@ mod tests {
             mod on_valid_index {
                 use super::*;
 
-                async fn check_persists_to_log_store_when_index_is_valid<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_persists_to_log_store_when_index_is_valid<R: NodeState>(
+                    mut node: RaftNode<R>,
                     log_store: Arc<MemoryStorage>,
                 ) {
                     log_store
@@ -192,33 +180,27 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_persist_to_log_store_when_index_is_valid_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_follower(log_store.clone());
                     check_persists_to_log_store_when_index_is_valid(node, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_persist_to_log_store_when_index_is_valid_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_candidate(log_store.clone());
                     check_persists_to_log_store_when_index_is_valid(node, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_persist_to_log_store_when_index_is_valid_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_leader(log_store.clone());
                     check_persists_to_log_store_when_index_is_valid(node, log_store).await;
                 }
 
-                async fn check_does_not_apply_to_fsm_when_index_is_valid<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_does_not_apply_to_fsm_when_index_is_valid<R: NodeState>(
+                    mut node: RaftNode<R>,
                     fsm: Arc<MockFsm>,
                     log_store: Arc<MemoryStorage>,
                 ) {
@@ -241,33 +223,32 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_not_apply_to_fsm_when_index_is_valid_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_follower(log_store.clone());
                     check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_not_apply_to_fsm_when_index_is_valid_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_candidate(log_store.clone());
                     check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_not_apply_to_fsm_when_index_is_valid_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_leader(log_store.clone());
                     check_does_not_apply_to_fsm_when_index_is_valid(node, fsm, log_store).await;
                 }
 
                 async fn check_does_not_apply_multiple_entries_when_index_jumps_ahead<
                     R: NodeState,
-                    S: StateMachine,
                 >(
-                    mut node: RaftNode<R, S>,
+                    mut node: RaftNode<R>,
                     fsm: Arc<MockFsm>,
                     log_store: Arc<MemoryStorage>,
                 ) {
@@ -292,9 +273,9 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_follower(log_store.clone());
                     check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
@@ -303,9 +284,9 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_candidate(log_store.clone());
                     check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
@@ -314,9 +295,9 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_not_apply_multiple_entries_when_index_jumps_ahead_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm.clone(), log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let fsm = Arc::new(MockFsm::default());
+                    let node = setup_node_as_leader(log_store.clone());
                     check_does_not_apply_multiple_entries_when_index_jumps_ahead(
                         node, fsm, log_store,
                     )
@@ -327,11 +308,8 @@ mod tests {
             mod on_stale_index {
                 use super::*;
 
-                async fn check_ignores_update_when_index_is_lower_than_current<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_ignores_update_when_index_is_lower_than_current<R: NodeState>(
+                    mut node: RaftNode<R>,
                     log_store: Arc<MemoryStorage>,
                 ) {
                     log_store
@@ -350,25 +328,22 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_ignore_update_when_index_is_lower_than_current_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_follower(log_store.clone());
                     check_ignores_update_when_index_is_lower_than_current(node, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_ignore_update_when_index_is_lower_than_current_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_candidate(log_store.clone());
                     check_ignores_update_when_index_is_lower_than_current(node, log_store).await;
                 }
 
                 #[tokio::test]
                 async fn should_ignore_update_when_index_is_lower_than_current_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm, log_store.clone());
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_leader(log_store.clone());
                     check_ignores_update_when_index_is_lower_than_current(node, log_store).await;
                 }
             }
@@ -376,11 +351,8 @@ mod tests {
             mod on_invalid_index {
                 use super::*;
 
-                async fn check_returns_error_when_index_exceeds_last_log_index<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_returns_error_when_index_exceeds_last_log_index<R: NodeState>(
+                    mut node: RaftNode<R>,
                 ) {
                     let result = node.advance_last_committed(LogIndex::new(1));
                     assert!(result.is_err());
@@ -389,25 +361,22 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_return_error_when_index_exceeds_last_log_index_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_follower(log_store);
                     check_returns_error_when_index_exceeds_last_log_index(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_index_exceeds_last_log_index_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_candidate(log_store);
                     check_returns_error_when_index_exceeds_last_log_index(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_index_exceeds_last_log_index_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_leader(log_store);
                     check_returns_error_when_index_exceeds_last_log_index(node).await;
                 }
             }
@@ -450,11 +419,11 @@ mod tests {
 
                 async fn check_returns_error_when_fsm_index_is_ahead_of_last_committed<
                     R: NodeState,
-                    S: StateMachine,
                 >(
-                    mut node: RaftNode<R, S>,
+                    mut node: RaftNode<R>,
+                    fsm: &RegressionFsm,
                 ) {
-                    let result = node.apply_to_state_machine();
+                    let result = node.apply_to_state_machine(fsm);
                     assert!(result.is_err());
                     assert!(
                         result
@@ -467,42 +436,49 @@ mod tests {
                 #[tokio::test]
                 async fn should_return_error_when_fsm_index_is_ahead_of_last_committed_as_follower()
                 {
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm: Arc::new(RegressionFsm),
-                        log_store: Arc::new(MemoryStorage::new()),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::new(100),
-                        state: Follower::new(None, Tick::new(0), TickDuration::new(100)),
-                    };
-                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
+                    let fsm = RegressionFsm;
+                    let mut node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap();
+                    node.last_applied = LogIndex::new(100);
+                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node, &fsm).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_fsm_index_is_ahead_of_last_committed_as_candidate()
                  {
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm: Arc::new(RegressionFsm),
-                        log_store: Arc::new(MemoryStorage::new()),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
-                    };
-                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
+                    let fsm = RegressionFsm;
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap()
+                    .try_into_candidate(Tick::new(0), TickDuration::new(150))
+                    .unwrap();
+                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node, &fsm).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_fsm_index_is_ahead_of_last_committed_as_leader() {
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm: Arc::new(RegressionFsm),
-                        log_store: Arc::new(MemoryStorage::new()),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
-                    };
-                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node).await;
+                    let fsm = RegressionFsm;
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap()
+                    .try_into_candidate(Tick::new(0), TickDuration::new(150))
+                    .unwrap()
+                    .try_into_leader(vec![], Tick::new(0))
+                    .unwrap();
+                    check_returns_error_when_fsm_index_is_ahead_of_last_committed(node, &fsm).await;
                 }
             }
 
@@ -511,12 +487,12 @@ mod tests {
 
                 async fn check_returns_error_when_committed_entry_is_missing_from_log_store<
                     R: NodeState,
-                    S: StateMachine,
                 >(
-                    mut node: RaftNode<R, S>,
+                    mut node: RaftNode<R>,
+                    fsm: &MockFsm,
                 ) {
                     node.last_committed = LogIndex::new(5);
-                    let result = node.apply_to_state_machine();
+                    let result = node.apply_to_state_machine(fsm);
                     assert!(result.is_err());
                     assert!(result.unwrap_err().to_string().contains("missing from log"));
                 }
@@ -524,43 +500,52 @@ mod tests {
                 #[tokio::test]
                 async fn should_return_error_when_committed_entry_is_missing_from_log_store_as_follower()
                  {
-                    let node = RaftNode::<Follower, MockFsm>::try_new(
+                    let fsm = MockFsm::default();
+                    let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
-                        Arc::new(MockFsm::default()),
                         Arc::new(MemoryStorage::new()),
                         Tick::new(0),
                         TickDuration::new(100),
                     )
                     .unwrap();
-                    check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
+                    check_returns_error_when_committed_entry_is_missing_from_log_store(node, &fsm)
+                        .await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_committed_entry_is_missing_from_log_store_as_candidate()
                  {
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm: Arc::new(MockFsm::default()),
-                        log_store: Arc::new(MemoryStorage::new()),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Candidate::new(Tick::new(0), TickDuration::new(150)),
-                    };
-                    check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
+                    let fsm = MockFsm::default();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap()
+                    .try_into_candidate(Tick::new(0), TickDuration::new(150))
+                    .unwrap();
+                    check_returns_error_when_committed_entry_is_missing_from_log_store(node, &fsm)
+                        .await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_committed_entry_is_missing_from_log_store_as_leader()
                  {
-                    let node = RaftNode {
-                        identity: test_identity(1),
-                        fsm: Arc::new(MockFsm::default()),
-                        log_store: Arc::new(MemoryStorage::new()),
-                        last_committed: LogIndex::ZERO,
-                        last_applied: LogIndex::ZERO,
-                        state: Leader::new(vec![], LogIndex::ZERO, Tick::new(0)).unwrap(),
-                    };
-                    check_returns_error_when_committed_entry_is_missing_from_log_store(node).await;
+                    let fsm = MockFsm::default();
+                    let node = RaftNode::<Follower>::try_new(
+                        test_identity(1),
+                        Arc::new(MemoryStorage::new()),
+                        Tick::new(0),
+                        TickDuration::new(100),
+                    )
+                    .unwrap()
+                    .try_into_candidate(Tick::new(0), TickDuration::new(150))
+                    .unwrap()
+                    .try_into_leader(vec![], Tick::new(0))
+                    .unwrap();
+                    check_returns_error_when_committed_entry_is_missing_from_log_store(node, &fsm)
+                        .await;
                 }
             }
         }
@@ -574,11 +559,8 @@ mod tests {
                 const HIGHER_TERM: Term = Term::new(6);
                 const BOOTSTRAP_TERM: Term = Term::new(4);
 
-                async fn check_persists_new_term_and_resets_voted_for<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_persists_new_term_and_resets_voted_for<R: NodeState>(
+                    mut node: RaftNode<R>,
                 ) {
                     node.advance_term(HIGHER_TERM).unwrap();
                     assert_eq!(node.current_term().unwrap(), HIGHER_TERM);
@@ -587,25 +569,23 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_persist_new_term_and_reset_voted_for_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     log_store
                         .save_hard_state(STARTING_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
-                    let node = setup_node_as_follower(fsm, log_store);
+                    let node = setup_node_as_follower(log_store);
                     check_persists_new_term_and_resets_voted_for(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_persist_new_term_and_reset_voted_for_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     // Start at BOOTSTRAP_TERM so setup_node_as_candidate increments to
                     // STARTING_TERM.
                     log_store
                         .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
-                    let mut node = setup_node_as_candidate(fsm, log_store);
+                    let mut node = setup_node_as_candidate(log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
                     node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
@@ -614,13 +594,12 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_persist_new_term_and_reset_voted_for_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     // Start at BOOTSTRAP_TERM so setup_node_as_leader increments to STARTING_TERM.
                     log_store
                         .save_hard_state(BOOTSTRAP_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
-                    let mut node = setup_node_as_leader(fsm, log_store);
+                    let mut node = setup_node_as_leader(log_store);
                     // Manually inject a vote for someone else to verify clearing.
                     node.advance_term(STARTING_TERM).unwrap();
                     node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
@@ -634,11 +613,8 @@ mod tests {
                 const SAME_TERM: Term = Term::new(5);
                 const BOOTSTRAP_TERM: Term = Term::new(4);
 
-                async fn check_preserves_current_term_and_voting_state<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_preserves_current_term_and_voting_state<R: NodeState>(
+                    mut node: RaftNode<R>,
                 ) {
                     node.advance_term(SAME_TERM).unwrap();
                     assert_eq!(node.current_term().unwrap(), STARTING_TERM);
@@ -647,22 +623,20 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_preserve_current_term_and_voting_state_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     log_store
                         .save_hard_state(STARTING_TERM, Some(NodeId::try_new(2).unwrap()))
                         .unwrap();
-                    let node = setup_node_as_follower(fsm, log_store);
+                    let node = setup_node_as_follower(log_store);
                     check_preserves_current_term_and_voting_state(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_preserve_current_term_and_voting_state_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     // setup results in STARTING_TERM.
                     log_store.save_hard_state(BOOTSTRAP_TERM, None).unwrap();
-                    let mut node = setup_node_as_candidate(fsm, log_store);
+                    let mut node = setup_node_as_candidate(log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
                     node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
@@ -671,11 +645,10 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_preserve_current_term_and_voting_state_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
+                    let log_store = Arc::new(MemoryStorage::new());
                     // setup results in STARTING_TERM.
                     log_store.save_hard_state(BOOTSTRAP_TERM, None).unwrap();
-                    let mut node = setup_node_as_leader(fsm, log_store);
+                    let mut node = setup_node_as_leader(log_store);
                     // Ensure voted_for is node 2 as expected by check.
                     node.advance_term(STARTING_TERM).unwrap();
                     node.persist_vote(NodeId::try_new(2).unwrap()).unwrap();
@@ -688,11 +661,8 @@ mod tests {
                 const TARGET_TERM: Term = Term::new(10);
                 const LOWER_TERM: Term = Term::new(5);
 
-                async fn check_returns_error_when_new_term_is_lower_than_current<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_returns_error_when_new_term_is_lower_than_current<R: NodeState>(
+                    mut node: RaftNode<R>,
                 ) {
                     node.advance_term(TARGET_TERM).unwrap();
 
@@ -706,25 +676,22 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_return_error_when_new_term_is_lower_than_current_as_follower() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_follower(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_follower(log_store);
                     check_returns_error_when_new_term_is_lower_than_current(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_new_term_is_lower_than_current_as_candidate() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_candidate(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_candidate(log_store);
                     check_returns_error_when_new_term_is_lower_than_current(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_return_error_when_new_term_is_lower_than_current_as_leader() {
-                    let (fsm, log_store) =
-                        (Arc::new(MockFsm::default()), Arc::new(MemoryStorage::new()));
-                    let node = setup_node_as_leader(fsm, log_store);
+                    let log_store = Arc::new(MemoryStorage::new());
+                    let node = setup_node_as_leader(log_store);
                     check_returns_error_when_new_term_is_lower_than_current(node).await;
                 }
             }
@@ -810,11 +777,8 @@ mod tests {
                     }
                 }
 
-                async fn check_propagates_persistence_error_when_storage_fails<
-                    R: NodeState,
-                    S: StateMachine,
-                >(
-                    mut node: RaftNode<R, S>,
+                async fn check_propagates_persistence_error_when_storage_fails<R: NodeState>(
+                    mut node: RaftNode<R>,
                 ) {
                     let result = node.advance_term(Term::new(2));
 
@@ -829,11 +793,9 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_propagate_persistence_error_when_storage_fails_as_follower() {
-                    let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(FailingStorage);
-                    let node = RaftNode::<Follower, MockFsm>::try_new(
+                    let node = RaftNode::<Follower>::try_new(
                         test_identity(1),
-                        fsm,
                         log_store,
                         Tick::new(0),
                         TickDuration::new(100),
@@ -844,24 +806,20 @@ mod tests {
 
                 #[tokio::test]
                 async fn should_propagate_persistence_error_when_storage_fails_as_candidate() {
-                    let fsm = Arc::new(MockFsm::default());
-                    let _node = RaftNode {
+                    let node = RaftNode {
                         identity: test_identity(1),
-                        fsm: fsm.clone(),
                         log_store: Arc::new(FailingStorage),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
                         state: Candidate::new(Tick::new(0), TickDuration::new(150)),
                     };
-                    check_propagates_persistence_error_when_storage_fails(_node).await;
+                    check_propagates_persistence_error_when_storage_fails(node).await;
                 }
 
                 #[tokio::test]
                 async fn should_propagate_persistence_error_when_storage_fails_as_leader() {
-                    let fsm = Arc::new(MockFsm::default());
                     let node = RaftNode {
                         identity: test_identity(1),
-                        fsm,
                         log_store: Arc::new(FailingStorage),
                         last_committed: LogIndex::ZERO,
                         last_applied: LogIndex::ZERO,
@@ -880,9 +838,8 @@ mod tests {
 
                 #[test]
                 fn should_persist_to_log_store_when_invoked() {
-                    let fsm = Arc::new(MockFsm::default());
                     let log_store = Arc::new(MemoryStorage::new());
-                    let mut node = setup_node_as_follower(fsm, log_store.clone());
+                    let mut node = setup_node_as_follower(log_store.clone());
                     let candidate_id = NodeId::try_new(2).unwrap();
 
                     node.persist_vote(candidate_id).unwrap();

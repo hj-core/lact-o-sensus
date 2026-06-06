@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 
-use common::raft_api::StateMachine;
 use common::types::NodeId;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
@@ -67,12 +66,12 @@ impl Candidate {
 
 impl NodeState for Candidate {}
 
-impl<S: StateMachine> RaftNode<Candidate, S> {
+impl RaftNode<Candidate> {
     pub fn try_into_restarted_candidate(
         self,
         election_start: Tick,
         timeout: TickDuration,
-    ) -> Result<RaftNode<Candidate, S>, NodeError> {
+    ) -> Result<RaftNode<Candidate>, NodeError> {
         let current_term = self.current_term()?;
         let mut node = self.transition(Candidate::new(election_start, timeout));
 
@@ -94,7 +93,7 @@ impl<S: StateMachine> RaftNode<Candidate, S> {
         self,
         peer_ids: Vec<NodeId>,
         last_heartbeat: Tick,
-    ) -> Result<RaftNode<Leader, S>, NodeError> {
+    ) -> Result<RaftNode<Leader>, NodeError> {
         let last_log_index = self.last_log_index()?;
         let term = self.current_term()?;
         let node = self.transition(Leader::new(peer_ids, last_log_index, last_heartbeat)?);
@@ -126,9 +125,8 @@ mod tests {
 
         #[test]
         fn should_increment_term_and_vote_for_self_on_election_restart() {
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(MemoryStorage::new());
-            let node = setup_node_as_candidate(fsm, log_store);
+            let node = setup_node_as_candidate(log_store);
             let initial_term = node.current_term().unwrap();
 
             let restarted = node
@@ -149,7 +147,6 @@ mod tests {
 
         #[test]
         fn should_initialize_leader_state_with_next_index_at_end_of_log() {
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(MemoryStorage::new());
             // Append some entries to the log
             log_store
@@ -167,7 +164,7 @@ mod tests {
                 ])
                 .unwrap();
 
-            let node = setup_node_as_candidate(fsm, log_store);
+            let node = setup_node_as_candidate(log_store);
             let peer_ids = vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()];
 
             let leader = node
@@ -193,9 +190,8 @@ mod tests {
 
         #[test]
         fn should_be_idempotent_when_adding_vote_per_peer() {
-            let fsm = Arc::new(MockFsm::default());
             let log_store = Arc::new(MemoryStorage::new());
-            let mut node = setup_node_as_candidate(fsm, log_store);
+            let mut node = setup_node_as_candidate(log_store);
 
             node.state_mut().add_vote(NodeId::try_new(2).unwrap());
             node.state_mut().add_vote(NodeId::try_new(2).unwrap()); // Duplicate

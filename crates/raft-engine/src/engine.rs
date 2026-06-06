@@ -61,10 +61,10 @@ pub struct ConsensusProgress {
 /// Orchestrates the physical Raft node according to its current role, managing
 /// the transitions between Raft roles (ADR 002).
 #[derive(Debug)]
-pub enum RoleState<S: StateMachine> {
-    Follower(RaftNode<Follower, S>),
-    Candidate(RaftNode<Candidate, S>),
-    Leader(RaftNode<Leader, S>),
+pub enum RoleState {
+    Follower(RaftNode<Follower>),
+    Candidate(RaftNode<Candidate>),
+    Leader(RaftNode<Leader>),
     Poisoned, // ADR 001: Safety barrier during transition failures
 }
 
@@ -72,7 +72,8 @@ pub enum RoleState<S: StateMachine> {
 /// deterministic clock, and randomized timeouts.
 #[derive(Debug)]
 pub struct LogicalNode<S: StateMachine> {
-    state: RoleState<S>,
+    state: RoleState,
+    fsm: Arc<S>,
     current_tick: Tick,
     thresholds: TickThresholds,
     rng: StdRng,
@@ -300,30 +301,47 @@ impl<S: StateMachine> LogicalNode<S> {
         let current_tick = Tick::ZERO;
         let timeout = thresholds.generate_election_timeout(&mut rng);
 
-        let node =
-            RaftNode::<Follower, S>::try_new(identity, fsm, log_store, current_tick, timeout)?;
+        // Invariant check: FSM must not be ahead of the log store.
+        let fsm_applied = fsm.last_applied_index().map_err(|e| e.into())?;
+        let last_committed = log_store.last_committed().map_err(NodeError::from)?;
+        if fsm_applied > last_committed {
+            return Err(NodeError::Protocol(format!(
+                "Causal invariant violation: FSM applied index {} is ahead of LogStore committed \
+                 index {}",
+                fsm_applied, last_committed
+            )));
+        }
+
+        let node = RaftNode::<Follower>::try_new_with_applied(
+            identity,
+            log_store,
+            fsm_applied,
+            current_tick,
+            timeout,
+        )?;
 
         Ok(Self {
             state: RoleState::Follower(node),
+            fsm,
             current_tick,
             thresholds,
             rng,
         })
     }
 
-    pub fn state(&self) -> &RoleState<S> {
+    pub fn state(&self) -> &RoleState {
         &self.state
     }
 
     #[cfg(test)]
-    pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower, S>> {
+    pub(crate) fn as_follower_mut(&mut self) -> Option<&mut RaftNode<Follower>> {
         match &mut self.state {
             RoleState::Follower(node) => Some(node),
             _ => None,
         }
     }
 
-    pub(crate) fn as_candidate_mut(&mut self) -> Option<&mut RaftNode<Candidate, S>> {
+    pub(crate) fn as_candidate_mut(&mut self) -> Option<&mut RaftNode<Candidate>> {
         match &mut self.state {
             RoleState::Candidate(node) => Some(node),
             _ => None,
@@ -331,14 +349,14 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     #[cfg(test)]
-    pub(crate) fn as_leader(&self) -> Option<&RaftNode<Leader, S>> {
+    pub(crate) fn as_leader(&self) -> Option<&RaftNode<Leader>> {
         match &self.state {
             RoleState::Leader(node) => Some(node),
             _ => None,
         }
     }
 
-    pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader, S>> {
+    pub(crate) fn as_leader_mut(&mut self) -> Option<&mut RaftNode<Leader>> {
         match &mut self.state {
             RoleState::Leader(node) => Some(node),
             _ => None,
@@ -623,7 +641,7 @@ impl<S: StateMachine> LogicalNode<S> {
     /// Safely transitions the node state using an ownership-consuming closure.
     pub fn transition<F>(&mut self, f: F)
     where
-        F: FnOnce(RoleState<S>) -> RoleState<S>,
+        F: FnOnce(RoleState) -> RoleState,
     {
         let old_state = mem::replace(&mut self.state, RoleState::Poisoned);
         self.state = f(old_state);
@@ -850,7 +868,7 @@ impl<S: StateMachine> LogicalNode<S> {
     }
 
     pub fn fsm(&self) -> Arc<S> {
-        delegate_to_inner!(self, fsm)
+        self.fsm.clone()
     }
 
     /// Returns the high-level role of the logical node.

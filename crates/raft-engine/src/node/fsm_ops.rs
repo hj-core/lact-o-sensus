@@ -4,6 +4,7 @@
 //! application of committed log entries to the business logic and
 //! advancing logical horizons after snapshot restoration (ADR 011).
 
+#[cfg(test)]
 use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::errors::NodeError;
@@ -15,7 +16,7 @@ use tracing::instrument;
 use super::NodeState;
 use super::RaftNode;
 
-impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
+impl<R: NodeState> RaftNode<R> {
     /// Updates the commit index without triggering FSM application.
     ///
     /// FSM application is deferred to the background applier loop to prevent
@@ -96,17 +97,14 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
     /// NOTE: This method is only used by tests. Production code now uses the
     /// background applier loop via `shell.apply_committed()`.
     #[cfg(test)]
-    #[instrument(
-        name = "fsm_application",
-        target = "clinical::fsm",
-        skip_all,
-        fields(last_committed = %self.last_committed)
-    )]
-    pub(super) fn apply_to_state_machine(&mut self) -> Result<(), NodeError> {
+    pub(super) fn apply_to_state_machine<F: StateMachine>(
+        &mut self,
+        fsm: &F,
+    ) -> Result<(), NodeError> {
         use tracing::error;
 
         // Safety Barrier: Ensure FSM hasn't regressed or moved ahead of log.
-        let fsm_last = self.fsm.last_applied_index().map_err(|e| e.into())?;
+        let fsm_last = fsm.last_applied_index().map_err(|e| e.into())?;
         if fsm_last > self.last_committed {
             return Err(NodeError::Protocol(format!(
                 "FSM index {} is ahead of last_committed {}. Possible log regression.",
@@ -123,7 +121,7 @@ impl<R: NodeState, S: StateMachine> RaftNode<R, S> {
                 ))
             })?;
 
-            if let Err(e) = self.fsm.apply(apply_idx, &entry.data) {
+            if let Err(e) = fsm.apply(apply_idx, &entry.data) {
                 error!(
                     target: ClinicalTarget::ClinicalFsm.as_str(),
                     index = %apply_idx,
