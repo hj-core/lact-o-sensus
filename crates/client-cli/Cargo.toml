@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+common-rpc = { path = "../common-rpc" }
 tokio.workspace = true
 tonic.workspace = true
 prost.workspace = true

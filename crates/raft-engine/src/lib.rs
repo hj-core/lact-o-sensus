@@ -1,5 +1,6 @@
 pub mod config;
 pub mod consensus;
+pub mod consensus_api;
 pub mod engine;
 pub mod identity;
 pub mod node;
@@ -13,6 +14,8 @@ pub mod storage;
 pub mod test_utils;
 pub mod tick;
 
+pub use crate::consensus_api::ConsensusAuthority;
+pub use crate::consensus_api::ConsensusHandle;
 pub use crate::tick::Tick;
 pub use crate::tick::TickDuration;
 pub use crate::tick::TickThresholds;

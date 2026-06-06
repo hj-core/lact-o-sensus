@@ -29,6 +29,7 @@ dependencies = [
  "anyhow",
  "clap",
  "common",
+ "common-rpc",
  "ollama-rs",
  "prost",
  "prost-types",
@@ -389,6 +390,7 @@ dependencies = [
  "chrono",
  "clap",
  "common",
+ "common-rpc",
  "prost",
  "rand 0.10.1",
  "rust_decimal",
@@ -416,9 +418,6 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "common"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
  "prost",
  "prost-types",
  "rust_decimal",
@@ -431,6 +430,16 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "common-rpc"
+version = "0.1.0"
+dependencies = [
+ "common",
+ "serde_json",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -696,9 +705,11 @@ dependencies = [
  "async-trait",
  "chrono",
  "common",
+ "common-rpc",
  "futures",
  "prost",
  "prost-types",
+ "raft-engine",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -1223,6 +1234,7 @@ dependencies = [
  "anyhow",
  "clap",
  "common",
+ "common-rpc",
  "tokio",
  "tonic",
  "tracing",
@@ -1261,6 +1273,7 @@ dependencies = [
  "chrono",
  "clap",
  "common",
+ "common-rpc",
  "futures",
  "gateway",
  "lacto-fsm",
@@ -1658,6 +1671,7 @@ dependencies = [
  "chrono",
  "clap",
  "common",
+ "common-rpc",
  "futures",
  "parking_lot 0.12.5",
  "prost",

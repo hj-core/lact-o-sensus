@@ -22,13 +22,13 @@ use common::proto::v1::raft::InstallSnapshotResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::raft_api::StateMachine;
-use common::rpc::TraceInterceptor;
 use common::types::LogIndex;
 use common::types::NodeId;
 use common::types::Term;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use common_rpc::TraceInterceptor;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::time::sleep;
@@ -1528,10 +1528,10 @@ mod tests {
     use common::proto::v1::raft::LogEntry;
     use common::proto::v1::raft::consensus_service_server::ConsensusService;
     use common::proto::v1::raft::consensus_service_server::ConsensusServiceServer;
-    use common::rpc::HEADER_TRACE_ID;
     use common::types::ClusterId;
     use common::types::NodeId;
     use common::types::NodeIdentity;
+    use common_rpc::HEADER_TRACE_ID;
     use futures::FutureExt;
     use futures::stream;
     use rand::SeedableRng;
@@ -2472,7 +2472,7 @@ mod tests {
     }
 
     mod verify_trace_integrity {
-        use common::rpc::TraceInterceptor;
+        use common_rpc::TraceInterceptor;
         use tonic::Response;
 
         use super::*;

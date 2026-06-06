@@ -8,8 +8,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::raft_api::ConsensusAuthority;
-use common::raft_api::ConsensusHandle;
 use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::NodeId;
@@ -24,6 +22,8 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::consensus_api::ConsensusAuthority;
+use crate::consensus_api::ConsensusHandle;
 use crate::engine::NodeRole;
 use crate::peer::PeerManager;
 use crate::shell::ConsensusShell;

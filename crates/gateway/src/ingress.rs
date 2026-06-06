@@ -23,9 +23,6 @@ use common::proto::v1::app::QueryStateRequest;
 use common::proto::v1::app::QueryStateResponse;
 use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
-use common::raft_api::ConsensusAuthority;
-use common::raft_api::ConsensusHandle;
-use common::rpc::TraceInterceptor;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::LogIndex;
@@ -35,7 +32,10 @@ use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
+use common_rpc::TraceInterceptor;
 use prost::Message;
+use raft_engine::ConsensusAuthority;
+use raft_engine::ConsensusHandle;
 use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tonic::Request;
@@ -1036,8 +1036,6 @@ mod tests {
     use common::proto::v1::app::QueryStateRequest;
     use common::proto::v1::app::QueryStatus;
     use common::proto::v1::app::SessionRecord;
-    use common::raft_api::ConsensusAuthority;
-    use common::raft_api::ConsensusHandle;
     use common::types::ClientId;
     use common::types::LogIndex;
     use common::types::SequenceId;
@@ -1045,6 +1043,8 @@ mod tests {
     use common::types::errors::FsmError;
     use common::types::trace::TraceId;
     use prost::Message;
+    use raft_engine::ConsensusAuthority;
+    use raft_engine::ConsensusHandle;
     use tonic::Request;
 
     use super::*;

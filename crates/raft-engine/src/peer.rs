@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use common::proto::v1::raft::consensus_service_client::ConsensusServiceClient;
-use common::rpc::IdentityInterceptor;
-use common::rpc::TraceInterceptor;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use common_rpc::IdentityInterceptor;
+use common_rpc::TraceInterceptor;
 use thiserror::Error;
 use tonic::Request;
 use tonic::Status;

@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 
 use clap::Parser;
 use common::proto::v1::app::policy_service_server::PolicyServiceServer;
-use common::rpc::TraceInterceptor;
 use common::types::trace::ClinicalTarget;
+use common_rpc::TraceInterceptor;
 use tonic::transport::Server;
 use tracing::Instrument;
 use tracing::error;

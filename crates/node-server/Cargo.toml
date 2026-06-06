@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+common-rpc = { path = "../common-rpc" }
 raft-engine = { path = "../raft-engine" }
 lacto-fsm = { path = "../lacto-fsm" }
 gateway = { path = "../gateway" }

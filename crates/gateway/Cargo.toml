@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+common-rpc = { path = "../common-rpc" }
+raft-engine = { path = "../raft-engine" }
 async-trait.workspace = true
 tokio.workspace = true
 tonic.workspace = true
