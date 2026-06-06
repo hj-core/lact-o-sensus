@@ -6,7 +6,7 @@
 - **Status:** Proposed
 - **Scope:** Internal Raft Node Structure and Concurrency
 - **Primary Goal:** Define the structural hierarchy of the Raft node to ensure strict isolation between protocol logic, concurrency management, and reactive signaling.
-- **Last Updated:** 2026-06-02
+- **Last Updated:** 2026-06-06
 
 ## Context
 
@@ -21,14 +21,14 @@ We will implement a tri-layered "Onion" architecture for the internal Raft node,
 ### 1. Layer 1: The Physical Foundation (Isolated Persistence)
 
 - **Nature:** Pure Data Mutator.
-- **Abstractions:** `RaftNode<S: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
+- **Abstractions:** `RaftNode<R: NodeState>` utilizing the **Type-State Pattern** and `sled::Tree` for isolated storage.
 - **Responsibility:** Raw state management (Log, Term, VotedFor, Commit Index, FSM application, Snapshot Metadata and Truncation).
 - **Constraint:** This layer must be strictly synchronous (`fn`) and deterministic. It is the "Silent State Machine," containing only the logical state and transitions necessary for protocol correctness. It uses dedicated `sled` database handles to ensure component isolation.
 
 ### 2. Layer 2: The Logical Orchestrator (Safety Barrier)
 
 - **Nature:** Protocol Dispatcher and Safety Barrier.
-- **Abstractions:** `LogicalNode` enum (Follower, Candidate, Leader, Poisoned).
+- **Abstractions:** `LogicalNode<S>` struct wrapping `RoleState` enum (Follower, Candidate, Leader, Poisoned) and owning the FSM handle.
 - **Responsibility:** Mapping high-level RPC intents (AppendEntries, RequestVote) to Physical mutations, managing role transitions, and enforcing protocol invariants.
 - **Constraint:** This layer must be strictly synchronous (`fn`). All decisions are evaluated deterministically without yielding to an async executor.
 - **The Halt Mandate (Poison-then-Panic):** To mitigate the lack of lock poisoning in Tokio, any terminal failure or invariant violation MUST follow a strict sequence:
