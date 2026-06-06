@@ -113,6 +113,12 @@ impl FailingTermStorage {
             succeed_count: AtomicU32::new(n),
         }
     }
+
+    /// Sets the number of successful `current_term()` calls before failing.
+    /// A value of 0 means the next call fails.
+    pub fn set_succeed_count(&self, n: u32) {
+        self.succeed_count.store(n, Ordering::Release);
+    }
 }
 
 impl Default for FailingTermStorage {

@@ -658,9 +658,10 @@ async fn process_vote_response<S: StateMachine>(
         let total_nodes = peer_ids.len() + 1;
         let quorum = (total_nodes / 2) + 1;
 
+        let current_term = guard.current_term();
         #[allow(clippy::collapsible_if)]
         if let Some(node) = guard.as_candidate_mut() {
-            if node.current_term().unwrap_or(Term::ZERO) == term {
+            if current_term == term {
                 node.state_mut().add_vote(peer_id);
                 if node.state().vote_count() >= quorum {
                     quorum_reached = true;
@@ -1827,6 +1828,64 @@ mod tests {
 
     mod process_vote_response {
         use super::*;
+
+        mod when_storage_fails_during_tally {
+            use super::*;
+            use crate::test_utils::FailingTermStorage;
+
+            #[tokio::test]
+            async fn triggers_halt_mandate() {
+                let _config = mock_config(50, 100);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                // Keep a handle to control when failure triggers
+                let failing = Arc::new(FailingTermStorage::with_succeed_count(10));
+                let storage: Arc<dyn LogStorage> = failing.clone();
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let node =
+                    LogicalNode::try_new(id.clone(), Arc::new(MockFsm), storage, thresholds, rng)
+                        .unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Transition to candidate (so as_candidate_mut returns Some)
+                {
+                    let mut guard = state.write().await;
+                    guard.into_candidate();
+                }
+
+                // Arm the failure: the next current_term() call will fail
+                failing.set_succeed_count(0);
+
+                let peer_ids = vec![NodeId::try_new(2).unwrap(), NodeId::try_new(3).unwrap()];
+                let res = Ok(RequestVoteResponse::new(Term::new(1), true));
+
+                let state_clone = state.clone();
+                let handle = tokio::spawn(async move {
+                    process_vote_response(
+                        &state_clone,
+                        Term::new(1),
+                        &peer_ids,
+                        NodeId::try_new(2).unwrap(),
+                        res,
+                    )
+                    .await
+                });
+
+                let result = handle.await;
+                assert!(result.is_err(), "Expected panic (Halt Mandate)");
+
+                // Verify node is poisoned after the panic
+                let guard = state.read().await;
+                assert!(matches!(guard.state(), RoleState::Poisoned));
+            }
+        }
 
         mod discovering_higher_term {
             use super::*;
