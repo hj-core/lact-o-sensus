@@ -9,6 +9,8 @@ pub mod recovery;
 pub mod service;
 pub mod shell;
 pub mod storage;
+#[cfg(test)]
+pub mod test_utils;
 pub mod tick;
 
 pub use crate::tick::Tick;

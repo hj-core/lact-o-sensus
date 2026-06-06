@@ -324,3 +324,255 @@ pub(crate) async fn verify_leadership_quorum<S: StateMachine>(
     .instrument(span.clone())
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use common::types::ClusterId;
+    use common::types::LogIndex;
+    use common::types::NodeId;
+    use common::types::NodeIdentity;
+    use common::types::Term;
+    use common::types::errors::ConsensusError;
+    use common::types::errors::FsmError;
+    use common::types::trace::TraceId;
+    use rand::SeedableRng;
+
+    use crate::engine::LogicalNode;
+    use crate::peer::PeerManager;
+    use crate::service::consensus::SnapshotParams;
+    use crate::shell::ConsensusShell;
+    use crate::storage::MemoryStorage;
+    use crate::test_utils::mock_shell;
+    use crate::test_utils::test_config;
+    use crate::tick::TickDuration;
+    use crate::tick::TickThresholds;
+
+    mod verify_leadership_quorum {
+        use super::*;
+
+        mod with_stable_leader {
+            use super::*;
+
+            #[tokio::test]
+            async fn completes_successfully_and_batches_concurrent_reads_in_single_round() {
+                let shell = mock_shell();
+                let config = Arc::new(test_config());
+                let peer_manager = Arc::new(
+                    PeerManager::try_new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                );
+
+                // 1. Transition to leader
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![
+                        NodeId::try_new(2).unwrap(),
+                        NodeId::try_new(3).unwrap(),
+                    ]);
+                }
+
+                // 2. Start two concurrent reads
+                let shell1 = shell.clone();
+                let config1 = config.clone();
+                let pm1 = peer_manager.clone();
+                let read1 = tokio::spawn(async move {
+                    crate::orchestration::verify_leadership_quorum(
+                        &shell1,
+                        config1,
+                        pm1,
+                        TraceId::generate(),
+                    )
+                    .await
+                });
+
+                let shell2 = shell.clone();
+                let config2 = config.clone();
+                let pm2 = peer_manager.clone();
+                let read2 = tokio::spawn(async move {
+                    crate::orchestration::verify_leadership_quorum(
+                        &shell2,
+                        config2,
+                        pm2,
+                        TraceId::generate(),
+                    )
+                    .await
+                });
+
+                // Give them time to register and start waiting
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                // 3. Verify they are both waiting for the SAME epoch (batching)
+                {
+                    let guard = shell.read().await;
+                    let leader = guard.as_leader().unwrap();
+                    assert_eq!(leader.state().current_read_epoch(), 1);
+                }
+
+                // 4. Simulate quorum acknowledgment
+                {
+                    let mut guard = shell.write().await;
+                    let leader = guard.as_leader_mut().unwrap();
+                    leader
+                        .state_mut()
+                        .acknowledge_heartbeat(NodeId::try_new(2).unwrap(), 2);
+                }
+
+                // 5. Verify both reads complete successfully
+                let res1 = read1.await.unwrap();
+                let res2 = read2.await.unwrap();
+
+                assert!(res1.is_ok());
+                assert!(res2.is_ok());
+            }
+        }
+
+        mod with_unstable_leader {
+            use super::*;
+
+            #[tokio::test]
+            async fn returns_error_on_demotion() {
+                let shell = mock_shell();
+                let config = Arc::new(test_config());
+                let peer_manager = Arc::new(
+                    PeerManager::try_new(shell.read().await.identity(), &HashMap::new()).unwrap(),
+                );
+
+                // 1. Transition to leader
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_candidate();
+                    guard.into_leader(vec![NodeId::try_new(2).unwrap()]);
+                }
+
+                let shell_clone = shell.clone();
+                let config_clone = config.clone();
+                let pm_clone = peer_manager.clone();
+                let task = tokio::spawn(async move {
+                    crate::orchestration::verify_leadership_quorum(
+                        &shell_clone,
+                        config_clone,
+                        pm_clone,
+                        TraceId::generate(),
+                    )
+                    .await
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                // 2. Simulate demotion
+                {
+                    let mut guard = shell.write().await;
+                    guard.into_follower(Term::new(10), None);
+                }
+
+                let result = task.await.unwrap();
+                assert!(matches!(result, Err(ConsensusError::NotLeader)));
+            }
+        }
+    }
+
+    mod handle_install_snapshot {
+        use std::sync::Arc;
+        use std::sync::Barrier;
+
+        use common::raft_api::StateMachine;
+
+        use super::*;
+
+        #[derive(Debug)]
+        struct MockDelayedFsm {
+            barrier: Arc<Barrier>,
+        }
+
+        impl StateMachine for MockDelayedFsm {
+            type Error = FsmError;
+
+            fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+                Ok(LogIndex::ZERO)
+            }
+
+            fn apply(&self, _idx: LogIndex, _data: &[u8]) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
+                Ok(vec![])
+            }
+
+            fn install_snapshot(
+                &self,
+                _idx: LogIndex,
+                _data: &[u8],
+                _trace_id: TraceId,
+            ) -> Result<(), Self::Error> {
+                self.barrier.wait();
+                Ok(())
+            }
+        }
+
+        mod non_blocking_behavior {
+            use super::*;
+            use crate::engine::TickAction;
+
+            #[tokio::test]
+            async fn tick_loop_continues_during_heavy_restoration() {
+                let barrier = Arc::new(Barrier::new(2));
+                let fsm = Arc::new(MockDelayedFsm {
+                    barrier: barrier.clone(),
+                });
+
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = rand::rngs::StdRng::seed_from_u64(1);
+                let node = LogicalNode::try_new(id, fsm, storage, thresholds, rng).unwrap();
+                let shell = Arc::new(ConsensusShell::new(node));
+
+                let params = SnapshotParams {
+                    leader_id: NodeId::try_new(2).unwrap(),
+                    term: Term::new(1),
+                    last_included_index: LogIndex::new(100),
+                    last_included_term: Term::new(1),
+                    data: vec![1, 2, 3],
+                    trace_id: TraceId::generate(),
+                };
+
+                // 1. Trigger heavy restoration
+                crate::orchestration::handle_install_snapshot(&shell, params)
+                    .await
+                    .unwrap();
+
+                // 2. Verify we can immediately acquire the lock and perform a tick.
+                let mut guard = shell.write().await;
+                let action = guard.tick();
+
+                assert!(matches!(
+                    action,
+                    TickAction::None | TickAction::StartElection
+                ));
+
+                drop(guard);
+
+                // 5. Release the background task
+                barrier.wait();
+
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // 6. Verify horizon was advanced
+                let guard = shell.read().await;
+                assert_eq!(guard.last_committed(), LogIndex::new(100));
+                assert_eq!(guard.last_applied(), LogIndex::new(100));
+            }
+        }
+    }
+}
