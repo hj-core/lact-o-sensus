@@ -86,6 +86,75 @@ impl ConsensusHandle for MockRaftHandle {
     }
 }
 
+/// A mock Raft handle that simulates a leader being demoted during mutation
+/// processing.
+///
+/// The first call to `authority()` returns `is_leader=true` (initial
+/// authorization passes). All subsequent calls return `is_leader=false`
+/// with the configured `new_leader_hint` (post-veto re-check detects
+/// demotion).
+#[derive(Debug)]
+pub struct DemotingRaftHandle {
+    pub mock: Arc<MockRaftHandle>,
+    pub authority_calls: Mutex<usize>,
+    pub new_leader_hint: String,
+    pub new_rejection_reason: String,
+}
+
+impl DemotingRaftHandle {
+    pub fn new(new_leader_hint: impl Into<String>) -> Self {
+        Self {
+            mock: Arc::new(MockRaftHandle {
+                is_leader: true,
+                ..Default::default()
+            }),
+            authority_calls: Mutex::new(0),
+            new_leader_hint: new_leader_hint.into(),
+            new_rejection_reason: "Node was demoted during mutation processing".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ConsensusHandle for DemotingRaftHandle {
+    async fn propose(&self, data: Vec<u8>) -> Result<LogIndex, ConsensusError> {
+        self.mock.propose(data).await
+    }
+
+    async fn await_commit(&self, index: LogIndex) -> Result<(), ConsensusError> {
+        self.mock.await_commit(index).await
+    }
+
+    async fn await_apply(&self, index: LogIndex) -> Result<(), ConsensusError> {
+        self.mock.await_apply(index).await
+    }
+
+    fn authority(&self) -> ConsensusAuthority {
+        let mut count = self.authority_calls.lock().unwrap();
+        *count += 1;
+        if *count == 1 {
+            // First call: initial authorization — node is leader
+            ConsensusAuthority {
+                is_leader: true,
+                ..Default::default()
+            }
+        } else {
+            // Subsequent calls: post-demotion — node is follower
+            ConsensusAuthority {
+                is_leader: false,
+                is_poisoned: false,
+                last_committed: LogIndex::default(),
+                leader_hint: self.new_leader_hint.clone(),
+                rejection_reason: self.new_rejection_reason.clone(),
+            }
+        }
+    }
+
+    async fn verify_leadership(&self) -> Result<(), ConsensusError> {
+        self.mock.verify_leadership().await
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MockVetoRelay {
     pub outcome: Option<VetoOutcome>,

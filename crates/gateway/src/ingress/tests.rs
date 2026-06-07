@@ -713,6 +713,60 @@ mod propose_mutation {
         assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
     }
 
+    // --- Phase 3.5: Leader Demotion During AI Veto ---
+
+    mod demotion_during_veto {
+        use super::*;
+        use crate::ingress::test_utils::DemotingRaftHandle;
+
+        #[tokio::test]
+        async fn redirects_when_demoted_during_mutation_processing() {
+            let new_leader_hint = "http://new-leader:50052".to_string();
+            let raft = Arc::new(DemotingRaftHandle::new(new_leader_hint.clone()));
+            let veto = Arc::new(MockVetoRelay {
+                outcome: Some(VetoOutcome {
+                    is_approved: false,
+                    category_assignment: "Primary Flora".to_string(),
+                    moral_justification: "Mock justification".to_string(),
+                    resolved_item_key: "milk".to_string(),
+                    suggested_display_name: "Milk".to_string(),
+                    resolved_unit: "ml".to_string(),
+                    conversion_multiplier_to_base: "1".to_string(),
+                }),
+                ..Default::default()
+            });
+            let inventory = successful_inventory();
+            let dispatcher = mock_dispatcher(raft.clone(), inventory.clone(), inventory, veto);
+            let cid = ClientId::generate();
+            let req = make_request(ProposeMutationRequest::new(
+                &cid,
+                SequenceId::new(1),
+                MutationIntent::new(
+                    "bananas".to_string(),
+                    Some("5".to_string()),
+                    None,
+                    None,
+                    OperationType::Add,
+                ),
+            ));
+
+            let response = dispatcher.propose_mutation(req).await.unwrap().into_inner();
+
+            // 1. Must return Rejected status, not a gRPC error
+            assert_eq!(response.status, MutationStatus::Rejected as i32);
+
+            // 2. Must include new leader's address in the hint
+            assert_eq!(response.leader_hint, new_leader_hint);
+
+            // 3. Must NOT have proposed anything to Raft (demoted before propose)
+            let proposals = raft.mock.proposals.lock().unwrap();
+            assert!(
+                proposals.is_empty(),
+                "No mutation should be proposed when leader is demoted"
+            );
+        }
+    }
+
     // --- Phase 4 & 5: Consensus & State Machine (Layer 4/5) ---
 
     #[tokio::test]
