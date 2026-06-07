@@ -497,6 +497,8 @@ mod tests {
         use super::*;
         use common::proto::v1::app::CommittedMutation;
         use common::proto::v1::app::OperationType;
+        use common::proto::v1::app::SessionRecord;
+        use common::types::errors::FsmError;
         use prost::Message;
         use crate::veto::VetoError;
         use crate::veto::VetoOutcome;
@@ -1688,6 +1690,7 @@ mod tests {
     mod exactly_once_semantics {
         use common::proto::v1::app::SessionRecord;
         use common::proto::v1::app::OperationType;
+        use common::types::errors::FsmError;
 
         use super::*;
 

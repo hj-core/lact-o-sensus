@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-pub use common::proto::v1::app::SessionRecord;
-pub use common::types::errors::FsmError;
+use common::proto::v1::app::SessionRecord;
+use common::types::errors::FsmError;
 
 use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
