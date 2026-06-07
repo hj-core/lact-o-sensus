@@ -35,6 +35,16 @@ pub struct ConsensusShell<S: StateMachine> {
     /// Guards all FSM I/O (`apply`, `snapshot`, `install_snapshot`) to
     /// prevent concurrent state machine access from overlapping tasks
     /// (ADR 009, ADR 011).
+    ///
+    /// # Lock ordering
+    ///
+    /// When both `fsm_lock` and `inner` must be held in the same context,
+    /// acquire `fsm_lock` **before** `inner` (the `apply_committed` path
+    /// demonstrates this pattern). In `spawn_blocking` snapshot paths
+    /// (`replicate_snapshot_to_peer`, `handle_install_snapshot`) the code
+    /// fully releases `inner` **before** acquiring `fsm_lock`, ensuring no
+    /// concurrent hold of both locks across the blocking boundary. Future
+    /// code paths must maintain this invariant to prevent deadlock.
     pub(crate) fsm_lock: Mutex<()>,
     /// Reference-counted freeze depth (ADR 011). The FSM is considered frozen
     /// for application as long as this counter is greater than zero. Managed
