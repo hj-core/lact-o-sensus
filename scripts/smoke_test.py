@@ -2,6 +2,7 @@
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -405,7 +406,15 @@ def test_replication_chaos(cluster: ClusterManager) -> None:
 
         final_ver = extract_version(output)
         if final_ver > 0:
-            verify_convergence(cluster, final_ver, "Committed")
+            cluster.refresh_logs()
+            status = "Committed"
+            for line in cluster.logs.node_logs.get(leader_id, []):
+                if f"apply{{index={final_ver}" in line and "Mutation applied" in line:
+                    m = re.search(r"status=(\w+)", line)
+                    if m:
+                        status = m.group(1)
+                    break
+            verify_convergence(cluster, final_ver, status)
         print("SUCCESS: 100% Data Integrity achieved after Chaos.")
     finally:
         flooder.stop()
