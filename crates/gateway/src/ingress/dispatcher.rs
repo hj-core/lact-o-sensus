@@ -182,6 +182,15 @@ impl IngressDispatcher {
                 .resolve_semantic_mutation(client_id.clone(), &intent, &current_inventory, trace_id)
                 .await?;
 
+            // 6.5 Re-checks authority — the leader may have been demoted during
+            //     AI evaluation (long-running LLM call). If so, redirect the client
+            //     to the new leader instead of attempting to propose to a stale
+            //     term.
+            let fresh = self.raft_handle.authority();
+            if !fresh.is_leader {
+                return Ok(self.mutation_redirection_response(fresh));
+            }
+
             // 7. Proposes the finalized intent to the cluster for consensus.
             let proposal_index = self
                 .commit_to_consensus(MutationProposal {

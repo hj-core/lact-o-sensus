@@ -92,7 +92,7 @@ pub(crate) fn build_mutation_response(
 /// Translates domain ConsensusErrors into standard gRPC Status objects.
 pub(crate) fn map_consensus_error(err: ConsensusError, status: &ConsensusAuthority) -> Status {
     match err {
-        ConsensusError::NotLeader => Status::failed_precondition(format!(
+        ConsensusError::NotLeader => Status::unavailable(format!(
             "Not the leader. Hint: {} ({})",
             status.leader_hint, status.rejection_reason
         )),
