@@ -14,9 +14,9 @@ use tracing::info;
 use tracing::info_span;
 use tracing::warn;
 
-use super::IngressConfig;
-use super::StabilizedMutation;
 use super::stabilizer;
+use super::types::IngressConfig;
+use super::types::StabilizedMutation;
 use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;

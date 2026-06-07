@@ -16,7 +16,7 @@ use tonic::Status;
 use tracing::error;
 use tracing::info;
 
-use super::MutationProposal;
+use super::types::MutationProposal;
 
 /// Commits the finalized intent to the consensus log and waits for quorum
 /// commitment.

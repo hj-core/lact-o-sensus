@@ -9,7 +9,7 @@ use common::units::UnitRegistry;
 use rust_decimal::Decimal;
 use tonic::Status;
 
-use super::StabilizedMutation;
+use super::types::StabilizedMutation;
 use crate::veto::VetoOutcome;
 
 /// Audits AI-resolved metadata against system registries and stabilizes
