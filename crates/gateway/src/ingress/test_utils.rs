@@ -1,8 +1,13 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+pub use common::proto::v1::app::CommittedMutation;
+pub use common::proto::v1::app::OperationType;
 pub use common::proto::v1::app::SessionRecord;
 pub use common::types::errors::FsmError;
+pub use prost::Message;
+pub use crate::veto::VetoError;
+pub use crate::veto::VetoOutcome;
 
 use super::*;
 

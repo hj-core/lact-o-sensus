@@ -149,30 +149,17 @@ fn enforce_physical_invariants(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use common::proto::v1::app::GroceryItem;
     use common::proto::v1::app::MutationIntent;
     use common::proto::v1::app::OperationType;
     use common::types::LogIndex;
 
-    use crate::ingress::IngressDispatcher;
+    use super::validate_and_stabilize;
     use crate::ingress::test_utils::*;
     use crate::veto::VetoOutcome;
 
-    fn test_dispatcher() -> IngressDispatcher {
-        let inventory = successful_inventory();
-        mock_dispatcher(
-            Arc::new(MockRaftHandle::default()),
-            inventory.clone(),
-            inventory,
-            Arc::new(MockVetoRelay::default()),
-        )
-    }
-
     #[test]
     fn rejects_hallucinated_category() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1".to_string()),
@@ -190,14 +177,13 @@ mod tests {
             conversion_multiplier_to_base: "1".to_string(),
         };
 
-        let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+        let result = validate_and_stabilize(&intent, &veto, &[]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
     }
 
     #[test]
     fn rejects_hallucinated_unit() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1".to_string()),
@@ -215,14 +201,13 @@ mod tests {
             conversion_multiplier_to_base: "1".to_string(),
         };
 
-        let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+        let result = validate_and_stabilize(&intent, &veto, &[]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
     fn rejects_invalid_si_unit_conversion() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("abc".to_string()),
@@ -240,14 +225,13 @@ mod tests {
             conversion_multiplier_to_base: "1".to_string(),
         };
 
-        let result = dispatcher.validate_and_stabilize(&intent, &veto, &[]);
+        let result = validate_and_stabilize(&intent, &veto, &[]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[test]
     fn rejects_cross_dimensional_arithmetic() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1".to_string()),
@@ -275,7 +259,7 @@ mod tests {
             LogIndex::new(0),
         )];
 
-        let result = dispatcher.validate_and_stabilize(&intent, &veto, &inventory);
+        let result = validate_and_stabilize(&intent, &veto, &inventory);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -284,7 +268,6 @@ mod tests {
 
     #[test]
     fn applies_bankers_rounding_to_si_stabilization() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1.5".to_string()),
@@ -302,9 +285,7 @@ mod tests {
             conversion_multiplier_to_base: "453.59237".to_string(),
         };
 
-        let result = dispatcher
-            .validate_and_stabilize(&intent, &veto, &[])
-            .unwrap();
+        let result = validate_and_stabilize(&intent, &veto, &[]).unwrap();
 
         // 1.5 * 453.59237 = 680.388555
         // Banker's Rounding to 4 dp as defined in units.rs
@@ -314,7 +295,6 @@ mod tests {
 
     #[test]
     fn grants_contextual_override_when_unit_is_dynamic() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("2".to_string()),
@@ -329,16 +309,13 @@ mod tests {
             ..valid_outcome()
         };
 
-        let result = dispatcher
-            .validate_and_stabilize(&intent, &veto, &[])
-            .unwrap();
+        let result = validate_and_stabilize(&intent, &veto, &[]).unwrap();
         // 2 packs * 6 multiplier = 12 base units
         assert_eq!(result.updated_base_quantity, "12");
     }
 
     #[test]
     fn ignores_physical_constant_redefinition_when_unit_is_static() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1".to_string()),
@@ -354,9 +331,7 @@ mod tests {
             ..valid_outcome()
         };
 
-        let result = dispatcher
-            .validate_and_stabilize(&intent, &veto, &[])
-            .unwrap();
+        let result = validate_and_stabilize(&intent, &veto, &[]).unwrap();
 
         // Physical Law Check: Registry (1000) must override AI (500)
         assert_eq!(result.updated_base_quantity, "1000");
@@ -365,7 +340,6 @@ mod tests {
 
     #[test]
     fn rejects_non_positive_quantity_during_stabilization() {
-        let dispatcher = test_dispatcher();
         let intent = MutationIntent::new(
             "".into(),
             Some("1".to_string()),
@@ -381,9 +355,7 @@ mod tests {
             conversion_multiplier_to_base: "0".to_string(),
             ..valid_outcome()
         };
-        let status_zero = dispatcher
-            .validate_and_stabilize(&intent, &veto_zero, &[])
-            .unwrap_err();
+        let status_zero = validate_and_stabilize(&intent, &veto_zero, &[]).unwrap_err();
         assert_eq!(status_zero.code(), tonic::Code::InvalidArgument);
 
         // Test 2: Negative
@@ -393,9 +365,7 @@ mod tests {
             conversion_multiplier_to_base: "-1".to_string(),
             ..valid_outcome()
         };
-        let status_neg = dispatcher
-            .validate_and_stabilize(&intent, &veto_neg, &[])
-            .unwrap_err();
+        let status_neg = validate_and_stabilize(&intent, &veto_neg, &[]).unwrap_err();
         assert_eq!(status_neg.code(), tonic::Code::InvalidArgument);
         assert!(status_neg.message().contains("strictly positive"));
     }

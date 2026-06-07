@@ -11,11 +11,9 @@ use std::time::Duration;
 
 use common::app_api::InventoryReader;
 use common::app_api::SessionProvider;
-use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
-use common::proto::v1::app::OperationType;
 use common::proto::v1::app::ProposeMutationRequest;
 use common::proto::v1::app::ProposeMutationResponse;
 use common::proto::v1::app::QueryStateRequest;
@@ -30,7 +28,6 @@ use common::types::errors::ConsensusError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use common_rpc::TraceInterceptor;
-use prost::Message;
 use raft_engine::ConsensusAuthority;
 use raft_engine::ConsensusHandle;
 use tokio::sync::Mutex;
@@ -38,15 +35,13 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::Instrument;
-use tracing::error;
 use tracing::info;
 use tracing::info_span;
-use tracing::warn;
 
-use crate::veto::VetoError;
-use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
 
+mod ai_oracle;
+pub(crate) mod proposer;
 pub(crate) mod scrubber;
 pub(crate) mod sequencer;
 pub(crate) mod stabilizer;
@@ -67,18 +62,18 @@ pub struct IngressConfig {
 /// Implements Layer 4 (Validation Proxy) of the Defensive Onion (ADR 007).
 #[derive(Debug, Clone)]
 pub(crate) struct StabilizedMutation {
-    resolved_item_key: String,
-    suggested_display_name: String,
-    updated_base_quantity: String,
-    base_unit: String,
-    display_unit: String,
-    category: GroceryCategory,
-    moral_justification: String,
+    pub(crate) resolved_item_key: String,
+    pub(crate) suggested_display_name: String,
+    pub(crate) updated_base_quantity: String,
+    pub(crate) base_unit: String,
+    pub(crate) display_unit: String,
+    pub(crate) category: GroceryCategory,
+    pub(crate) moral_justification: String,
 }
 
 /// Encapsulated data for a mutation proposal to be committed to consensus.
 #[derive(Debug)]
-struct MutationProposal<'a> {
+pub(crate) struct MutationProposal<'a> {
     client_id: &'a ClientId,
     sequence_id: SequenceId,
     intent: MutationIntent,
@@ -423,8 +418,7 @@ impl IngressDispatcher {
         scrubber::normalize_intent(intent)
     }
 
-    /// Orchestrates the semantic resolution loop, managing AI policy evaluation
-    /// and SI stabilization retries.
+    /// Delegates to the ai_oracle submodule for semantic resolution.
     async fn resolve_semantic_mutation(
         &self,
         client_id: ClientId,
@@ -432,179 +426,34 @@ impl IngressDispatcher {
         current_inventory: &[GroceryItem],
         trace_id: TraceId,
     ) -> Result<(MutationStatus, StabilizedMutation), Status> {
-        let mut stabilized_mutation = None;
-        let mut final_status = MutationStatus::Committed;
-
-        for attempt in 0..=self.config.veto_max_retries {
-            if attempt > 0 {
-                info!(
-                    target: ClinicalTarget::ClinicalOracle.as_str(),
-                    attempt = attempt + 1,
-                    max_retries = self.config.veto_max_retries + 1,
-                    "Retrying AI resolution..."
-                );
-            }
-
-            let veto = match self
-                .evaluate_policy(client_id.clone(), intent, current_inventory, trace_id)
-                .await
-            {
-                Ok(v) => v,
-                Err(e) if attempt < self.config.veto_max_retries => {
-                    warn!(
-                        target: ClinicalTarget::ClinicalOracle.as_str(),
-                        attempt = attempt + 1,
-                        error = %e,
-                        "Transient AI failure. Retrying..."
-                    );
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-
-            if !veto.is_approved {
-                final_status = MutationStatus::Vetoed;
-                stabilized_mutation = Some(StabilizedMutation {
-                    resolved_item_key: veto.resolved_item_key,
-                    suggested_display_name: veto.suggested_display_name,
-                    updated_base_quantity: "0".to_string(), // Rejection has zero impact
-                    base_unit: "units".to_string(),
-                    display_unit: "units".to_string(),
-                    category: GroceryCategory::AnomalousInputs,
-                    moral_justification: veto.moral_justification,
-                });
-                break;
-            }
-
-            match self.validate_and_stabilize(intent, &veto, current_inventory) {
-                Ok(s) => {
-                    stabilized_mutation = Some(s);
-                    break;
-                }
-                Err(status) if attempt < self.config.veto_max_retries => {
-                    warn!(
-                        target: ClinicalTarget::ClinicalOracle.as_str(),
-                        attempt = attempt + 1,
-                        error = %status.message(),
-                        "AI response failed physical validation. Retrying..."
-                    );
-                    continue;
-                }
-                Err(status) => {
-                    warn!(
-                        target: ClinicalTarget::ClinicalOracle.as_str(),
-                        error = %status.message(),
-                        "AI resolution exhausted retries and failed validation."
-                    );
-                    final_status = MutationStatus::Vetoed;
-                    stabilized_mutation = Some(StabilizedMutation {
-                        resolved_item_key: veto.resolved_item_key,
-                        suggested_display_name: veto.suggested_display_name,
-                        updated_base_quantity: "0".to_string(),
-                        base_unit: "units".to_string(),
-                        display_unit: "units".to_string(),
-                        category: GroceryCategory::AnomalousInputs,
-                        moral_justification: "A physical unit mismatch was detected between this \
-                                              request and the existing inventory record for this \
-                                              item. Please ensure the units are compatible with \
-                                              previous entries."
-                            .to_string(),
-                    });
-                    break;
-                }
-            }
-        }
-
-        let stabilized = stabilized_mutation
-            .ok_or_else(|| self.internal_error("Retry loop failed to produce an outcome record"))?;
-
-        Ok((final_status, stabilized))
+        ai_oracle::resolve_semantic_mutation(
+            &*self.veto_relay,
+            &self.config,
+            client_id,
+            intent,
+            current_inventory,
+            trace_id,
+        )
+        .await
     }
 
-    /// Commits the finalized intent to the consensus log and waits for quorum
-    /// commitment.
+    /// Delegates to the proposer submodule for consensus commitment.
     async fn commit_to_consensus(
         &self,
         proposal: MutationProposal<'_>,
     ) -> Result<LogIndex, Status> {
-        let is_delete = proposal.intent.operation == OperationType::Delete as i32;
-
-        let mutation = CommittedMutation::new(
-            proposal.client_id,
-            proposal.sequence_id,
-            proposal.stabilized.resolved_item_key,
-            proposal.stabilized.suggested_display_name,
-            proposal.stabilized.updated_base_quantity,
-            proposal.stabilized.base_unit,
-            proposal.stabilized.display_unit,
-            proposal.stabilized.category.to_string(),
-            proposal.raw_user_input,
-            proposal.stabilized.moral_justification,
-            is_delete,
-            proposal.status,
-            std::time::SystemTime::now(),
-        );
-
-        let mut command = Vec::new();
-        mutation
-            .encode(&mut command)
-            .map_err(|e| self.internal_error(e.to_string()))?;
-
-        let proposal_index = self
-            .raft_handle
-            .propose(command)
+        proposer::commit_to_consensus(&*self.raft_handle, self.config.consensus_timeout, proposal)
             .await
-            .map_err(|e| self.map_consensus_error(e, proposal.consensus_status))?;
-
-        info!(
-            "Mutation index {} appended. Waiting for quorum...",
-            proposal_index
-        );
-
-        tokio::time::timeout(
-            self.config.consensus_timeout,
-            self.raft_handle.await_commit(proposal_index),
-        )
-        .await
-        .map_err(|_| {
-            Status::deadline_exceeded(format!(
-                "Quorum commitment for index {} timed out after {:?}",
-                proposal_index, self.config.consensus_timeout
-            ))
-        })?
-        .map_err(|e| self.map_consensus_error(e, proposal.consensus_status))?;
-        Ok(proposal_index)
     }
 
-    /// Constructs the final gRPC response reflecting the committed lifecycle
-    /// status.
+    /// Delegates to the proposer submodule for mutation response construction.
     fn build_mutation_response(
         &self,
         index: LogIndex,
         status: MutationStatus,
         moral_justification: String,
     ) -> Response<ProposeMutationResponse> {
-        Response::new(ProposeMutationResponse {
-            status: status as i32,
-            state_version: index.as_u64(),
-            leader_hint: String::new(),
-            error_message: if status == MutationStatus::Vetoed {
-                moral_justification
-            } else {
-                String::new()
-            },
-        })
-    }
-
-    /// Delegates to the stabilizer submodule for AI-resolved metadata
-    /// validation and SI unit stabilization.
-    fn validate_and_stabilize(
-        &self,
-        intent: &MutationIntent,
-        veto: &VetoOutcome,
-        current_inventory: &[GroceryItem],
-    ) -> Result<StabilizedMutation, Status> {
-        stabilizer::validate_and_stabilize(intent, veto, current_inventory)
+        proposer::build_mutation_response(index, status, moral_justification)
     }
 
     /// Delegates to the scrubber submodule for raw input formatting.
@@ -612,115 +461,9 @@ impl IngressDispatcher {
         scrubber::format_raw_input(intent)
     }
 
-    /// Executes the AI policy evaluation with timeout and error handling.
-    async fn evaluate_policy(
-        &self,
-        client_id: ClientId,
-        intent: &MutationIntent,
-        current_inventory: &[GroceryItem],
-        trace_id: TraceId,
-    ) -> Result<VetoOutcome, Status> {
-        let span = info_span!(
-            target: ClinicalTarget::ClinicalOracle.as_str(),
-            "veto_evaluation",
-            %trace_id,
-            timeout = ?self.config.veto_timeout
-        );
-
-        info!(
-            target: ClinicalTarget::ClinicalIngress.as_str(),
-            "Triggering AI Veto evaluation for normalized intent..."
-        );
-
-        let outcome = self
-            .veto_relay
-            .evaluate(
-                client_id,
-                intent,
-                current_inventory,
-                self.config.veto_timeout,
-                self.config.max_justification_len,
-                trace_id,
-            )
-            .instrument(span)
-            .await;
-
-        match outcome {
-            Ok(v) => {
-                if !v.is_approved {
-                    info!(
-                        target: ClinicalTarget::ClinicalIngress.as_str(),
-                        resolution = "Vetoed",
-                        "Mutation VETOED by AI"
-                    );
-                    tracing::trace!(
-                        target: ClinicalTarget::ClinicalIngress.as_str(),
-                        moral_justification = %v.moral_justification,
-                        "AI Moral Justification (PII)"
-                    );
-                }
-                Ok(v)
-            }
-            Err(VetoError::CausalIntegrityViolation) => {
-                // Byzantine Resilience: Explicitly detected trace grafting.
-                error!(
-                    target: ClinicalTarget::ClinicalTelemetry.as_str(),
-                    "Causal Integrity Violation: AI Veto Node returned mismatched TraceId"
-                );
-                Err(Status::failed_precondition("Causal Integrity Violation"))
-            }
-            Err(VetoError::Timeout(d)) => {
-                warn!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    timeout = ?d,
-                    "AI Veto evaluation timed out"
-                );
-                Err(Status::deadline_exceeded(
-                    "AI evaluation timed out. Please retry shortly.",
-                ))
-            }
-            Err(e) => {
-                error!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    error = %e,
-                    "AI Veto infrastructure failure"
-                );
-                Err(self.internal_error("Internal policy engine failure"))
-            }
-        }
-    }
-
-    /// Translates domain ConsensusErrors into standard gRPC Status objects.
+    /// Delegates to the proposer submodule for consensus error translation.
     fn map_consensus_error(&self, err: ConsensusError, status: &ConsensusAuthority) -> Status {
-        match err {
-            ConsensusError::NotLeader => Status::failed_precondition(format!(
-                "Not the leader. Hint: {} ({})",
-                status.leader_hint, status.rejection_reason
-            )),
-            ConsensusError::LeaderUnknown => {
-                Status::unavailable("Leader unknown. Election in progress.")
-            }
-            ConsensusError::CommitTimeout(idx) => {
-                Status::deadline_exceeded(format!("Proposal at index {} timed out", idx))
-            }
-            ConsensusError::Poisoned => {
-                error!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    "CRITICAL: Node is in a poisoned state due to fatal safety violation."
-                );
-                Status::aborted("Node is in a fatal state and cannot process requests.")
-            }
-            ConsensusError::Internal(msg) => {
-                error!(
-                    target: ClinicalTarget::ClinicalIngress.as_str(),
-                    error = %msg,
-                    "Consensus Internal Error"
-                );
-                Status::internal("Internal Consensus Failure")
-            }
-            ConsensusError::Terminated => Status::unavailable("Consensus engine is shutting down"),
-            ConsensusError::Timeout => Status::deadline_exceeded("Quorum verification timed out"),
-        }
+        proposer::map_consensus_error(err, status)
     }
 
     /// Generates a standard gRPC InvalidArgument status.
