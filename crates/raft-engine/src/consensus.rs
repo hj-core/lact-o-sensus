@@ -1079,7 +1079,7 @@ async fn prepare_and_replicate_to_peer<S: StateMachine>(
         } => {
             // If a snapshot is already in flight for this peer, we downgrade
             // to a lightweight heartbeat to avoid redundant heavy work.
-            if let Some(permit) = state.try_acquire_snapshot_permit(peer_id).await {
+            if let Some(permit) = state.try_acquire_snapshot_permit(peer_id) {
                 replicate_snapshot_to_peer(
                     state,
                     peer_manager,
@@ -2130,11 +2130,7 @@ mod tests {
                     }
 
                     let snapshot_index = LogIndex::new(50);
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let res = Ok(Some(ReplicationOutcome::InstallSnapshot {
                         last_included_index: snapshot_index,
                         response: InstallSnapshotResponse::new(Term::new(1)),
@@ -2189,11 +2185,7 @@ mod tests {
                         trace_id: TraceId::generate(),
                     };
 
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let res = replicate_snapshot_to_peer(
                         ctx.state.clone(),
                         ctx.peer_manager.clone(),
@@ -2238,11 +2230,7 @@ mod tests {
                         trace_id: TraceId::generate(),
                     };
 
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let res = replicate_snapshot_to_peer(
                         ctx.state.clone(),
                         ctx.peer_manager.clone(),
@@ -2324,11 +2312,7 @@ mod tests {
                         trace_id: TraceId::generate(),
                     };
 
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let _ = replicate_snapshot_to_peer(
                         ctx.state.clone(),
                         ctx.peer_manager.clone(),
@@ -2405,11 +2389,7 @@ mod tests {
                         trace_id: TraceId::generate(),
                     };
 
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let _ = replicate_snapshot_to_peer(
                         ctx.state.clone(),
                         ctx.peer_manager.clone(),
@@ -2712,11 +2692,7 @@ mod tests {
                     );
 
                     // 3. Execute snapshot task
-                    let permit = ctx
-                        .state
-                        .try_acquire_snapshot_permit(peer_id)
-                        .await
-                        .unwrap();
+                    let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
                     let res = replicate_snapshot_to_peer(
                         ctx.state.clone(),
                         pm,

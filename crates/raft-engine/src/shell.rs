@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
@@ -40,7 +41,7 @@ pub struct ConsensusShell<S: StateMachine> {
     /// via `freeze()` / `thaw()`; read via `is_frozen()`.
     fsm_freeze_depth: AtomicU32,
     /// Track peers with an active snapshot replication in flight.
-    in_flight_snapshots: Mutex<HashSet<NodeId>>,
+    in_flight_snapshots: StdMutex<HashSet<NodeId>>,
 }
 
 /// Returned by `freeze()` / `thaw()` when the freeze-depth invariant is
@@ -61,7 +62,7 @@ impl<S: StateMachine> ConsensusShell<S> {
             progress_tx,
             fsm_lock: Mutex::new(()),
             fsm_freeze_depth: AtomicU32::new(0),
-            in_flight_snapshots: Mutex::new(HashSet::new()),
+            in_flight_snapshots: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -70,11 +71,11 @@ impl<S: StateMachine> ConsensusShell<S> {
     ///
     /// Returns a RAII guard if successful, or None if a snapshot is already in
     /// flight.
-    pub async fn try_acquire_snapshot_permit(
+    pub fn try_acquire_snapshot_permit(
         self: &Arc<Self>,
         peer_id: NodeId,
     ) -> Option<SnapshotPermit<S>> {
-        let mut in_flight = self.in_flight_snapshots.lock().await;
+        let mut in_flight = self.in_flight_snapshots.lock().unwrap();
         if in_flight.insert(peer_id) {
             Some(SnapshotPermit {
                 shell: self.clone(),
@@ -287,14 +288,9 @@ pub struct SnapshotPermit<S: StateMachine> {
 
 impl<S: StateMachine> Drop for SnapshotPermit<S> {
     fn drop(&mut self) {
-        // We use a background task here because Drop cannot be async.
-        // ADR 011: This is a lightweight set operation and is safe for the executor.
-        let shell = self.shell.clone();
-        let peer_id = self.peer_id;
-        tokio::spawn(async move {
-            let mut in_flight = shell.in_flight_snapshots.lock().await;
-            in_flight.remove(&peer_id);
-        });
+        if let Ok(mut in_flight) = self.shell.in_flight_snapshots.lock() {
+            in_flight.remove(&self.peer_id);
+        }
     }
 }
 
@@ -309,39 +305,36 @@ mod tests {
     mod snapshot_permits {
         use super::*;
 
-        #[tokio::test]
-        async fn only_one_permit_can_be_held_per_peer() {
+        #[test]
+        fn only_one_permit_can_be_held_per_peer() {
             let shell = mock_shell();
             let peer_id = NodeId::try_new(2).unwrap();
 
             // 1. First permit acquisition succeeds
-            let permit1 = shell.try_acquire_snapshot_permit(peer_id).await;
+            let permit1 = shell.try_acquire_snapshot_permit(peer_id);
             assert!(permit1.is_some());
 
             // 2. Second permit acquisition for the SAME peer fails
-            let permit2 = shell.try_acquire_snapshot_permit(peer_id).await;
+            let permit2 = shell.try_acquire_snapshot_permit(peer_id);
             assert!(permit2.is_none());
 
             // 3. Acquisition for a DIFFERENT peer succeeds
             let peer_id_other = NodeId::try_new(3).unwrap();
-            let permit3 = shell.try_acquire_snapshot_permit(peer_id_other).await;
+            let permit3 = shell.try_acquire_snapshot_permit(peer_id_other);
             assert!(permit3.is_some());
         }
 
-        #[tokio::test]
-        async fn permit_is_released_when_dropped() {
+        #[test]
+        fn permit_is_released_when_dropped() {
             let shell = mock_shell();
             let peer_id = NodeId::try_new(2).unwrap();
 
             {
-                let _permit = shell.try_acquire_snapshot_permit(peer_id).await;
+                let _permit = shell.try_acquire_snapshot_permit(peer_id);
             }
 
-            // Drop is async (spawned), so give it a tiny moment
-            tokio::time::sleep(Duration::from_millis(5)).await;
-
-            // Acquisition should succeed again
-            let permit2 = shell.try_acquire_snapshot_permit(peer_id).await;
+            // Acquisition should succeed again (synchronously)
+            let permit2 = shell.try_acquire_snapshot_permit(peer_id);
             assert!(permit2.is_some());
         }
     }
