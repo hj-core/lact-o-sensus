@@ -279,7 +279,7 @@ async fn request_vote_from_peer(
     let response = client.request_vote(request).await?;
 
     // Causal Integrity Verification (ADR 010)
-    super::verify_trace_integrity(&response, params.trace_id, peer_id)?;
+    super::rpc::verify_trace_integrity(&response, params.trace_id, peer_id)?;
 
     Ok(response.into_inner())
 }
