@@ -1146,5 +1146,80 @@ mod tests {
                 }
             }
         }
+
+        mod install_snapshot {
+            use std::sync::Arc;
+            use std::thread;
+            use std::time::Duration;
+
+            use super::*;
+
+            #[test]
+            fn tombstone_lifecycle() {
+                // Prepare snapshot data from Store A
+                let store_a = setup_store();
+                let cid = ClientId::generate();
+                for i in 1..=50 {
+                    let mut data = Vec::new();
+                    let mut m = mock_mutation(&cid, i, MutationStatus::Committed);
+                    m.resolved_item_key = format!("item-{}", i);
+                    m.encode(&mut data).unwrap();
+                    store_a.apply(LogIndex::new(i), &data).unwrap();
+                }
+                let snapshot_data = store_a.snapshot().unwrap();
+
+                // Store B: will run install_snapshot in a background thread
+                let store_b = Arc::new(setup_store());
+
+                // Verify no tombstone before install_snapshot
+                assert!(
+                    !store_b
+                        .meta
+                        .contains_key(LactoStore::KEY_RESTORE_IN_PROGRESS)
+                        .unwrap()
+                );
+
+                let store_clone = store_b.clone();
+                let handle = thread::spawn(move || {
+                    store_clone
+                        .install_snapshot(LogIndex::new(100), &snapshot_data, TraceId::generate())
+                        .unwrap();
+                });
+
+                // Poll for tombstone presence during install_snapshot execution.
+                // install_snapshot writes the tombstone in step 1 and clears it in
+                // step 5. Since steps 2-4 involve I/O with 50 items, the tombstone
+                // window is long enough for reliable observation.
+                let tombstone_detected = loop {
+                    if store_b
+                        .meta
+                        .contains_key(LactoStore::KEY_RESTORE_IN_PROGRESS)
+                        .unwrap()
+                    {
+                        break true;
+                    }
+                    if handle.is_finished() {
+                        break false;
+                    }
+                    thread::sleep(Duration::from_micros(500));
+                };
+
+                assert!(
+                    tombstone_detected,
+                    "Tombstone flag must be observable during install_snapshot execution"
+                );
+
+                handle.join().unwrap();
+
+                // After completion, tombstone must be cleared
+                assert!(
+                    !store_b
+                        .meta
+                        .contains_key(LactoStore::KEY_RESTORE_IN_PROGRESS)
+                        .unwrap()
+                );
+                assert_eq!(store_b.last_applied_index().unwrap(), LogIndex::new(100));
+            }
+        }
     }
 }
