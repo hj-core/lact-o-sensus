@@ -44,6 +44,14 @@ To prevent "Split-Vote" live-locks, every node will pick a random duration betwe
 - **Transport Logic:** While TCP/gRPC provides point-to-point reliability (Reliable FIFO), the application must handle **Network Partitions** where a majority quorum cannot be reached.
 - **Replay Protection:** Deduplication is handled via the **Session Table (`sequence_id`)** at the state machine level (ADR 006).
 
+### 5. Pre-Vote Campaign Timeout
+
+To support the Pre-Vote mechanism (Phase 8), a campaign timeout is introduced:
+
+- **`PRE_VOTE_CAMPAIGN_TIMEOUT`:** ~80ms (2× RPC_TIMEOUT). This provides sufficient time for a full round-trip of PreVote requests to all peers while being short enough to not significantly delay the overall election MTTR.
+
+**MTTR Impact:** Pre-vote adds approximately one RTT (~40ms) to the success path, bringing the worst-case failover from ~340ms to ~380ms — still well within the sub-second recovery target.
+
 ## Rationale
 
 - **MTTR vs. Stability:** A 150ms–300ms election range provides a "Mean Time to Recover" of under 500ms in most failure scenarios, which is suitable for a responsive grocery application.
