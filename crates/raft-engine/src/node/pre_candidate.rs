@@ -10,6 +10,7 @@ use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use tracing::info;
 
+use super::Follower;
 use super::NodeState;
 use super::RaftNode;
 use super::TickAction;
@@ -55,6 +56,16 @@ impl PreCandidate {
 impl NodeState for PreCandidate {}
 
 impl RaftNode<PreCandidate> {
+    pub fn campaign_start(&self) -> Tick {
+        self.state.campaign_start
+    }
+
+    pub fn timeout(&self) -> TickDuration {
+        self.state.timeout
+    }
+}
+
+impl RaftNode<Follower> {
     pub fn try_into_pre_candidate(
         self,
         campaign_start: Tick,

@@ -254,10 +254,7 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
         let mut guard = self.state.write().await;
         self.verify_node_integrity(&mut guard)?;
 
-        // TODO(Task 4): Replace with guard.handle_pre_vote() once that method
-        // exists on LogicalNode. Currently delegates to request_vote as a
-        // temporary measure so the crate compiles during incremental build-out.
-        Ok(guard.handle_request_vote(
+        Ok(guard.handle_pre_vote(
             params.candidate_id,
             params.term,
             params.last_log_index,

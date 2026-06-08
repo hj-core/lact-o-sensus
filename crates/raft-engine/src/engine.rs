@@ -32,6 +32,7 @@ pub use crate::node::RaftNode;
 pub use crate::node::TickAction;
 use crate::storage::LogStorage;
 use crate::tick::Tick;
+use crate::tick::TickDuration;
 use crate::tick::TickThresholds;
 
 /// The logical role of a Raft node.
@@ -546,6 +547,47 @@ impl<S: StateMachine> LogicalNode<S> {
         }
     }
 
+    /// Processes a PreVote RPC (Phase 8: Pre-Vote Integrity).
+    ///
+    /// Read-only dry-run: does NOT demote on higher term, does NOT persist
+    /// voted_for, does NOT reset heartbeat timer. Only checks log up-to-date.
+    #[instrument(
+        name = "handle_pre_vote",
+        target = "raft::foundation",
+        skip_all,
+        fields(candidate = %candidate_id, term = %req_term)
+    )]
+    pub fn handle_pre_vote(
+        &mut self,
+        candidate_id: NodeId,
+        req_term: Term,
+        req_last_log_index: LogIndex,
+        req_last_log_term: Term,
+    ) -> RequestVoteResult {
+        // Phase 8: Pre-vote is read-only — NO term advancement, NO demotion,
+        // NO timer reset, NO persistence. Only log freshness is checked.
+        let vote_granted = match &mut self.state {
+            RoleState::Follower(node) => match node.grant_pre_vote(
+                candidate_id,
+                req_term,
+                req_last_log_index,
+                req_last_log_term,
+            ) {
+                Ok(granted) => granted,
+                Err(e) => {
+                    self.apply_fatal(e);
+                }
+            },
+            _ => false,
+        };
+
+        if vote_granted {
+            RequestVoteResult::granted(self.current_term())
+        } else {
+            RequestVoteResult::rejected(self.current_term())
+        }
+    }
+
     /// Appends a new command to the leader's log and returns the assigned log
     /// index.
     #[instrument(
@@ -628,6 +670,27 @@ impl<S: StateMachine> LogicalNode<S> {
             },
             RoleState::Candidate(n) => match n.try_into_restarted_candidate(tick, timeout) {
                 Ok(new) => RoleState::Candidate(new),
+                Err(e) => Self::apply_fatal_static(e),
+            },
+            other => other,
+        });
+    }
+
+    /// Transitions to PreCandidate role (Phase 8: Pre-Vote Integrity).
+    #[instrument(
+        name = "transition_to_pre_candidate",
+        target = "raft::foundation",
+        skip_all
+    )]
+    pub fn into_pre_candidate(&mut self) {
+        // Pre-vote campaign timeout: ~8 ticks (~80ms at 10ms/tick, 2× RPC_TIMEOUT).
+        // NOT the election timeout — this is a short dry-run window.
+        let pre_vote_timeout = TickDuration::new(8);
+        let tick = self.current_tick;
+
+        self.transition(|old_role| match old_role {
+            RoleState::Follower(n) => match n.try_into_pre_candidate(tick, pre_vote_timeout) {
+                Ok(new) => RoleState::PreCandidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
             other => other,
