@@ -15,6 +15,7 @@ pub(crate) mod types;
 pub(crate) use types::*;
 
 pub(crate) mod election;
+pub(crate) use election::start_pre_vote_campaign;
 
 pub(crate) mod replication;
 pub(crate) use replication::initiate_replication;

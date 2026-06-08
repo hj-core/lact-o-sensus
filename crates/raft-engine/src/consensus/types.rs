@@ -57,6 +57,28 @@ pub(super) struct ElectionCampaignParams {
     pub(super) trace_id: TraceId,
 }
 
+/// DTO for PreVote Campaign parameters, captured during the tick boundary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreVoteCampaignParams {
+    pub(crate) term: Term,
+    pub(crate) node_id: NodeId,
+    pub(crate) last_log_index: LogIndex,
+    pub(crate) last_log_term: Term,
+    pub(crate) rpc_timeout: std::time::Duration,
+    pub(crate) trace_id: TraceId,
+}
+
+/// Decision outcomes from the pre-vote tallying process.
+#[derive(Debug, PartialEq)]
+pub(super) enum PreVoteAction {
+    /// Pre-vote quorum reached; transition to Candidate for real election.
+    PreVoteQuorumReached,
+    /// Pre-vote denied; return to Follower without term change.
+    PreVoteDenied,
+    /// Pre-vote campaign continues.
+    Continue,
+}
+
 /// Decision outcomes from the vote-tallying process.
 ///
 /// Maps the distributed responses from peers into immediate state

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use common::proto::v1::raft::PreVoteRequest;
+use common::proto::v1::raft::PreVoteResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::raft_api::StateMachine;
@@ -22,6 +24,7 @@ use tracing::instrument;
 
 use super::types::ConsensusResult;
 use super::types::ElectionCampaignParams;
+use super::types::PreVoteCampaignParams;
 use super::types::RpcResult;
 use super::types::VoteAction;
 use super::types::VoteRequestParams;
@@ -279,6 +282,193 @@ async fn request_vote_from_peer(
     let response = client.request_vote(request).await?;
 
     // Causal Integrity Verification (ADR 010)
+    super::rpc::verify_trace_integrity(&response, params.trace_id, peer_id)?;
+
+    Ok(response.into_inner())
+}
+
+// =============================================================================
+// Phase 8: Pre-Vote Campaign (Election Safety)
+// =============================================================================
+
+/// Spawns an asynchronous task to orchestrate a pre-vote campaign.
+///
+/// Parented to the current role session telemetry context (ADR 010).
+pub(crate) fn start_pre_vote_campaign<S: StateMachine>(
+    config: Arc<Config>,
+    state: Arc<ConsensusShell<S>>,
+    peer_manager: Arc<PeerManager>,
+    params: PreVoteCampaignParams,
+    parent_span: tracing::Span,
+) {
+    let span = info_span!(
+        target: ClinicalTarget::RaftFoundation.as_str(),
+        parent: &parent_span,
+        "pre_vote_campaign",
+        trace_id = %params.trace_id,
+        term = %params.term
+    );
+
+    tokio::spawn(
+        async move {
+            if let Err(e) =
+                initiate_pre_vote(config, state.clone(), peer_manager, params).await
+            {
+                error!( error = %e, "Failed to execute pre-vote campaign");
+                let mut guard = state.write().await;
+                guard.apply_fatal(e);
+            }
+        }
+        .instrument(span),
+    );
+}
+
+/// Orchestrates a Pre-Vote Campaign by soliciting dry-run votes from peers.
+///
+/// Unlike a real election, pre-vote does NOT advance the term, does NOT count
+/// a self-vote, and does NOT demote on higher term responses. If quorum is
+/// reached, the node transitions to Candidate (which advances the term) and
+/// the tick loop triggers StartElection. Otherwise the campaign times out and
+/// the PreCandidate's evaluate_tick returns StepDown.
+#[instrument(
+    name = "pre_vote_campaign_execution",
+    target = "raft::foundation",
+    skip_all,
+    fields(term = %params.term, trace_id = %params.trace_id)
+)]
+pub(super) async fn initiate_pre_vote<S: StateMachine>(
+    config: Arc<Config>,
+    state: Arc<ConsensusShell<S>>,
+    peer_manager: Arc<PeerManager>,
+    params: PreVoteCampaignParams,
+) -> ConsensusResult<()> {
+    info!(
+        target: ClinicalTarget::RaftFoundation.as_str(),
+        last_log_index = %params.last_log_index,
+        last_log_term = %params.last_log_term,
+        term = %params.term,
+        "Starting pre-vote campaign."
+    );
+
+    let peer_ids = peer_manager.peer_ids();
+    let total_nodes = peer_ids.len() + 1;
+    let quorum = (total_nodes / 2) + 1;
+
+    let mut pre_vote_stream = broadcast_pre_vote_requests(
+        config.as_ref(),
+        peer_manager.clone(),
+        params.term,
+        params.node_id,
+        params.last_log_index,
+        params.last_log_term,
+        params.trace_id,
+    );
+
+    let mut pre_votes_granted = 0; // No self-vote in pre-election
+
+    while let Some((_peer_id, res)) = pre_vote_stream.next().await {
+        let granted = process_pre_vote_response(res)?;
+        if granted {
+            pre_votes_granted += 1;
+            if pre_votes_granted >= quorum {
+                let mut guard = state.write().await;
+                guard.into_candidate();
+                info!(
+                    target: ClinicalTarget::RaftFoundation.as_str(),
+                    votes = %pre_votes_granted,
+                    quorum = %quorum,
+                    "Pre-vote quorum reached. Transitioning to Candidate."
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    info!(
+        target: ClinicalTarget::RaftFoundation.as_str(),
+        votes = %pre_votes_granted,
+        quorum = %quorum,
+        "Pre-vote campaign finished without quorum."
+    );
+
+    Ok(())
+}
+
+/// Evaluates a single pre-vote response. Returns true if pre-vote granted.
+///
+/// Phase 8: No higher term demotion — pre-vote is read-only.
+fn process_pre_vote_response(
+    res: RpcResult<PreVoteResponse>,
+) -> ConsensusResult<bool> {
+    match res {
+        Ok(resp) => {
+            if resp.vote_granted {
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        Err(e) => {
+            debug!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                error = %e,
+                "Failed to get pre-vote from peer"
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Broadcasts PreVote RPCs concurrently to all cluster peers.
+fn broadcast_pre_vote_requests(
+    config: &Config,
+    peer_manager: Arc<PeerManager>,
+    term: Term,
+    node_id: NodeId,
+    last_log_index: LogIndex,
+    last_log_term: Term,
+    trace_id: TraceId,
+) -> FuturesUnordered<impl futures::Future<Output = (NodeId, RpcResult<PreVoteResponse>)>> {
+    let params = PreVoteCampaignParams {
+        term,
+        node_id,
+        last_log_index,
+        last_log_term,
+        rpc_timeout: config.raft.rpc_timeout(),
+        trace_id,
+    };
+
+    peer_manager
+        .peer_ids()
+        .into_iter()
+        .map(|peer_id| {
+            let pm = peer_manager.clone();
+            async move { (peer_id, request_pre_vote_from_peer(pm, peer_id, params).await) }
+        })
+        .collect()
+}
+
+/// Executes a single PreVote RPC with causal verification.
+async fn request_pre_vote_from_peer(
+    peer_manager: Arc<PeerManager>,
+    peer_id: NodeId,
+    params: PreVoteCampaignParams,
+) -> RpcResult<PreVoteResponse> {
+    let mut client = peer_manager.get_client(peer_id)?;
+
+    let mut request = Request::new(PreVoteRequest::new(
+        params.term,
+        params.node_id,
+        params.last_log_index,
+        params.last_log_term,
+    ));
+    request.set_timeout(params.rpc_timeout);
+
+    TraceInterceptor::inject_trace_id_into_request(&mut request, params.trace_id)
+        .map_err(|e| Status::internal(format!("Telemetry injection failed: {}", e)))?;
+
+    let response = client.pre_vote(request).await?;
+
     super::rpc::verify_trace_integrity(&response, params.trace_id, peer_id)?;
 
     Ok(response.into_inner())
