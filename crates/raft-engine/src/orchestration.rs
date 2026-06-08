@@ -558,7 +558,7 @@ mod tests {
 
                 assert!(matches!(
                     action,
-                    TickAction::None | TickAction::StartElection
+                    TickAction::None | TickAction::StartPreVote | TickAction::StartElection
                 ));
 
                 drop(guard);

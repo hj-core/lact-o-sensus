@@ -126,6 +126,27 @@ pub(super) async fn initiate_election<S: StateMachine>(
         }
     }
 
+    // Post-loop check: self-vote may already reach quorum
+    // (e.g. single-node cluster).
+    if votes_granted >= quorum {
+        let is_candidate = {
+            let guard = state.read().await;
+            matches!(guard.state(), RoleState::Candidate(_))
+        };
+        if is_candidate {
+            let mut guard = state.write().await;
+            let peer_ids = peer_manager.peer_ids();
+            guard.into_leader(peer_ids);
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                votes = %votes_granted,
+                quorum = %quorum,
+                "Election quorum reached (self-vote). Transitioning to Leader."
+            );
+            return Ok(());
+        }
+    }
+
     // Loop finished without reaching quorum or being demoted.
     let still_candidate = {
         let guard = state.read().await;
@@ -311,9 +332,7 @@ pub(crate) fn start_pre_vote_campaign<S: StateMachine>(
 
     tokio::spawn(
         async move {
-            if let Err(e) =
-                initiate_pre_vote(config, state.clone(), peer_manager, params).await
-            {
+            if let Err(e) = initiate_pre_vote(config, state.clone(), peer_manager, params).await {
                 error!( error = %e, "Failed to execute pre-vote campaign");
                 let mut guard = state.write().await;
                 guard.apply_fatal(e);
@@ -364,7 +383,7 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
         params.trace_id,
     );
 
-    let mut pre_votes_granted = 0; // No self-vote in pre-election
+    let mut pre_votes_granted = 1; // Self-vote counts in pre-election (standard Raft)
 
     while let Some((_peer_id, res)) = pre_vote_stream.next().await {
         let granted = process_pre_vote_response(res)?;
@@ -384,6 +403,20 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
         }
     }
 
+    // Post-loop check: self-vote may already reach quorum
+    // (e.g. single-node cluster, or all peers denied).
+    if pre_votes_granted >= quorum {
+        let mut guard = state.write().await;
+        guard.into_candidate();
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            votes = %pre_votes_granted,
+            quorum = %quorum,
+            "Pre-vote quorum reached (self-vote). Transitioning to Candidate."
+        );
+        return Ok(());
+    }
+
     info!(
         target: ClinicalTarget::RaftFoundation.as_str(),
         votes = %pre_votes_granted,
@@ -397,9 +430,7 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
 /// Evaluates a single pre-vote response. Returns true if pre-vote granted.
 ///
 /// Phase 8: No higher term demotion — pre-vote is read-only.
-fn process_pre_vote_response(
-    res: RpcResult<PreVoteResponse>,
-) -> ConsensusResult<bool> {
+fn process_pre_vote_response(res: RpcResult<PreVoteResponse>) -> ConsensusResult<bool> {
     match res {
         Ok(resp) => {
             if resp.vote_granted {
@@ -443,7 +474,12 @@ fn broadcast_pre_vote_requests(
         .into_iter()
         .map(|peer_id| {
             let pm = peer_manager.clone();
-            async move { (peer_id, request_pre_vote_from_peer(pm, peer_id, params).await) }
+            async move {
+                (
+                    peer_id,
+                    request_pre_vote_from_peer(pm, peer_id, params).await,
+                )
+            }
         })
         .collect()
 }

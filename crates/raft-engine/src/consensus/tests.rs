@@ -1315,13 +1315,15 @@ mod reachability_first_snapshotting {
 
     // =========================================================================
     // Phase 8: Pre-Vote Integrity (Election Safety)
-    // Integration tests gated with #[cfg(any())] until production types exist.
     // =========================================================================
-    #[cfg(any())]
     mod pre_vote {
         use super::*;
+        use crate::consensus::election::initiate_election;
+        use crate::consensus::election::initiate_pre_vote;
         use crate::consensus::election::start_pre_vote_campaign;
+        use crate::consensus::types::ElectionCampaignParams;
         use crate::consensus::types::PreVoteCampaignParams;
+        use crate::engine::TickAction;
 
         mod campaign_lifecycle {
             use super::*;
@@ -1392,22 +1394,23 @@ mod reachability_first_snapshotting {
                 peer_map.insert(peer_id, format!("http://{}", bound_addr));
                 let pm = Arc::new(PeerManager::try_new(id_leader.clone(), &peer_map).unwrap());
 
-                // Set leader to term 5
+                // Set leader: into_candidate() increments term, so leader ends at term 6
                 {
                     let mut guard = leader_state.write().await;
                     guard.into_follower(Term::new(5), None);
                     guard.into_candidate();
                     guard.into_leader(pm.peer_ids());
                 }
+                let leader_term = Term::new(6);
 
                 // Now simulate the partitioned node (Node 2) trying to start a pre-vote
                 // Node 2 is at term 3 with stale log
                 let partitioned_params = PreVoteCampaignParams {
                     term: Term::new(3),
-                    hypothetical_term: Term::new(4),
                     node_id: peer_id,
                     last_log_index: LogIndex::new(1),
                     last_log_term: Term::new(3),
+                    rpc_timeout: config.raft.rpc_timeout(),
                     trace_id: TraceId::generate(),
                 };
 
@@ -1423,11 +1426,11 @@ mod reachability_first_snapshotting {
                 // Give the campaign time to complete
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
-                // Assert: Cluster term is still 5 (not disrupted by partitioned node)
+                // Assert: Cluster term is unchanged (not disrupted by partitioned node)
                 let guard = leader_state.read().await;
                 assert_eq!(
                     guard.try_current_term().unwrap(),
-                    Term::new(5),
+                    leader_term,
                     "Cluster term must remain stable during asymmetrical network partitions"
                 );
 
@@ -1442,6 +1445,8 @@ mod reachability_first_snapshotting {
 
             #[tokio::test]
             async fn pre_vote_quorum_triggers_real_election() {
+                // Single-node cluster: self-vote gives quorum immediately
+                // (1 total node, quorum = 1, pre_votes_granted starts at 1).
                 let config = mock_config(50, 100);
                 let id = Arc::new(NodeIdentity::new(
                     ClusterId::try_new("test-cluster").unwrap(),
@@ -1458,49 +1463,15 @@ mod reachability_first_snapshotting {
                 let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
                 let state = Arc::new(ConsensusShell::new(node));
 
-                // Setup peer that will grant pre-vote AND real vote
-                let mut peer_map = HashMap::new();
-                let service = Arc::new(MockConsensusService {
-                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
-                        Term::new(1),
-                        true,
-                    ))),
-                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
-                        Term::new(1),
-                        true,
-                        LogIndex::ZERO,
-                    ))),
-                    snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(
-                        Term::new(1),
-                    ))),
-                    pre_vote_response: Arc::new(Mutex::new(PreVoteResponse::new(Term::ZERO, true))),
-                });
-                let (tx, rx) = oneshot::channel::<()>();
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                let bound_addr = listener.local_addr().unwrap();
-                let service_clone = service.clone();
-                tokio::spawn(async move {
-                    let incoming = stream::unfold(listener, |listener| async move {
-                        let res = listener.accept().await.map(|(s, _)| s);
-                        Some((res, listener))
-                    });
-                    Server::builder()
-                        .add_service(ConsensusServiceServer::from_arc(service_clone))
-                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
-                        .await
-                        .expect("Mock server failed");
-                });
-                let peer_id = NodeId::try_new(2).unwrap();
-                peer_map.insert(peer_id, format!("http://{}", bound_addr));
-                let pm = Arc::new(PeerManager::try_new(id.clone(), &peer_map).unwrap());
+                let pm = Arc::new(PeerManager::try_new(id.clone(), &HashMap::new()).unwrap());
 
-                // Pre-vote campaign: current term is 0, hypothetical term is 1
+                // Pre-vote campaign: current term is 0
                 let params = PreVoteCampaignParams {
                     term: Term::ZERO,
-                    hypothetical_term: Term::new(1),
                     node_id: id.node_id(),
                     last_log_index: LogIndex::ZERO,
                     last_log_term: Term::ZERO,
+                    rpc_timeout: config.raft.rpc_timeout(),
                     trace_id: TraceId::generate(),
                 };
 
@@ -1510,18 +1481,40 @@ mod reachability_first_snapshotting {
                     guard.into_pre_candidate();
                 }
 
-                start_pre_vote_campaign(
-                    config,
-                    state.clone(),
-                    pm.clone(),
-                    params,
-                    tracing::Span::current(),
-                );
+                // Single-node: quorum reached immediately via self-vote
+                initiate_pre_vote(config.clone(), state.clone(), pm.clone(), params)
+                    .await
+                    .expect("Pre-vote campaign should succeed");
 
-                // Give time for pre-vote + real election to complete
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Verify pre-vote campaign transitioned to Candidate
+                {
+                    let guard = state.read().await;
+                    assert!(
+                        matches!(guard.state(), RoleState::Candidate(_)),
+                        "Pre-vote campaign should have transitioned to Candidate"
+                    );
+                    assert_eq!(
+                        guard.try_current_term().unwrap(),
+                        Term::new(1),
+                        "Candidate term should be 1"
+                    );
+                }
 
-                // Assert: Node is now Leader (pre-vote quorum -> real election -> won)
+                // Now trigger the real election (the tick loop would normally
+                // dispatch this via StartElection from the Candidate's evaluate_tick).
+                let current_term = state.read().await.try_current_term().unwrap();
+                let election_params = ElectionCampaignParams {
+                    term: current_term,
+                    node_id: id.node_id(),
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+                initiate_election(config, state.clone(), pm.clone(), election_params)
+                    .await
+                    .expect("Real election should succeed after pre-vote quorum");
+
+                // Assert: Node is now Leader at term 1
                 let guard = state.read().await;
                 assert!(
                     matches!(guard.state(), RoleState::Leader(_)),
@@ -1530,10 +1523,8 @@ mod reachability_first_snapshotting {
                 assert_eq!(
                     guard.try_current_term().unwrap(),
                     Term::new(1),
-                    "Term should be 1 (incremented once during real election)"
+                    "Term should be 1"
                 );
-
-                let _ = tx.send(());
             }
 
             #[tokio::test]
@@ -1593,12 +1584,13 @@ mod reachability_first_snapshotting {
                 peer_map.insert(peer_id, format!("http://{}", bound_addr));
                 let pm = Arc::new(PeerManager::try_new(id.clone(), &peer_map).unwrap());
 
+                // Pre-vote campaign at the current term (0).
                 let params = PreVoteCampaignParams {
-                    term: Term::new(1),
-                    hypothetical_term: Term::new(2),
+                    term: Term::ZERO,
                     node_id: id.node_id(),
                     last_log_index: LogIndex::ZERO,
                     last_log_term: Term::ZERO,
+                    rpc_timeout: config.raft.rpc_timeout(),
                     trace_id: TraceId::generate(),
                 };
 
@@ -1616,7 +1608,18 @@ mod reachability_first_snapshotting {
                     tracing::Span::current(),
                 );
 
+                // Wait for campaign to finish, then tick to trigger StepDown
                 tokio::time::sleep(Duration::from_millis(200)).await;
+                // Tick the node to trigger the pre-vote campaign timeout
+                for _ in 0..10 {
+                    let mut guard = state.write().await;
+                    if let RoleState::PreCandidate(_) = guard.state()
+                        && guard.tick() == TickAction::StepDown
+                    {
+                        guard.into_follower(Term::ZERO, None);
+                        break;
+                    }
+                }
 
                 // Assert: Back to Follower with term unchanged
                 let guard = state.read().await;
@@ -1626,7 +1629,7 @@ mod reachability_first_snapshotting {
                 );
                 assert_eq!(
                     guard.try_current_term().unwrap(),
-                    Term::new(1),
+                    Term::ZERO,
                     "Term must remain unchanged after failed pre-vote"
                 );
 

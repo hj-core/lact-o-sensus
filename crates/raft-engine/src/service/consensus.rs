@@ -315,11 +315,13 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
         );
 
         // 3. Execution: Delegate to the internal logic shell.
-        let result = self.execute_pre_vote_logic(&params).instrument(span).await?;
+        let result = self
+            .execute_pre_vote_logic(&params)
+            .instrument(span)
+            .await?;
 
         // 4. Construction: Build the response and inject telemetry feedback.
-        let mut response =
-            Response::new(PreVoteResponse::new(result.term, result.vote_granted));
+        let mut response = Response::new(PreVoteResponse::new(result.term, result.vote_granted));
         TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
         Ok(response)
@@ -1024,14 +1026,14 @@ mod tests {
 
     // =========================================================================
     // Phase 8: Pre-Vote Integrity (Election Safety)
-    // gRPC handler tests gated with #[cfg(any())] until PreVote RPC exists.
+    // gRPC handler tests for the PreVote RPC.
     // =========================================================================
-    #[cfg(any())]
+    #[cfg(test)]
     mod pre_vote {
         use common::proto::v1::raft::PreVoteRequest;
-        use common::proto::v1::raft::PreVoteResponse;
 
         use super::*;
+        use crate::engine::RoleState;
 
         mod trace_integrity {
             use super::*;

@@ -10,6 +10,7 @@ use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
 use tracing::info;
 
+use super::Candidate;
 use super::Follower;
 use super::NodeState;
 use super::RaftNode;
@@ -62,6 +63,30 @@ impl RaftNode<PreCandidate> {
 
     pub fn timeout(&self) -> TickDuration {
         self.state.timeout
+    }
+
+    /// Transitions from PreCandidate to Candidate, advancing the term
+    /// and beginning a real election campaign.
+    pub fn try_into_candidate(
+        self,
+        election_start: Tick,
+        timeout: TickDuration,
+    ) -> Result<RaftNode<Candidate>, NodeError> {
+        let current_term = self.current_term()?;
+        let mut node = self.transition(Candidate::new(election_start, timeout));
+
+        let new_term = (current_term + 1)?;
+        let node_id = node.node_id();
+        node.advance_term_and_vote(new_term, node_id)?;
+        node.state_mut().add_vote(node_id);
+
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            term = %new_term,
+            "Role Transition: PreCandidate -> Candidate"
+        );
+
+        Ok(node)
     }
 }
 

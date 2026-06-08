@@ -92,7 +92,7 @@ impl Follower {
 
     pub fn evaluate_tick(&self, now: Tick) -> TickAction {
         if now >= self.last_heartbeat && now - self.last_heartbeat >= self.timeout {
-            TickAction::StartElection
+            TickAction::StartPreVote
         } else {
             TickAction::None
         }
@@ -369,7 +369,7 @@ mod tests {
                 let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
                 assert_eq!(
                     follower.evaluate_tick(Tick::new(150)),
-                    TickAction::StartElection
+                    TickAction::StartPreVote
                 );
             }
 
@@ -378,7 +378,7 @@ mod tests {
                 let follower = Follower::new(None, Tick::new(100), TickDuration::new(50));
                 assert_eq!(
                     follower.evaluate_tick(Tick::new(200)),
-                    TickAction::StartElection
+                    TickAction::StartPreVote
                 );
             }
         }

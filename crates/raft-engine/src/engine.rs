@@ -637,7 +637,8 @@ impl<S: StateMachine> LogicalNode<S> {
                 Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
-            RoleState::PreCandidate(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
+            RoleState::PreCandidate(n) => match n.try_into_follower(term, leader_id, tick, timeout)
+            {
                 Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
@@ -665,6 +666,10 @@ impl<S: StateMachine> LogicalNode<S> {
 
         self.transition(|old_role| match old_role {
             RoleState::Follower(n) => match n.try_into_candidate(tick, timeout) {
+                Ok(new) => RoleState::Candidate(new),
+                Err(e) => Self::apply_fatal_static(e),
+            },
+            RoleState::PreCandidate(n) => match n.try_into_candidate(tick, timeout) {
                 Ok(new) => RoleState::Candidate(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
@@ -1527,13 +1532,11 @@ mod tests {
             }
 
             #[test]
-            fn should_trigger_election_at_timeout() {
+            fn should_trigger_pre_vote_at_timeout() {
                 let mut node = setup_node(1);
-                // We don't know the exact randomized timeout (15..30),
-                // but it MUST trigger by 30.
                 let mut triggered = false;
                 for _ in 0..30 {
-                    if node.tick() == TickAction::StartElection {
+                    if node.tick() == TickAction::StartPreVote {
                         triggered = true;
                         break;
                     }
@@ -1626,12 +1629,7 @@ mod tests {
 
     // =========================================================================
     // Phase 8: Pre-Vote Integrity (Election Safety)
-    // These tests define the expected behavioral contract. They are gated with
-    // #[cfg(any())] to allow the crate to compile until the production code
-    // is implemented (Tasks 2-7). Remove the gate progressively as each type
-    // becomes available.
     // =========================================================================
-    #[cfg(any())]
     mod pre_vote {
         use super::*;
 
@@ -1669,15 +1667,13 @@ mod tests {
                 );
                 assert!(
                     !found_start_election,
-                    "Follower must NOT return StartElection — that is Candidate's \
-                     action"
+                    "Follower must NOT return StartElection — that is Candidate's action"
                 );
             }
         }
 
         mod pre_candidate_tick_returns_step_down {
             use super::*;
-            use crate::node::pre_candidate::PreCandidate;
 
             #[test]
             fn when_campaign_timeout_fires() {
@@ -1697,8 +1693,6 @@ mod tests {
 
         mod grant_pre_vote {
             use super::*;
-            use crate::node::follower::Follower;
-            use crate::storage::MemoryStorage;
 
             #[test]
             fn does_not_reset_heartbeat_timer() {
@@ -1746,8 +1740,8 @@ mod tests {
                     _ => panic!("Expected Follower"),
                 };
                 assert_eq!(
-                    voted_for_before.unwrap(),
-                    None,
+                    voted_for_before.as_ref().unwrap(),
+                    &None,
                     "No vote should be recorded initially"
                 );
 
@@ -1808,10 +1802,7 @@ mod tests {
                                 Term::new(1),
                             )
                             .unwrap();
-                        assert!(
-                            !granted,
-                            "Pre-vote must deny candidate with older log term"
-                        );
+                        assert!(!granted, "Pre-vote must deny candidate with older log term");
                     }
                     _ => panic!("Expected Follower"),
                 }
@@ -1831,10 +1822,7 @@ mod tests {
                                 Term::ZERO,
                             )
                             .unwrap();
-                        assert!(
-                            granted,
-                            "Pre-vote must grant for up-to-date candidate"
-                        );
+                        assert!(granted, "Pre-vote must grant for up-to-date candidate");
                     }
                     _ => panic!("Expected Follower"),
                 }
