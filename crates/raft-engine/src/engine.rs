@@ -27,6 +27,7 @@ use tracing::instrument;
 pub use crate::node::Candidate;
 pub use crate::node::Follower;
 pub use crate::node::Leader;
+pub use crate::node::PreCandidate;
 pub use crate::node::RaftNode;
 pub use crate::node::TickAction;
 use crate::storage::LogStorage;
@@ -37,6 +38,7 @@ use crate::tick::TickThresholds;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Follower,
+    PreCandidate,
     Candidate,
     Leader,
     Poisoned,
@@ -63,6 +65,7 @@ pub struct ConsensusProgress {
 #[derive(Debug)]
 pub enum RoleState {
     Follower(RaftNode<Follower>),
+    PreCandidate(RaftNode<PreCandidate>),
     Candidate(RaftNode<Candidate>),
     Leader(RaftNode<Leader>),
     Poisoned, // ADR 001: Safety barrier during transition failures
@@ -83,6 +86,7 @@ macro_rules! delegate_to_inner {
     ($self:ident, $method:ident $(, $args:expr)*) => {
         match &$self.state {
             RoleState::Follower(n) => n.$method($($args),*),
+            RoleState::PreCandidate(n) => n.$method($($args),*),
             RoleState::Candidate(n) => n.$method($($args),*),
             RoleState::Leader(n) => n.$method($($args),*),
             RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
@@ -94,6 +98,7 @@ macro_rules! delegate_mut_to_inner {
     ($self:ident, $method:ident $(, $args:expr)*) => {
         match &mut $self.state {
             RoleState::Follower(n) => n.$method($($args),*),
+            RoleState::PreCandidate(n) => n.$method($($args),*),
             RoleState::Candidate(n) => n.$method($($args),*),
             RoleState::Leader(n) => n.$method($($args),*),
             RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
@@ -419,6 +424,7 @@ impl<S: StateMachine> LogicalNode<S> {
     pub fn log_store(&self) -> Arc<dyn LogStorage> {
         match &self.state {
             RoleState::Follower(n) => n.log_store().clone(),
+            RoleState::PreCandidate(n) => n.log_store().clone(),
             RoleState::Candidate(n) => n.log_store().clone(),
             RoleState::Leader(n) => n.log_store().clone(),
             RoleState::Poisoned => panic!("Halt Mandate: Node is poisoned"),
@@ -589,6 +595,10 @@ impl<S: StateMachine> LogicalNode<S> {
                 Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
             },
+            RoleState::PreCandidate(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
+                Ok(new) => RoleState::Follower(new),
+                Err(e) => Self::apply_fatal_static(e),
+            },
             RoleState::Candidate(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
                 Ok(new) => RoleState::Follower(new),
                 Err(e) => Self::apply_fatal_static(e),
@@ -655,6 +665,7 @@ impl<S: StateMachine> LogicalNode<S> {
 
         match &mut self.state {
             RoleState::Follower(node) => node.state().evaluate_tick(now),
+            RoleState::PreCandidate(node) => node.state().evaluate_tick(now),
             RoleState::Candidate(node) => node.state().evaluate_tick(now),
             RoleState::Leader(node) => node
                 .state()
@@ -828,6 +839,15 @@ impl<S: StateMachine> LogicalNode<S> {
                 leader_hint: n.state().leader_id(),
                 confirmed_read_epoch: 0,
             }),
+            RoleState::PreCandidate(n) => Ok(ConsensusProgress {
+                term: n.current_term()?,
+                role: NodeRole::PreCandidate,
+                last_log_index: n.last_log_index()?,
+                last_committed: n.last_committed(),
+                last_applied: n.last_applied(),
+                leader_hint: None,
+                confirmed_read_epoch: 0,
+            }),
             RoleState::Candidate(n) => Ok(ConsensusProgress {
                 term: n.current_term()?,
                 role: NodeRole::Candidate,
@@ -875,6 +895,7 @@ impl<S: StateMachine> LogicalNode<S> {
     pub fn node_role(&self) -> NodeRole {
         match &self.state {
             RoleState::Follower(_) => NodeRole::Follower,
+            RoleState::PreCandidate(_) => NodeRole::PreCandidate,
             RoleState::Candidate(_) => NodeRole::Candidate,
             RoleState::Leader(_) => NodeRole::Leader,
             RoleState::Poisoned => NodeRole::Poisoned,

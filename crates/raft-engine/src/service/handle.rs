@@ -63,6 +63,10 @@ impl<S: StateMachine> LocalRaftHandle<S> {
     ) -> (String, String) {
         match role {
             NodeRole::Follower => self.follower_redirection(leader_hint),
+            NodeRole::PreCandidate => (
+                String::new(),
+                "Pre-election in progress. No leader established.".to_string(),
+            ),
             NodeRole::Candidate => (
                 String::new(),
                 "Election in progress. No leader established.".to_string(),

@@ -183,6 +183,20 @@ impl RaftNode<Follower> {
         Ok(false)
     }
 
+    /// Evaluates a pre-vote grant without any persistent state mutation.
+    /// Phase 8: Pre-Vote Integrity — Read-only check, no timer reset,
+    /// no persistence, no term advancement.
+    pub fn grant_pre_vote(
+        &self,
+        _candidate_id: NodeId,
+        _req_term: Term,
+        req_last_log_index: LogIndex,
+        req_last_log_term: Term,
+    ) -> Result<bool, NodeError> {
+        // Pre-vote only checks log up-to-date; no term check, no persistence.
+        self.is_log_up_to_date(req_last_log_term, req_last_log_index)
+    }
+
     /// Follower -> Candidate transition (Triggered by Election Timeout).
     pub fn try_into_candidate(
         self,

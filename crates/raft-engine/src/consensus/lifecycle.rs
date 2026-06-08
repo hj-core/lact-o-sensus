@@ -162,6 +162,12 @@ pub fn spawn_tick_loop<S: StateMachine>(
                             );
                         }
                     }
+                    TickAction::StartPreVote => {
+                        // TODO(Task 7): dispatch pre-vote campaign
+                    }
+                    TickAction::StepDown => {
+                        // TODO(Task 7): step down from pre-candidate
+                    }
                     TickAction::SendHeartbeat => {
                         if let Some(params) = replication {
                             initiate_replication(

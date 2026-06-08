@@ -36,6 +36,10 @@ pub enum TickAction {
     None,
     /// Election timeout reached; transition to Candidate and campaign.
     StartElection,
+    /// Pre-election timeout reached; transition to PreCandidate for dry-run.
+    StartPreVote,
+    /// Pre-vote campaign timeout or denied quorum; return to Follower.
+    StepDown,
     /// Heartbeat interval reached; send AppendEntries to all peers.
     SendHeartbeat,
     /// Terminal state reached; stop the tick loop (ADR 009).

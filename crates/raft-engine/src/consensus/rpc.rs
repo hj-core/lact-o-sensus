@@ -33,6 +33,7 @@ use crate::engine::RoleState;
 pub(super) fn determine_node_role_name<S: StateMachine>(node: &LogicalNode<S>) -> &'static str {
     match node.state() {
         RoleState::Follower(_) => "follower_session",
+        RoleState::PreCandidate(_) => "pre_candidate_session",
         RoleState::Candidate(_) => "candidate_session",
         RoleState::Leader(_) => "leader_idle_session",
         RoleState::Poisoned => "poisoned",

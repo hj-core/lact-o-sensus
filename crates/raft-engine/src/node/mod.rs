@@ -13,6 +13,7 @@ pub mod candidate;
 pub mod follower;
 pub mod fsm_ops;
 pub mod leader;
+pub mod pre_candidate;
 pub mod shared;
 
 #[cfg(test)]
@@ -23,4 +24,5 @@ pub(crate) mod test_utils;
 pub use candidate::*;
 pub use follower::*;
 pub use leader::*;
+pub use pre_candidate::*;
 pub use shared::*;
