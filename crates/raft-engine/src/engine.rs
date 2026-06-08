@@ -35,6 +35,10 @@ use crate::tick::Tick;
 use crate::tick::TickDuration;
 use crate::tick::TickThresholds;
 
+/// Pre-vote campaign timeout in ticks (~80ms at 10ms/tick, 2× RPC_TIMEOUT).
+/// NOT the election timeout — this is a short dry-run window.
+const PRE_VOTE_CAMPAIGN_TICKS: u64 = 8;
+
 /// The logical role of a Raft node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
@@ -288,6 +292,9 @@ impl<S: StateMachine> LogicalNode<S> {
                 }
                 RoleState::Follower(node) => {
                     node.state_mut().set_leader_id(Some(leader_id));
+                }
+                RoleState::PreCandidate(_) => {
+                    self.into_follower(req_term, Some(leader_id));
                 }
                 _ => {}
             }
@@ -688,9 +695,7 @@ impl<S: StateMachine> LogicalNode<S> {
         skip_all
     )]
     pub fn into_pre_candidate(&mut self) {
-        // Pre-vote campaign timeout: ~8 ticks (~80ms at 10ms/tick, 2× RPC_TIMEOUT).
-        // NOT the election timeout — this is a short dry-run window.
-        let pre_vote_timeout = TickDuration::new(8);
+        let pre_vote_timeout = TickDuration::new(PRE_VOTE_CAMPAIGN_TICKS);
         let tick = self.current_tick;
 
         self.transition(|old_role| match old_role {
