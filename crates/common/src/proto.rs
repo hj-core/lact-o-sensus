@@ -56,6 +56,33 @@ pub mod v1 {
             }
         }
 
+        impl PreVoteRequest {
+            /// Constructs a new PreVoteRequest with proper NewType conversion.
+            pub fn new(
+                term: Term,
+                candidate_id: NodeId,
+                last_log_index: LogIndex,
+                last_log_term: Term,
+            ) -> Self {
+                Self {
+                    term: term.as_u64(),
+                    candidate_id: candidate_id.to_string(),
+                    last_log_index: last_log_index.as_u64(),
+                    last_log_term: last_log_term.as_u64(),
+                }
+            }
+        }
+
+        impl PreVoteResponse {
+            /// Constructs a new PreVoteResponse with proper NewType conversion.
+            pub fn new(term: Term, vote_granted: bool) -> Self {
+                Self {
+                    term: term.as_u64(),
+                    vote_granted,
+                }
+            }
+        }
+
         impl AppendEntriesRequest {
             /// Constructs a new AppendEntriesRequest with proper NewType
             /// conversion.
@@ -403,6 +430,46 @@ mod tests {
                     assert_eq!(req.candidate_id, "1");
                     assert_eq!(req.last_log_index, 10);
                     assert_eq!(req.last_log_term, 4);
+                }
+            }
+        }
+
+        mod pre_vote_request {
+            use super::*;
+            mod new {
+                use super::*;
+                #[test]
+                fn initializes_fields_with_correct_conversions() {
+                    let req = PreVoteRequest::new(
+                        Term::new(3),
+                        NodeId::try_new(2).unwrap(),
+                        LogIndex::new(7),
+                        Term::new(2),
+                    );
+                    assert_eq!(req.term, 3);
+                    assert_eq!(req.candidate_id, "2");
+                    assert_eq!(req.last_log_index, 7);
+                    assert_eq!(req.last_log_term, 2);
+                }
+            }
+        }
+
+        mod pre_vote_response {
+            use super::*;
+            mod new {
+                use super::*;
+                #[test]
+                fn initializes_fields_with_correct_conversions() {
+                    let resp = PreVoteResponse::new(Term::new(3), true);
+                    assert_eq!(resp.term, 3);
+                    assert!(resp.vote_granted);
+                }
+
+                #[test]
+                fn represents_denied_vote() {
+                    let resp = PreVoteResponse::new(Term::new(5), false);
+                    assert_eq!(resp.term, 5);
+                    assert!(!resp.vote_granted);
                 }
             }
         }

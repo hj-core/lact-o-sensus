@@ -8,6 +8,8 @@ use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::InstallSnapshotRequest;
 use common::proto::v1::raft::InstallSnapshotResponse;
 use common::proto::v1::raft::LogEntry;
+use common::proto::v1::raft::PreVoteRequest;
+use common::proto::v1::raft::PreVoteResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
@@ -106,6 +108,7 @@ impl<S: StateMachine> TestContext<S> {
                     LogIndex::ZERO,
                 ))),
                 snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(Term::ZERO))),
+                pre_vote_response: Arc::new(Mutex::new(PreVoteResponse::new(Term::ZERO, true))),
             });
 
             let (tx, rx) = oneshot::channel::<()>();
@@ -157,6 +160,7 @@ struct MockConsensusService {
     vote_response: Arc<Mutex<RequestVoteResponse>>,
     append_response: Arc<Mutex<AppendEntriesResponse>>,
     snapshot_response: Arc<Mutex<InstallSnapshotResponse>>,
+    pre_vote_response: Arc<Mutex<PreVoteResponse>>,
 }
 
 #[async_trait]
@@ -191,6 +195,18 @@ impl ConsensusService for MockConsensusService {
     ) -> Result<Response<InstallSnapshotResponse>, Status> {
         let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
         let mut res = Response::new(*self.snapshot_response.lock().unwrap());
+        if let Some(val) = trace_id_header {
+            res.metadata_mut().insert(HEADER_TRACE_ID, val);
+        }
+        Ok(res)
+    }
+
+    async fn pre_vote(
+        &self,
+        request: Request<PreVoteRequest>,
+    ) -> Result<Response<PreVoteResponse>, Status> {
+        let trace_id_header = request.metadata().get(HEADER_TRACE_ID).cloned();
+        let mut res = Response::new(*self.pre_vote_response.lock().unwrap());
         if let Some(val) = trace_id_header {
             res.metadata_mut().insert(HEADER_TRACE_ID, val);
         }

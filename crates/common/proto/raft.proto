@@ -10,6 +10,8 @@ package raft.v1;
 service ConsensusService {
     // Solicitation of votes during a leadership campaign.
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    // Pre-election dry-run vote to prevent term disruption (Phase 8).
+    rpc PreVote(PreVoteRequest) returns (PreVoteResponse);
     // Replication of log entries and heartbeat synchronization.
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
     // Synchronize the full state machine snapshot to a follower.
@@ -26,6 +28,21 @@ message RequestVoteRequest {
 
 // Response to a RequestVote solicitation.
 message RequestVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+// Pre-election dry-run vote request (Phase 8). Read-only — does not mutate
+// term, persisted state, or heartbeat timer on the voter.
+message PreVoteRequest {
+    uint64 term = 1;
+    string candidate_id = 2;
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+}
+
+// Response to a PreVote solicitation.
+message PreVoteResponse {
     uint64 term = 1;
     bool vote_granted = 2;
 }

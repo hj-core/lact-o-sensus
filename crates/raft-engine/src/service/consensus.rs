@@ -12,6 +12,8 @@ use common::proto::v1::raft::AppendEntriesResponse;
 use common::proto::v1::raft::InstallSnapshotRequest;
 use common::proto::v1::raft::InstallSnapshotResponse;
 use common::proto::v1::raft::LogEntry;
+use common::proto::v1::raft::PreVoteRequest;
+use common::proto::v1::raft::PreVoteResponse;
 use common::proto::v1::raft::RequestVoteRequest;
 use common::proto::v1::raft::RequestVoteResponse;
 use common::proto::v1::raft::consensus_service_server::ConsensusService;
@@ -50,6 +52,30 @@ struct VoteParams {
 impl VoteParams {
     /// Translates raw Protobuf types into strict domain NewTypes.
     fn try_from_proto(req: RequestVoteRequest) -> Result<Self, Status> {
+        let candidate_id = req.candidate_id.parse::<NodeId>().map_err(|_| {
+            Status::invalid_argument(format!("Invalid NodeId: '{}'", req.candidate_id))
+        })?;
+
+        Ok(Self {
+            candidate_id,
+            term: Term::new(req.term),
+            last_log_index: LogIndex::new(req.last_log_index),
+            last_log_term: Term::new(req.last_log_term),
+        })
+    }
+}
+
+/// Encapsulates the fully validated and parsed parameters for a PreVote RPC.
+struct PreVoteParams {
+    candidate_id: NodeId,
+    term: Term,
+    last_log_index: LogIndex,
+    last_log_term: Term,
+}
+
+impl PreVoteParams {
+    /// Translates raw Protobuf types into strict domain NewTypes.
+    fn try_from_proto(req: PreVoteRequest) -> Result<Self, Status> {
         let candidate_id = req.candidate_id.parse::<NodeId>().map_err(|_| {
             Status::invalid_argument(format!("Invalid NodeId: '{}'", req.candidate_id))
         })?;
@@ -213,6 +239,31 @@ impl<S: StateMachine> ConsensusDispatcher<S> {
             params.leader_commit,
         ))
     }
+
+    /// Executes the core logic for a PreVote RPC.
+    #[instrument(
+        name = "execute_pre_vote_logic",
+        target = "raft::foundation",
+        skip_all,
+        fields(candidate = %params.candidate_id, term = %params.term)
+    )]
+    async fn execute_pre_vote_logic(
+        &self,
+        params: &PreVoteParams,
+    ) -> Result<crate::engine::RequestVoteResult, Status> {
+        let mut guard = self.state.write().await;
+        self.verify_node_integrity(&mut guard)?;
+
+        // TODO(Task 4): Replace with guard.handle_pre_vote() once that method
+        // exists on LogicalNode. Currently delegates to request_vote as a
+        // temporary measure so the crate compiles during incremental build-out.
+        Ok(guard.handle_request_vote(
+            params.candidate_id,
+            params.term,
+            params.last_log_index,
+            params.last_log_term,
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -242,6 +293,36 @@ impl<S: StateMachine> ConsensusService for ConsensusDispatcher<S> {
         // 4. Construction: Build the response and inject telemetry feedback.
         let mut response =
             Response::new(RequestVoteResponse::new(result.term, result.vote_granted));
+        TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
+
+        Ok(response)
+    }
+
+    async fn pre_vote(
+        &self,
+        request: Request<PreVoteRequest>,
+    ) -> Result<Response<PreVoteResponse>, Status> {
+        // 1. Extraction: Enforce TraceId presence and parse domain parameters.
+        let trace_id = TraceInterceptor::require_trace_id(&request)?;
+        let params = PreVoteParams::try_from_proto(request.into_inner())?;
+
+        // 2. Instrumentation: Establish the clinical boundary.
+        let span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            "pre_vote",
+            cluster_id = %self.identity.cluster_id(),
+            node_id = %self.identity.node_id(),
+            trace_id = %trace_id,
+            term = %params.term,
+            sender_id = %params.candidate_id
+        );
+
+        // 3. Execution: Delegate to the internal logic shell.
+        let result = self.execute_pre_vote_logic(&params).instrument(span).await?;
+
+        // 4. Construction: Build the response and inject telemetry feedback.
+        let mut response =
+            Response::new(PreVoteResponse::new(result.term, result.vote_granted));
         TraceInterceptor::inject_trace_id_into_response(&mut response, trace_id)?;
 
         Ok(response)
