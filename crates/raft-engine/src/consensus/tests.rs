@@ -1296,4 +1296,326 @@ mod reachability_first_snapshotting {
             assert!(guard.is_poisoned());
         }
     }
+
+    // =========================================================================
+    // Phase 8: Pre-Vote Integrity (Election Safety)
+    // Integration tests gated with #[cfg(any())] until production types exist.
+    // =========================================================================
+    #[cfg(any())]
+    mod pre_vote {
+        use super::*;
+        use crate::consensus::election::start_pre_vote_campaign;
+        use crate::consensus::types::PreVoteCampaignParams;
+
+        mod campaign_lifecycle {
+            use super::*;
+
+            #[tokio::test]
+            async fn partitioned_node_does_not_disrupt_cluster_term() {
+                // Setup: Node 1 is Leader at term 5 with committed entries.
+                // Node 2 (the partitioned one) has term 3 with stale log.
+                let config = mock_config(50, 100);
+                let id_leader = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage_leader = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let leader_fsm = Arc::new(MockFsm);
+                let leader_node = LogicalNode::try_new(
+                    id_leader.clone(),
+                    leader_fsm,
+                    storage_leader,
+                    thresholds,
+                    rng,
+                )
+                .unwrap();
+                let leader_state = Arc::new(ConsensusShell::new(leader_node));
+
+                // Peer manager with Node 2 as remote peer
+                let mut peer_map = HashMap::new();
+                let service = Arc::new(MockConsensusService {
+                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
+                        Term::new(5),
+                        true,
+                    ))),
+                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
+                        Term::new(5),
+                        true,
+                        LogIndex::new(10),
+                    ))),
+                    snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(
+                        Term::new(5),
+                    ))),
+                    pre_vote_response: Arc::new(Mutex::new(PreVoteResponse::new(
+                        Term::new(5),
+                        false,
+                    ))),
+                });
+                let (tx, rx) = oneshot::channel::<()>();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bound_addr = listener.local_addr().unwrap();
+                let service_clone = service.clone();
+                tokio::spawn(async move {
+                    let incoming = stream::unfold(listener, |listener| async move {
+                        let res = listener.accept().await.map(|(s, _)| s);
+                        Some((res, listener))
+                    });
+                    Server::builder()
+                        .add_service(ConsensusServiceServer::from_arc(service_clone))
+                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
+                        .await
+                        .expect("Mock server failed");
+                });
+                let peer_id = NodeId::try_new(2).unwrap();
+                peer_map.insert(peer_id, format!("http://{}", bound_addr));
+                let pm = Arc::new(PeerManager::try_new(id_leader.clone(), &peer_map).unwrap());
+
+                // Set leader to term 5
+                {
+                    let mut guard = leader_state.write().await;
+                    guard.into_follower(Term::new(5), None);
+                    guard.into_candidate();
+                    guard.into_leader(pm.peer_ids());
+                }
+
+                // Now simulate the partitioned node (Node 2) trying to start a pre-vote
+                // Node 2 is at term 3 with stale log
+                let partitioned_params = PreVoteCampaignParams {
+                    term: Term::new(3),
+                    hypothetical_term: Term::new(4),
+                    node_id: peer_id,
+                    last_log_index: LogIndex::new(1),
+                    last_log_term: Term::new(3),
+                    trace_id: TraceId::generate(),
+                };
+
+                // Execute pre-vote campaign
+                start_pre_vote_campaign(
+                    config.clone(),
+                    leader_state.clone(),
+                    pm.clone(),
+                    partitioned_params,
+                    tracing::Span::current(),
+                );
+
+                // Give the campaign time to complete
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // Assert: Cluster term is still 5 (not disrupted by partitioned node)
+                let guard = leader_state.read().await;
+                assert_eq!(
+                    guard.try_current_term().unwrap(),
+                    Term::new(5),
+                    "Cluster term must remain stable during asymmetrical network partitions"
+                );
+
+                // Assert: Leader is still Leader (not demoted by pre-vote)
+                assert!(
+                    matches!(guard.state(), RoleState::Leader(_)),
+                    "Existing leader must not be demoted by a stale pre-vote request"
+                );
+
+                let _ = tx.send(());
+            }
+
+            #[tokio::test]
+            async fn pre_vote_quorum_triggers_real_election() {
+                let config = mock_config(50, 100);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let fsm = Arc::new(MockFsm);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Setup peer that will grant pre-vote AND real vote
+                let mut peer_map = HashMap::new();
+                let service = Arc::new(MockConsensusService {
+                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
+                        Term::new(1),
+                        true,
+                    ))),
+                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
+                        Term::new(1),
+                        true,
+                        LogIndex::ZERO,
+                    ))),
+                    snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(
+                        Term::new(1),
+                    ))),
+                    pre_vote_response: Arc::new(Mutex::new(PreVoteResponse::new(Term::ZERO, true))),
+                });
+                let (tx, rx) = oneshot::channel::<()>();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bound_addr = listener.local_addr().unwrap();
+                let service_clone = service.clone();
+                tokio::spawn(async move {
+                    let incoming = stream::unfold(listener, |listener| async move {
+                        let res = listener.accept().await.map(|(s, _)| s);
+                        Some((res, listener))
+                    });
+                    Server::builder()
+                        .add_service(ConsensusServiceServer::from_arc(service_clone))
+                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
+                        .await
+                        .expect("Mock server failed");
+                });
+                let peer_id = NodeId::try_new(2).unwrap();
+                peer_map.insert(peer_id, format!("http://{}", bound_addr));
+                let pm = Arc::new(PeerManager::try_new(id.clone(), &peer_map).unwrap());
+
+                // Pre-vote campaign: current term is 0, hypothetical term is 1
+                let params = PreVoteCampaignParams {
+                    term: Term::ZERO,
+                    hypothetical_term: Term::new(1),
+                    node_id: id.node_id(),
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+
+                // Need to be in PreCandidate state for campaign to work
+                {
+                    let mut guard = state.write().await;
+                    guard.into_pre_candidate();
+                }
+
+                start_pre_vote_campaign(
+                    config,
+                    state.clone(),
+                    pm.clone(),
+                    params,
+                    tracing::Span::current(),
+                );
+
+                // Give time for pre-vote + real election to complete
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                // Assert: Node is now Leader (pre-vote quorum -> real election -> won)
+                let guard = state.read().await;
+                assert!(
+                    matches!(guard.state(), RoleState::Leader(_)),
+                    "Node should become Leader after pre-vote quorum and real election"
+                );
+                assert_eq!(
+                    guard.try_current_term().unwrap(),
+                    Term::new(1),
+                    "Term should be 1 (incremented once during real election)"
+                );
+
+                let _ = tx.send(());
+            }
+
+            #[tokio::test]
+            async fn pre_vote_no_quorum_returns_to_follower_without_term_change() {
+                let config = mock_config(50, 100);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let fsm = Arc::new(MockFsm);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Peer that denies pre-vote
+                let mut peer_map = HashMap::new();
+                let service = Arc::new(MockConsensusService {
+                    vote_response: Arc::new(Mutex::new(RequestVoteResponse::new(
+                        Term::ZERO,
+                        false,
+                    ))),
+                    append_response: Arc::new(Mutex::new(AppendEntriesResponse::new(
+                        Term::ZERO,
+                        false,
+                        LogIndex::ZERO,
+                    ))),
+                    snapshot_response: Arc::new(Mutex::new(InstallSnapshotResponse::new(
+                        Term::ZERO,
+                    ))),
+                    pre_vote_response: Arc::new(Mutex::new(PreVoteResponse::new(
+                        Term::ZERO,
+                        false,
+                    ))),
+                });
+                let (tx, rx) = oneshot::channel::<()>();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let bound_addr = listener.local_addr().unwrap();
+                let service_clone = service.clone();
+                tokio::spawn(async move {
+                    let incoming = stream::unfold(listener, |listener| async move {
+                        let res = listener.accept().await.map(|(s, _)| s);
+                        Some((res, listener))
+                    });
+                    Server::builder()
+                        .add_service(ConsensusServiceServer::from_arc(service_clone))
+                        .serve_with_incoming_shutdown(incoming, rx.map(|_| ()))
+                        .await
+                        .expect("Mock server failed");
+                });
+                let peer_id = NodeId::try_new(2).unwrap();
+                peer_map.insert(peer_id, format!("http://{}", bound_addr));
+                let pm = Arc::new(PeerManager::try_new(id.clone(), &peer_map).unwrap());
+
+                let params = PreVoteCampaignParams {
+                    term: Term::new(1),
+                    hypothetical_term: Term::new(2),
+                    node_id: id.node_id(),
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    trace_id: TraceId::generate(),
+                };
+
+                // Transition to PreCandidate
+                {
+                    let mut guard = state.write().await;
+                    guard.into_pre_candidate();
+                }
+
+                start_pre_vote_campaign(
+                    config,
+                    state.clone(),
+                    pm.clone(),
+                    params,
+                    tracing::Span::current(),
+                );
+
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // Assert: Back to Follower with term unchanged
+                let guard = state.read().await;
+                assert!(
+                    matches!(guard.state(), RoleState::Follower(_)),
+                    "Node should return to Follower after failed pre-vote"
+                );
+                assert_eq!(
+                    guard.try_current_term().unwrap(),
+                    Term::new(1),
+                    "Term must remain unchanged after failed pre-vote"
+                );
+
+                let _ = tx.send(());
+            }
+        }
+    }
 }

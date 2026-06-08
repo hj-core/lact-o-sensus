@@ -943,4 +943,202 @@ mod tests {
             }
         }
     }
+
+    // =========================================================================
+    // Phase 8: Pre-Vote Integrity (Election Safety)
+    // gRPC handler tests gated with #[cfg(any())] until PreVote RPC exists.
+    // =========================================================================
+    #[cfg(any())]
+    mod pre_vote {
+        use common::proto::v1::raft::PreVoteRequest;
+        use common::proto::v1::raft::PreVoteResponse;
+
+        use super::*;
+
+        mod trace_integrity {
+            use super::*;
+
+            #[tokio::test]
+            async fn injects_trace_id_into_response() {
+                let dispatcher = mock_dispatcher();
+                let req = PreVoteRequest {
+                    term: 1,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                };
+
+                let trace_id = TraceId::generate();
+                let mut request = Request::new(req);
+                request.extensions_mut().insert(trace_id);
+
+                let resp = dispatcher.pre_vote(request).await.unwrap();
+                assert_eq!(
+                    TraceInterceptor::extract_trace_id_from_response(&resp).unwrap(),
+                    trace_id
+                );
+            }
+
+            #[tokio::test]
+            async fn rejects_request_missing_trace_id() {
+                let dispatcher = mock_dispatcher();
+                let req = Request::new(PreVoteRequest {
+                    term: 1,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                });
+
+                let result = dispatcher.pre_vote(req).await;
+                assert!(result.is_err());
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+        }
+
+        mod term_semantics {
+            use super::*;
+
+            #[tokio::test]
+            async fn higher_term_does_not_demote_follower() {
+                let dispatcher = mock_dispatcher();
+
+                // Follower at term 3
+                {
+                    let mut guard = dispatcher.state.write().await;
+                    guard.into_follower(Term::new(3), None);
+                }
+
+                let req = PreVoteRequest {
+                    term: 10, // Much higher term — should NOT demote
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                };
+
+                let response = dispatcher
+                    .pre_vote(make_request(req))
+                    .await
+                    .unwrap()
+                    .into_inner();
+
+                // Response term must be 3 (not 10) — no demotion
+                assert_eq!(
+                    response.term, 3,
+                    "PreVote response must reflect the Follower's current term, not the request \
+                     term"
+                );
+
+                // Verify node is still Follower
+                let guard = dispatcher.state.read().await;
+                assert!(
+                    matches!(guard.state(), RoleState::Follower(_)),
+                    "Node must remain Follower after receiving PreVote with higher term"
+                );
+                assert_eq!(
+                    guard.try_current_term().unwrap(),
+                    Term::new(3),
+                    "Follower's term must remain unchanged after PreVote with higher term"
+                );
+            }
+
+            #[tokio::test]
+            async fn grants_pre_vote_to_up_to_date_candidate() {
+                let dispatcher = mock_dispatcher();
+
+                let req = PreVoteRequest {
+                    term: 1,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                };
+
+                let response = dispatcher
+                    .pre_vote(make_request(req))
+                    .await
+                    .unwrap()
+                    .into_inner();
+
+                assert!(
+                    response.vote_granted,
+                    "PreVote should be granted to candidate with up-to-date log"
+                );
+                assert_eq!(
+                    response.term, 0,
+                    "Response term should be 0 (Follower's current term)"
+                );
+            }
+
+            #[tokio::test]
+            async fn denies_pre_vote_to_candidate_with_stale_log() {
+                let dispatcher = mock_dispatcher();
+
+                // Populate local log with entry at term 2
+                {
+                    let mut guard = dispatcher.state.write().await;
+                    let node = guard.as_follower_mut().expect("Should be follower");
+                    node.log_store()
+                        .append_entries(vec![common::proto::v1::raft::LogEntry::new(
+                            LogIndex::new(1),
+                            Term::new(2),
+                            vec![],
+                        )])
+                        .unwrap();
+                }
+
+                let req = PreVoteRequest {
+                    term: 2,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 5, // Longer log
+                    last_log_term: 1,  // but older term
+                };
+
+                let response = dispatcher
+                    .pre_vote(make_request(req))
+                    .await
+                    .unwrap()
+                    .into_inner();
+
+                assert!(
+                    !response.vote_granted,
+                    "PreVote must be denied to candidate with stale log term"
+                );
+            }
+
+            #[tokio::test]
+            async fn grants_pre_vote_when_candidate_has_newer_term() {
+                let dispatcher = mock_dispatcher();
+
+                // Local log: 1 entry at term 1
+                {
+                    let mut guard = dispatcher.state.write().await;
+                    let node = guard.as_follower_mut().expect("Should be follower");
+                    node.log_store()
+                        .append_entries(vec![common::proto::v1::raft::LogEntry::new(
+                            LogIndex::new(1),
+                            Term::new(1),
+                            vec![],
+                        )])
+                        .unwrap();
+                }
+
+                let req = PreVoteRequest {
+                    term: 2,
+                    candidate_id: "2".to_string(),
+                    last_log_index: 1, // Shorter log, but...
+                    last_log_term: 2,  // ...newer term
+                };
+
+                let response = dispatcher
+                    .pre_vote(make_request(req))
+                    .await
+                    .unwrap()
+                    .into_inner();
+
+                assert!(
+                    response.vote_granted,
+                    "PreVote should be granted when candidate has a newer term"
+                );
+            }
+        }
+    }
 }

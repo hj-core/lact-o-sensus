@@ -1539,4 +1539,333 @@ mod tests {
             }
         }
     }
+
+    // =========================================================================
+    // Phase 8: Pre-Vote Integrity (Election Safety)
+    // These tests define the expected behavioral contract. They are gated with
+    // #[cfg(any())] to allow the crate to compile until the production code
+    // is implemented (Tasks 2-7). Remove the gate progressively as each type
+    // becomes available.
+    // =========================================================================
+    #[cfg(any())]
+    mod pre_vote {
+        use super::*;
+
+        mod follower_tick_returns_start_pre_vote {
+            use super::*;
+
+            #[test]
+            fn when_election_timeout_fires() {
+                let mut node = setup_node(1);
+                let mut triggered = false;
+                for _ in 0..30 {
+                    if node.tick() == TickAction::StartPreVote {
+                        triggered = true;
+                        break;
+                    }
+                }
+                assert!(triggered);
+            }
+
+            #[test]
+            fn does_not_return_start_election() {
+                let mut node = setup_node(1);
+                let mut found_start_election = false;
+                let mut found_start_pre_vote = false;
+                for _ in 0..30 {
+                    match node.tick() {
+                        TickAction::StartElection => found_start_election = true,
+                        TickAction::StartPreVote => found_start_pre_vote = true,
+                        _ => {}
+                    }
+                }
+                assert!(
+                    found_start_pre_vote,
+                    "Follower should return StartPreVote on timeout, not StartElection"
+                );
+                assert!(
+                    !found_start_election,
+                    "Follower must NOT return StartElection — that is Candidate's \
+                     action"
+                );
+            }
+        }
+
+        mod pre_candidate_tick_returns_step_down {
+            use super::*;
+            use crate::node::pre_candidate::PreCandidate;
+
+            #[test]
+            fn when_campaign_timeout_fires() {
+                let mut node = setup_node(1);
+                node.into_pre_candidate();
+
+                let mut triggered = false;
+                for _ in 0..30 {
+                    if node.tick() == TickAction::StepDown {
+                        triggered = true;
+                        break;
+                    }
+                }
+                assert!(triggered);
+            }
+        }
+
+        mod grant_pre_vote {
+            use super::*;
+            use crate::node::follower::Follower;
+            use crate::storage::MemoryStorage;
+
+            #[test]
+            fn does_not_reset_heartbeat_timer() {
+                let mut node = setup_node(1);
+                let initial_heartbeat = match &node.state {
+                    RoleState::Follower(n) => n.state().last_heartbeat(),
+                    _ => panic!("Expected Follower"),
+                };
+
+                for _ in 0..5 {
+                    node.tick();
+                }
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        let _ = n
+                            .grant_pre_vote(
+                                NodeId::try_new(2).unwrap(),
+                                Term::new(1),
+                                LogIndex::ZERO,
+                                Term::ZERO,
+                            )
+                            .unwrap();
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+
+                let heartbeat_after = match &node.state {
+                    RoleState::Follower(n) => n.state().last_heartbeat(),
+                    _ => panic!("Expected Follower"),
+                };
+
+                assert_eq!(
+                    initial_heartbeat, heartbeat_after,
+                    "grant_pre_vote must NOT reset the heartbeat timer"
+                );
+            }
+
+            #[test]
+            fn does_not_persist_voted_for() {
+                let mut node = setup_node(1);
+
+                let voted_for_before = match &node.state {
+                    RoleState::Follower(n) => n.voted_for(),
+                    _ => panic!("Expected Follower"),
+                };
+                assert_eq!(
+                    voted_for_before.unwrap(),
+                    None,
+                    "No vote should be recorded initially"
+                );
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        let granted = n
+                            .grant_pre_vote(
+                                NodeId::try_new(2).unwrap(),
+                                Term::new(1),
+                                LogIndex::ZERO,
+                                Term::ZERO,
+                            )
+                            .unwrap();
+                        assert!(
+                            granted,
+                            "Pre-vote should be granted for up-to-date candidate"
+                        );
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+
+                let voted_for_after = match &node.state {
+                    RoleState::Follower(n) => n.voted_for(),
+                    _ => panic!("Expected Follower"),
+                };
+
+                assert_eq!(
+                    voted_for_before.unwrap(),
+                    voted_for_after.unwrap(),
+                    "grant_pre_vote must NOT persist voted_for"
+                );
+            }
+
+            #[test]
+            fn respects_log_up_to_date_check() {
+                let mut node = setup_node(1);
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        n.log_store()
+                            .append_entries(vec![LogEntry::new(
+                                LogIndex::new(1),
+                                Term::new(2),
+                                vec![],
+                            )])
+                            .unwrap();
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        let granted = n
+                            .grant_pre_vote(
+                                NodeId::try_new(2).unwrap(),
+                                Term::new(2),
+                                LogIndex::new(5),
+                                Term::new(1),
+                            )
+                            .unwrap();
+                        assert!(
+                            !granted,
+                            "Pre-vote must deny candidate with older log term"
+                        );
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+            }
+
+            #[test]
+            fn grants_when_candidate_log_is_up_to_date() {
+                let mut node = setup_node(1);
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        let granted = n
+                            .grant_pre_vote(
+                                NodeId::try_new(2).unwrap(),
+                                Term::new(1),
+                                LogIndex::ZERO,
+                                Term::ZERO,
+                            )
+                            .unwrap();
+                        assert!(
+                            granted,
+                            "Pre-vote must grant for up-to-date candidate"
+                        );
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+            }
+        }
+
+        mod candidate_restart {
+            use super::*;
+
+            #[test]
+            fn skips_pre_vote_and_returns_start_election() {
+                let mut node = setup_node(1);
+                node.into_candidate();
+
+                let mut triggered_start_election = false;
+                for _ in 0..30 {
+                    if node.tick() == TickAction::StartElection {
+                        triggered_start_election = true;
+                        break;
+                    }
+                }
+                assert!(
+                    triggered_start_election,
+                    "Candidate restart must return StartElection, not StartPreVote"
+                );
+            }
+        }
+
+        mod handle_pre_vote {
+            use super::*;
+
+            #[test]
+            fn higher_term_does_not_demote() {
+                let mut node = setup_node(1);
+
+                let result = node.handle_pre_vote(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(10),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                );
+
+                assert_eq!(
+                    result.term,
+                    Term::ZERO,
+                    "handle_pre_vote must NOT advance term on higher req_term"
+                );
+
+                assert!(
+                    matches!(node.state, RoleState::Follower(_)),
+                    "Node must remain Follower after handle_pre_vote with higher term"
+                );
+            }
+
+            #[test]
+            fn grants_vote_when_log_is_up_to_date() {
+                let mut node = setup_node(1);
+
+                let result = node.handle_pre_vote(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(1),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                );
+
+                assert!(result.vote_granted, "Pre-vote should be granted");
+                assert_eq!(result.term, Term::ZERO, "Term must remain unchanged");
+            }
+
+            #[test]
+            fn rejects_vote_when_candidate_log_is_stale() {
+                let mut node = setup_node(1);
+
+                match &mut node.state {
+                    RoleState::Follower(n) => {
+                        n.log_store()
+                            .append_entries(vec![LogEntry::new(
+                                LogIndex::new(1),
+                                Term::new(2),
+                                vec![],
+                            )])
+                            .unwrap();
+                    }
+                    _ => panic!("Expected Follower"),
+                }
+
+                let result = node.handle_pre_vote(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(2),
+                    LogIndex::new(5),
+                    Term::new(1),
+                );
+
+                assert!(
+                    !result.vote_granted,
+                    "Pre-vote must be denied for stale candidate log"
+                );
+            }
+
+            #[test]
+            fn peer_stays_follower_after_pre_vote() {
+                let mut node = setup_node(1);
+
+                let _result = node.handle_pre_vote(
+                    NodeId::try_new(2).unwrap(),
+                    Term::new(5),
+                    LogIndex::ZERO,
+                    Term::ZERO,
+                );
+
+                assert!(
+                    matches!(node.state, RoleState::Follower(_)),
+                    "Node must stay Follower after receiving any PreVote"
+                );
+            }
+        }
+    }
 }
