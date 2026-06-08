@@ -20,9 +20,11 @@ use tracing::info;
 use tracing::info_span;
 
 use super::election::start_election_campaign;
+use super::election::start_pre_vote_campaign;
 use super::replication::initiate_replication;
 use super::rpc::determine_node_role_name;
 use super::types::ElectionCampaignParams;
+use super::types::PreVoteCampaignParams;
 use super::types::ReplicationRoundParams;
 use crate::config::Config;
 use crate::engine::LogicalNode;
@@ -67,20 +69,18 @@ pub fn spawn_tick_loop<S: StateMachine>(
 
                 // 2. Drive the logical engine and capture the required action
                 // Perform state transitions (Atomic Handoff) while holding the lock.
-                let (action, role_name, term, campaign, replication) = {
+                let (action, role_name, term, campaign, pre_vote_campaign, replication) = {
                     let mut guard = state.write().await;
                     let action = guard.tick();
                     let role = determine_node_role_name(&guard);
                     let term = guard.current_term();
 
                     let mut campaign_params = None;
+                    let mut pre_vote_params = None;
                     let mut replication_params = None;
 
                     // COMPACTION TRIGGER (ADR 011)
                     if should_compact_log(&mut guard, &config, state.is_frozen()) {
-                        // We set the flag immediately within the locked boundary to
-                        // prevent the next tick (10ms later) from re-triggering while
-                        // the async task is being spawned.
                         if let Err(e) = state.freeze() {
                             guard.apply_fatal(NodeError::Protocol(e.0.to_string()));
                         }
@@ -103,6 +103,18 @@ pub fn spawn_tick_loop<S: StateMachine>(
                                 trace_id,
                             });
                         }
+                        TickAction::StartPreVote => {
+                            let trace_id = TraceId::generate();
+                            guard.into_pre_candidate();
+                            pre_vote_params = Some(PreVoteCampaignParams {
+                                term,
+                                node_id: guard.node_id(),
+                                last_log_index: guard.last_log_index(),
+                                last_log_term: guard.last_log_term(),
+                                rpc_timeout: config.raft.rpc_timeout(),
+                                trace_id,
+                            });
+                        }
                         TickAction::SendHeartbeat => {
                             let trace_id = TraceId::generate();
                             replication_params = Some(ReplicationRoundParams {
@@ -120,6 +132,7 @@ pub fn spawn_tick_loop<S: StateMachine>(
                         role.to_string(),
                         term,
                         campaign_params,
+                        pre_vote_params,
                         replication_params,
                     )
                 };
@@ -163,10 +176,24 @@ pub fn spawn_tick_loop<S: StateMachine>(
                         }
                     }
                     TickAction::StartPreVote => {
-                        // TODO(Task 7): dispatch pre-vote campaign
+                        if let Some(params) = pre_vote_campaign {
+                            start_pre_vote_campaign(
+                                config.clone(),
+                                state.clone(),
+                                peer_manager.clone(),
+                                params,
+                                session_span,
+                            );
+                        }
                     }
                     TickAction::StepDown => {
-                        // TODO(Task 7): step down from pre-candidate
+                        let mut guard = state.write().await;
+                        let current_term = guard.current_term();
+                        guard.into_follower(current_term, None);
+                        info!(
+                            target: ClinicalTarget::RaftFoundation.as_str(),
+                            "Pre-vote campaign timeout. Returning to Follower."
+                        );
                     }
                     TickAction::SendHeartbeat => {
                         if let Some(params) = replication {
