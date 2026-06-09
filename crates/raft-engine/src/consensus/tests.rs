@@ -1318,10 +1318,8 @@ mod reachability_first_snapshotting {
     // =========================================================================
     mod pre_vote {
         use super::*;
-        use crate::consensus::election::initiate_election;
         use crate::consensus::election::initiate_pre_vote;
         use crate::consensus::election::start_pre_vote_campaign;
-        use crate::consensus::types::ElectionCampaignParams;
         use crate::consensus::types::PreVoteCampaignParams;
         use crate::engine::TickAction;
 
@@ -1482,43 +1480,23 @@ mod reachability_first_snapshotting {
                 }
 
                 // Single-node: quorum reached immediately via self-vote
-                initiate_pre_vote(config.clone(), state.clone(), pm.clone(), params)
-                    .await
-                    .expect("Pre-vote campaign should succeed");
+                initiate_pre_vote(
+                    config.clone(),
+                    state.clone(),
+                    pm.clone(),
+                    params,
+                    tracing::Span::none(),
+                )
+                .await
+                .expect("Pre-vote campaign should succeed");
 
-                // Verify pre-vote campaign transitioned to Candidate
-                {
-                    let guard = state.read().await;
-                    assert!(
-                        matches!(guard.state(), RoleState::Candidate(_)),
-                        "Pre-vote campaign should have transitioned to Candidate"
-                    );
-                    assert_eq!(
-                        guard.try_current_term().unwrap(),
-                        Term::new(1),
-                        "Candidate term should be 1"
-                    );
-                }
-
-                // Now trigger the real election (the tick loop would normally
-                // dispatch this via StartElection from the Candidate's evaluate_tick).
-                let current_term = state.read().await.try_current_term().unwrap();
-                let election_params = ElectionCampaignParams {
-                    term: current_term,
-                    node_id: id.node_id(),
-                    last_log_index: LogIndex::ZERO,
-                    last_log_term: Term::ZERO,
-                    trace_id: TraceId::generate(),
-                };
-                initiate_election(config, state.clone(), pm.clone(), election_params)
-                    .await
-                    .expect("Real election should succeed after pre-vote quorum");
-
-                // Assert: Node is now Leader at term 1
+                // Pre-vote quorum immediately triggers a real election. In a
+                // single-node cluster the self-vote wins instantly, so the node
+                // should already be Leader at term 1.
                 let guard = state.read().await;
                 assert!(
                     matches!(guard.state(), RoleState::Leader(_)),
-                    "Node should become Leader after pre-vote quorum and real election"
+                    "Node should become Leader immediately after pre-vote quorum"
                 );
                 assert_eq!(
                     guard.try_current_term().unwrap(),

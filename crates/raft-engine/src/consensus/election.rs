@@ -330,10 +330,19 @@ pub(crate) fn start_pre_vote_campaign<S: StateMachine>(
         term = %params.term
     );
 
+    let peer_manager_clone = peer_manager.clone();
     tokio::spawn(
         async move {
-            if let Err(e) = initiate_pre_vote(config, state.clone(), peer_manager, params).await {
-                error!( error = %e, "Failed to execute pre-vote campaign");
+            if let Err(e) = initiate_pre_vote(
+                config,
+                state.clone(),
+                peer_manager_clone,
+                params,
+                parent_span,
+            )
+            .await
+            {
+                error!(error = %e, "Failed to execute pre-vote campaign");
                 let mut guard = state.write().await;
                 guard.apply_fatal(e);
             }
@@ -346,9 +355,9 @@ pub(crate) fn start_pre_vote_campaign<S: StateMachine>(
 ///
 /// Unlike a real election, pre-vote does NOT advance the term, does NOT count
 /// a self-vote, and does NOT demote on higher term responses. If quorum is
-/// reached, the node transitions to Candidate (which advances the term) and
-/// the tick loop triggers StartElection. Otherwise the campaign times out and
-/// the PreCandidate's evaluate_tick returns StepDown.
+/// reached, the node transitions to Candidate and immediately starts a real
+/// election campaign (initiate_election) within the same async task, avoiding
+/// the 150-300ms dead window that would otherwise occur.
 #[instrument(
     name = "pre_vote_campaign_execution",
     target = "raft::foundation",
@@ -360,6 +369,7 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
     state: Arc<ConsensusShell<S>>,
     peer_manager: Arc<PeerManager>,
     params: PreVoteCampaignParams,
+    parent_span: tracing::Span,
 ) -> ConsensusResult<()> {
     info!(
         target: ClinicalTarget::RaftFoundation.as_str(),
@@ -411,9 +421,20 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
         if granted {
             pre_votes_granted += 1;
             if pre_votes_granted >= quorum {
-                let mut guard = state.write().await;
-                let actual_term = guard.current_term();
-                guard.into_candidate();
+                let (campaign_params, actual_term) = {
+                    let mut guard = state.write().await;
+                    let actual_term = guard.current_term();
+                    guard.into_candidate();
+                    let new_term = guard.current_term();
+                    let params = ElectionCampaignParams {
+                        term: new_term,
+                        node_id: guard.node_id(),
+                        last_log_index: guard.last_log_index(),
+                        last_log_term: guard.last_log_term(),
+                        trace_id: TraceId::generate(),
+                    };
+                    (params, actual_term)
+                };
                 info!(
                     target: ClinicalTarget::RaftFoundation.as_str(),
                     votes = %pre_votes_granted,
@@ -421,6 +442,21 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
                     "Pre-vote quorum reached (campaign_term={}, actual_term={}). Transitioning to Candidate.",
                     params.term, actual_term,
                 );
+                let election_span = info_span!(
+                    target: ClinicalTarget::RaftFoundation.as_str(),
+                    parent: &parent_span,
+                    "election_campaign",
+                    trace_id = %campaign_params.trace_id,
+                    term = %campaign_params.term,
+                );
+                initiate_election(
+                    config.clone(),
+                    state.clone(),
+                    peer_manager.clone(),
+                    campaign_params,
+                )
+                .instrument(election_span)
+                .await?;
                 return Ok(());
             }
         }
@@ -429,9 +465,20 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
     // Post-loop check: self-vote may already reach quorum
     // (e.g. single-node cluster, or all peers denied).
     if pre_votes_granted >= quorum {
-        let mut guard = state.write().await;
-        let actual_term = guard.current_term();
-        guard.into_candidate();
+        let (campaign_params, actual_term) = {
+            let mut guard = state.write().await;
+            let actual_term = guard.current_term();
+            guard.into_candidate();
+            let new_term = guard.current_term();
+            let params = ElectionCampaignParams {
+                term: new_term,
+                node_id: guard.node_id(),
+                last_log_index: guard.last_log_index(),
+                last_log_term: guard.last_log_term(),
+                trace_id: TraceId::generate(),
+            };
+            (params, actual_term)
+        };
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             votes = %pre_votes_granted,
@@ -439,6 +486,21 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
             "Pre-vote quorum reached (self-vote). campaign_term={}, actual_term={}",
             params.term, actual_term,
         );
+        let election_span = info_span!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            parent: &parent_span,
+            "election_campaign",
+            trace_id = %campaign_params.trace_id,
+            term = %campaign_params.term,
+        );
+        initiate_election(
+            config.clone(),
+            state.clone(),
+            peer_manager.clone(),
+            campaign_params,
+        )
+        .instrument(election_span)
+        .await?;
         return Ok(());
     }
 
