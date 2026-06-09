@@ -1506,6 +1506,71 @@ mod reachability_first_snapshotting {
             }
 
             #[tokio::test]
+            async fn pre_vote_quorum_triggers_immediate_election_independent_of_election_timeout() {
+                // Regression test: the immediate election after pre-vote quorum
+                // must NOT rely on the Candidate's election timeout (tick loop).
+                // We set an extremely large election timeout (10K-20K ticks) —
+                // if the election waited for the tick loop, this test would
+                // take 100+ seconds.
+                let config = mock_config(50, 100);
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(10_000),
+                    max_election: TickDuration::new(20_000),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let fsm = Arc::new(MockFsm);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                let pm = Arc::new(PeerManager::try_new(id.clone(), &HashMap::new()).unwrap());
+
+                let params = PreVoteCampaignParams {
+                    term: Term::ZERO,
+                    node_id: id.node_id(),
+                    last_log_index: LogIndex::ZERO,
+                    last_log_term: Term::ZERO,
+                    rpc_timeout: config.raft.rpc_timeout(),
+                    trace_id: TraceId::generate(),
+                };
+
+                {
+                    let mut guard = state.write().await;
+                    guard.into_pre_candidate();
+                }
+
+                // This call must return immediately (within < 1s) despite the
+                // 10K-tick election timeout, proving the election was started
+                // directly by initiate_pre_vote and not by the tick loop.
+                initiate_pre_vote(
+                    config.clone(),
+                    state.clone(),
+                    pm.clone(),
+                    params,
+                    tracing::Span::none(),
+                )
+                .await
+                .expect("Pre-vote campaign should succeed");
+
+                // Node must be Leader (not just Candidate) at term 1
+                let guard = state.read().await;
+                assert!(
+                    matches!(guard.state(), RoleState::Leader(_)),
+                    "Node must become Leader immediately after pre-vote quorum"
+                );
+                assert_eq!(
+                    guard.try_current_term().unwrap(),
+                    Term::new(1),
+                    "Term must be 1 (campaign_term 0 + 1)"
+                );
+            }
+
+            #[tokio::test]
             async fn pre_vote_no_quorum_returns_to_follower_without_term_change() {
                 let config = mock_config(50, 100);
                 let id = Arc::new(NodeIdentity::new(
