@@ -631,19 +631,18 @@ impl<S: StateMachine> LogicalNode<S> {
         let tick = self.current_tick;
 
         let old_role_name = self.state.as_role_name();
+        let new_role_name = "Follower";
 
-        if old_role_name != "Follower" {
+        if old_role_name != new_role_name {
             info!(
                 target: ClinicalTarget::RaftFoundation.as_str(),
                 old_role = %old_role_name,
-                new_role = "Follower",
+                new_role = %new_role_name,
                 term = %term,
                 leader_id = ?leader_id,
-                "Role Transition: {} -> Follower",
-                old_role_name
+                "Role Transition"
             );
         }
-
         self.transition(|old_role| match old_role {
             RoleState::Follower(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
                 Ok(new) => RoleState::Follower(new),
@@ -672,12 +671,12 @@ impl<S: StateMachine> LogicalNode<S> {
         let tick = self.current_tick;
 
         let old_role_name = self.state.as_role_name();
+        let new_role_name = "Candidate";
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             old_role = %old_role_name,
-            new_role = "Candidate",
-            "Role Transition: {} -> Candidate",
-            old_role_name
+            new_role = %new_role_name,
+            "Role Transition"
         );
 
         self.transition(|old_role| match old_role {
@@ -703,12 +702,12 @@ impl<S: StateMachine> LogicalNode<S> {
         let tick = self.current_tick;
 
         let old_role_name = self.state.as_role_name();
+        let new_role_name = "PreCandidate";
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             old_role = %old_role_name,
-            new_role = "PreCandidate",
-            "Role Transition: {} -> PreCandidate",
-            old_role_name
+            new_role = %new_role_name,
+            "Role Transition"
         );
 
         self.transition(|old_role| match old_role {
@@ -725,12 +724,12 @@ impl<S: StateMachine> LogicalNode<S> {
         let tick = self.current_tick;
 
         let old_role_name = self.state.as_role_name();
+        let new_role_name = "Leader";
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             old_role = %old_role_name,
-            new_role = "Leader",
-            "Role Transition: {} -> Leader",
-            old_role_name
+            new_role = %new_role_name,
+            "Role Transition"
         );
 
         self.transition(|old_role| match old_role {

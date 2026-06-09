@@ -475,7 +475,7 @@ def find_current_leader(cluster: ClusterManager) -> Optional[int]:
 
     # Verify no subsequent demotion
     for line in cluster.logs.node_logs[best_lid]:
-        if "-> Follower" in line and "Role Transition" in line:
+        if "new_role=Follower" in line and "Role Transition" in line:
             term_match = re.search(r"term[= ](\d+)", line)
             if (
                 parse_log_timestamp(line) >= best_ts
@@ -585,7 +585,7 @@ def count_elections(cluster: ClusterManager) -> int:
         1
         for lines in cluster.logs.node_logs.values()
         for l in lines
-        if "-> Leader" in l and "Role Transition" in l
+        if "new_role=Leader" in l and "Role Transition" in l
     )
 
 
