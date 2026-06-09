@@ -22,8 +22,11 @@ use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::policy_service_client::PolicyServiceClient;
 use common::types::ClientId;
+use common::types::ClusterId;
+use common::types::NodeId;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use common_rpc::IdentityInterceptor;
 use common_rpc::TraceInterceptor;
 use thiserror::Error;
 use tonic::Request;
@@ -81,12 +84,16 @@ pub trait VetoRelay: Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct GrpcVetoRelay {
     client: PolicyServiceClient<Channel>,
+    cluster_id: ClusterId,
+    node_id: NodeId,
 }
 
 impl GrpcVetoRelay {
-    pub fn new(channel: Channel) -> Self {
+    pub fn new(channel: Channel, cluster_id: ClusterId, node_id: NodeId) -> Self {
         Self {
             client: PolicyServiceClient::new(channel),
+            cluster_id,
+            node_id,
         }
     }
 
@@ -127,7 +134,15 @@ impl VetoRelay for GrpcVetoRelay {
         ));
         request.set_timeout(timeout);
 
-        // Explicit Outbound Propagation (ADR 010)
+        // Explicit Outbound Propagation of Cluster Identity (ADR 004/005)
+        IdentityInterceptor::inject_identity_into_request(
+            &mut request,
+            &self.cluster_id,
+            self.node_id,
+        )
+        .map_err(|e| VetoError::RpcFailure(format!("Identity injection failed: {}", e)))?;
+
+        // Explicit Outbound Propagation of Trace Identity (ADR 010)
         TraceInterceptor::inject_trace_id_into_request(&mut request, trace_id)
             .map_err(|e| VetoError::RpcFailure(format!("Telemetry injection failed: {}", e)))?;
 
@@ -191,6 +206,8 @@ mod tests {
     use common::proto::v1::app::EvaluateProposalResponse;
     use common::proto::v1::app::policy_service_server::PolicyService;
     use common::proto::v1::app::policy_service_server::PolicyServiceServer;
+    use common::types::ClusterId;
+    use common::types::NodeId;
     use common_rpc::TraceInterceptor;
     use tokio::sync::oneshot;
     use tonic::Response;
@@ -290,7 +307,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            (GrpcVetoRelay::new(channel), mock_service, tx)
+            let cluster_id = ClusterId::try_new("test-cluster").unwrap();
+            let node_id = NodeId::try_new(1).unwrap();
+            (
+                GrpcVetoRelay::new(channel, cluster_id, node_id),
+                mock_service,
+                tx,
+            )
         }
 
         mod evaluate {

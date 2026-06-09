@@ -332,7 +332,11 @@ fn init_dispatchers(
             anyhow::anyhow!("Failed to parse AI Veto address: {}", e)
         })?
         .connect_lazy();
-    let veto_relay = Arc::new(GrpcVetoRelay::new(veto_channel));
+    let veto_relay = Arc::new(GrpcVetoRelay::new(
+        veto_channel,
+        identity.cluster_id().clone(),
+        identity.node_id(),
+    ));
 
     let ingress_dispatcher = IngressDispatcher::new(
         raft_handle,
