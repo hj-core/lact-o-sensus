@@ -1635,6 +1635,101 @@ mod reachability_first_snapshotting {
 
                 let _ = tx.send(());
             }
+
+            #[tokio::test]
+            async fn stale_candidate_rejected() {
+                // Node at term 5. A stale candidate at term 2 should be
+                // rejected by grant_pre_vote's new term fence.
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let fsm = Arc::new(MockFsm);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Set node's term to 5
+                {
+                    let mut guard = state.write().await;
+                    guard.into_follower(Term::new(5), None);
+                }
+
+                // Stale candidate at term 2 should be rejected
+                let result = {
+                    let mut guard = state.write().await;
+                    guard.handle_pre_vote(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(2),
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                    )
+                };
+
+                assert!(
+                    !result.vote_granted,
+                    "Stale candidate must not get pre-vote"
+                );
+                assert_eq!(
+                    result.term,
+                    Term::new(5),
+                    "Response term must reflect node's current term"
+                );
+            }
+
+            #[tokio::test]
+            async fn up_to_date_candidate_accepted() {
+                // Node at term 3. A candidate at the same term with an
+                // up-to-date log should be granted the pre-vote.
+                let id = Arc::new(NodeIdentity::new(
+                    ClusterId::try_new("test-cluster").unwrap(),
+                    NodeId::try_new(1).unwrap(),
+                ));
+                let storage = Arc::new(MemoryStorage::new());
+                let thresholds = TickThresholds {
+                    heartbeat_interval: TickDuration::new(10),
+                    min_election: TickDuration::new(15),
+                    max_election: TickDuration::new(30),
+                };
+                let rng = StdRng::seed_from_u64(1);
+                let fsm = Arc::new(MockFsm);
+                let node = LogicalNode::try_new(id.clone(), fsm, storage, thresholds, rng).unwrap();
+                let state = Arc::new(ConsensusShell::new(node));
+
+                // Set node's term to 3
+                {
+                    let mut guard = state.write().await;
+                    guard.into_follower(Term::new(3), None);
+                }
+
+                // Candidate at same term 3 with up-to-date log should be
+                // granted pre-vote
+                let result = {
+                    let mut guard = state.write().await;
+                    guard.handle_pre_vote(
+                        NodeId::try_new(2).unwrap(),
+                        Term::new(3),
+                        LogIndex::ZERO,
+                        Term::ZERO,
+                    )
+                };
+
+                assert!(
+                    result.vote_granted,
+                    "Up-to-date candidate should get pre-vote"
+                );
+                assert_eq!(
+                    result.term,
+                    Term::new(3),
+                    "Response term must match node's current term"
+                );
+            }
         }
     }
 }
