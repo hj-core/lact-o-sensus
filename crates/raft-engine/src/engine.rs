@@ -76,6 +76,18 @@ pub enum RoleState {
     Poisoned, // ADR 001: Safety barrier during transition failures
 }
 
+impl RoleState {
+    pub fn as_role_name(&self) -> &'static str {
+        match self {
+            RoleState::Follower(_) => "Follower",
+            RoleState::PreCandidate(_) => "PreCandidate",
+            RoleState::Candidate(_) => "Candidate",
+            RoleState::Leader(_) => "Leader",
+            RoleState::Poisoned => "Poisoned",
+        }
+    }
+}
+
 /// The logical orchestrator of a Raft node, managing its role state,
 /// deterministic clock, and randomized timeouts.
 #[derive(Debug)]
@@ -639,6 +651,17 @@ impl<S: StateMachine> LogicalNode<S> {
         let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
         let tick = self.current_tick;
 
+        let old_role_name = self.state.as_role_name();
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            old_role = %old_role_name,
+            new_role = "Follower",
+            term = %term,
+            leader_id = ?leader_id,
+            "Role Transition: {} -> Follower",
+            old_role_name
+        );
+
         self.transition(|old_role| match old_role {
             RoleState::Follower(n) => match n.try_into_follower(term, leader_id, tick, timeout) {
                 Ok(new) => RoleState::Follower(new),
@@ -671,6 +694,15 @@ impl<S: StateMachine> LogicalNode<S> {
         let timeout = self.thresholds.generate_election_timeout(&mut self.rng);
         let tick = self.current_tick;
 
+        let old_role_name = self.state.as_role_name();
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            old_role = %old_role_name,
+            new_role = "Candidate",
+            "Role Transition: {} -> Candidate",
+            old_role_name
+        );
+
         self.transition(|old_role| match old_role {
             RoleState::Follower(n) => match n.try_into_candidate(tick, timeout) {
                 Ok(new) => RoleState::Candidate(new),
@@ -698,6 +730,15 @@ impl<S: StateMachine> LogicalNode<S> {
         let pre_vote_timeout = TickDuration::new(PRE_VOTE_CAMPAIGN_TICKS);
         let tick = self.current_tick;
 
+        let old_role_name = self.state.as_role_name();
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            old_role = %old_role_name,
+            new_role = "PreCandidate",
+            "Role Transition: {} -> PreCandidate",
+            old_role_name
+        );
+
         self.transition(|old_role| match old_role {
             RoleState::Follower(n) => match n.try_into_pre_candidate(tick, pre_vote_timeout) {
                 Ok(new) => RoleState::PreCandidate(new),
@@ -711,6 +752,15 @@ impl<S: StateMachine> LogicalNode<S> {
     #[instrument(name = "transition_to_leader", target = "raft::foundation", skip_all)]
     pub fn into_leader(&mut self, peer_ids: Vec<NodeId>) {
         let tick = self.current_tick;
+
+        let old_role_name = self.state.as_role_name();
+        info!(
+            target: ClinicalTarget::RaftFoundation.as_str(),
+            old_role = %old_role_name,
+            new_role = "Leader",
+            "Role Transition: {} -> Leader",
+            old_role_name
+        );
 
         self.transition(|old_role| match old_role {
             RoleState::Candidate(n) => match n.try_into_leader(peer_ids, tick) {

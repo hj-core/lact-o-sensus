@@ -211,12 +211,6 @@ impl RaftNode<Follower> {
         node.advance_term_and_vote(new_term, node_id)?;
         node.state_mut().add_vote(node_id);
 
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            term = %new_term,
-            "Role Transition: -> Candidate"
-        );
-
         Ok(node)
     }
 

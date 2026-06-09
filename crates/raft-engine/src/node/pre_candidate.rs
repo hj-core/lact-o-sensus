@@ -7,8 +7,6 @@
 //! returns to Follower without any term change.
 
 use common::types::errors::NodeError;
-use common::types::trace::ClinicalTarget;
-use tracing::info;
 
 use super::Candidate;
 use super::Follower;
@@ -80,12 +78,6 @@ impl RaftNode<PreCandidate> {
         node.advance_term_and_vote(new_term, node_id)?;
         node.state_mut().add_vote(node_id);
 
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            term = %new_term,
-            "Role Transition: PreCandidate -> Candidate"
-        );
-
         Ok(node)
     }
 }
@@ -97,10 +89,6 @@ impl RaftNode<Follower> {
         timeout: TickDuration,
     ) -> Result<RaftNode<PreCandidate>, NodeError> {
         let node = self.transition(PreCandidate::new(campaign_start, timeout));
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            "Role Transition: -> PreCandidate"
-        );
         Ok(node)
     }
 }

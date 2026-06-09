@@ -8,8 +8,6 @@ use std::collections::HashSet;
 
 use common::types::NodeId;
 use common::types::errors::NodeError;
-use common::types::trace::ClinicalTarget;
-use tracing::info;
 
 use super::Leader;
 use super::NodeState;
@@ -80,12 +78,6 @@ impl RaftNode<Candidate> {
         node.advance_term_and_vote(new_term, node_id)?;
         node.state_mut().add_vote(node_id);
 
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            term = %new_term,
-            "Role Transition: -> Candidate (Restarted)"
-        );
-
         Ok(node)
     }
 
@@ -95,14 +87,7 @@ impl RaftNode<Candidate> {
         last_heartbeat: Tick,
     ) -> Result<RaftNode<Leader>, NodeError> {
         let last_log_index = self.last_log_index()?;
-        let term = self.current_term()?;
         let node = self.transition(Leader::new(peer_ids, last_log_index, last_heartbeat)?);
-
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            term = %term,
-            "Role Transition: -> Leader"
-        );
 
         Ok(node)
     }

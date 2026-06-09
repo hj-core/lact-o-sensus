@@ -214,12 +214,6 @@ impl<R: NodeState> RaftNode<R> {
         // Transition to next term if higher (§5.1)
         node.advance_term(term)?;
 
-        info!(
-            target: ClinicalTarget::RaftFoundation.as_str(),
-            leader_id = ?leader_id,
-            "Role Transition: -> Follower"
-        );
-
         Ok(node)
     }
 

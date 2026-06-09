@@ -93,7 +93,7 @@ def test_leader_failover(cluster: ClusterManager) -> None:
                 if node["id"] == leader_id:
                     continue
                 for line in get_complete_lines(node["log"], log_offsets.get(node["id"], 0)):
-                    if "Role Transition: -> Leader" in line:
+                    if "-> Leader" in line:
                         log_ts = parse_log_timestamp(line)
                         return node["id"], int((log_ts if log_ts > 0 else now_ms()) - kill_time)
         return None
