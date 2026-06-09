@@ -397,10 +397,9 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
                 if peer_term > current_term {
                     info!(
                         target: ClinicalTarget::RaftFoundation.as_str(),
-                        campaign_term = %params.term,
-                        current_term = %current_term,
                         peer_term = %peer_term,
-                        "Pre-vote peer has higher term. Stepping down."
+                        "Pre-vote peer has higher term (campaign_term={}, current_term={}, peer_term={}). Stepping down.",
+                        params.term, current_term, peer_term,
                     );
                     guard.into_follower(peer_term, None);
                     return Ok(());
@@ -413,12 +412,14 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
             pre_votes_granted += 1;
             if pre_votes_granted >= quorum {
                 let mut guard = state.write().await;
+                let actual_term = guard.current_term();
                 guard.into_candidate();
                 info!(
                     target: ClinicalTarget::RaftFoundation.as_str(),
                     votes = %pre_votes_granted,
                     quorum = %quorum,
-                    "Pre-vote quorum reached. Transitioning to Candidate."
+                    "Pre-vote quorum reached (campaign_term={}, actual_term={}). Transitioning to Candidate.",
+                    params.term, actual_term,
                 );
                 return Ok(());
             }
@@ -429,21 +430,28 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
     // (e.g. single-node cluster, or all peers denied).
     if pre_votes_granted >= quorum {
         let mut guard = state.write().await;
+        let actual_term = guard.current_term();
         guard.into_candidate();
         info!(
             target: ClinicalTarget::RaftFoundation.as_str(),
             votes = %pre_votes_granted,
             quorum = %quorum,
-            "Pre-vote quorum reached (self-vote). Transitioning to Candidate."
+            "Pre-vote quorum reached (self-vote). campaign_term={}, actual_term={}",
+            params.term, actual_term,
         );
         return Ok(());
     }
 
+    let actual_term = {
+        let mut guard = state.write().await;
+        guard.current_term()
+    };
     info!(
         target: ClinicalTarget::RaftFoundation.as_str(),
         votes = %pre_votes_granted,
         quorum = %quorum,
-        "Pre-vote campaign finished without quorum."
+        "Pre-vote campaign finished without quorum. votes={} quorum={} campaign_term={} actual_term={}",
+        pre_votes_granted, quorum, params.term, actual_term,
     );
 
     Ok(())
