@@ -3,86 +3,124 @@
 ## Metadata
 
 - **Date:** 2026-04-09
-- **Status:** Proposed
-- **Scope:** Logical RPC Contracts and Service Definitions
+- **Status:** Accepted
+- **Scope:** Protobuf interface boundary (consensus vs. application), identity metadata enforcement via gRPC interceptors, ledger entry format (Absolute State, stringified decimals). Excludes specific field-level protobuf definitions (defined in `.proto` files), wire protocol encoding details, gRPC channel configuration, and serialization library selection.
 - **Primary Goal:** Define a consistent, typed interface for all inter-node communication, ensuring cluster isolation and semantic integrity.
-- **Last Updated:** 2026-05-26
+- **Last Updated:** 2026-06-09
 
 ## Context
 
-Lact-O-Sensus consists of three distinct interaction domains: internal consensus, external user ingress, and policy egress. Per ADR 007 and ADR 008, our interface must support AI-driven semantic resolution and internal SI stabilization while maintaining the strict cluster identity mandates of ADR 004.
+Lact-O-Sensus consists of three distinct interaction domains: internal consensus (Raft peer-to-peer), external user ingress (client-to-leader), and policy egress (leader-to-AI). Each domain has different contract requirements:
+
+- **Cluster isolation** (ADR 004): Every gRPC request must carry `cluster_id` and `target_node_id` to prevent cross-environment contamination. This identity must be enforced at the interceptor layer, before application logic executes.
+- **Domain agnosticism** (ADR 001, ADR 003): The consensus engine must be reusable across state machine implementations — it replicates opaque payloads and must not depend on grocery-specific schemas.
+- **AI semantic resolution** (ADR 007): The AI Veto node receives normalized intents and returns semantic metadata (resolved item key, category, unit). These AI responses must enter the Raft log deterministically via the Leader (per ADR 002).
+- **SI normalization** (ADR 008): All physical quantities are normalized to SI base units. The ledger must record absolute results as stringified fixed-point decimals to prevent IEEE 754 non-determinism across architectures.
+
+Without a clean interface boundary, the consensus engine would become coupled to the grocery domain, preventing reuse and making it impossible to evolve the application schema without touching the Raft core.
+
+## Options Considered
+
+### Option A: Single Unified Protobuf
+
+Define all RPCs and data structures in a single `.proto` file — consensus, ingress, policy, and ledger.
+- **Complexity**: Lowest — one schema to maintain; no cross-file coordination.
+- **Reusability**: None — the consensus services are coupled to grocery-specific types; cannot be reused for other state machine projects.
+- **Schema evolution**: Harder — a change to any domain type requires regenerating the entire protobuf, including the consensus stubs.
+- **Verdict**: Rejected — violates ADR 001's domain-agnosticism requirement for the consensus engine.
+
+### Option B: Split Protobuf + Metadata Identity (Chosen)
+
+Two `.proto` files: `raft.proto` (domain-agnostic consensus) and `app.proto` (grocery-specific ingress, policy, ledger). Identity flows through gRPC metadata headers, enforced at the interceptor layer.
+- **Reusability**: Strong — `raft.proto` contains no grocery types; the consensus engine is a portable black box.
+- **Complexity**: Moderate — requires interceptor middleware and cross-file coordination for schema evolution.
+- **Safety**: Strong — identity enforcement is centralized in middleware, not scattered across handlers.
+- **Verdict**: Chosen — balances reusability, safety, and evolutionary flexibility.
+
+### Option C: Identity in Message Body + Single Protobuf
+
+Identity fields (`cluster_id`, `target_node_id`) are carried inside every protobuf message rather than in gRPC metadata. All services live in one `.proto` file.
+- **Reusability**: Weak — identity fields pollute every message; the consensus protobuf cannot be reused without carrying grocery-identity baggage.
+- **Complexity**: Moderate — no interceptor needed, but each handler must manually validate identity.
+- **Safety**: Weak — identity validation is scattered across handlers; a new handler could forget to check, creating a cross-contamination gap.
+- **Verdict**: Rejected — weaker safety guarantees and no reuse benefit over Option B.
+
+### Option D: Do Nothing
+
+Continue without defined interface boundaries; consensus and application types coexist in shared protobuf definitions.
+- **Reusability**: None — the current implementation is inherently coupled.
+- **Complexity**: Lowest — no refactoring needed.
+- **Safety**: Low — no systematic identity enforcement; each handler implements its own checks (or omits them).
+- **Verdict**: Rejected — unacceptable for a clinical-grade system.
 
 ## Decision
 
 We will define three logical services with strict contracts, decoupled into two distinct protobuf definitions to separate the generic consensus engine from the grocery application logic.
 
-### 1. Centralized Identity Guarding (ADR 004)
+### Assumptions & Constraints
 
-Every gRPC request MUST be validated at the **Interceptor/Middleware layer** against the local logical identity. Messages with mismatched `ClusterId` or `TargetNodeId` MUST be rejected with a `PermissionDenied` status before reaching application logic. This ensures that individual service implementations do not need to manually verify cluster identity, preventing cross-environment contamination.
+- **Crash-Recovery model** (per ADR 001): Nodes may stop and restart; interface contracts must survive log replay across restarts.
+- **Cluster size ≤ 7 nodes**: Interface overhead (double serialization, metadata injection) is acceptable for small clusters.
+- **gRPC transport** (per ADR 002): All inter-node communication uses gRPC; identity metadata flows through gRPC headers.
+- **Stringified decimals** (per ADR 008): All physical quantities must be transmitted as stringified fixed-point decimals to avoid IEEE 754 cross-architecture non-determinism.
+- **Absolute State recording**: The ledger records absolute results (not deltas) to ensure state machine idempotency.
+- **Forward compatibility**: Ledger entries are persistent; schema changes must support backward compatibility (e.g., protobuf optional fields) to allow older logs to be replayed by newer binaries.
 
-### 2. The Generic Consensus Interface (`raft.proto`)
+### 1. Identity Enforcement via gRPC Metadata
 
-Used exclusively for Raft peer-to-peer communication. This interface is domain-agnostic and replicates opaque byte payloads.
+Every gRPC request MUST carry identity (`cluster_id`, `target_node_id`) as gRPC metadata headers, not in the protobuf message body. This ensures that identity enforcement is transparent to individual service implementations and prevents cross-environment contamination (per ADR 004).
 
-- **`ConsensusService` (Package: `raft.v1`)**:
-  - **`RequestVote`**:
-    - **Input:** `cluster_id`, `target_node_id`, `term`, `candidate_id`, `last_log_index`, `last_log_term`.
-    - **Output:** `cluster_id`, `node_id` (Responder), `term`, `vote_granted`.
-  - **`AppendEntries`**:
-    - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `prev_log_index`, `prev_log_term`, `entries[]`, `leader_commit`.
-    - **Output:** `cluster_id`, `node_id` (Responder), `term`, `success`, `last_log_index`.
-  - **`InstallSnapshot`**:
-    - **Input:** `cluster_id`, `target_node_id`, `term`, `leader_id`, `last_included_index`, `last_included_term`, `data` (Snapshot payload).
-    - **Output:** `cluster_id`, `node_id` (Responder), `term`.
-- **`LogEntry`**:
-  - **Structure:** `term`, `index`, `data` (Opaque `bytes` containing a serialized application-level entry).
+- **Inbound:** A common interceptor validates both headers against the local node's identity before the request reaches any handler. Mismatched or missing headers are rejected immediately.
+- **Outbound:** The same interceptor injects both headers into every outbound RPC — internal consensus calls, client-to-leader calls, and leader-to-AI policy calls.
 
-### 2. The Application Interface (`app.proto`)
+### 2. Consensus Interface — Domain-Agnostic (`raft.proto`)
 
-Used for external client ingress, policy egress, and the internal state machine representation.
+Used exclusively for Raft peer-to-peer communication. This interface MUST NOT contain any application-level types — it replicates opaque byte payloads only. It defines the standard Raft RPCs:
 
-#### A. The Ingress Service (Client-to-Leader)
+- **RequestVote:** Exchanged during leader election. Carries the candidate's term and log metadata; returns the responder's term and grant status.
+- **AppendEntries:** Used for log replication and heartbeats. Carries the leader's term, log entries (as opaque bytes), and commit index.
+- **InstallSnapshot:** Transfers a full state snapshot to a lagging follower. Carries the snapshot metadata and data payload (opaque bytes).
+- **LogEntry:** A generic container holding `(term, index, data)` where `data` is opaque bytes containing a serialized application-level entry.
 
-Used for user mutations and queries. (Package: `lacto_sensus.v1`)
+The exact field definitions for these RPCs follow the Raft paper (Ongaro & Ousterhout, USENIX ATC 2014) and are specified in `crates/common/proto/raft.proto`.
 
-- **`ProposeMutation`**:
-  - **Input:** `cluster_id`, `target_node_id`, `client_id`, `sequence_id`, `MutationIntent`.
-  - **Output:** `cluster_id`, `node_id` (Leader), `status` (Committed/Rejected/Vetoed), `state_version`, `leader_hint`, `error_message`.
-- **`QueryState`**:
-  - **Input:** `cluster_id`, `target_node_id`, `query_filter` (optional), `min_state_version` (optional).
-  - **Output:** `cluster_id`, `node_id` (Responder), `item_list[]` (of `GroceryItem`), `current_state_version`, `status`, `leader_hint`, `error_message`.
+### 3. Application Interface — Domain-Specific (`app.proto`)
 
-#### B. The Policy Service (Leader-to-AI)
+Used for external client ingress, policy egress, and the internal state machine representation. The exact field definitions are specified in `crates/common/proto/app.proto`.
 
-Used for semantic resolution and physical verification. (Package: `lacto_sensus.v1`)
+#### A. Ingress Service (Client-to-Leader)
 
-- **`EvaluateProposal`**:
-  - **Input:** `cluster_id`, `target_node_id`, `client_id`, `normalized_intent`, `current_inventory[]`, `request_context`.
-  - **Output:**
-    - `cluster_id`, `node_id` (The AI Node ID), `is_approved`, `moral_justification`.
-    - **Semantic Data:** `resolved_item_key`, `suggested_display_name`, `category_assignment`, `resolved_unit`.
-    - **Conversion Data:** `conversion_multiplier_to_base` (Decimal string).
+Provides mutation and query operations. Every request carries the client's identity (`client_id`) and a monotonic `sequence_id` for exactly-once deduplication (per ADR 006).
 
-#### C. The Replicated Ledger Entry (`CommittedMutation`)
+- **ProposeMutation:** Accepts a `MutationIntent` (the user's raw input). Returns the committed result status (Committed, Rejected, or Vetoed), the new state version, and a `leader_hint` for redirection if the target node is not the leader.
+- **QueryState:** Returns the current inventory state, optionally filtered. Supports a minimum state version for read-after-write consistency.
 
-The serialized binary format stored as `bytes` within the Raft `LogEntry`. This represents the "Final Truth" of the grocery state.
+#### B. Policy Service (Leader-to-AI)
 
-- **Mandate (Absolute State):** The Leader is exclusively responsible for performing all physical arithmetic (Base SI * Multiplier). The log entry must record the **Absolute Result** (not the delta) to ensure state machine idempotency.
-- **Precision Policy:** All numeric quantities and multipliers MUST be transmitted and stored as **Stringified Fixed-Point Decimals** to avoid IEEE 754 non-determinism across different architectures.
+Used exclusively by the Raft Leader (per ADR 002) to request semantic resolution of a mutation intent. Identity flows through gRPC metadata.
 
-- **Identity:** `resolved_item_key` (Canonical Slug).
-- **Display:** `suggested_display_name` (UI Metadata).
-- **State:** `updated_base_quantity` (Absolute Result in SI as Decimal string), `base_unit` (Canonical SI Symbol), `display_unit` (User-preferred symbol), `updated_category` (Metadata).
-- **Session:** `client_id`, `sequence_id` (For Exactly-Once Semantics).
-- **Audit:** `raw_user_input` (Original Intent), `moral_justification` (AI Rationale), `event_time` (Timestamp).
-- **Control:** `status` (Outcome: APPROVED/VETOED), `is_delete` (Boolean flag).
+- **EvaluateProposal:** Accepts a normalized intent and the current inventory snapshot. Returns:
+  - An approval decision with moral justification.
+  - Semantic metadata: resolved canonical item key, suggested display name, category assignment, and resolved SI unit.
+  - A conversion multiplier (as a stringified fixed-point decimal) to normalize the user's quantity to the base SI unit.
+
+#### C. Replicated Ledger Entry
+
+The serialized binary stored as opaque bytes within the Raft `LogEntry`. This is the single source of truth for all inventory state. The entry MUST record the absolute result of the mutation (not the delta) to ensure idempotent replay. It contains the following categories of data:
+
+- **Identity:** The canonical item key (stable slug) for deduplication across mutations.
+- **Display:** UI-facing metadata (display name, category label).
+- **State:** The updated absolute quantity in SI base units (as a stringified fixed-point decimal), the canonical SI unit symbol, and the user's preferred display unit.
+- **Session:** The originating `(client_id, sequence_id)` pair for exactly-once deduplication (per ADR 006).
+- **Audit:** The original raw user input, the AI's moral justification, and the event timestamp — providing full causal history for every state change.
+- **Control:** The outcome status (Approved or Vetoed) and a deletion flag.
 
 ## Rationale
 
-- **Protocol Reusability:** By splitting `raft.proto` from `app.proto`, the consensus engine becomes a domain-agnostic "black box." This ensures the core Raft implementation can be reused for any distributed state machine project.
-- **Contractual Clarity:** Developers working on the Raft core only need to understand the simple consensus state machine, while application developers focus on the rich grocery schema.
-- **Identity Guarding:** Mandating `cluster_id` in every RPC ensures that nodes and clients never accidentally process traffic from a foreign cluster.
-- **Separation of Concerns:** The `MutationIntent` captures human ambiguity, while the `CommittedMutation` captures deterministic physical and taxonomic state.
+- **Protocol Reusability:** By splitting the protobuf definitions, the consensus engine (`raft.proto`) contains zero grocery-specific types. This ensures the Raft implementation can be reused for any distributed state machine project, consistent with ADR 001's domain-agnosticism mandate. The opaque `bytes` payload in `LogEntry` is the standard decoupling mechanism described in the Raft paper (Ongaro & Ousterhout, USENIX ATC 2014, §5.3).
+- **Identity Centralization** (per ADR 004): Enforcing identity via gRPC metadata interceptors rather than per-handler validation guarantees that no new RPC handler can accidentally omit identity checks. This is a defense-in-depth measure — the interceptor acts as a single validation point before any application logic executes. If identity were in the message body, every handler would need to independently validate it; a missed check would create a cross-contamination vulnerability.
+- **Contractual Clarity:** The split creates two independent schemas with different evolution cycles — the consensus schema changes only when the Raft protocol changes, while the application schema evolves with the grocery domain. This prevents a grocery schema change from forcing regeneration of consensus stubs.
+- **Separation of Concerns** (per ADR 007, ADR 008): The `MutationIntent` captures human-ambiguous input (an unstructured string like "2 gallons of milk"), while the `CommittedMutation` captures the deterministic resolution after AI processing and SI normalization. This separation maps directly to the Defense Onion pipeline (ADR 007): raw input enters at Layer 2 (Syntactic Scrubbing), passes through AI resolution (Layer 3), and emerges as an absolute SI-quantified state (Layer 4). Recording the absolute result (not a delta) ensures that replaying the log is idempotent — applying the same `CommittedMutation` twice yields the same state, regardless of the order of other entries (per ADR 006).
 
 ## Consequences
 
@@ -102,3 +140,10 @@ The serialized binary format stored as `bytes` within the Raft `LogEntry`. This 
 - **Schema Evolution:** Since the ledger format (`CommittedMutation`) is persistent, any changes to the logical interface must support backward compatibility (e.g., Protobuf optional fields) to allow older logs to be replayed by newer binaries.
 - **Observability:** The inclusion of audit metadata (original intent and AI rationale) significantly simplifies debugging but requires monitoring for log-induced disk pressure.
 - **Protocol Drift:** Strict validation of `cluster_id` and `node_id` simplifies the isolation of environmental issues but requires rigorous configuration management during cluster deployment.
+
+## Follow-Up
+
+- **Protobuf specification audit:** Verify that `raft.proto` contains no application-level types and `app.proto` contains no consensus types. Enforce via code review checklist.
+- **Schema evolution policy:** Document the backward-compatibility requirements for `CommittedMutation` — new fields MUST be protobuf optional; existing fields MUST NOT be removed or repurposed.
+- **Log compaction monitoring:** Add disk-pressure alerting for the Raft log, informed by the audit metadata size in each `CommittedMutation` entry.
+- **Interface boundary review:** Revisit the split boundary if a new service domain is added (e.g., external marketplace integration) that could benefit from its own protobuf file.
