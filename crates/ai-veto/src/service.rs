@@ -11,6 +11,7 @@ use common::proto::v1::app::EvaluateProposalRequest;
 use common::proto::v1::app::EvaluateProposalResponse;
 use common::proto::v1::app::OperationType;
 use common::proto::v1::app::policy_service_server::PolicyService;
+use common::slug::slugify;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::trace::ClinicalTarget;
@@ -375,8 +376,8 @@ impl PolicyService for RealPolicyService {
             info!(
                 target: ClinicalTarget::ClinicalOracle.as_str(),
                 resolution = if llm_res.is_approved { "Approved" } else { "Vetoed" },
-                resolved_key = %llm_res.resolved_item_key,
-                category = %llm_res.category_assignment,
+                resolved_key = %slugify(&llm_res.resolved_item_key),
+                category = %slugify(&llm_res.category_assignment),
                 "Semantic Integrity Validated"
             );
 

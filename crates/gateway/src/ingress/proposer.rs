@@ -54,8 +54,9 @@ pub(crate) async fn commit_to_consensus(
         .map_err(|e| map_consensus_error(e, proposal.consensus_status))?;
 
     info!(
-        "Mutation index {} appended. Waiting for quorum...",
-        proposal_index
+        target: ClinicalTarget::ClinicalIngress.as_str(),
+        index = %proposal_index,
+        "Mutation index {proposal_index} appended. Waiting for quorum..."
     );
 
     tokio::time::timeout(consensus_timeout, raft_handle.await_commit(proposal_index))

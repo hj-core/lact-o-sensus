@@ -12,6 +12,7 @@ use common::proto::v1::app::QueryStateRequest;
 use common::proto::v1::app::QueryStateResponse;
 use common::proto::v1::app::QueryStatus;
 use common::proto::v1::app::ingress_service_server::IngressService;
+use common::slug::slugify;
 use common::types::ClientId;
 use common::types::LogIndex;
 use common::types::SequenceId;
@@ -209,8 +210,8 @@ impl IngressDispatcher {
                 target: ClinicalTarget::ClinicalIngress.as_str(),
                 index = %proposal_index,
                 status = ?final_status,
-                category_slug = %stabilized.category,
-                item_slug = %stabilized.resolved_item_key,
+                category_slug = %stabilized.category.slug(),
+                item_slug = %slugify(&stabilized.resolved_item_key),
                 "Mutation committed to consensus."
             );
 
