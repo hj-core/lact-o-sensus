@@ -358,6 +358,30 @@ impl UnitRegistry {
             Dimension::Anomalous => PhysicalQuantity::Anomalous(Anomalous(val)),
         }
     }
+
+    /// Reverse-converts a base SI quantity back to a display unit.
+    ///
+    /// This enables the QueryState response to present quantities in the user's
+    /// preferred unit (e.g., returning `"lb"` instead of `"g"`).
+    /// Contextual units (e.g., `"pack"`) cannot be reversed because the
+    /// AI-provided multiplier is not stored.
+    #[instrument(
+        name = "display_conversion",
+        target = "clinical::fsm",
+        skip_all,
+        fields(base_qty = %base_quantity, display_unit = %display_unit)
+    )]
+    pub fn convert_to_display_value(base_quantity: &str, display_unit: &str) -> Option<String> {
+        let entry = Self::resolve_symbol(display_unit).ok()?;
+        if entry.is_contextual {
+            return None;
+        }
+        let base = Decimal::from_str(base_quantity).ok()?;
+        let result = base
+            .checked_div(entry.multiplier)
+            .map(|r| r.round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven))?;
+        Some(result.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +406,22 @@ mod tests {
                 let res = UnitRegistry::parse_and_convert("1.0", "gal").unwrap();
                 assert_eq!(res.dimension(), Dimension::Volume);
                 assert_eq!(res.value().to_string(), "3785.4118"); // 3785.41178 rounded to 4dp
+            }
+
+            #[test]
+            fn returns_stabilized_quantity_when_unit_is_ounces() {
+                let res = UnitRegistry::parse_and_convert("1.0", "oz").unwrap();
+                assert_eq!(res.dimension(), Dimension::Mass);
+                // 1 * 28.34952 = 28.34952 -> rounded to 4dp = 28.3495
+                assert_eq!(res.value().to_string(), "28.3495");
+            }
+
+            #[test]
+            fn returns_stabilized_quantity_when_unit_is_fluid_ounces() {
+                let res = UnitRegistry::parse_and_convert("1.0", "fl_oz").unwrap();
+                assert_eq!(res.dimension(), Dimension::Volume);
+                // 1 * 29.57353 = 29.57353 -> rounded to 4dp = 29.5735
+                assert_eq!(res.value().to_string(), "29.5735");
             }
         }
 
@@ -471,6 +511,35 @@ mod tests {
                 let res = UnitRegistry::resolve_symbol("invalid_unit");
                 assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
             }
+        }
+    }
+
+    mod convert_to_display_value {
+        use super::*;
+        #[test]
+        fn converts_base_si_to_display_unit_for_mass() {
+            // 907.1847 g -> lb
+            let result = UnitRegistry::convert_to_display_value("907.1847", "lb");
+            assert_eq!(result, Some("2.0000".to_string()));
+        }
+
+        #[test]
+        fn converts_base_si_to_display_unit_for_volume() {
+            // 3785.4118 ml -> gal
+            let result = UnitRegistry::convert_to_display_value("3785.4118", "gal");
+            assert_eq!(result, Some("1.0000".to_string()));
+        }
+
+        #[test]
+        fn returns_none_for_contextual_units() {
+            let result = UnitRegistry::convert_to_display_value("12", "pack");
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn returns_none_for_unknown_display_unit() {
+            let result = UnitRegistry::convert_to_display_value("100", "blorgs");
+            assert!(result.is_none());
         }
     }
 

@@ -169,6 +169,7 @@ impl LactoStore {
             mutation.client_id,
             mutation.event_time.unwrap_or_default(),
             index,
+            mutation.display_unit,
         )
     }
 

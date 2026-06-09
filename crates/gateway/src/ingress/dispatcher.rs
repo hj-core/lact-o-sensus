@@ -18,6 +18,7 @@ use common::types::SequenceId;
 use common::types::errors::ConsensusError;
 use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
+use common::units::UnitRegistry;
 use common_rpc::TraceInterceptor;
 use raft_engine::ConsensusAuthority;
 use raft_engine::ConsensusHandle;
@@ -280,6 +281,23 @@ impl IngressDispatcher {
 
         // 4. Fetches the consolidated inventory from the State Machine.
         let items = self.inventory_reader.get_inventory();
+
+        // 4b. Display Conversion (ADR 008): Convert SI base quantities to the
+        // user's preferred display unit when possible.
+        let items: Vec<GroceryItem> = items
+            .into_iter()
+            .map(|mut item| {
+                if !item.display_unit.is_empty()
+                    && item.display_unit != item.unit
+                    && let Some(display_qty) =
+                        UnitRegistry::convert_to_display_value(&item.quantity, &item.display_unit)
+                {
+                    item.quantity = display_qty;
+                    item.unit = item.display_unit.clone();
+                }
+                item
+            })
+            .collect();
 
         let version = self.inventory_reader.current_version();
 

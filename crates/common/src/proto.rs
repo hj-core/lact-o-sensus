@@ -180,6 +180,7 @@ pub mod v1 {
                 last_modifier_id: String,
                 last_activity: Timestamp,
                 state_version: LogIndex,
+                display_unit: String,
             ) -> Self {
                 Self {
                     item_key,
@@ -189,6 +190,7 @@ pub mod v1 {
                     last_modifier_id,
                     last_activity: Some(last_activity),
                     state_version: state_version.as_u64(),
+                    display_unit,
                 }
             }
         }
@@ -520,6 +522,7 @@ mod tests {
                         "mod".into(),
                         ts,
                         index,
+                        "unit".into(),
                     );
 
                     assert_eq!(item.state_version, 100);

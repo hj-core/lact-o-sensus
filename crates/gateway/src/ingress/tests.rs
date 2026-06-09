@@ -181,6 +181,7 @@ mod propose_mutation {
             "client".to_string(),
             prost_types::Timestamp::default(),
             LogIndex::new(1),
+            "g".to_string(),
         );
 
         let raft = successful_raft();
@@ -1716,6 +1717,7 @@ mod query_state {
                 "client".to_string(),
                 prost_types::Timestamp::default(),
                 LogIndex::new(0),
+                "ml".to_string(),
             ),
             GroceryItem::new(
                 "eggs".to_string(),
@@ -1725,6 +1727,7 @@ mod query_state {
                 "client".to_string(),
                 prost_types::Timestamp::default(),
                 LogIndex::new(0),
+                "units".to_string(),
             ),
         ];
 
@@ -1761,6 +1764,7 @@ mod query_state {
                 "client".to_string(),
                 prost_types::Timestamp::default(),
                 LogIndex::new(0),
+                "unit".to_string(),
             ),
             GroceryItem::new(
                 "milk-skim".to_string(),
@@ -1770,6 +1774,7 @@ mod query_state {
                 "client".to_string(),
                 prost_types::Timestamp::default(),
                 LogIndex::new(0),
+                "unit".to_string(),
             ),
             GroceryItem::new(
                 "eggs".to_string(),
@@ -1779,6 +1784,7 @@ mod query_state {
                 "client".to_string(),
                 prost_types::Timestamp::default(),
                 LogIndex::new(0),
+                "units".to_string(),
             ),
         ];
 

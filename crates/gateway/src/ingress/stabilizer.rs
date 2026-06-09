@@ -257,6 +257,7 @@ mod tests {
             "client".to_string(),
             prost_types::Timestamp::default(),
             LogIndex::new(0),
+            "g".to_string(),
         )];
 
         let result = validate_and_stabilize(&intent, &veto, &inventory);
@@ -368,5 +369,41 @@ mod tests {
         let status_neg = validate_and_stabilize(&intent, &veto_neg, &[]).unwrap_err();
         assert_eq!(status_neg.code(), tonic::Code::InvalidArgument);
         assert!(status_neg.message().contains("strictly positive"));
+    }
+
+    #[test]
+    fn allows_set_operation_across_dimensions() {
+        // SET operations are exempt from the Dimensional Fence (ADR 008).
+        let intent = MutationIntent::new(
+            "".into(),
+            Some("1".to_string()),
+            None,
+            None,
+            OperationType::Set, // SET, not ADD
+        );
+        let veto = VetoOutcome {
+            is_approved: true,
+            resolved_item_key: "milk".to_string(),
+            category_assignment: "Animal Secretions".to_string(),
+            moral_justification: "Approved".to_string(),
+            suggested_display_name: "Milk".to_string(),
+            resolved_unit: "ml".to_string(), // Volume
+            conversion_multiplier_to_base: "1".to_string(),
+        };
+        let inventory = vec![GroceryItem::new(
+            "milk".to_string(),
+            "1000".to_string(),
+            "g".to_string(), // Existing item is Mass
+            "Animal Secretions".to_string(),
+            "client".to_string(),
+            prost_types::Timestamp::default(),
+            LogIndex::new(0),
+            "g".to_string(),
+        )];
+
+        // SET across dimensions (Mass -> Volume) should succeed.
+        let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
+        assert_eq!(result.base_unit, "ml");
+        assert_eq!(result.updated_base_quantity, "1");
     }
 }

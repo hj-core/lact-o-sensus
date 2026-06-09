@@ -1,7 +1,7 @@
 //! Clinical Peer Management and Transport Layer.
 //!
-//! This module orchestrates outbound gRPC connections to other nodes in the
-//! cluster, enforcing the "Leader-Centric Hub-and-Spoke" topology (ADR 002).
+//! This module orchestrates outbound gRPC connections to all peer nodes in the
+//! cluster for full-mesh internal consensus traffic (Zone A, ADR 002).
 //! It provides lazy-initialized connection pooling and automatic injection of
 //! clinical metadata (Identity and Trace headers) for all outbound RPCs.
 

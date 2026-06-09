@@ -9,11 +9,12 @@ import "google/protobuf/timestamp.proto";
 message GroceryItem {
     string item_key = 1;
     string quantity = 2; // Using string to transport Decimal safely
-    string unit = 3;
+    string unit = 3;     // SI base unit (e.g. "g", "ml")
     string category = 4; // Matches the 12-Point Taxonomy
     string last_modifier_id = 5;
     google.protobuf.Timestamp last_activity = 6;
     uint64 state_version = 7;
+    string display_unit = 8; // User's preferred display unit (e.g. "lb", "gal")
 }
 
 enum OperationType {

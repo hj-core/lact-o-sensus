@@ -250,6 +250,28 @@ Constraint: Do NOT invent units or categories. Use exactly the strings provided 
             return Err(Status::internal("AI Hallucination: Empty Item Key"));
         }
 
+        // 4. Identity Split Enforcement (ADR 008): If the resolved unit is
+        // anomalous (e.g., "misc", "handful", "bunch"), the item key MUST
+        // contain the unit slug to prevent identity collisions across
+        // different non-standard units.
+        if let Ok(entry) = UnitRegistry::resolve_symbol(&res.resolved_unit)
+            && entry.dimension == common::units::Dimension::Anomalous
+        {
+            let unit_slug = res.resolved_unit.trim().to_lowercase();
+            let key_slug = res.resolved_item_key.trim().to_lowercase();
+            if !key_slug.ends_with(&format!("_{}", unit_slug)) {
+                warn!(
+                    target: ClinicalTarget::ClinicalOracle.as_str(),
+                    key = %res.resolved_item_key,
+                    unit = %res.resolved_unit,
+                    "AI violated Identity Split: anomalous unit but key does not end with unit slug."
+                );
+                return Err(Status::internal(
+                    "AI Hallucination: Identity Split required for anomalous unit.",
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -522,6 +544,7 @@ mod tests {
                         "client-1".to_string(),
                         Timestamp::default(),
                         LogIndex::new(0),
+                        "units".to_string(),
                     )],
                     "".into(),
                 );
@@ -605,6 +628,38 @@ mod tests {
                 let status = service.validate_semantic_integrity(&res).unwrap_err();
                 assert_eq!(status.code(), tonic::Code::Internal);
                 assert!(status.message().contains("Invalid Unit"));
+            }
+
+            #[test]
+            fn returns_internal_error_when_identity_split_is_missing_for_anomalous_unit() {
+                let service = RealPolicyService::new(test_args(false));
+                let res = LlmResponse {
+                    is_approved: true,
+                    category_assignment: "Anomalous Inputs".to_string(),
+                    moral_justification: "OK".to_string(),
+                    resolved_item_key: "apple".to_string(), // Should be "apple_handful"
+                    suggested_display_name: "Apple".to_string(),
+                    resolved_unit: "handful".to_string(),
+                    custom_multiplier: None,
+                };
+                let status = service.validate_semantic_integrity(&res).unwrap_err();
+                assert_eq!(status.code(), tonic::Code::Internal);
+                assert!(status.message().contains("Identity Split"));
+            }
+
+            #[test]
+            fn accepts_identity_split_when_key_ends_with_anomalous_unit_slug() {
+                let service = RealPolicyService::new(test_args(false));
+                let res = LlmResponse {
+                    is_approved: true,
+                    category_assignment: "Anomalous Inputs".to_string(),
+                    moral_justification: "OK".to_string(),
+                    resolved_item_key: "apple_handful".to_string(), // Correct split
+                    suggested_display_name: "Apple".to_string(),
+                    resolved_unit: "handful".to_string(),
+                    custom_multiplier: None,
+                };
+                assert!(service.validate_semantic_integrity(&res).is_ok());
             }
         }
     }
