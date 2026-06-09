@@ -3,86 +3,105 @@
 ## Metadata
 
 - **Date:** 2026-05-18
-- **Status:** Proposed
-- **Scope:** System-wide Instrumentation and Diagnostics
+- **Status:** Accepted
+- **Scope:** System-wide instrumentation and diagnostics; excludes client-side logging, third-party monitoring integrations, and audit-log retention policies.
 - **Primary Goal:** Transition from unstructured logging to a clinical-grade structured telemetry framework that enables deterministic reconstruction of distributed events while strictly preserving information opacity.
-- **Last Updated:** 2026-05-27
+- **Last Updated:** 2026-06-09
 
 ## Context
 
-Current instrumentation relies on unstructured `info!`, `warn!`, and `error!` macros. While sufficient for basic debugging, this approach fails the "Clinical Rigor" test in three ways:
+Current instrumentation relies on unstructured text logs. While sufficient for basic debugging, this approach fails clinical rigor in four ways:
 
 1. **Causal Ambiguity:** It is difficult to link network RPCs to internal state transitions or subsequent state machine mutations across node boundaries.
-2. **Physical Obscurity:** "Physical Truth" (ADR 008) is often logged as stringified blobs, making it impossible for automated tools to audit stabilization or rounding logic.
-3. **Implicit Latency:** There is no standard way to measure the "Moral Evaluation" overhead (ADR 005) or Raft role durations without manual timer injections.
-4. **Information Disclosure:** Standard logging of domain objects often leaks PII (e.g., full Client IDs, raw user input, or AI moral justifications) into persistent log files, violating the "Information Opacity" mandate (ADR 006).
+2. **Physical Obscurity:** Physical quantities (ADR 008) are often logged as stringified blobs, making it impossible for automated tools to audit stabilization or rounding logic.
+3. **Implicit Latency:** There is no standard way to measure the Defense Onion pipeline overhead (ADR 007) or Raft role durations without manual timer injection.
+4. **Information Disclosure (ADR 006):** Standard logging of domain objects leaks sensitive data — full client IDs, raw user input, AI moral justifications — into persistent log files, violating the information opacity mandate.
+
+These four problems share a root cause: telemetry lacks structure, so it cannot be filtered, correlated, or redacted programmatically.
+
+## Options Considered
+
+- **Option A: Unstructured logging (baseline).** Continue with free-text `info!`/`warn!`/`error!` calls. Rejected because it provides no mechanism for causal correlation across nodes, no structured fields for automated audit tooling, and no enforceable redaction layer.
+- **Option B: Structured event log with mandatory fields.** Add a structured event schema with required correlation fields (`trace_id`, `node_id`, `term`, etc.) but no distributed trace propagation. Rejected because it still cannot link causally related events across node boundaries — a mutation's path from Gateway through Leader to AI Oracle and back remains opaque.
+- **Option C: Distributed trace propagation with structured events (chosen).** Combine a structured event schema with a propagated trace identifier, allowing end-to-end reconstruction of a mutation's lifecycle. Structured fields enable automated redaction and audit tooling.
+- **Option D: Full observability platform (OpenTelemetry).** Adopt OpenTelemetry for traces, metrics, and logs. Rejected as over-engineering for a ≤7-node cluster; the operational burden of running an OTEL collector and backend exceeds the benefit.
 
 ## Decision
 
-We will adopt a **Structured Event & Lifecycle Span** model powered by the `tracing` ecosystem, with mandatory redaction layers.
+We will adopt a **structured event model with distributed trace propagation**, where every significant system event records a standardized set of correlation fields and a propagated trace identifier links causally related events across node boundaries. All domain-specific payloads are subject to mandatory redaction rules.
 
-### 1. The "Clinical Event" Schema
+### 1. Event Schema
 
-All events must utilize a standardized set of `target` and `kind` fields:
+All events must carry a standardized set of correlation fields:
 
-- **`raft::foundation`**: Core consensus state (Term advances, Role transitions, VotedFor persistence).
-- **`raft::replication`**: Log maintenance (AppendEntries reconciliation, Commit index advances).
-- **`raft::compaction`**: Log truncation, snapshot generation, and physical disk reclamation (ADR 011).
-- **`clinical::ingress`**: The 5-Layer Defense Onion (ADR 007) lifecycle.
-- **`clinical::fsm`**: Physical state mutations and stabilization (ADR 008).
-- **`clinical::foundation`**: Node startup, identity verification (ADR 004), storage initialization, and lifecycle management.
-- **`clinical::recovery`**: State machine synchronization and log replay during node startup.
-- **`clinical::oracle`**: Semantic resolution, policy evaluation, and LLM latency tracking.
-- **`clinical::telemetry`**: Trace verification, Byzantine grafting detection, and protocol integrity checks.
+- **Trace identifier:** A unique value for distributed causal correlation, generated at the system boundary.
+- **Node identity:** Cluster and node identifiers for topological correlation.
+- **Raft coordinates:** Term and index values for consensus-level correlation.
+- **Session coordinates:** Client identifier and sequence number for linearizability correlation (ADR 006).
+- **Outcome:** The resolution status of any evaluation or mutation (e.g., approved, vetoed).
 
-### 2. Standardized Field Naming
+Events are grouped into high-level categories corresponding to system domains: consensus core (term advances, role transitions, log replication); the Defense Onion pipeline (ADR 007); physical state mutations (ADR 008); node lifecycle; and AI Oracle interactions.
 
-Mandatory fields for telemetry correlation:
+### 2. Lifecycle Spans (Duration & Context)
 
-- `trace_id`: Distributed trace identifier (UUID v7) for causal correlation.
-- `cluster_id`, `node_id`: Identity correlation.
-- `term`, `index`: Raft coordinates.
-- `last_included_index`, `last_included_term`: Snapshot coordinates for log compaction auditing.
-- `client_id`, `seq`: Session/Linearizability coordinates (ADR 006).
-- `resolution`: Outcomes of the Semantic Oracle (e.g., `Approved`, `Vetoed`).
+- **Role spans:** Each Raft role tenure (Follower, Candidate, Leader) is a time-bounded span for duration tracking.
+- **RPC spans:** Every inbound gRPC handler enters a span linked to the request's trace identifier.
+- **Evaluation spans:** AI Oracle relay calls are wrapped in spans to track semantic resolution latency, inheriting the caller's trace identifier.
 
-### 3. Lifecycle Spans (Duration & Context)
+### 3. Data Redaction & Clinical Sealing
 
-- **Role Spans**: Each Raft state (`Follower`, `Candidate`, `Leader`) will be a span.
-- **RPC Spans**: Every gRPC handler will enter a span containing the `trace_id` and `sender_id`.
-- **Evaluation Spans**: The AI Veto relay will wrap its calls in a span to track "Moral Latency," inheriting the `trace_id`.
+To preserve information opacity (ADR 006), the following redaction rules are mandatory:
 
-### 4. Data Redaction & Clinical Sealing
+- **Client identity:** Full client identifiers must never appear in log output. They must be truncated to a correlation-safe prefix.
+- **Domain payloads (PII):** Full AI moral justifications and raw user input strings are classified as sensitive. They must only be logged in full at the highest verbosity level. At standard operational levels, these fields must be omitted or replaced with a redaction placeholder.
+- **Canonical identifiers over raw input:** At standard verbosity, physical mutations must be logged using their canonical registry slugs rather than the raw user-provided item keys.
 
-To preserve information opacity, the following redaction rules are MANDATORY:
+### 4. Distributed Trace Propagation & Authority
 
-- **Client ID Redaction**: `client_id` must never be logged in its raw form in the `message` or as a full string in structured fields. It MUST be logged as a **Correlation-Safe Truncation** (the first 8 characters of the UUID).
-- **Moral Advocate Output (PII)**: Full AI-generated `moral_justification` and `raw_user_input` strings are classified as PII. They MUST ONLY be logged in full at the `TRACE` level. At `INFO` or `WARN` levels, these fields must be omitted or replaced with a generic "PII-Redacted" placeholder.
-- **Registry Slugs over Raw Strings**: At the `INFO` level, physical mutations must be logged using their canonical **Registry Slugs** (e.g., `inventory.dairy.milk`) rather than the raw user-provided item keys to prevent leak of intent.
-
-### 5. Distributed Trace Propagation & Authority
-
-We will implement a `TraceInterceptor` to propagate `trace_id` via gRPC metadata, linking a client's mutation intent through the gateway, AI Veto relay, and Raft consensus log.
-
-- **Gateway Authority:** To adhere to the Byzantine Client model (ADR 001), the Gateway node is the **Authoritative Generator** of the `trace_id` (UUID v7). Any `x-trace-id` provided by an external client MUST be ignored.
-- **Clinical Birth:** The moment a request enters the Ingress Service, it is assigned a `trace_id` which defines its "Clinical Birth." This ID is then propagated to internal cluster services (AI Veto, Raft Engine) to ensure causal correlation.
-- **Trace Feedback:** The generated `trace_id` should be returned to the client in the gRPC response headers to provide a correlation handle for external troubleshooting.
+- **Propagation:** A unique trace identifier is propagated via gRPC metadata, linking a client's mutation intent through the Gateway, AI Oracle relay, and Raft consensus log.
+- **Gateway Authority:** To adhere to the Byzantine Client model (ADR 001), the Gateway node is the authoritative generator of the trace identifier. Any trace identifier provided by an external client must be ignored.
+- **Clinical Birth:** The moment a request enters the Gateway's ingress, it is assigned a trace identifier which defines its causal origin. This identifier is then propagated to internal services (AI Oracle, Raft Engine) for end-to-end correlation.
+- **Feedback:** The assigned trace identifier should be returned to the client in the gRPC response headers to provide a correlation handle for external troubleshooting.
 
 ## Rationale
 
-- **Clinical Auditability:** Standardized fields allow a "Black Box" flight recorder to reconstruct event chains without leaking sensitive user data.
-- **Security-by-Default:** By classifying AI output and raw input as `TRACE`-only, we ensure that standard production logs do not become a source of PII leakage.
-- **Alignment with ADR 006/008:** Respects both the "Information Opacity" (redaction) and "Physical Truth" (structured stabilization data) mandates.
+- **Clinical Auditability:** Standardized correlation fields allow a "Black Box" flight recorder to reconstruct event chains without leaking sensitive user data. Option A provides no such capability.
+- **Security-by-Default:** By classifying domain payloads as sensitive by default, we ensure that standard operational logs do not become a source of data leakage. Under Option A, every log line is a potential exposure.
+- **Alignment with ADR 006/008:** The redaction rules respect the information opacity mandate, and the structured physical-state fields enable automated verification of ADR 008's rounding and stabilization logic.
+
+## Assumptions and Constraints
+
+- The cluster size is small (≤7 nodes), so the overhead of trace propagation (one additional gRPC metadata header per RPC) is negligible.
+- Trace identifiers are generated by the Gateway only; internal nodes never originate a new trace. If a component needs to initiate work independent of a client request, a separate correlation mechanism is required.
+- Redaction rules rely on developers correctly tagging sensitive fields at the call site; there is no automated static analysis to enforce compliance.
 
 ## Consequences
 
 ### Pros
 
-- **Deterministic Reconstruction:** Enables full-trace analysis of clinical events.
-- **PII Protection:** Strict redaction rules prevent accidental leakage of user intent into logs.
-- **Performance Insight:** Identifies bottlenecks in the AI Veto egress or Log I/O.
+- **Deterministic Reconstruction:** Enables full-trace analysis of clinical events across node boundaries.
+- **PII Protection:** Strict redaction rules prevent accidental leakage of user intent into operational logs.
+- **Performance Insight:** Identifies bottlenecks in the AI Oracle egress or log I/O via duration spans.
 
 ### Cons
 
-- **Debugging Friction:** Debugging complex AI vetoes in production may require elevating the log level to `TRACE`, potentially increasing log volume.
-- **Implementation Rigor:** Requires manual adherence to redaction rules in every `event!` call.
+- **Debugging Friction:** Debugging complex AI Oracle interactions may require elevating verbosity to include sensitive fields, increasing log volume and requiring careful access control.
+- **Implementation Rigor:** Requires manual adherence to redaction rules in every event emission; a missed redaction creates a PII leak vector.
+
+### Operational Impact
+
+- **Log Volume:** Structured events are larger than unstructured text messages per event, but the ability to filter by category and field reduces the total volume ingested by downstream tooling.
+- **Monitoring Setup:** Downstream observability tooling must be configured to index the structured fields for effective querying.
+
+## Follow-Up
+
+- Implement a linting rule or pre-commit hook that flags event emissions lacking the required correlation fields.
+- Establish a periodic audit process for log samples to verify redaction rule compliance.
+- Revisit the trace-propagation approach if the cluster grows beyond 7 nodes and the O(N) overhead of per-RPC propagation becomes measurable.
+
+## References
+
+- ADR 001 — Byzantine Client model motivating Gateway authority over trace identifiers.
+- ADR 006 — Information opacity mandate informing the redaction rules.
+- ADR 007 — Defense Onion pipeline whose lifecycle is captured by the event schema categories.
+- ADR 008 — Physical state representation whose stabilization logic is auditable via structured fields.
