@@ -25,7 +25,7 @@ The workspace is organized into 7 specialized crates to enforce dependency inver
 - **3.5. Logical Interface (ADR 005):** Strictly separates generic consensus payloads from application domain logic through gRPC metadata and interceptors.
 - **3.6. Exactly-Once Semantics (ADR 006):** Guarantees linearizability by recording every mutation outcome in a replicated Session Table.
 - **3.7. Defensive Mutation Lifecycle (ADR 007):** Implements a 5-layer "Defense Onion" pipeline to scrub, resolve, and validate mutation intents before they reach consensus.
-- **3.8. Universal Unit Registry (ADR 008):** Normalizes all physical quantities to SI base units using `rust_decimal` and Banker's Rounding for stability.
+- **3.8. Universal Unit Registry (ADR 008):** Normalizes all physical quantities to SI base units using high-precision fixed-point arithmetic and Banker's Rounding for stability.
 - **3.9. Internal Node Architecture (ADR 009):** Mandates a strictly synchronous core (Physical and Logical layers) protected by a "Poison-then-Panic" protocol within an asynchronous Execution Shell.
 - **3.10. Clinical Telemetry (ADR 010):** Establishes a structured tracing framework with authoritative Gateway `trace_id` generation and mandatory PII redaction.
 - **3.11. Asynchronous Log Compaction (ADR 011):** Offloads state machine snapshot generation and restoration to background threads using a "Restoration Tombstone" protocol to preserve heartbeat stability and crash-safety.
