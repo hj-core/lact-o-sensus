@@ -74,12 +74,6 @@ pub(super) fn start_election_campaign<S: StateMachine>(
 /// Acts as the high-level coordinator: it uses the pre-captured parameters
 /// to solicit votes concurrently from all peers and processes the asynchronous
 /// stream of responses to determine the campaign's success or failure.
-#[instrument(
-    name = "election_campaign_execution",
-    target = "raft::foundation",
-    skip_all,
-    fields(term = %params.term, trace_id = %params.trace_id)
-)]
 pub(super) async fn initiate_election<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
@@ -358,12 +352,6 @@ pub(crate) fn start_pre_vote_campaign<S: StateMachine>(
 /// reached, the node transitions to Candidate and immediately starts a real
 /// election campaign (initiate_election) within the same async task, avoiding
 /// the 150-300ms dead window that would otherwise occur.
-#[instrument(
-    name = "pre_vote_campaign_execution",
-    target = "raft::foundation",
-    skip_all,
-    fields(term = %params.term, trace_id = %params.trace_id)
-)]
 pub(super) async fn initiate_pre_vote<S: StateMachine>(
     config: Arc<Config>,
     state: Arc<ConsensusShell<S>>,
