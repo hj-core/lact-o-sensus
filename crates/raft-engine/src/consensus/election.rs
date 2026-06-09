@@ -386,6 +386,28 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
     let mut pre_votes_granted = 1; // Self-vote counts in pre-election (standard Raft)
 
     while let Some((_peer_id, res)) = pre_vote_stream.next().await {
+        // If any peer reports a term higher than our campaign start,
+        // check whether it also exceeds our actual current term. If so,
+        // step down to that term and abort the campaign (§5.1, Phase 8).
+        if let Ok(ref resp) = res {
+            let peer_term = Term::new(resp.term);
+            if peer_term > params.term {
+                let mut guard = state.write().await;
+                let current_term = guard.current_term();
+                if peer_term > current_term {
+                    info!(
+                        target: ClinicalTarget::RaftFoundation.as_str(),
+                        campaign_term = %params.term,
+                        current_term = %current_term,
+                        peer_term = %peer_term,
+                        "Pre-vote peer has higher term. Stepping down."
+                    );
+                    guard.into_follower(peer_term, None);
+                    return Ok(());
+                }
+            }
+        }
+
         let granted = process_pre_vote_response(res)?;
         if granted {
             pre_votes_granted += 1;
@@ -429,16 +451,11 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
 
 /// Evaluates a single pre-vote response. Returns true if pre-vote granted.
 ///
-/// Phase 8: No higher term demotion — pre-vote is read-only.
+/// Phase 8: Pre-vote is read-only by design — term advancement on higher-term
+/// responses is handled by the caller (initiate_pre_vote).
 fn process_pre_vote_response(res: RpcResult<PreVoteResponse>) -> ConsensusResult<bool> {
     match res {
-        Ok(resp) => {
-            if resp.vote_granted {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
+        Ok(resp) => Ok(resp.vote_granted),
         Err(e) => {
             debug!(
                 target: ClinicalTarget::RaftFoundation.as_str(),

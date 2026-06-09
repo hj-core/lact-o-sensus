@@ -189,11 +189,16 @@ impl RaftNode<Follower> {
     pub fn grant_pre_vote(
         &self,
         _candidate_id: NodeId,
-        _req_term: Term,
+        req_term: Term,
         req_last_log_index: LogIndex,
         req_last_log_term: Term,
     ) -> Result<bool, NodeError> {
-        // Pre-vote only checks log up-to-date; no term check, no persistence.
+        // Reject stale candidates with a lower term to prevent unnecessary
+        // term advancement and leader disruption (§5.1, Phase 8).
+        let current_term = self.current_term()?;
+        if req_term < current_term {
+            return Ok(false);
+        }
         self.is_log_up_to_date(req_last_log_term, req_last_log_index)
     }
 

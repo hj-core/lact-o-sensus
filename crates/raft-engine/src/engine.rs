@@ -585,6 +585,7 @@ impl<S: StateMachine> LogicalNode<S> {
     ) -> RequestVoteResult {
         // Phase 8: Pre-vote is read-only — NO term advancement, NO demotion,
         // NO timer reset, NO persistence. Only log freshness is checked.
+        let current_term = self.current_term();
         let vote_granted = match &mut self.state {
             RoleState::Follower(node) => match node.grant_pre_vote(
                 candidate_id,
@@ -593,17 +594,25 @@ impl<S: StateMachine> LogicalNode<S> {
                 req_last_log_term,
             ) {
                 Ok(granted) => granted,
-                Err(e) => {
-                    self.apply_fatal(e);
-                }
+                Err(e) => self.apply_fatal(e),
             },
             _ => false,
         };
 
+        if !vote_granted && req_term < current_term {
+            info!(
+                target: ClinicalTarget::RaftFoundation.as_str(),
+                candidate = %candidate_id,
+                req_term = %req_term,
+                current_term = %current_term,
+                "Stale pre-vote candidate rejected"
+            );
+        }
+
         if vote_granted {
-            RequestVoteResult::granted(self.current_term())
+            RequestVoteResult::granted(current_term)
         } else {
-            RequestVoteResult::rejected(self.current_term())
+            RequestVoteResult::rejected(current_term)
         }
     }
 
