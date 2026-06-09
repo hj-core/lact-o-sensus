@@ -94,7 +94,7 @@ This roadmap prioritizes establishing the **Logical Interface** and **Network To
   - Verify: A new node can catch up to the cluster using a snapshot.
 - **Success Metric:** Successful log truncation and snapshot-based peer synchronization verified via deterministic smoke tests.
 
-## 🛡️ Phase 8: Pre-Vote Integrity (Election Safety) [IN PROGRESS]
+## 🛡️ Phase 8: Pre-Vote Integrity (Election Safety) [DONE]
 
 - **Goal:** Implement the Pre-Vote phase to prevent disruptive elections from partitioned nodes.
 - **Key Actions:**
