@@ -250,7 +250,7 @@ async fn init_node_state(
         "Commencing cold-boot recovery..."
     );
     recovery
-        .recover()
+        .recover(trace_id)
         .instrument(recovery_span)
         .await
         .map_err(|e| {

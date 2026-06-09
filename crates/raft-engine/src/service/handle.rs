@@ -222,16 +222,18 @@ impl<S: StateMachine> ConsensusHandle for LocalRaftHandle<S> {
     }
 
     async fn verify_leadership(&self) -> Result<(), ConsensusError> {
+        let trace_id = TraceId::generate();
         let span = info_span!(
             target: ClinicalTarget::RaftFoundation.as_str(),
-            "verify_leadership"
+            "verify_leadership",
+            trace_id = %trace_id,
         );
 
         crate::orchestration::verify_leadership_quorum(
             &self.state,
             self.config.clone(),
             self.peer_manager.clone(),
-            TraceId::generate(),
+            trace_id,
         )
         .instrument(span)
         .await

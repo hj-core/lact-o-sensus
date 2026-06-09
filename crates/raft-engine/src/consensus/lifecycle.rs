@@ -69,7 +69,16 @@ pub fn spawn_tick_loop<S: StateMachine>(
 
                 // 2. Drive the logical engine and capture the required action
                 // Perform state transitions (Atomic Handoff) while holding the lock.
-                let (action, role_name, term, campaign, pre_vote_campaign, replication) = {
+                let (
+                    action,
+                    role_name,
+                    term,
+                    cluster_id,
+                    node_id,
+                    campaign,
+                    pre_vote_campaign,
+                    replication,
+                ) = {
                     let mut guard = state.write().await;
                     let action = guard.tick();
                     let role = determine_node_role_name(&guard);
@@ -131,6 +140,8 @@ pub fn spawn_tick_loop<S: StateMachine>(
                         action,
                         role.to_string(),
                         term,
+                        guard.cluster_id().clone(),
+                        guard.node_id(),
                         campaign_params,
                         pre_vote_params,
                         replication_params,
@@ -150,7 +161,9 @@ pub fn spawn_tick_loop<S: StateMachine>(
                         target: ClinicalTarget::RaftFoundation.as_str(),
                         "role_session",
                         role = %role_name,
-                        term = %term
+                        term = %term,
+                        cluster_id = %cluster_id,
+                        node_id = %node_id,
                     );
                     current_session = Some((span, role_name.clone(), term));
                 }

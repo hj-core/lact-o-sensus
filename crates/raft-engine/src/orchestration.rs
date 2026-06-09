@@ -185,6 +185,7 @@ pub(crate) async fn handle_install_snapshot<S: StateMachine>(
                 target: ClinicalTarget::RaftCompaction.as_str(),
                 "background_snapshot_install",
                 index = %index,
+                last_included_term = %term,
                 trace_id = %trace_id
             );
             let _enter = span.enter();

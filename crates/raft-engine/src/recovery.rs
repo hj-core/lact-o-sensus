@@ -16,6 +16,7 @@ use common::raft_api::StateMachine;
 use common::types::LogIndex;
 use common::types::errors::NodeError;
 use common::types::trace::ClinicalTarget;
+use common::types::trace::TraceId;
 use tracing::Instrument;
 use tracing::error;
 use tracing::info;
@@ -40,11 +41,12 @@ impl<S: StateMachine> RecoveryManager<S> {
     ///
     /// This method blocks until the FSM reaches the last persisted commit
     /// index.
-    pub async fn recover(&self) -> Result<(), NodeError> {
+    pub async fn recover(&self, trace_id: TraceId) -> Result<(), NodeError> {
         // ADR 010: Manual span orchestration to use type-safe ClinicalTarget registry.
         let span = info_span!(
             target: ClinicalTarget::ClinicalRecovery.as_str(),
-            "recovery_session"
+            "recovery_session",
+            trace_id = %trace_id,
         );
 
         async move {
@@ -236,7 +238,10 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(3)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                recovery.recover().await.expect("Recovery failed");
+                recovery
+                    .recover(TraceId::generate())
+                    .await
+                    .expect("Recovery failed");
 
                 let applied = fsm.applied_indices.lock().unwrap();
                 assert_eq!(
@@ -257,7 +262,10 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(1)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                recovery.recover().await.expect("Recovery failed");
+                recovery
+                    .recover(TraceId::generate())
+                    .await
+                    .expect("Recovery failed");
 
                 let applied = fsm.applied_indices.lock().unwrap();
                 assert_eq!(applied.as_slice(), &[LogIndex::new(1)]);
@@ -277,7 +285,10 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(3)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                recovery.recover().await.expect("Recovery failed");
+                recovery
+                    .recover(TraceId::generate())
+                    .await
+                    .expect("Recovery failed");
 
                 let applied = fsm.applied_indices.lock().unwrap();
                 assert!(applied.is_empty());
@@ -298,7 +309,7 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(3)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                let _ = recovery.recover().await;
+                let _ = recovery.recover(TraceId::generate()).await;
             }
         }
 
@@ -313,7 +324,7 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(1)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                let _ = recovery.recover().await;
+                let _ = recovery.recover(TraceId::generate()).await;
             }
         }
 
@@ -333,7 +344,7 @@ mod tests {
                 storage.save_last_committed(LogIndex::new(1)).unwrap();
 
                 let recovery = RecoveryManager::new(fsm.clone(), Arc::new(storage));
-                let result = recovery.recover().await;
+                let result = recovery.recover(TraceId::generate()).await;
 
                 assert!(result.is_err());
                 assert!(
