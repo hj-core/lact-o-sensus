@@ -396,8 +396,9 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
                     info!(
                         target: ClinicalTarget::RaftFoundation.as_str(),
                         peer_term = %peer_term,
-                        "Pre-vote peer has higher term (campaign_term={}, current_term={}, peer_term={}). Stepping down.",
-                        params.term, current_term, peer_term,
+                        campaign_term = %params.term,
+                        current_term = %current_term,
+                        "Pre-vote peer has higher term. Stepping down."
                     );
                     guard.into_follower(peer_term, None);
                     return Ok(());
@@ -427,8 +428,9 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
                     target: ClinicalTarget::RaftFoundation.as_str(),
                     votes = %pre_votes_granted,
                     quorum = %quorum,
-                    "Pre-vote quorum reached (campaign_term={}, actual_term={}). Transitioning to Candidate.",
-                    params.term, actual_term,
+                    campaign_term = %params.term,
+                    actual_term = %actual_term,
+                    "Pre-vote quorum reached. Transitioning to Candidate."
                 );
                 let election_span = info_span!(
                     target: ClinicalTarget::RaftFoundation.as_str(),
@@ -471,8 +473,9 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
             target: ClinicalTarget::RaftFoundation.as_str(),
             votes = %pre_votes_granted,
             quorum = %quorum,
-            "Pre-vote quorum reached (self-vote). campaign_term={}, actual_term={}",
-            params.term, actual_term,
+            campaign_term = %params.term,
+            actual_term = %actual_term,
+            "Pre-vote quorum reached (self-vote). Transitioning to Candidate."
         );
         let election_span = info_span!(
             target: ClinicalTarget::RaftFoundation.as_str(),
@@ -500,8 +503,9 @@ pub(super) async fn initiate_pre_vote<S: StateMachine>(
         target: ClinicalTarget::RaftFoundation.as_str(),
         votes = %pre_votes_granted,
         quorum = %quorum,
-        "Pre-vote campaign finished without quorum. votes={} quorum={} campaign_term={} actual_term={}",
-        pre_votes_granted, quorum, params.term, actual_term,
+        campaign_term = %params.term,
+        actual_term = %actual_term,
+        "Pre-vote campaign finished without quorum."
     );
 
     Ok(())
