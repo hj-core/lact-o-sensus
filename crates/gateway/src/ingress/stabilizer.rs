@@ -51,11 +51,18 @@ pub(crate) fn validate_and_stabilize(
         current_inventory,
     )?;
 
+    let accumulated = apply_arithmetic_accumulation(
+        intent,
+        &veto.resolved_item_key,
+        base_quantity,
+        current_inventory,
+    )?;
+
     Ok(StabilizedMutation {
         resolved_item_key: veto.resolved_item_key.clone(),
         suggested_display_name: veto.suggested_display_name.clone(),
-        updated_base_quantity: base_quantity.value().to_string(),
-        base_unit: base_quantity.dimension().base_unit().to_string(),
+        updated_base_quantity: accumulated.value().to_string(),
+        base_unit: accumulated.dimension().base_unit().to_string(),
         display_unit: veto.resolved_unit.clone(),
         category,
         moral_justification: veto.moral_justification.clone(),
@@ -145,6 +152,61 @@ fn enforce_physical_invariants(
         }
     }
     Ok(())
+}
+
+/// Applies arithmetic accumulation for Add/Sub operations.
+/// For Set/Delete or when no existing item is found, returns base_quantity
+/// unchanged.
+fn apply_arithmetic_accumulation(
+    intent: &MutationIntent,
+    resolved_key: &str,
+    base_quantity: PhysicalQuantity,
+    current_inventory: &[GroceryItem],
+) -> Result<PhysicalQuantity, Status> {
+    let Ok(op) = OperationType::try_from(intent.operation) else {
+        return Err(Status::invalid_argument("Unknown operation type"));
+    };
+
+    match op {
+        OperationType::Add | OperationType::Subtract => {}
+        OperationType::Set | OperationType::Delete | OperationType::Unspecified => {
+            return Ok(base_quantity);
+        }
+    }
+
+    let existing_item = match current_inventory
+        .iter()
+        .find(|i| i.item_key == resolved_key)
+    {
+        Some(item) => item,
+        None => return Ok(base_quantity),
+    };
+
+    let existing_qty =
+        UnitRegistry::parse_and_convert(&existing_item.quantity, &existing_item.unit)
+            .map_err(|e| Status::internal(format!("Failed to parse existing quantity: {}", e)))?;
+
+    let result = match op {
+        OperationType::Add => existing_qty + base_quantity,
+        OperationType::Subtract => existing_qty - base_quantity,
+        OperationType::Set | OperationType::Delete | OperationType::Unspecified => {
+            unreachable!("already filtered by the guard above")
+        }
+    }
+    .map_err(|e| {
+        Status::invalid_argument(format!(
+            "Physical Invariant Violation: Arithmetic failed ({})",
+            e
+        ))
+    })?;
+
+    if result.value().is_sign_negative() {
+        return Err(Status::invalid_argument(
+            "Physical Invariant Violation: Resulting quantity would be negative.",
+        ));
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -405,5 +467,164 @@ mod tests {
         let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
         assert_eq!(result.base_unit, "ml");
         assert_eq!(result.updated_base_quantity, "1");
+    }
+
+    mod arithmetic_accumulation {
+        use super::*;
+
+        #[test]
+        fn add_accumulates_existing_quantity() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("5".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let inventory = vec![GroceryItem::new(
+                "milk".to_string(),
+                "10".to_string(),
+                "ml".to_string(),
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(0),
+                "ml".to_string(),
+            )];
+            let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
+            assert_eq!(result.updated_base_quantity, "15");
+            assert_eq!(result.base_unit, "ml");
+        }
+
+        #[test]
+        fn subtract_reduces_existing_quantity() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("3".to_string()),
+                None,
+                None,
+                OperationType::Subtract,
+            );
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let inventory = vec![GroceryItem::new(
+                "milk".to_string(),
+                "10".to_string(),
+                "ml".to_string(),
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(0),
+                "ml".to_string(),
+            )];
+            let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
+            assert_eq!(result.updated_base_quantity, "7");
+            assert_eq!(result.base_unit, "ml");
+        }
+
+        #[test]
+        fn subtract_below_zero_returns_error() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("15".to_string()),
+                None,
+                None,
+                OperationType::Subtract,
+            );
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let inventory = vec![GroceryItem::new(
+                "milk".to_string(),
+                "10".to_string(),
+                "ml".to_string(),
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(0),
+                "ml".to_string(),
+            )];
+            let err = validate_and_stabilize(&intent, &veto, &inventory).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(err.message().contains("negative"));
+        }
+
+        #[test]
+        fn add_with_no_existing_item_uses_raw_quantity() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("5".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let result = validate_and_stabilize(&intent, &veto, &[]).unwrap();
+            assert_eq!(result.updated_base_quantity, "5");
+            assert_eq!(result.base_unit, "ml");
+        }
+
+        #[test]
+        fn set_operation_does_not_accumulate() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("5".to_string()),
+                None,
+                None,
+                OperationType::Set,
+            );
+            let veto = VetoOutcome {
+                is_approved: true,
+                resolved_item_key: "milk".to_string(),
+                category_assignment: "Animal Secretions".to_string(),
+                moral_justification: "Approved".to_string(),
+                suggested_display_name: "Milk".to_string(),
+                resolved_unit: "ml".to_string(),
+                conversion_multiplier_to_base: "1".to_string(),
+            };
+            let inventory = vec![GroceryItem::new(
+                "milk".to_string(),
+                "10".to_string(),
+                "ml".to_string(),
+                "Animal Secretions".to_string(),
+                "client".to_string(),
+                prost_types::Timestamp::default(),
+                LogIndex::new(0),
+                "ml".to_string(),
+            )];
+            let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
+            assert_eq!(result.updated_base_quantity, "5");
+            assert_eq!(result.base_unit, "ml");
+        }
     }
 }
