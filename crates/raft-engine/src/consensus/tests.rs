@@ -1263,6 +1263,55 @@ mod reachability_first_snapshotting {
         }
 
         #[tokio::test]
+        async fn should_apply_committed_entries_via_background_applier() {
+            let fsm = Arc::new(MockFsm);
+            let id = Arc::new(NodeIdentity::new(
+                ClusterId::try_new("test-cluster").unwrap(),
+                NodeId::try_new(1).unwrap(),
+            ));
+            let storage = Arc::new(MemoryStorage::new());
+            let thresholds = TickThresholds {
+                heartbeat_interval: TickDuration::new(10),
+                min_election: TickDuration::new(15),
+                max_election: TickDuration::new(30),
+            };
+            let rng = StdRng::seed_from_u64(1);
+            let node = LogicalNode::try_new(id, fsm, storage.clone(), thresholds, rng).unwrap();
+            let state = Arc::new(ConsensusShell::new(node));
+
+            // Append and commit two entries so the applier has work to do.
+            storage
+                .append_entries(vec![
+                    common::proto::v1::raft::LogEntry {
+                        index: 1,
+                        term: 1,
+                        data: vec![1],
+                    },
+                    common::proto::v1::raft::LogEntry {
+                        index: 2,
+                        term: 1,
+                        data: vec![2],
+                    },
+                ])
+                .unwrap();
+            {
+                let mut guard = state.write().await;
+                guard.advance_last_committed(LogIndex::new(2));
+            }
+
+            // Spawn the background applier. The initial catch-up inside
+            // the spawned task should apply all committed entries.
+            spawn_background_applier(state.clone());
+
+            // Yield to the runtime so the spawned task can run.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Verify all entries were applied.
+            let guard = state.read().await;
+            assert_eq!(guard.last_applied(), LogIndex::new(2));
+        }
+
+        #[tokio::test]
         async fn should_poison_node_when_fsm_apply_fails_via_background_applier() {
             let fsm = Arc::new(PoisonApplyFsm);
             let id = Arc::new(NodeIdentity::new(

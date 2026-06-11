@@ -242,30 +242,37 @@ pub fn spawn_tick_loop<S: StateMachine>(
 /// loop, the consensus write lock is never held across slow I/O, preventing
 /// heartbeat starvation.
 pub fn spawn_background_applier<S: StateMachine>(state: Arc<ConsensusShell<S>>) {
-    tokio::spawn(async move {
-        let mut progress_rx = state.subscribe();
+    let span = info_span!(
+        target: ClinicalTarget::RaftFoundation.as_str(),
+        "background_applier"
+    );
+    tokio::spawn(
+        async move {
+            let mut progress_rx = state.subscribe();
 
-        // Initial catch-up: apply any entries committed before we started.
-        crate::orchestration::apply_committed(&state).await;
-
-        loop {
-            // Wait for the next progress signal.
-            if progress_rx.changed().await.is_err() {
-                // The sender was dropped — node is shutting down.
-                return;
-            }
-
-            // During snapshot freeze (compaction, serialization, or install),
-            // skip applying. The applier will be woken again when the snapshot
-            // completes via the MutationGuard broadcast.
-            if state.is_frozen() {
-                continue;
-            }
-
-            // Apply any pending committed entries outside the consensus lock.
+            // Initial catch-up: apply any entries committed before we started.
             crate::orchestration::apply_committed(&state).await;
+
+            loop {
+                // Wait for the next progress signal.
+                if progress_rx.changed().await.is_err() {
+                    // The sender was dropped — node is shutting down.
+                    return;
+                }
+
+                // During snapshot freeze (compaction, serialization, or install),
+                // skip applying. The applier will be woken again when the snapshot
+                // completes via the MutationGuard broadcast.
+                if state.is_frozen() {
+                    continue;
+                }
+
+                // Apply any pending committed entries outside the consensus lock.
+                crate::orchestration::apply_committed(&state).await;
+            }
         }
-    });
+        .instrument(span),
+    );
 }
 
 /// Determines whether the density of un-snapshotted applied entries exceeds
