@@ -18,6 +18,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::instrument;
+use tracing::warn;
 
 use crate::engine::ConsensusProgress;
 use crate::engine::LogicalNode;
@@ -85,7 +86,13 @@ impl<S: StateMachine> ConsensusShell<S> {
         self: &Arc<Self>,
         peer_id: NodeId,
     ) -> Option<SnapshotPermit<S>> {
-        let mut in_flight = self.in_flight_snapshots.lock().unwrap();
+        let mut in_flight = self.in_flight_snapshots.lock().unwrap_or_else(|e| {
+            warn!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                "Snapshot permit tracker mutex was poisoned; recovering"
+            );
+            e.into_inner()
+        });
         if in_flight.insert(peer_id) {
             Some(SnapshotPermit {
                 shell: self.clone(),
@@ -298,9 +305,14 @@ pub struct SnapshotPermit<S: StateMachine> {
 
 impl<S: StateMachine> Drop for SnapshotPermit<S> {
     fn drop(&mut self) {
-        if let Ok(mut in_flight) = self.shell.in_flight_snapshots.lock() {
-            in_flight.remove(&self.peer_id);
-        }
+        let mut in_flight = self.shell.in_flight_snapshots.lock().unwrap_or_else(|e| {
+            warn!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                "Snapshot permit release mutex was poisoned; recovering"
+            );
+            e.into_inner()
+        });
+        in_flight.remove(&self.peer_id);
     }
 }
 
@@ -346,6 +358,35 @@ mod tests {
             // Acquisition should succeed again (synchronously)
             let permit2 = shell.try_acquire_snapshot_permit(peer_id);
             assert!(permit2.is_some());
+        }
+
+        #[test]
+        fn should_recover_from_poisoned_mutex() {
+            let shell = mock_shell();
+            let peer_id = NodeId::try_new(99).unwrap();
+
+            // Poison the mutex by panicking inside a spawned thread while
+            // holding the lock. We clone the Arc so the thread can access
+            // the private field.
+            let shell_clone = shell.clone();
+            let handle = std::thread::spawn(move || {
+                let _lock = shell_clone.in_flight_snapshots.lock().unwrap();
+                panic!("deliberate poisoning for test");
+            });
+            assert!(handle.join().is_err(), "Thread should have panicked");
+
+            // The mutex is now poisoned. try_acquire_snapshot_permit must
+            // recover instead of propagating a panic.
+            let permit = shell.try_acquire_snapshot_permit(peer_id);
+            assert!(permit.is_some(), "Should recover from poisoned mutex");
+
+            // Verify the permit actually tracks correctly after recovery.
+            drop(permit);
+            let permit2 = shell.try_acquire_snapshot_permit(peer_id);
+            assert!(
+                permit2.is_some(),
+                "Permit should be released properly after recovery"
+            );
         }
     }
 
