@@ -35,6 +35,7 @@ use tonic::transport::Server;
 
 use super::election::initiate_election;
 use super::election::process_vote_response;
+use super::lifecycle::initiate_log_compaction;
 use super::lifecycle::should_compact_log;
 use super::replication::broadcast_append_entries;
 use super::replication::process_replication_response;
@@ -1198,6 +1199,72 @@ mod should_compact_log {
                 assert!(!should_compact_log(&mut guard, &ctx.config, true));
             }
         }
+    }
+}
+
+mod initiate_log_compaction {
+    use super::*;
+
+    #[tokio::test]
+    async fn should_truncate_log_front_and_thaw() {
+        let fsm = Arc::new(MockFsm);
+        let id = Arc::new(NodeIdentity::new(
+            ClusterId::try_new("test-cluster").unwrap(),
+            NodeId::try_new(1).unwrap(),
+        ));
+        let storage = Arc::new(MemoryStorage::new());
+        let thresholds = TickThresholds {
+            heartbeat_interval: TickDuration::new(10),
+            min_election: TickDuration::new(15),
+            max_election: TickDuration::new(30),
+        };
+        let rng = StdRng::seed_from_u64(1);
+        let node = LogicalNode::try_new(id, fsm, storage.clone(), thresholds, rng).unwrap();
+        let state = Arc::new(ConsensusShell::new(node));
+
+        // Append entries and advance horizon.
+        storage
+            .append_entries(vec![
+                common::proto::v1::raft::LogEntry {
+                    index: 1,
+                    term: 1,
+                    data: vec![],
+                },
+                common::proto::v1::raft::LogEntry {
+                    index: 2,
+                    term: 1,
+                    data: vec![],
+                },
+            ])
+            .unwrap();
+        {
+            let mut guard = state.write().await;
+            guard
+                .advance_horizon_after_snapshot(LogIndex::new(2))
+                .unwrap();
+        }
+
+        // The tick loop freezes the state before calling
+        // initiate_log_compaction (see lifecycle.rs:93-100).
+        state.freeze().unwrap();
+
+        let parent_span = tracing::info_span!("test_compaction_parent");
+        initiate_log_compaction(state.clone(), LogIndex::new(2), Term::new(1), &parent_span);
+
+        // Wait for the spawned compaction task to finish.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // State should be thawed after compaction.
+        assert!(
+            !state.is_frozen(),
+            "State should be thawed after compaction"
+        );
+
+        // Log entries 1..=2 should be removed from the front.
+        let entries = storage
+            .read_entries(LogIndex::new(1), LogIndex::new(2))
+            .unwrap();
+        assert!(entries.is_empty(), "Front-truncated entries should be gone");
     }
 }
 

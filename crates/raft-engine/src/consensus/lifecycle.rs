@@ -342,8 +342,12 @@ pub(crate) fn initiate_log_compaction<S: StateMachine>(
 
             // 2. Perform heavy truncation (Unlocked)
             // This is offloaded to a background thread to preserve the tick loop.
-            let truncation_res =
-                tokio::task::spawn_blocking(move || log_store.truncate_log_front(index)).await;
+            let span = tracing::Span::current();
+            let truncation_res = tokio::task::spawn_blocking(move || {
+                let _enter = span.enter();
+                log_store.truncate_log_front(index)
+            })
+            .await;
 
             // 3. Unfreeze and catch up (Locked)
             {
