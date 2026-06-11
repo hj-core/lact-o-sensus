@@ -507,7 +507,9 @@ pub(super) async fn replicate_snapshot_to_peer<S: StateMachine>(
     // The lock is acquired inside spawn_blocking via blocking_lock()
     // to avoid lifetime conflicts with the 'static closure bound.
     let state_clone = state.clone();
+    let span = tracing::Span::current();
     let res = tokio::task::spawn_blocking(move || {
+        let _enter = span.enter();
         let _fsm_guard = state_clone.fsm_lock.blocking_lock();
         fsm.snapshot()
     })

@@ -849,6 +849,43 @@ mod replicate_snapshot_to_peer {
                 );
             }
         }
+
+        #[tokio::test]
+        async fn should_serialize_snapshot_and_send_to_peer() {
+            let ctx = TestContext::setup(true).await;
+            let last_included_index = LogIndex::new(10);
+            let last_included_term = Term::new(2);
+            let peer_id = NodeId::try_new(2).unwrap();
+            let params = ReplicationRoundParams {
+                term: Term::new(3),
+                node_id: NodeId::try_new(1).unwrap(),
+                last_committed: LogIndex::new(0),
+                trace_id: TraceId::generate(),
+            };
+
+            let permit = ctx.state.try_acquire_snapshot_permit(peer_id).unwrap();
+            let res = replicate_snapshot_to_peer(
+                ctx.state.clone(),
+                ctx.peer_manager.clone(),
+                peer_id,
+                params,
+                last_included_index,
+                last_included_term,
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                permit,
+            )
+            .await;
+
+            // The snapshot should be serialized (inside spawn_blocking)
+            // and attempted to be sent to the peer.
+            assert!(res.is_ok(), "Snapshot serialization should succeed");
+            let outcome = res.unwrap();
+            assert!(
+                outcome.is_some(),
+                "A replication outcome should be returned"
+            );
+        }
     }
 }
 
