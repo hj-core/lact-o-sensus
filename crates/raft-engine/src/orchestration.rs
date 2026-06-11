@@ -88,7 +88,13 @@ pub(crate) async fn apply_committed<S: StateMachine>(shell: &Arc<ConsensusShell<
         let apply_res = if let Some(entry) = entry {
             let fsm = fsm.clone();
             let data = entry.data.clone();
-            match tokio::task::spawn_blocking(move || fsm.apply(next_idx, &data)).await {
+            let span = tracing::Span::current();
+            match tokio::task::spawn_blocking(move || {
+                let _enter = span.enter();
+                fsm.apply(next_idx, &data)
+            })
+            .await
+            {
                 Ok(result) => result,
                 Err(join_err) => {
                     let mut guard = shell.write().await;
