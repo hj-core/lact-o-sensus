@@ -5,10 +5,12 @@ use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::OperationType;
 use common::slug::slugify;
 use common::taxonomy::GroceryCategory;
+use common::types::trace::ClinicalTarget;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
 use rust_decimal::Decimal;
 use tonic::Status;
+use tracing::error;
 
 use super::types::StabilizedMutation;
 use crate::veto::VetoOutcome;
@@ -23,10 +25,12 @@ pub(crate) fn validate_and_stabilize(
     let category = verify_category_registry(&veto.category_assignment)?;
 
     if slugify(&veto.resolved_item_key) != veto.resolved_item_key {
-        return Err(Status::internal(format!(
-            "AI Hallucination: Item key '{}' is not a valid slug.",
-            veto.resolved_item_key
-        )));
+        error!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            key = %veto.resolved_item_key,
+            "AI returned non-slug item key"
+        );
+        return Err(Status::internal("Request rejected"));
     }
 
     if intent.operation == OperationType::Delete as i32 {
@@ -80,10 +84,12 @@ pub(crate) fn validate_and_stabilize(
 /// Verifies AI-resolved categories against the clinical registry.
 fn verify_category_registry(category_str: &str) -> Result<GroceryCategory, Status> {
     GroceryCategory::from_str(category_str).map_err(|_| {
-        Status::internal(format!(
-            "AI Hallucination: Unregistered category '{}'",
-            category_str
-        ))
+        error!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            category = %category_str,
+            "AI returned unregistered category"
+        );
+        Status::internal("Request rejected")
     })
 }
 
@@ -95,17 +101,22 @@ fn verify_unit_stabilization(
     ai_multiplier: &str,
 ) -> Result<PhysicalQuantity, Status> {
     let entry = UnitRegistry::resolve_symbol(unit_symbol).map_err(|e| {
-        Status::invalid_argument(format!(
-            "Physical Invariant Violation: Invalid unit '{}' ({}).",
-            unit_symbol, e
-        ))
+        error!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            unit = %unit_symbol,
+            detail = %e,
+            "AI returned invalid unit symbol"
+        );
+        Status::invalid_argument("Request rejected")
     })?;
 
     let ai_val = Decimal::from_str(ai_multiplier).map_err(|_| {
-        Status::internal(format!(
-            "AI Hallucination: Malformed multiplier '{}' for contextual unit.",
-            ai_multiplier
-        ))
+        error!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            multiplier = %ai_multiplier,
+            "AI returned malformed conversion multiplier"
+        );
+        Status::internal("Request rejected")
     })?;
 
     let base_quantity_res = if entry.is_contextual {
@@ -115,10 +126,14 @@ fn verify_unit_stabilization(
     };
 
     let base_quantity = base_quantity_res.map_err(|e| {
-        Status::invalid_argument(format!(
-            "Physical Invariant Violation: Stabilization failed ({}).",
-            e
-        ))
+        error!(
+            target: ClinicalTarget::ClinicalIngress.as_str(),
+            quantity = %quantity,
+            unit = %unit_symbol,
+            detail = %e,
+            "Unit stabilization failed"
+        );
+        Status::invalid_argument("Request rejected")
     })?;
 
     if base_quantity.value().is_sign_negative() || base_quantity.value().is_zero() {
@@ -144,19 +159,24 @@ fn enforce_physical_invariants(
             .find(|i| i.item_key == resolved_key)
     {
         let existing_unit = UnitRegistry::resolve_symbol(&existing_item.unit).map_err(|e| {
-            Status::internal(format!(
-                "Internal state corruption: Existing item has invalid unit '{}' ({})",
-                existing_item.unit, e
-            ))
+            error!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                unit = %existing_item.unit,
+                detail = %e,
+                "Existing inventory item has invalid unit"
+            );
+            Status::internal("Request rejected")
         })?;
 
         if existing_unit.dimension != new_quantity.dimension() {
-            return Err(Status::invalid_argument(format!(
-                "Physical Invariant Violation: Cannot perform arithmetic between {:?} and {:?} \
-                 (Dimensional Fence).",
-                existing_unit.dimension,
-                new_quantity.dimension()
-            )));
+            error!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                existing_dim = ?existing_unit.dimension,
+                new_dim = ?new_quantity.dimension(),
+                item_key = %resolved_key,
+                "Dimensional Fence violation"
+            );
+            return Err(Status::invalid_argument("Request rejected"));
         }
     }
     Ok(())
@@ -332,9 +352,7 @@ mod tests {
 
         let result = validate_and_stabilize(&intent, &veto, &inventory);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("Dimensional Fence"));
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

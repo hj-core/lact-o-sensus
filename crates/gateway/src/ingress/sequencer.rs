@@ -6,6 +6,7 @@ use common::types::SequenceId;
 use common::types::trace::ClinicalTarget;
 use tonic::Response;
 use tonic::Status;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -37,7 +38,15 @@ pub(crate) async fn enforce_sequence_firewall(
 
     let last_session = session_provider
         .check_session(client_id, SequenceId::new(0))
-        .map_err(|e| Status::invalid_argument(format!("Session lookup failed: {}", e)))?;
+        .map_err(|e| {
+            error!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                client_id = %client_id.truncated(),
+                detail = %e,
+                "Session lookup failed"
+            );
+            Status::invalid_argument("Request validation failed")
+        })?;
 
     if let Some(record) = last_session {
         if sequence_id.as_u64() == record.last_sequence_id {

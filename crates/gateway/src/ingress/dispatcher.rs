@@ -28,6 +28,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::Instrument;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
 
@@ -127,10 +128,15 @@ impl IngressDispatcher {
         let req = request.into_inner();
 
         let sequence_id = SequenceId::new(req.sequence_id);
-        let client_id = req
-            .client_id
-            .parse::<ClientId>()
-            .map_err(|e| self.invalid_argument(format!("Invalid client_id: {}", e)))?;
+        let client_id = req.client_id.parse::<ClientId>().map_err(|e| {
+            error!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                client_id_raw = %req.client_id,
+                detail = %e,
+                "Invalid client_id format"
+            );
+            self.invalid_argument("Invalid client_id")
+        })?;
 
         let span = info_span!(
             "propose_mutation",
@@ -181,7 +187,14 @@ impl IngressDispatcher {
                 self.normalize_intent(&mut intent)?;
 
                 // 5. Fetches the authoritative linearizable state for context (ADR 007).
-                let current_inventory = self.inventory_reader.get_inventory();
+                let current_inventory = self.inventory_reader.get_inventory().map_err(|e| {
+                    error!(
+                        target: ClinicalTarget::ClinicalIngress.as_str(),
+                        detail = %e,
+                        "Failed to read inventory"
+                    );
+                    Status::internal("Request rejected")
+                })?;
 
                 // 6. Resolves semantic metadata and stabilizes physical quantities via the AI
                 //    resolution loop.
@@ -263,7 +276,14 @@ impl IngressDispatcher {
                     ConsensusError::NotLeader => {
                         return Ok(self.query_redirection_response(status));
                     }
-                    _ => return Err(Status::internal(format!("Linearizable read failed: {}", e))),
+                    _ => {
+                        error!(
+                            target: ClinicalTarget::ClinicalIngress.as_str(),
+                            detail = %e,
+                            "Linearizable read failed"
+                        );
+                        return Err(Status::internal("Query failed"));
+                    }
                 }
             }
 
@@ -294,7 +314,14 @@ impl IngressDispatcher {
             }
 
             // 4. Fetches the consolidated inventory from the State Machine.
-            let items = self.inventory_reader.get_inventory();
+            let items = self.inventory_reader.get_inventory().map_err(|e| {
+                error!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    detail = %e,
+                    "Failed to read inventory"
+                );
+                Status::internal("Request rejected")
+            })?;
 
             // 4b. Display Conversion (ADR 008): Convert SI base quantities to the
             // user's preferred display unit when possible.

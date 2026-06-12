@@ -294,8 +294,8 @@ impl SessionProvider for MockInventorySource {
 }
 
 impl InventoryReader for MockInventorySource {
-    fn get_inventory(&self) -> Vec<GroceryItem> {
-        self.items.clone()
+    fn get_inventory(&self) -> Result<Vec<GroceryItem>, FsmError> {
+        Ok(self.items.clone())
     }
 
     fn current_version(&self) -> Result<LogIndex, FsmError> {

@@ -29,7 +29,7 @@ pub trait SessionProvider: Send + Sync + Debug {
 /// Trait for authoritative business state retrieval.
 pub trait InventoryReader: Send + Sync + Debug {
     /// Returns the current list of items in the inventory.
-    fn get_inventory(&self) -> Vec<GroceryItem>;
+    fn get_inventory(&self) -> Result<Vec<GroceryItem>, FsmError>;
 
     /// Returns the version (LogIndex) that this snapshot represents.
     fn current_version(&self) -> Result<LogIndex, FsmError>;

@@ -23,6 +23,8 @@
 //! - `meta`: [Key (String) => Metadata (Binary)], e.g., last_applied_index.
 
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use common::app_api::InventoryReader;
 use common::app_api::SessionProvider;
@@ -73,6 +75,7 @@ pub struct LactoStore {
     inventory: Tree,
     sessions: Tree,
     meta: Tree,
+    poisoned: AtomicBool,
 }
 
 impl LactoStore {
@@ -99,6 +102,7 @@ impl LactoStore {
             inventory,
             sessions,
             meta,
+            poisoned: AtomicBool::new(false),
         };
 
         // STARTUP SANITIZATION (ADR 011)
@@ -235,6 +239,13 @@ impl LactoStore {
             }
         }
     }
+
+    fn check_not_poisoned(&self) -> Result<(), FsmError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(FsmError::poisoned());
+        }
+        Ok(())
+    }
 }
 
 impl SessionProvider for LactoStore {
@@ -243,6 +254,7 @@ impl SessionProvider for LactoStore {
         client_id: &ClientId,
         sequence_id: SequenceId,
     ) -> Result<Option<SessionRecord>, FsmError> {
+        self.check_not_poisoned()?;
         match self.get_session_record(client_id.as_str())? {
             Some(record)
                 if sequence_id.as_u64() == 0 || record.last_sequence_id == sequence_id.as_u64() =>
@@ -255,14 +267,17 @@ impl SessionProvider for LactoStore {
 }
 
 impl InventoryReader for LactoStore {
-    fn get_inventory(&self) -> Vec<GroceryItem> {
-        self.inventory
+    fn get_inventory(&self) -> Result<Vec<GroceryItem>, FsmError> {
+        self.check_not_poisoned()?;
+        Ok(self
+            .inventory
             .iter()
             .filter_map(Self::decode_inventory_entry)
-            .collect()
+            .collect())
     }
 
     fn current_version(&self) -> Result<LogIndex, FsmError> {
+        self.check_not_poisoned()?;
         StateMachine::last_applied_index(self)
     }
 }
@@ -271,6 +286,7 @@ impl StateMachine for LactoStore {
     type Error = FsmError;
 
     fn last_applied_index(&self) -> Result<LogIndex, Self::Error> {
+        self.check_not_poisoned()?;
         self.meta
             .get(Self::KEY_LAST_APPLIED)
             .map_err(|e| {
@@ -296,6 +312,7 @@ impl StateMachine for LactoStore {
         )
     )]
     fn apply(&self, index: LogIndex, data: &[u8]) -> Result<(), Self::Error> {
+        self.check_not_poisoned()?;
         let mutation = CommittedMutation::decode(data).map_err(|e| {
             FsmError::deserialization(format!(
                 "Failed to deserialize mutation at index {}: {}",
@@ -312,6 +329,7 @@ impl StateMachine for LactoStore {
                 got = %index,
                 "HALT MANDATE (ADR 009): Non-sequential LogIndex apply attempted. Log regression or divergence suspected."
             );
+            self.poisoned.store(true, Ordering::SeqCst);
             return Err(FsmError::invariant(format!(
                 "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
                 current_applied, index
@@ -330,6 +348,7 @@ impl StateMachine for LactoStore {
                     error = %e,
                     "HALT MANDATE (ADR 004): Invalid client_id in ledger. Identity metadata is corrupted."
                 );
+                self.poisoned.store(true, Ordering::SeqCst);
                 return Err(FsmError::invariant(format!(
                     "Invalid client_id '{}' in ledger at index {}. Identity metadata is \
                      corrupted: {}",
@@ -376,6 +395,7 @@ impl StateMachine for LactoStore {
                 expected_seq = %expected_seq,
                 "HALT MANDATE (ADR 006): Sequence gap detected. Causal history broken."
             );
+            self.poisoned.store(true, Ordering::SeqCst);
             return Err(FsmError::invariant(format!(
                 "Sequence gap for client {}: expected {}, got {}",
                 client_id, expected_seq, seq
@@ -395,6 +415,7 @@ impl StateMachine for LactoStore {
                     status_int = %mutation.status,
                     "HALT MANDATE (ADR 009): Unknown MutationStatus integer. Protocol version mismatch or ledger corruption."
                 );
+                self.poisoned.store(true, Ordering::SeqCst);
                 return Err(FsmError::invariant(format!(
                     "Unknown MutationStatus integer {} at index {}. The node is likely running an \
                      obsolete version or the ledger is corrupted.",
@@ -412,6 +433,7 @@ impl StateMachine for LactoStore {
                     target: ClinicalTarget::ClinicalFsm.as_str(),
                     "HALT MANDATE (ADR 006): Mutation is missing mandatory event_time. Cannot update deterministic clinical clock."
                 );
+                self.poisoned.store(true, Ordering::SeqCst);
                 return Err(FsmError::invariant(format!(
                     "Mutation at index {} is missing mandatory event_time. Cannot update \
                      deterministic clinical clock.",
@@ -496,7 +518,8 @@ impl StateMachine for LactoStore {
     /// mutations occur during serialization.
     #[tracing::instrument(name = "fsm_snapshot", target = "raft::compaction", skip_all)]
     fn snapshot(&self) -> Result<Vec<u8>, Self::Error> {
-        let inventory = self.get_inventory();
+        self.check_not_poisoned()?;
+        let inventory = self.get_inventory()?;
 
         let mut sessions = Vec::new();
         for res in self.sessions.iter() {
@@ -540,6 +563,7 @@ impl StateMachine for LactoStore {
         data: &[u8],
         trace_id: TraceId,
     ) -> Result<(), Self::Error> {
+        self.check_not_poisoned()?;
         let snapshot = SnapshotData::decode(data).map_err(|e| {
             // HALT FORENSICS (Rule 15, ADR 010)
             error!(
@@ -712,7 +736,7 @@ mod tests {
                 store.apply(LogIndex::new(2), &data).unwrap();
 
                 assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(2));
-                assert_eq!(store.get_inventory().len(), 1);
+                assert_eq!(store.get_inventory().unwrap().len(), 1);
             }
 
             #[test]
@@ -772,7 +796,7 @@ mod tests {
                 store.apply(LogIndex::new(1), &d1).unwrap();
                 store.apply(LogIndex::new(2), &d2).unwrap();
 
-                assert_eq!(store.get_inventory().len(), 2);
+                assert_eq!(store.get_inventory().unwrap().len(), 2);
             }
         }
 
@@ -789,7 +813,7 @@ mod tests {
                     .unwrap();
 
                 store.apply(LogIndex::new(1), &data).unwrap();
-                assert_eq!(store.get_inventory().len(), 1);
+                assert_eq!(store.get_inventory().unwrap().len(), 1);
             }
 
             #[test]
@@ -802,7 +826,7 @@ mod tests {
                     .unwrap();
 
                 store.apply(LogIndex::new(1), &data).unwrap();
-                assert!(store.get_inventory().is_empty());
+                assert!(store.get_inventory().unwrap().is_empty());
             }
 
             #[test]
@@ -822,7 +846,7 @@ mod tests {
                 m2.encode(&mut d2).unwrap();
 
                 store.apply(LogIndex::new(2), &d2).unwrap();
-                assert!(store.get_inventory().is_empty());
+                assert!(store.get_inventory().unwrap().is_empty());
             }
         }
 
@@ -846,7 +870,7 @@ mod tests {
                     let db = sled::open(db_path).unwrap();
                     let store = LactoStore::new(db).unwrap();
                     assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(1));
-                    assert_eq!(store.get_inventory().len(), 1);
+                    assert_eq!(store.get_inventory().unwrap().len(), 1);
                 }
             }
         }
@@ -917,6 +941,51 @@ mod tests {
                 assert!(
                     matches!(result, Err(FsmError::Invariant(ref msg)) if msg.contains("Invalid client_id")),
                     "Expected Invariant error for invalid client_id, got {:?}",
+                    result
+                );
+            }
+        }
+
+        mod poison {
+            use super::*;
+
+            #[test]
+            fn returns_poisoned_error_when_invariant_violated_then_subsequent_call_fails() {
+                let store = setup_store();
+                let cid = ClientId::generate();
+                let mut mutation = mock_mutation(&cid, 1, MutationStatus::Committed);
+                mutation.client_id = "not-a-uuid".to_string();
+
+                let mut data = Vec::new();
+                mutation.encode(&mut data).unwrap();
+
+                let result = store.apply(LogIndex::new(1), &data);
+                assert!(matches!(result, Err(FsmError::Invariant(_))));
+
+                let result = store.apply(LogIndex::new(2), &data);
+                assert!(
+                    matches!(result, Err(FsmError::Poisoned)),
+                    "Expected Poisoned error after invariant violation, got {:?}",
+                    result
+                );
+            }
+
+            #[test]
+            fn poisons_state_machine_on_sequence_gap() {
+                let store = setup_store();
+                let cid = ClientId::generate();
+                let mut data = Vec::new();
+                mock_mutation(&cid, 2, MutationStatus::Committed)
+                    .encode(&mut data)
+                    .unwrap();
+
+                let result = store.apply(LogIndex::new(1), &data);
+                assert!(matches!(result, Err(FsmError::Invariant(_))));
+
+                let result = store.apply(LogIndex::new(2), &data);
+                assert!(
+                    matches!(result, Err(FsmError::Poisoned)),
+                    "Expected Poisoned after sequence gap, got {:?}",
                     result
                 );
             }
@@ -1092,7 +1161,7 @@ mod tests {
 
                 // 4. Verify Equality
                 assert_eq!(store_b.last_applied_index().unwrap(), last_index);
-                assert_eq!(store_b.get_inventory().len(), 2);
+                assert_eq!(store_b.get_inventory().unwrap().len(), 2);
 
                 let session = store_b
                     .check_session(&cid, SequenceId::new(2))
@@ -1142,7 +1211,7 @@ mod tests {
 
                     // 3. Verify Sanitization
                     assert_eq!(store.last_applied_index().unwrap(), LogIndex::new(0));
-                    assert!(store.get_inventory().is_empty());
+                    assert!(store.get_inventory().unwrap().is_empty());
                     assert!(!store.is_restoration_stale().unwrap());
                 }
             }
@@ -1220,6 +1289,35 @@ mod tests {
                         .unwrap()
                 );
                 assert_eq!(store_b.last_applied_index().unwrap(), LogIndex::new(100));
+            }
+
+            #[test]
+            fn returns_poisoned_error_after_prior_invariant_violation() {
+                let store = setup_store();
+                let cid = ClientId::generate();
+
+                // Apply a valid mutation first so we have snapshot data
+                let mut data = Vec::new();
+                mock_mutation(&cid, 1, MutationStatus::Committed)
+                    .encode(&mut data)
+                    .unwrap();
+                store.apply(LogIndex::new(1), &data).unwrap();
+                let snapshot_data = store.snapshot().unwrap();
+
+                // Poison the store via an invalid client_id
+                let mut bad_mutation = mock_mutation(&cid, 2, MutationStatus::Committed);
+                bad_mutation.client_id = "not-a-uuid".to_string();
+                let mut bad_data = Vec::new();
+                bad_mutation.encode(&mut bad_data).unwrap();
+                let _ = store.apply(LogIndex::new(2), &bad_data);
+
+                let result =
+                    store.install_snapshot(LogIndex::new(1), &snapshot_data, TraceId::generate());
+                assert!(
+                    matches!(result, Err(FsmError::Poisoned)),
+                    "Expected Poisoned error after prior invariant violation, got {:?}",
+                    result
+                );
             }
         }
     }

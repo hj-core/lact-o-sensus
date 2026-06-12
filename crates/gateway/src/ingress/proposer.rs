@@ -101,7 +101,12 @@ pub(crate) fn map_consensus_error(err: ConsensusError, status: &ConsensusAuthori
             Status::unavailable("Leader unknown. Election in progress.")
         }
         ConsensusError::CommitTimeout(idx) => {
-            Status::deadline_exceeded(format!("Proposal at index {} timed out", idx))
+            error!(
+                target: ClinicalTarget::ClinicalIngress.as_str(),
+                index = %idx,
+                "Proposal timed out at consensus"
+            );
+            Status::deadline_exceeded("Request timed out")
         }
         ConsensusError::Poisoned => {
             error!(

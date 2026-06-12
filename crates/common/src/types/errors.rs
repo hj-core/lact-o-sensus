@@ -171,6 +171,10 @@ pub enum FsmError {
     /// Arithmetic failure during inventory or sequence tracking.
     #[error("Arithmetic failure: {0}")]
     Arithmetic(#[from] ArithmeticError),
+
+    /// State machine is poisoned due to a prior invariant violation.
+    #[error("State machine is poisoned")]
+    Poisoned,
 }
 
 impl FsmError {
@@ -192,6 +196,11 @@ impl FsmError {
     /// Factory for creating an Invariant error.
     pub fn invariant(msg: impl Into<String>) -> Self {
         Self::Invariant(msg.into())
+    }
+
+    /// Returns the `Poisoned` sentinel error.
+    pub fn poisoned() -> Self {
+        Self::Poisoned
     }
 }
 
@@ -279,6 +288,7 @@ impl From<FsmError> for NodeError {
             FsmError::Deserialization(msg) => NodeError::Integrity(msg),
             FsmError::Invariant(msg) => NodeError::Protocol(msg),
             FsmError::Arithmetic(e) => NodeError::Arithmetic(e),
+            FsmError::Poisoned => NodeError::Protocol("State machine is poisoned".into()),
         }
     }
 }
@@ -360,6 +370,14 @@ mod tests {
                     let err = FsmError::Invariant("causal gap".into());
                     let node_err: NodeError = err.into();
                     assert!(matches!(node_err, NodeError::Protocol(m) if m == "causal gap"));
+                }
+
+                #[test]
+                fn maps_poisoned_to_protocol_error() {
+                    let node_err: NodeError = FsmError::Poisoned.into();
+                    assert!(
+                        matches!(node_err, NodeError::Protocol(m) if m == "State machine is poisoned")
+                    );
                 }
             }
         }

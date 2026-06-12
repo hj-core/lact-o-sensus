@@ -134,8 +134,8 @@ mod propose_mutation {
             }
         }
         impl InventoryReader for DuplicateSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1303,8 +1303,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1354,8 +1354,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1408,8 +1408,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1457,8 +1457,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1499,8 +1499,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1547,8 +1547,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1597,8 +1597,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
@@ -1640,8 +1640,8 @@ mod exactly_once_semantics {
             }
         }
         impl InventoryReader for MockSource {
-            fn get_inventory(&self) -> Vec<GroceryItem> {
-                vec![]
+            fn get_inventory(&self) -> Result<Vec<GroceryItem>, common::types::errors::FsmError> {
+                Ok(vec![])
             }
 
             fn current_version(&self) -> Result<LogIndex, FsmError> {
