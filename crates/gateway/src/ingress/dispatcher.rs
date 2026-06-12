@@ -132,97 +132,104 @@ impl IngressDispatcher {
             client = %client_id.truncated(),
             seq = %sequence_id
         );
-        let _enter = span.enter();
-
-        // 1. Verifies that this node is the authorized leader.
-        let status = match self.authorize_mutation() {
-            AuthorityOutcome::Authorized(s) => s,
-            AuthorityOutcome::Redirect(r) => return Ok(r),
-            AuthorityOutcome::Fatal(e) => return Err(e),
-        };
-
-        // 2. Enforces linearizability via the sequence firewall.
-        if let Some(cached_response) = self
-            .enforce_sequence_firewall(&client_id, sequence_id)
-            .await?
-        {
-            return Ok(cached_response);
-        }
-
-        // 3. Guards against concurrent mutation attempts and instruments the critical
-        //    section.
-        let sequencing_span = info_span!(
-            target: ClinicalTarget::ClinicalIngress.as_str(),
-            "mutation_sequencing",
-            %trace_id,
-            client = %client_id.truncated()
-        );
-
         async {
-            let _lock = self.mutation_lock.lock().await;
+            // 1. Verifies that this node is the authorized leader.
+            let status = match self.authorize_mutation() {
+                AuthorityOutcome::Authorized(s) => s,
+                AuthorityOutcome::Redirect(r) => return Ok(r),
+                AuthorityOutcome::Fatal(e) => return Err(e),
+            };
 
-            // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
-            let mut intent = req.intent.clone().ok_or_else(|| {
-                self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
-            })?;
-            let raw_user_input = self.format_raw_input(&intent);
-
-            tracing::trace!(
-                target: ClinicalTarget::ClinicalIngress.as_str(),
-                raw_input = %raw_user_input,
-                "Raw User Input (PII)"
-            );
-
-            self.normalize_intent(&mut intent)?;
-
-            // 5. Fetches the authoritative linearizable state for context (ADR 007).
-            let current_inventory = self.inventory_reader.get_inventory();
-
-            // 6. Resolves semantic metadata and stabilizes physical quantities via the AI
-            //    resolution loop.
-            let (final_status, stabilized) = self
-                .resolve_semantic_mutation(client_id.clone(), &intent, &current_inventory, trace_id)
-                .await?;
-
-            // 6.5 Re-checks authority — the leader may have been demoted during
-            //     AI evaluation (long-running LLM call). If so, redirect the client
-            //     to the new leader instead of attempting to propose to a stale
-            //     term.
-            let fresh = self.raft_handle.authority();
-            if !fresh.is_leader {
-                return Ok(self.mutation_redirection_response(fresh));
+            // 2. Enforces linearizability via the sequence firewall.
+            if let Some(cached_response) = self
+                .enforce_sequence_firewall(&client_id, sequence_id)
+                .await?
+            {
+                return Ok(cached_response);
             }
 
-            // 7. Proposes the finalized intent to the cluster for consensus.
-            let proposal_index = self
-                .commit_to_consensus(MutationProposal {
-                    client_id: &client_id,
-                    sequence_id,
-                    intent,
-                    stabilized: stabilized.clone(),
-                    raw_user_input,
-                    status: final_status,
-                    consensus_status: &status,
-                })
-                .await?;
-
-            info!(
+            // 3. Guards against concurrent mutation attempts and instruments the critical
+            //    section.
+            let sequencing_span = info_span!(
                 target: ClinicalTarget::ClinicalIngress.as_str(),
-                index = %proposal_index,
-                status = ?final_status,
-                category_slug = %stabilized.category.slug(),
-                item_slug = %slugify(&stabilized.resolved_item_key),
-                "Mutation committed to consensus."
+                "mutation_sequencing",
+                %trace_id,
+                client = %client_id.truncated()
             );
 
-            // 7. Constructs the final response reflecting the committed lifecycle status.
-            Ok(self.build_mutation_response(
-                proposal_index,
-                final_status,
-                stabilized.moral_justification,
-            ))
+            async {
+                let _lock = self.mutation_lock.lock().await;
+
+                // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
+                let mut intent = req.intent.clone().ok_or_else(|| {
+                    self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
+                })?;
+                let raw_user_input = self.format_raw_input(&intent);
+
+                tracing::trace!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    raw_input = %raw_user_input,
+                    "Raw User Input (PII)"
+                );
+
+                self.normalize_intent(&mut intent)?;
+
+                // 5. Fetches the authoritative linearizable state for context (ADR 007).
+                let current_inventory = self.inventory_reader.get_inventory();
+
+                // 6. Resolves semantic metadata and stabilizes physical quantities via the AI
+                //    resolution loop.
+                let (final_status, stabilized) = self
+                    .resolve_semantic_mutation(
+                        client_id.clone(),
+                        &intent,
+                        &current_inventory,
+                        trace_id,
+                    )
+                    .await?;
+
+                // 6.5 Re-checks authority — the leader may have been demoted during
+                //     AI evaluation (long-running LLM call). If so, redirect the client
+                //     to the new leader instead of attempting to propose to a stale
+                //     term.
+                let fresh = self.raft_handle.authority();
+                if !fresh.is_leader {
+                    return Ok(self.mutation_redirection_response(fresh));
+                }
+
+                // 7. Proposes the finalized intent to the cluster for consensus.
+                let proposal_index = self
+                    .commit_to_consensus(MutationProposal {
+                        client_id: &client_id,
+                        sequence_id,
+                        intent,
+                        stabilized: stabilized.clone(),
+                        raw_user_input,
+                        status: final_status,
+                        consensus_status: &status,
+                    })
+                    .await?;
+
+                info!(
+                    target: ClinicalTarget::ClinicalIngress.as_str(),
+                    index = %proposal_index,
+                    status = ?final_status,
+                    category_slug = %stabilized.category.slug(),
+                    item_slug = %slugify(&stabilized.resolved_item_key),
+                    "Mutation committed to consensus."
+                );
+
+                // 7. Constructs the final response reflecting the committed lifecycle status.
+                Ok(self.build_mutation_response(
+                    proposal_index,
+                    final_status,
+                    stabilized.moral_justification,
+                ))
+            }
+            .instrument(sequencing_span)
+            .await
         }
-        .instrument(sequencing_span)
+        .instrument(span)
         .await
     }
 
@@ -235,90 +242,95 @@ impl IngressDispatcher {
         let req = request.into_inner();
 
         let span = info_span!("query_state", trace_id = %trace_id);
-        let _enter = span.enter();
 
-        // 1. Verifies that this node is the authorized leader.
-        let status = match self.authorize_query() {
-            AuthorityOutcome::Authorized(s) => s,
-            AuthorityOutcome::Redirect(r) => return Ok(r),
-            AuthorityOutcome::Fatal(e) => return Err(e),
-        };
+        async {
+            // 1. Verifies that this node is the authorized leader.
+            let status = match self.authorize_query() {
+                AuthorityOutcome::Authorized(s) => s,
+                AuthorityOutcome::Redirect(r) => return Ok(r),
+                AuthorityOutcome::Fatal(e) => return Err(e),
+            };
 
-        // 2. Linearizable Quorum Read (Verification of leadership continuity).
-        if let Err(e) = self.raft_handle.verify_leadership().await {
-            match e {
-                ConsensusError::NotLeader => {
-                    return Ok(self.query_redirection_response(status));
+            // 2. Linearizable Quorum Read (Verification of leadership continuity).
+            if let Err(e) = self.raft_handle.verify_leadership().await {
+                match e {
+                    ConsensusError::NotLeader => {
+                        return Ok(self.query_redirection_response(status));
+                    }
+                    _ => return Err(Status::internal(format!("Linearizable read failed: {}", e))),
                 }
-                _ => return Err(Status::internal(format!("Linearizable read failed: {}", e))),
-            }
-        }
-
-        // 3. Linearizable Consistency Fence (ADR 006).
-        // If a minimum state version is requested, we ensure the local state
-        // machine has caught up to that version before responding.
-        if let Some(version) = req.min_state_version {
-            if version > status.last_committed.as_u64() {
-                return Err(Status::failed_precondition(format!(
-                    "Requested version {} exceeds consistent horizon {}.",
-                    version,
-                    status.last_committed.as_u64()
-                )));
             }
 
-            tokio::time::timeout(
-                self.config.consensus_timeout,
-                self.raft_handle.await_apply(LogIndex::new(version)),
-            )
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "Consistency fence at version {} timed out after {:?}",
-                    version, self.config.consensus_timeout
-                ))
-            })?
-            .map_err(|e| self.map_consensus_error(e, &status))?;
-        }
-
-        // 4. Fetches the consolidated inventory from the State Machine.
-        let items = self.inventory_reader.get_inventory();
-
-        // 4b. Display Conversion (ADR 008): Convert SI base quantities to the
-        // user's preferred display unit when possible.
-        let items: Vec<GroceryItem> = items
-            .into_iter()
-            .map(|mut item| {
-                if !item.display_unit.is_empty()
-                    && item.display_unit != item.unit
-                    && let Some(display_qty) =
-                        UnitRegistry::convert_to_display_value(&item.quantity, &item.display_unit)
-                {
-                    item.quantity = display_qty;
-                    item.unit = item.display_unit.clone();
+            // 3. Linearizable Consistency Fence (ADR 006).
+            // If a minimum state version is requested, we ensure the local state
+            // machine has caught up to that version before responding.
+            if let Some(version) = req.min_state_version {
+                if version > status.last_committed.as_u64() {
+                    return Err(Status::failed_precondition(format!(
+                        "Requested version {} exceeds consistent horizon {}.",
+                        version,
+                        status.last_committed.as_u64()
+                    )));
                 }
-                item
-            })
-            .collect();
 
-        let version = self.inventory_reader.current_version();
+                tokio::time::timeout(
+                    self.config.consensus_timeout,
+                    self.raft_handle.await_apply(LogIndex::new(version)),
+                )
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "Consistency fence at version {} timed out after {:?}",
+                        version, self.config.consensus_timeout
+                    ))
+                })?
+                .map_err(|e| self.map_consensus_error(e, &status))?;
+            }
 
-        // 5. Redacts or filters results if a query filter was provided.
-        let filtered_items = if let Some(ref filter) = req.query_filter {
-            let filter_lower = filter.to_lowercase();
-            items
+            // 4. Fetches the consolidated inventory from the State Machine.
+            let items = self.inventory_reader.get_inventory();
+
+            // 4b. Display Conversion (ADR 008): Convert SI base quantities to the
+            // user's preferred display unit when possible.
+            let items: Vec<GroceryItem> = items
                 .into_iter()
-                .filter(|item| item.item_key.to_lowercase().contains(&filter_lower))
-                .collect()
-        } else {
-            items
-        };
+                .map(|mut item| {
+                    if !item.display_unit.is_empty()
+                        && item.display_unit != item.unit
+                        && let Some(display_qty) = UnitRegistry::convert_to_display_value(
+                            &item.quantity,
+                            &item.display_unit,
+                        )
+                    {
+                        item.quantity = display_qty;
+                        item.unit = item.display_unit.clone();
+                    }
+                    item
+                })
+                .collect();
 
-        Ok(Response::new(QueryStateResponse {
-            items: filtered_items,
-            current_state_version: version.as_u64(),
-            status: QueryStatus::Success as i32,
-            ..Default::default()
-        }))
+            let version = self.inventory_reader.current_version();
+
+            // 5. Redacts or filters results if a query filter was provided.
+            let filtered_items = if let Some(ref filter) = req.query_filter {
+                let filter_lower = filter.to_lowercase();
+                items
+                    .into_iter()
+                    .filter(|item| item.item_key.to_lowercase().contains(&filter_lower))
+                    .collect()
+            } else {
+                items
+            };
+
+            Ok(Response::new(QueryStateResponse {
+                items: filtered_items,
+                current_state_version: version.as_u64(),
+                status: QueryStatus::Success as i32,
+                ..Default::default()
+            }))
+        }
+        .instrument(span)
+        .await
     }
 }
 
