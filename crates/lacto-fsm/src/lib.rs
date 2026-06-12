@@ -262,8 +262,8 @@ impl InventoryReader for LactoStore {
             .collect()
     }
 
-    fn current_version(&self) -> LogIndex {
-        StateMachine::last_applied_index(self).unwrap_or(LogIndex::ZERO)
+    fn current_version(&self) -> Result<LogIndex, FsmError> {
+        StateMachine::last_applied_index(self)
     }
 }
 

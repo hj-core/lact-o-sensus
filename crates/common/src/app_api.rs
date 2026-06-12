@@ -32,5 +32,5 @@ pub trait InventoryReader: Send + Sync + Debug {
     fn get_inventory(&self) -> Vec<GroceryItem>;
 
     /// Returns the version (LogIndex) that this snapshot represents.
-    fn current_version(&self) -> LogIndex;
+    fn current_version(&self) -> Result<LogIndex, FsmError>;
 }

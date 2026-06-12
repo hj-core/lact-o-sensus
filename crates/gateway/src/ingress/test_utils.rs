@@ -298,8 +298,8 @@ impl InventoryReader for MockInventorySource {
         self.items.clone()
     }
 
-    fn current_version(&self) -> LogIndex {
-        self.version
+    fn current_version(&self) -> Result<LogIndex, FsmError> {
+        Ok(self.version)
     }
 }
 

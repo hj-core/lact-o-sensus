@@ -315,7 +315,10 @@ impl IngressDispatcher {
                 })
                 .collect();
 
-            let version = self.inventory_reader.current_version();
+            let version = self
+                .inventory_reader
+                .current_version()
+                .map_err(|e| Status::internal(format!("Failed to read state version: {}", e)))?;
 
             // 5. Redacts or filters results if a query filter was provided.
             let filtered_items = if let Some(ref filter) = req.query_filter {

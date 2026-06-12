@@ -138,8 +138,8 @@ mod propose_mutation {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1307,8 +1307,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1358,8 +1358,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1412,8 +1412,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1461,8 +1461,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1503,8 +1503,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1551,8 +1551,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1601,8 +1601,8 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
 
@@ -1644,10 +1644,11 @@ mod exactly_once_semantics {
                 vec![]
             }
 
-            fn current_version(&self) -> LogIndex {
-                LogIndex::ZERO
+            fn current_version(&self) -> Result<LogIndex, FsmError> {
+                Ok(LogIndex::ZERO)
             }
         }
+
         let mock_source = Arc::new(MockSource);
         let dispatcher = mock_dispatcher(raft, mock_source.clone(), mock_source, successful_veto());
         let req = make_request(ProposeMutationRequest {
