@@ -39,6 +39,8 @@ use super::sequencer;
 use super::types::AuthorityOutcome;
 use super::types::IngressConfig;
 use super::types::MutationProposal;
+use super::types::ProposalStatus;
+use super::types::ScrubbedIntent;
 use super::types::StabilizedMutation;
 use crate::veto::VetoRelay;
 
@@ -173,18 +175,20 @@ impl IngressDispatcher {
                 let _lock = self.mutation_lock.lock().await;
 
                 // 4. Scrubs user input and ensures syntactic/taxonomic integrity.
-                let mut intent = req.intent.clone().ok_or_else(|| {
+                let proto_intent = req.intent.clone().ok_or_else(|| {
                     self.invalid_argument("ProposeMutationRequest is missing 'intent' field")
                 })?;
-                let raw_user_input = self.format_raw_input(&intent);
+                // Raw input must be captured from the original proto before
+                // normalization to preserve the original user-typed string
+                // for audit logging.
+                let raw_user_input = scrubber::format_raw_input_from_proto(&proto_intent);
+                let intent = self.normalize_intent(&proto_intent)?;
 
                 tracing::trace!(
                     target: ClinicalTarget::ClinicalIngress.as_str(),
                     raw_input = %raw_user_input,
                     "Raw User Input (PII)"
                 );
-
-                self.normalize_intent(&mut intent)?;
 
                 // 5. Fetches the authoritative linearizable state for context (ADR 007).
                 let current_inventory = self.inventory_reader.get_inventory().map_err(|e| {
@@ -436,7 +440,7 @@ impl IngressDispatcher {
 
     /// Delegates to the scrubber submodule for syntactic/taxonomic
     /// normalization.
-    fn normalize_intent(&self, intent: &mut MutationIntent) -> Result<(), Status> {
+    fn normalize_intent(&self, intent: &MutationIntent) -> Result<ScrubbedIntent, Status> {
         scrubber::normalize_intent(intent)
     }
 
@@ -444,11 +448,11 @@ impl IngressDispatcher {
     async fn resolve_semantic_mutation(
         &self,
         client_id: ClientId,
-        intent: &MutationIntent,
+        intent: &ScrubbedIntent,
         current_inventory: &[GroceryItem],
         trace_id: TraceId,
-    ) -> Result<(MutationStatus, StabilizedMutation), Status> {
-        ai_oracle::resolve_semantic_mutation(
+    ) -> Result<(ProposalStatus, StabilizedMutation), Status> {
+        let (status, stabilized) = ai_oracle::resolve_semantic_mutation(
             &*self.veto_relay,
             &self.config,
             client_id,
@@ -456,7 +460,13 @@ impl IngressDispatcher {
             current_inventory,
             trace_id,
         )
-        .await
+        .await?;
+        let proposal_status = match status {
+            MutationStatus::Committed => ProposalStatus::Committed,
+            MutationStatus::Vetoed => ProposalStatus::Vetoed,
+            _ => return Err(Status::internal("Request rejected")),
+        };
+        Ok((proposal_status, stabilized))
     }
 
     /// Delegates to the proposer submodule for consensus commitment.
@@ -472,15 +482,10 @@ impl IngressDispatcher {
     fn build_mutation_response(
         &self,
         index: LogIndex,
-        status: MutationStatus,
+        status: ProposalStatus,
         moral_justification: String,
     ) -> Response<ProposeMutationResponse> {
         proposer::build_mutation_response(index, status, moral_justification)
-    }
-
-    /// Delegates to the scrubber submodule for raw input formatting.
-    fn format_raw_input(&self, intent: &MutationIntent) -> String {
-        scrubber::format_raw_input(intent)
     }
 
     /// Delegates to the proposer submodule for consensus error translation.

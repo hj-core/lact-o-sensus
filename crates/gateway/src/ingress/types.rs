@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use common::proto::v1::app::MutationIntent;
-use common::proto::v1::app::MutationStatus;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::SequenceId;
@@ -18,6 +16,34 @@ pub struct IngressConfig {
     pub veto_max_retries: usize,
     /// Maximum characters allowed in the AI's moral justification.
     pub max_justification_len: usize,
+}
+
+/// Domain type for mutation operations, decoupled from proto OperationType.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Operation {
+    Add,
+    Subtract,
+    Set,
+    Delete,
+}
+
+/// Domain type for mutation lifecycle status, decoupled from proto
+/// MutationStatus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ProposalStatus {
+    Committed,
+    Vetoed,
+}
+
+/// Scrubbed and validated user intent, converted from the proto
+/// MutationIntent at the gRPC boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct ScrubbedIntent {
+    pub(crate) item_key: String,
+    pub(crate) operation: Operation,
+    pub(crate) quantity: Option<String>,
+    pub(crate) unit: Option<String>,
+    pub(crate) category: Option<String>,
 }
 
 /// Validated and mathematically stabilized data ready for consensus.
@@ -39,10 +65,10 @@ pub(crate) struct StabilizedMutation {
 pub(crate) struct MutationProposal<'a> {
     pub(crate) client_id: &'a ClientId,
     pub(crate) sequence_id: SequenceId,
-    pub(crate) intent: MutationIntent,
+    pub(crate) intent: ScrubbedIntent,
     pub(crate) stabilized: StabilizedMutation,
     pub(crate) raw_user_input: String,
-    pub(crate) status: MutationStatus,
+    pub(crate) status: ProposalStatus,
     pub(crate) consensus_status: &'a ConsensusAuthority,
 }
 

@@ -1,8 +1,6 @@
 use std::str::FromStr;
 
 use common::proto::v1::app::GroceryItem;
-use common::proto::v1::app::MutationIntent;
-use common::proto::v1::app::OperationType;
 use common::slug::slugify;
 use common::taxonomy::GroceryCategory;
 use common::types::trace::ClinicalTarget;
@@ -12,13 +10,15 @@ use rust_decimal::Decimal;
 use tonic::Status;
 use tracing::error;
 
+use super::types::Operation;
+use super::types::ScrubbedIntent;
 use super::types::StabilizedMutation;
 use crate::veto::VetoOutcome;
 
 /// Audits AI-resolved metadata against system registries and stabilizes
 /// physical quantities.
 pub(crate) fn validate_and_stabilize(
-    intent: &MutationIntent,
+    intent: &ScrubbedIntent,
     veto: &VetoOutcome,
     current_inventory: &[GroceryItem],
 ) -> Result<StabilizedMutation, Status> {
@@ -33,7 +33,7 @@ pub(crate) fn validate_and_stabilize(
         return Err(Status::internal("Request rejected"));
     }
 
-    if intent.operation == OperationType::Delete as i32 {
+    if intent.operation == Operation::Delete {
         return Ok(StabilizedMutation {
             resolved_item_key: veto.resolved_item_key.clone(),
             suggested_display_name: veto.suggested_display_name.clone(),
@@ -147,13 +147,12 @@ fn verify_unit_stabilization(
 
 /// Enforces the Dimensional Fence to prevent cross-dimensional arithmetic.
 fn enforce_physical_invariants(
-    intent: &MutationIntent,
+    intent: &ScrubbedIntent,
     resolved_key: &str,
     new_quantity: &PhysicalQuantity,
     current_inventory: &[GroceryItem],
 ) -> Result<(), Status> {
-    if (intent.operation == OperationType::Add as i32
-        || intent.operation == OperationType::Subtract as i32)
+    if (intent.operation == Operation::Add || intent.operation == Operation::Subtract)
         && let Some(existing_item) = current_inventory
             .iter()
             .find(|i| i.item_key == resolved_key)
@@ -186,18 +185,14 @@ fn enforce_physical_invariants(
 /// For Set/Delete or when no existing item is found, returns base_quantity
 /// unchanged.
 fn apply_arithmetic_accumulation(
-    intent: &MutationIntent,
+    intent: &ScrubbedIntent,
     resolved_key: &str,
     base_quantity: PhysicalQuantity,
     current_inventory: &[GroceryItem],
 ) -> Result<PhysicalQuantity, Status> {
-    let Ok(op) = OperationType::try_from(intent.operation) else {
-        return Err(Status::invalid_argument("Unknown operation type"));
-    };
-
-    match op {
-        OperationType::Add | OperationType::Subtract => {}
-        OperationType::Set | OperationType::Delete | OperationType::Unspecified => {
+    match intent.operation {
+        Operation::Add | Operation::Subtract => {}
+        Operation::Set | Operation::Delete => {
             return Ok(base_quantity);
         }
     }
@@ -214,10 +209,10 @@ fn apply_arithmetic_accumulation(
         UnitRegistry::parse_and_convert(&existing_item.quantity, &existing_item.unit)
             .map_err(|e| Status::internal(format!("Failed to parse existing quantity: {}", e)))?;
 
-    let result = match op {
-        OperationType::Add => existing_qty + base_quantity,
-        OperationType::Subtract => existing_qty - base_quantity,
-        OperationType::Set | OperationType::Delete | OperationType::Unspecified => {
+    let result = match intent.operation {
+        Operation::Add => existing_qty + base_quantity,
+        Operation::Subtract => existing_qty - base_quantity,
+        Operation::Set | Operation::Delete => {
             unreachable!("already filtered by the guard above")
         }
     }
@@ -240,23 +235,32 @@ fn apply_arithmetic_accumulation(
 #[cfg(test)]
 mod tests {
     use common::proto::v1::app::GroceryItem;
-    use common::proto::v1::app::MutationIntent;
-    use common::proto::v1::app::OperationType;
     use common::types::LogIndex;
 
     use super::validate_and_stabilize;
     use crate::ingress::test_utils::*;
+    use crate::ingress::types::Operation;
     use crate::veto::VetoOutcome;
+
+    fn test_intent(
+        item_key: String,
+        quantity: Option<String>,
+        unit: Option<String>,
+        category: Option<String>,
+        operation: Operation,
+    ) -> super::ScrubbedIntent {
+        super::ScrubbedIntent {
+            item_key,
+            operation,
+            quantity,
+            unit,
+            category,
+        }
+    }
 
     #[test]
     fn rejects_hallucinated_category() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("1".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
         let veto = VetoOutcome {
             is_approved: true,
             category_assignment: "Space Matter".to_string(), // Hallucination
@@ -274,13 +278,7 @@ mod tests {
 
     #[test]
     fn rejects_hallucinated_unit() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("1".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
         let veto = VetoOutcome {
             is_approved: true,
             category_assignment: "Primary Flora".to_string(),
@@ -298,12 +296,12 @@ mod tests {
 
     #[test]
     fn rejects_invalid_si_unit_conversion() {
-        let intent = MutationIntent::new(
+        let intent = test_intent(
             "".into(),
             Some("abc".to_string()),
             None,
             None,
-            OperationType::Add,
+            Operation::Add,
         );
         let veto = VetoOutcome {
             is_approved: true,
@@ -322,13 +320,7 @@ mod tests {
 
     #[test]
     fn rejects_cross_dimensional_arithmetic() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("1".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
         // AI resolves a liquid unit for an item that exists as weight
         let veto = VetoOutcome {
             is_approved: true,
@@ -357,12 +349,12 @@ mod tests {
 
     #[test]
     fn applies_bankers_rounding_to_si_stabilization() {
-        let intent = MutationIntent::new(
+        let intent = test_intent(
             "".into(),
             Some("1.5".to_string()),
             None,
             None,
-            OperationType::Add,
+            Operation::Add,
         );
         let veto = VetoOutcome {
             is_approved: true,
@@ -384,13 +376,7 @@ mod tests {
 
     #[test]
     fn grants_contextual_override_when_unit_is_dynamic() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("2".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("2".to_string()), None, None, Operation::Add);
         let veto = VetoOutcome {
             is_approved: true,
             resolved_unit: "pack".to_string(), // Contextual unit
@@ -405,13 +391,7 @@ mod tests {
 
     #[test]
     fn ignores_physical_constant_redefinition_when_unit_is_static() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("1".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
         let veto = VetoOutcome {
             is_approved: true,
             resolved_unit: "kg".to_string(), // Static unit
@@ -429,13 +409,7 @@ mod tests {
 
     #[test]
     fn rejects_non_positive_quantity_during_stabilization() {
-        let intent = MutationIntent::new(
-            "".into(),
-            Some("1".to_string()),
-            None,
-            None,
-            OperationType::Add,
-        );
+        let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
 
         // Test 1: Zero (using contextual unit to ensure AI multiplier is applied)
         let veto_zero = VetoOutcome {
@@ -462,12 +436,12 @@ mod tests {
     #[test]
     fn allows_set_operation_across_dimensions() {
         // SET operations are exempt from the Dimensional Fence (ADR 008).
-        let intent = MutationIntent::new(
+        let intent = test_intent(
             "".into(),
             Some("1".to_string()),
             None,
             None,
-            OperationType::Set, // SET, not ADD
+            Operation::Set, // SET, not ADD
         );
         let veto = VetoOutcome {
             is_approved: true,
@@ -500,13 +474,7 @@ mod tests {
 
         #[test]
         fn rejects_key_with_spaces() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("1".to_string()),
-                None,
-                None,
-                OperationType::Add,
-            );
+            let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
             let veto = VetoOutcome {
                 resolved_item_key: "milk 2percent".to_string(),
                 ..valid_outcome()
@@ -518,13 +486,7 @@ mod tests {
 
         #[test]
         fn rejects_key_with_uppercase() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("1".to_string()),
-                None,
-                None,
-                OperationType::Add,
-            );
+            let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
             let veto = VetoOutcome {
                 resolved_item_key: "MILK".to_string(),
                 ..valid_outcome()
@@ -536,13 +498,7 @@ mod tests {
 
         #[test]
         fn accepts_valid_slug() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("1".to_string()),
-                None,
-                None,
-                OperationType::Add,
-            );
+            let intent = test_intent("".into(), Some("1".to_string()), None, None, Operation::Add);
             let veto = VetoOutcome {
                 resolved_item_key: "milk".to_string(),
                 ..valid_outcome()
@@ -557,13 +513,7 @@ mod tests {
 
         #[test]
         fn add_accumulates_existing_quantity() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("5".to_string()),
-                None,
-                None,
-                OperationType::Add,
-            );
+            let intent = test_intent("".into(), Some("5".to_string()), None, None, Operation::Add);
             let veto = VetoOutcome {
                 is_approved: true,
                 resolved_item_key: "milk".to_string(),
@@ -590,12 +540,12 @@ mod tests {
 
         #[test]
         fn subtract_reduces_existing_quantity() {
-            let intent = MutationIntent::new(
+            let intent = test_intent(
                 "".into(),
                 Some("3".to_string()),
                 None,
                 None,
-                OperationType::Subtract,
+                Operation::Subtract,
             );
             let veto = VetoOutcome {
                 is_approved: true,
@@ -623,12 +573,12 @@ mod tests {
 
         #[test]
         fn subtract_below_zero_returns_error() {
-            let intent = MutationIntent::new(
+            let intent = test_intent(
                 "".into(),
                 Some("15".to_string()),
                 None,
                 None,
-                OperationType::Subtract,
+                Operation::Subtract,
             );
             let veto = VetoOutcome {
                 is_approved: true,
@@ -656,13 +606,7 @@ mod tests {
 
         #[test]
         fn add_with_no_existing_item_uses_raw_quantity() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("5".to_string()),
-                None,
-                None,
-                OperationType::Add,
-            );
+            let intent = test_intent("".into(), Some("5".to_string()), None, None, Operation::Add);
             let veto = VetoOutcome {
                 is_approved: true,
                 resolved_item_key: "milk".to_string(),
@@ -679,13 +623,7 @@ mod tests {
 
         #[test]
         fn set_operation_does_not_accumulate() {
-            let intent = MutationIntent::new(
-                "".into(),
-                Some("5".to_string()),
-                None,
-                None,
-                OperationType::Set,
-            );
+            let intent = test_intent("".into(), Some("5".to_string()), None, None, Operation::Set);
             let veto = VetoOutcome {
                 is_approved: true,
                 resolved_item_key: "milk".to_string(),

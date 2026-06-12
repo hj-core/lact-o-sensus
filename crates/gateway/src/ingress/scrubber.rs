@@ -6,67 +6,91 @@ use common::taxonomy::GroceryCategory;
 use rust_decimal::Decimal;
 use tonic::Status;
 
+use super::types::Operation;
+use super::types::ScrubbedIntent;
+
 /// Normalizes user intents and enforces clinical taxonomy constraints
-/// before semantic resolution.
-pub(crate) fn normalize_intent(intent: &mut MutationIntent) -> Result<(), Status> {
-    intent.item_key = intent.item_key.trim().to_lowercase();
-
-    if let Some(q) = intent.quantity.as_mut() {
-        let trimmed = q.trim();
-        if trimmed.is_empty() {
-            intent.quantity = None;
-        } else {
-            let val = Decimal::from_str(trimmed).map_err(|_| {
-                Status::invalid_argument(format!("Invalid quantity format: '{}'", trimmed))
-            })?;
-            if val.is_sign_negative() {
-                return Err(Status::invalid_argument(
-                    "quantity cannot be negative. Use SUBTRACT or DELETE for removals.",
-                ));
-            }
-            *q = trimmed.to_string();
+/// before semantic resolution. Returns a domain-typed `ScrubbedIntent`
+/// decoupled from the proto representation.
+pub(crate) fn normalize_intent(intent: &MutationIntent) -> Result<ScrubbedIntent, Status> {
+    let item_key = intent.item_key.trim().to_lowercase();
+    let mut quantity = intent.quantity.as_deref().map(str::trim).map(String::from);
+    if quantity.as_deref() == Some("") {
+        quantity = None;
+    }
+    if let Some(ref q) = quantity {
+        let val = Decimal::from_str(q)
+            .map_err(|_| Status::invalid_argument(format!("Invalid quantity format: '{}'", q)))?;
+        if val.is_sign_negative() {
+            return Err(Status::invalid_argument(
+                "quantity cannot be negative. Use SUBTRACT or DELETE for removals.",
+            ));
         }
     }
 
-    if let Some(unit) = intent.unit.as_mut() {
-        *unit = unit.trim().to_lowercase();
+    let unit = intent
+        .unit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase);
+
+    let category = intent
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    // Taxonomy Guard (ADR 007 Layer 2)
+    if let Some(ref cat) = category {
+        GroceryCategory::from_str(cat).map_err(|_| {
+            Status::invalid_argument(format!(
+                "Invalid category hint: '{}'. Must be one of the 12 clinical categories.",
+                cat
+            ))
+        })?;
     }
 
-    // --- Taxonomy Guard (ADR 007 Layer 2) ---
-    if let Some(category) = intent.category.as_mut() {
-        let trimmed = category.trim();
-        if !trimmed.is_empty() {
-            GroceryCategory::from_str(trimmed).map_err(|_| {
-                Status::invalid_argument(format!(
-                    "Invalid category hint: '{}'. Must be one of the 12 clinical categories.",
-                    trimmed
-                ))
-            })?;
-            *category = trimmed.to_string();
-        }
-    }
-
-    if intent.item_key.is_empty() {
+    if item_key.is_empty() {
         return Err(Status::invalid_argument("item_key cannot be empty"));
     }
 
-    if intent.operation == OperationType::Delete as i32 && intent.quantity.is_some() {
+    let operation = match OperationType::try_from(intent.operation) {
+        Ok(OperationType::Add) => Operation::Add,
+        Ok(OperationType::Subtract) => Operation::Subtract,
+        Ok(OperationType::Set) => Operation::Set,
+        Ok(OperationType::Delete) => Operation::Delete,
+        _ => {
+            return Err(Status::invalid_argument("Unknown operation type"));
+        }
+    };
+
+    if operation == Operation::Delete && quantity.is_some() {
         return Err(Status::invalid_argument(
             "DELETE operations must not contain a quantity string",
         ));
     }
 
-    if intent.operation != OperationType::Delete as i32 && intent.quantity.is_none() {
+    if operation != Operation::Delete && quantity.is_none() {
         return Err(Status::invalid_argument(
             "quantity is required for this operation",
         ));
     }
 
-    Ok(())
+    Ok(ScrubbedIntent {
+        item_key,
+        operation,
+        quantity,
+        unit,
+        category,
+    })
 }
 
 /// Captures the raw human intent for audit logging.
-pub(crate) fn format_raw_input(intent: &MutationIntent) -> String {
+/// Operates on the proto MutationIntent to preserve the original user-typed
+/// string before normalization.
+pub(crate) fn format_raw_input_from_proto(intent: &MutationIntent) -> String {
     let op = match OperationType::try_from(intent.operation) {
         Ok(OperationType::Add) => "Add",
         Ok(OperationType::Subtract) => "Sub",

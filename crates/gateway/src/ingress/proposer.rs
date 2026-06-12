@@ -3,7 +3,6 @@ use std::time::SystemTime;
 
 use common::proto::v1::app::CommittedMutation;
 use common::proto::v1::app::MutationStatus;
-use common::proto::v1::app::OperationType;
 use common::proto::v1::app::ProposeMutationResponse;
 use common::types::LogIndex;
 use common::types::errors::ConsensusError;
@@ -17,6 +16,7 @@ use tracing::error;
 use tracing::info;
 
 use super::types::MutationProposal;
+use super::types::ProposalStatus;
 
 /// Commits the finalized intent to the consensus log and waits for quorum
 /// commitment.
@@ -25,7 +25,12 @@ pub(crate) async fn commit_to_consensus(
     consensus_timeout: Duration,
     proposal: MutationProposal<'_>,
 ) -> Result<LogIndex, Status> {
-    let is_delete = proposal.intent.operation == OperationType::Delete as i32;
+    let is_delete = proposal.intent.operation == super::types::Operation::Delete;
+
+    let proto_status = match proposal.status {
+        ProposalStatus::Committed => MutationStatus::Committed,
+        ProposalStatus::Vetoed => MutationStatus::Vetoed,
+    };
 
     let mutation = CommittedMutation::new(
         proposal.client_id,
@@ -39,7 +44,7 @@ pub(crate) async fn commit_to_consensus(
         proposal.raw_user_input,
         proposal.stabilized.moral_justification,
         is_delete,
-        proposal.status,
+        proto_status,
         SystemTime::now(),
     );
 
@@ -75,14 +80,18 @@ pub(crate) async fn commit_to_consensus(
 /// status.
 pub(crate) fn build_mutation_response(
     index: LogIndex,
-    status: MutationStatus,
+    status: ProposalStatus,
     moral_justification: String,
 ) -> Response<ProposeMutationResponse> {
+    let proto_status = match status {
+        ProposalStatus::Committed => MutationStatus::Committed,
+        ProposalStatus::Vetoed => MutationStatus::Vetoed,
+    };
     Response::new(ProposeMutationResponse {
-        status: status as i32,
+        status: proto_status as i32,
         state_version: index.as_u64(),
         leader_hint: String::new(),
-        error_message: if status == MutationStatus::Vetoed {
+        error_message: if status == ProposalStatus::Vetoed {
             moral_justification
         } else {
             String::new()

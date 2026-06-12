@@ -3,6 +3,7 @@ use std::time::Duration;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::MutationStatus;
+use common::proto::v1::app::OperationType;
 use common::taxonomy::GroceryCategory;
 use common::types::ClientId;
 use common::types::trace::ClinicalTarget;
@@ -16,10 +17,30 @@ use tracing::warn;
 
 use super::stabilizer;
 use super::types::IngressConfig;
+use super::types::Operation;
+use super::types::ScrubbedIntent;
 use super::types::StabilizedMutation;
 use crate::veto::VetoError;
 use crate::veto::VetoOutcome;
 use crate::veto::VetoRelay;
+
+/// Converts a domain ScrubbedIntent back to a proto MutationIntent for
+/// VetoRelay evaluation.
+fn intent_to_proto(intent: &ScrubbedIntent) -> MutationIntent {
+    let operation = match intent.operation {
+        Operation::Add => OperationType::Add,
+        Operation::Subtract => OperationType::Subtract,
+        Operation::Set => OperationType::Set,
+        Operation::Delete => OperationType::Delete,
+    };
+    MutationIntent::new(
+        intent.item_key.clone(),
+        intent.quantity.clone(),
+        intent.unit.clone(),
+        intent.category.clone(),
+        operation,
+    )
+}
 
 /// Executes the AI policy evaluation with timeout and error handling.
 pub(crate) async fn evaluate_policy(
@@ -105,12 +126,13 @@ pub(crate) async fn resolve_semantic_mutation(
     veto_relay: &dyn VetoRelay,
     config: &IngressConfig,
     client_id: ClientId,
-    intent: &MutationIntent,
+    intent: &ScrubbedIntent,
     current_inventory: &[GroceryItem],
     trace_id: TraceId,
 ) -> Result<(MutationStatus, StabilizedMutation), Status> {
     let mut stabilized_mutation = None;
     let mut final_status = MutationStatus::Committed;
+    let proto_intent = intent_to_proto(intent);
 
     for attempt in 0..=config.veto_max_retries {
         if attempt > 0 {
@@ -127,7 +149,7 @@ pub(crate) async fn resolve_semantic_mutation(
             config.veto_timeout,
             config.max_justification_len,
             client_id.clone(),
-            intent,
+            &proto_intent,
             current_inventory,
             trace_id,
         )
