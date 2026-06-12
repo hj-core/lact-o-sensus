@@ -85,7 +85,10 @@ async fn main() -> Result<()> {
     let (system_db, log_db, fsm_db) = init_persistence(&config)?;
 
     // 2. Logical Orchestrator: Identity & Recovery (ADR 004/009)
-    let identity = Arc::new(init_identity(&system_db, &config)?);
+    let identity = Arc::new(match init_identity(&system_db, &config) {
+        Ok(id) => id,
+        Err(e) => panic!("Bootstrap Halt Mandate (ADR 004): {e}"),
+    });
 
     let root_span = info_span!(
         "node",
