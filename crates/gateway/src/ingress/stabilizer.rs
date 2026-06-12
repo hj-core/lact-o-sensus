@@ -3,6 +3,7 @@ use std::str::FromStr;
 use common::proto::v1::app::GroceryItem;
 use common::proto::v1::app::MutationIntent;
 use common::proto::v1::app::OperationType;
+use common::slug::slugify;
 use common::taxonomy::GroceryCategory;
 use common::units::PhysicalQuantity;
 use common::units::UnitRegistry;
@@ -20,6 +21,13 @@ pub(crate) fn validate_and_stabilize(
     current_inventory: &[GroceryItem],
 ) -> Result<StabilizedMutation, Status> {
     let category = verify_category_registry(&veto.category_assignment)?;
+
+    if slugify(&veto.resolved_item_key) != veto.resolved_item_key {
+        return Err(Status::internal(format!(
+            "AI Hallucination: Item key '{}' is not a valid slug.",
+            veto.resolved_item_key
+        )));
+    }
 
     if intent.operation == OperationType::Delete as i32 {
         return Ok(StabilizedMutation {
@@ -467,6 +475,63 @@ mod tests {
         let result = validate_and_stabilize(&intent, &veto, &inventory).unwrap();
         assert_eq!(result.base_unit, "ml");
         assert_eq!(result.updated_base_quantity, "1");
+    }
+
+    mod slug_format {
+        use super::*;
+
+        #[test]
+        fn rejects_key_with_spaces() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
+            let veto = VetoOutcome {
+                resolved_item_key: "milk 2percent".to_string(),
+                ..valid_outcome()
+            };
+            let result = validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+
+        #[test]
+        fn rejects_key_with_uppercase() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
+            let veto = VetoOutcome {
+                resolved_item_key: "MILK".to_string(),
+                ..valid_outcome()
+            };
+            let result = validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+        }
+
+        #[test]
+        fn accepts_valid_slug() {
+            let intent = MutationIntent::new(
+                "".into(),
+                Some("1".to_string()),
+                None,
+                None,
+                OperationType::Add,
+            );
+            let veto = VetoOutcome {
+                resolved_item_key: "milk".to_string(),
+                ..valid_outcome()
+            };
+            let result = validate_and_stabilize(&intent, &veto, &[]);
+            assert!(result.is_ok());
+        }
     }
 
     mod arithmetic_accumulation {

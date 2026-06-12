@@ -174,7 +174,7 @@ mod propose_mutation {
     #[tokio::test]
     async fn rejects_mutation_violating_dimensional_fence() {
         let existing_item = GroceryItem::new(
-            "milk-whole".to_string(),
+            "milk_whole".to_string(),
             "1000".to_string(),
             "g".to_string(), // Stored as MASS
             "Animal Secretions".to_string(),
@@ -194,7 +194,7 @@ mod propose_mutation {
         let veto = Arc::new(MockVetoRelay {
             outcome: Some(VetoOutcome {
                 is_approved: true,
-                resolved_item_key: "milk-whole".to_string(),
+                resolved_item_key: "milk_whole".to_string(),
                 resolved_unit: "ml".to_string(), // VOLUME
                 ..valid_outcome()
             }),
@@ -278,7 +278,7 @@ mod propose_mutation {
                     is_approved: true,
                     category_assignment: "Animal Secretions".to_string(),
                     moral_justification: "Milk is ethical".to_string(),
-                    resolved_item_key: "milk-whole".to_string(),
+                    resolved_item_key: "milk_whole".to_string(),
                     suggested_display_name: "Whole Milk".to_string(),
                     resolved_unit: "gal".to_string(),
                     conversion_multiplier_to_base: "3785.4118".to_string(),
@@ -308,7 +308,7 @@ mod propose_mutation {
         let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
 
         // Verification of SI Stabilization (1.5 * 3785.4118 = 5678.1177)
-        assert_eq!(mutation.resolved_item_key, "milk-whole");
+        assert_eq!(mutation.resolved_item_key, "milk_whole");
         assert_eq!(mutation.updated_base_quantity, "5678.1177");
         assert_eq!(mutation.base_unit, "ml");
         assert_eq!(mutation.display_unit, "gal");
@@ -352,7 +352,7 @@ mod propose_mutation {
                     is_approved: true,
                     category_assignment: "Animal Secretions".to_string(),
                     moral_justification: "Item removed".to_string(),
-                    resolved_item_key: "milk-whole".to_string(),
+                    resolved_item_key: "milk_whole".to_string(),
                     suggested_display_name: "Whole Milk".to_string(),
                     resolved_unit: "ml".to_string(),
                     conversion_multiplier_to_base: "1".to_string(),
@@ -374,7 +374,7 @@ mod propose_mutation {
         let proposals = raft.proposals.lock().unwrap();
         let mutation = CommittedMutation::decode(&proposals[0][..]).unwrap();
         assert!(mutation.is_delete);
-        assert_eq!(mutation.resolved_item_key, "milk-whole");
+        assert_eq!(mutation.resolved_item_key, "milk_whole");
     }
 
     #[tokio::test]
@@ -1757,7 +1757,7 @@ mod query_state {
     async fn filters_items_by_substring_match() {
         let items = vec![
             GroceryItem::new(
-                "milk-whole".to_string(),
+                "milk_whole".to_string(),
                 "1".to_string(),
                 "unit".to_string(),
                 "Dairy".to_string(),
@@ -1808,7 +1808,7 @@ mod query_state {
 
         assert_eq!(response_items.len(), 2);
         assert_eq!(response_items[0].item_key, "milk-skim");
-        assert_eq!(response_items[1].item_key, "milk-whole");
+        assert_eq!(response_items[1].item_key, "milk_whole");
     }
 
     #[tokio::test]
