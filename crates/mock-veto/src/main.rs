@@ -41,7 +41,9 @@ impl PolicyService for MockPolicyService {
         })?;
         let req = request.into_inner();
 
-        let intent = req.intent.unwrap();
+        let intent = req.intent.ok_or_else(|| {
+            Status::invalid_argument("EvaluateProposalRequest is missing 'intent' field")
+        })?;
 
         let mut response = Response::new(EvaluateProposalResponse::new(
             true, // is_approved
