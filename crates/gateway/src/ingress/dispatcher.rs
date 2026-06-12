@@ -85,6 +85,9 @@ impl IngressService for IngressDispatcher {
         &self,
         request: Request<ProposeMutationRequest>,
     ) -> Result<Response<ProposeMutationResponse>, Status> {
+        // TraceId guaranteed by TraceInterceptor registered in
+        // node-server/src/main.rs:409. Do not remove the interceptor
+        // without updating this call site.
         let trace_id = TraceInterceptor::require_trace_id(&request)?;
 
         let mut result = self.handle_propose_mutation(request, trace_id).await;
@@ -100,6 +103,9 @@ impl IngressService for IngressDispatcher {
         &self,
         request: Request<QueryStateRequest>,
     ) -> Result<Response<QueryStateResponse>, Status> {
+        // TraceId guaranteed by TraceInterceptor registered in
+        // node-server/src/main.rs:409. Do not remove the interceptor
+        // without updating this call site.
         let trace_id = TraceInterceptor::require_trace_id(&request)?;
 
         let mut result = self.handle_query_state(request, trace_id).await;

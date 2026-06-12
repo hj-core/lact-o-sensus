@@ -406,6 +406,9 @@ async fn run_server(
         };
 
         let identity_interceptor = IdentityInterceptor::new(identity.clone());
+        // TraceInterceptor MUST be registered before any services are added.
+        // Gateway dispatcher's require_trace_id() depends on this interceptor
+        // to populate request extensions per ADR 010 (see dispatcher.rs:88, 103).
         let ingress_trace_interceptor = TraceInterceptor::authoritative();
         let consensus_trace_interceptor = TraceInterceptor::propagative();
 
@@ -493,7 +496,61 @@ fn generate_deterministic_seed(node_id: NodeId) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use tonic::Request;
+
     use super::*;
+
+    mod trace_interceptor_registration {
+        use super::*;
+
+        mod ingress_authoritative_mode {
+            use super::*;
+
+            #[test]
+            fn generates_trace_id_when_request_has_none() {
+                let mut interceptor = TraceInterceptor::authoritative();
+                let request = Request::new(());
+                let result = interceptor
+                    .call(request)
+                    .expect("Interceptor should succeed");
+                let trace_id = TraceInterceptor::require_trace_id(&result)
+                    .expect("Authoritative interceptor must insert a TraceId");
+                assert!(
+                    trace_id.as_uuid().get_version_num() == 7,
+                    "TraceId must be a UUIDv7"
+                );
+            }
+
+            #[test]
+            fn ignores_client_provided_trace_id() {
+                let mut interceptor = TraceInterceptor::authoritative();
+                let client_id = TraceId::generate();
+                let mut request = Request::new(());
+                TraceInterceptor::inject_trace_id_into_request(&mut request, client_id)
+                    .expect("Failed to inject client trace_id");
+                let result = interceptor
+                    .call(request)
+                    .expect("Interceptor should succeed");
+                let server_id = TraceInterceptor::require_trace_id(&result)
+                    .expect("Authoritative interceptor must insert a TraceId");
+                assert_ne!(
+                    server_id, client_id,
+                    "Authoritative mode must generate a new TraceId, ignoring client value"
+                );
+            }
+
+            #[test]
+            fn propagative_mode_requires_client_trace_id() {
+                let mut interceptor = TraceInterceptor::propagative();
+                let request = Request::new(());
+                let result = interceptor.call(request);
+                assert!(
+                    result.is_err(),
+                    "Propagative interceptor must reject requests without TraceId"
+                );
+            }
+        }
+    }
 
     mod generate_deterministic_seed {
         use super::*;
