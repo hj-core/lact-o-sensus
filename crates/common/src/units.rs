@@ -203,6 +203,13 @@ const MULTIPLIER_OZ: Decimal = Decimal::from_parts(2834952, 0, 0, false, 5); // 
 const MULTIPLIER_GAL: Decimal = Decimal::from_parts(378541178, 0, 0, false, 5); // 3785.41178 (gal -> ml)
 const MULTIPLIER_FL_OZ: Decimal = Decimal::from_parts(2957353, 0, 0, false, 5); // 29.57353 (fl_oz -> ml)
 
+/// Normalizes a unit symbol for matching: trims whitespace, lowercases, and
+/// replaces hyphens and spaces with underscores so that "fl-oz" and "fl oz"
+/// resolve identically to "fl_oz".
+fn normalize_symbol(symbol: &str) -> String {
+    symbol.trim().to_lowercase().replace(['-', ' '], "_")
+}
+
 impl UnitRegistry {
     /// High-level Orchestrator: Parses a quantity and unit symbol into a
     /// validated, stabilized `PhysicalQuantity`.
@@ -245,29 +252,29 @@ impl UnitRegistry {
         fields(symbol = %symbol)
     )]
     pub fn resolve_symbol(symbol: &str) -> Result<UnitRegistryEntry, UnitError> {
-        let normalized = symbol.trim().to_lowercase();
+        let normalized = normalize_symbol(symbol);
 
         match normalized.as_str() {
             // --- Mass ---
-            "g" => Ok(UnitRegistryEntry {
+            "g" | "gram" | "grams" => Ok(UnitRegistryEntry {
                 symbol: "g",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::ONE,
                 is_contextual: false,
             }),
-            "kg" => Ok(UnitRegistryEntry {
+            "kg" | "kilogram" | "kilograms" => Ok(UnitRegistryEntry {
                 symbol: "kg",
                 dimension: Dimension::Mass,
                 multiplier: Decimal::from(1000),
                 is_contextual: false,
             }),
-            "lb" | "lbs" => Ok(UnitRegistryEntry {
+            "lb" | "lbs" | "pound" | "pounds" => Ok(UnitRegistryEntry {
                 symbol: "lb",
                 dimension: Dimension::Mass,
                 multiplier: MULTIPLIER_LB,
                 is_contextual: false,
             }),
-            "oz" => Ok(UnitRegistryEntry {
+            "oz" | "ounce" | "ounces" => Ok(UnitRegistryEntry {
                 symbol: "oz",
                 dimension: Dimension::Mass,
                 multiplier: MULTIPLIER_OZ,
@@ -275,25 +282,27 @@ impl UnitRegistry {
             }),
 
             // --- Volume ---
-            "ml" => Ok(UnitRegistryEntry {
-                symbol: "ml",
-                dimension: Dimension::Volume,
-                multiplier: Decimal::ONE,
-                is_contextual: false,
-            }),
-            "l" => Ok(UnitRegistryEntry {
+            "ml" | "milliliter" | "milliliters" | "millilitre" | "millilitres" => {
+                Ok(UnitRegistryEntry {
+                    symbol: "ml",
+                    dimension: Dimension::Volume,
+                    multiplier: Decimal::ONE,
+                    is_contextual: false,
+                })
+            }
+            "l" | "liter" | "liters" | "litre" | "litres" => Ok(UnitRegistryEntry {
                 symbol: "L",
                 dimension: Dimension::Volume,
                 multiplier: Decimal::from(1000),
                 is_contextual: false,
             }),
-            "gal" => Ok(UnitRegistryEntry {
+            "gal" | "gallon" | "gallons" => Ok(UnitRegistryEntry {
                 symbol: "gal",
                 dimension: Dimension::Volume,
                 multiplier: MULTIPLIER_GAL,
                 is_contextual: false,
             }),
-            "fl_oz" => Ok(UnitRegistryEntry {
+            "fl_oz" | "fluid_ounce" | "fluid_ounces" => Ok(UnitRegistryEntry {
                 symbol: "fl_oz",
                 dimension: Dimension::Volume,
                 multiplier: MULTIPLIER_FL_OZ,
@@ -321,7 +330,7 @@ impl UnitRegistry {
             }),
 
             // --- Anomalous ---
-            "misc" | "handful" | "bunch" => Ok(UnitRegistryEntry {
+            "misc" | "handful" | "bunch" | "handfuls" | "bunches" => Ok(UnitRegistryEntry {
                 symbol: "misc",
                 dimension: Dimension::Anomalous,
                 multiplier: Decimal::ONE,
@@ -513,11 +522,173 @@ mod tests {
             }
         }
 
+        mod with_normalization {
+            use super::*;
+            #[test]
+            fn symbol_with_hyphens_maps_to_underscore_unit() {
+                let res = UnitRegistry::resolve_symbol("fl-oz").unwrap();
+                assert_eq!(res.dimension, Dimension::Volume);
+                assert_eq!(res.symbol, "fl_oz");
+            }
+
+            #[test]
+            fn symbol_with_spaces_maps_to_underscore_unit() {
+                let res = UnitRegistry::resolve_symbol("fl oz").unwrap();
+                assert_eq!(res.dimension, Dimension::Volume);
+                assert_eq!(res.symbol, "fl_oz");
+            }
+        }
+
+        mod with_full_word_aliases {
+            use super::*;
+
+            mod mass_aliases {
+                use super::*;
+                #[test]
+                fn returns_mass_for_ounce() {
+                    let res = UnitRegistry::resolve_symbol("ounce").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "oz");
+                }
+
+                #[test]
+                fn returns_mass_for_ounces() {
+                    let res = UnitRegistry::resolve_symbol("ounces").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "oz");
+                }
+
+                #[test]
+                fn returns_mass_for_pound() {
+                    let res = UnitRegistry::resolve_symbol("pound").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "lb");
+                }
+
+                #[test]
+                fn returns_mass_for_pounds() {
+                    let res = UnitRegistry::resolve_symbol("pounds").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "lb");
+                }
+
+                #[test]
+                fn returns_mass_for_gram() {
+                    let res = UnitRegistry::resolve_symbol("gram").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "g");
+                }
+
+                #[test]
+                fn returns_mass_for_grams() {
+                    let res = UnitRegistry::resolve_symbol("grams").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "g");
+                }
+
+                #[test]
+                fn returns_mass_for_kilogram() {
+                    let res = UnitRegistry::resolve_symbol("kilogram").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "kg");
+                }
+
+                #[test]
+                fn returns_mass_for_kilograms() {
+                    let res = UnitRegistry::resolve_symbol("kilograms").unwrap();
+                    assert_eq!(res.dimension, Dimension::Mass);
+                    assert_eq!(res.symbol, "kg");
+                }
+            }
+
+            mod volume_aliases {
+                use super::*;
+                #[test]
+                fn returns_volume_for_milliliter() {
+                    let res = UnitRegistry::resolve_symbol("milliliter").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "ml");
+                }
+
+                #[test]
+                fn returns_volume_for_millilitre() {
+                    let res = UnitRegistry::resolve_symbol("millilitre").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "ml");
+                }
+
+                #[test]
+                fn returns_volume_for_liter() {
+                    let res = UnitRegistry::resolve_symbol("liter").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "L");
+                }
+
+                #[test]
+                fn returns_volume_for_litre() {
+                    let res = UnitRegistry::resolve_symbol("litre").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "L");
+                }
+
+                #[test]
+                fn returns_volume_for_gallon() {
+                    let res = UnitRegistry::resolve_symbol("gallon").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "gal");
+                }
+
+                #[test]
+                fn returns_volume_for_gallons() {
+                    let res = UnitRegistry::resolve_symbol("gallons").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "gal");
+                }
+
+                #[test]
+                fn returns_volume_for_fluid_ounce() {
+                    let res = UnitRegistry::resolve_symbol("fluid_ounce").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "fl_oz");
+                }
+
+                #[test]
+                fn returns_volume_for_fluid_ounces() {
+                    let res = UnitRegistry::resolve_symbol("fluid_ounces").unwrap();
+                    assert_eq!(res.dimension, Dimension::Volume);
+                    assert_eq!(res.symbol, "fl_oz");
+                }
+            }
+
+            mod anomalous_aliases {
+                use super::*;
+                #[test]
+                fn returns_anomalous_for_handfuls() {
+                    let res = UnitRegistry::resolve_symbol("handfuls").unwrap();
+                    assert_eq!(res.dimension, Dimension::Anomalous);
+                    assert_eq!(res.symbol, "misc");
+                }
+
+                #[test]
+                fn returns_anomalous_for_bunches() {
+                    let res = UnitRegistry::resolve_symbol("bunches").unwrap();
+                    assert_eq!(res.dimension, Dimension::Anomalous);
+                    assert_eq!(res.symbol, "misc");
+                }
+            }
+        }
+
         mod with_invalid_symbols {
             use super::*;
             #[test]
             fn returns_error_when_symbol_is_malformed() {
                 let res = UnitRegistry::resolve_symbol("invalid_unit");
+                assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
+            }
+
+            #[test]
+            fn returns_error_when_symbol_is_genuinely_unknown() {
+                let res = UnitRegistry::resolve_symbol("blorgs");
                 assert!(matches!(res, Err(UnitError::InvalidSymbol(_))));
             }
         }
