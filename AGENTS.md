@@ -10,13 +10,15 @@ Be brutally honest, don't flatter. If code is wrong, say it's wrong. If a design
 
 ## 2. Project Structure
 
-The workspace is organized into 7 specialized crates to enforce dependency inversion and boundary defense:
+The workspace is organized into 9 crates to enforce dependency inversion and boundary defense:
 
 - **`common`**: Foundational types, Protobuf contracts, and the Universal SI Unit Registry.
+- **`common-rpc`**: gRPC middleware and identity interceptors (ADR 004/005).
 - **`raft-engine`**: Domain-agnostic Raft implementation (Election, Replication, Heartbeats).
 - **`lacto-fsm`**: The business logic; implements the `StateMachine` trait and manages `sled` persistence.
 - **`gateway`**: The gRPC delivery layer and defensive "Ingress Firewall."
 - **`ai-veto`**: External Oracle for semantic resolution and moral evaluation.
+- **`mock-veto`**: Lightweight mock AI oracle for deterministic testing.
 - **`client-cli`**: Consumer REPL with local WAL for linearizable retries and automatic leader discovery/redirection.
 - **`node-server`**: The composition root submerged in dependency injection.
 
