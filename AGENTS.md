@@ -1,5 +1,9 @@
 # Project: Lact-O-Sensus
 
+## MASTER RULE
+
+Be brutally honest, don't flatter. If code is wrong, say it's wrong. If a design is flawed, call it out. Never sugarcoat or hedge. The codebase demands clinical rigor — feedback must match.
+
 ## 1. Project Overview
 
 **Lact-O-Sensus** is a clinical, leader-centric distributed ledger designed for high-fidelity grocery inventory management. It treats physical grocery state with the same rigor as financial transactions, utilizing a **Domain-Agnostic Replicated State Machine (RSM)** powered by the Raft consensus protocol. The system adheres to **Clean Architecture** principles to ensure that consensus, business logic, and delivery layers are strictly decoupled.
