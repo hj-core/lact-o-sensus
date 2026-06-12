@@ -1,3 +1,9 @@
+//! Self-validating domain primitives (NewTypes) for identity, consensus,
+//! client tracking, error classification, and clinical telemetry.
+//!
+//! Each type enforces its invariants at construction and provides controlled
+//! conversions. Re-exports the most commonly used types at the module root.
+
 pub mod client;
 pub mod consensus;
 pub mod errors;

@@ -1,3 +1,9 @@
+//! Clinical slug conventions for canonical string representations.
+//!
+//! Slugs are lowercase, underscore-separated identifiers derived from
+//! arbitrary input strings. Used for item keys and category labels to
+//! ensure a consistent, sanitized form throughout the ledger.
+
 use crate::taxonomy::GroceryCategory;
 
 /// Converts an arbitrary string into a canonical slug for clinical telemetry.
