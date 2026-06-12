@@ -254,6 +254,7 @@ fn mock_config(min_ms: u64, max_ms: u64) -> Arc<Config> {
             [raft]
             election_timeout_min_ms = {}
             election_timeout_max_ms = {}
+            rpc_timeout_ms = 5000
             snapshot_threshold = 20
             [policy]
             veto_addr = "http://127.0.0.1:50060"
