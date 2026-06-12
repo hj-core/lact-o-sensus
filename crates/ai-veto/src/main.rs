@@ -9,6 +9,7 @@ pub mod args;
 pub mod model;
 pub mod service;
 
+use std::net::IpAddr;
 use std::net::SocketAddr;
 
 use clap::Parser;
@@ -37,7 +38,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let bind_addr: IpAddr = args.bind_addr.parse().unwrap_or_else(|e| {
+        eprintln!("Invalid bind address '{}': {}", args.bind_addr, e);
+        std::process::exit(1);
+    });
+    let addr = SocketAddr::new(bind_addr, args.port);
 
     let root_span = info_span!(
         target: ClinicalTarget::ClinicalFoundation.as_str(),

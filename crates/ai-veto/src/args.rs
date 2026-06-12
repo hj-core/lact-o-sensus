@@ -14,6 +14,10 @@ pub struct Args {
     #[arg(short, long, default_value_t = 50060)]
     pub port: u16,
 
+    /// Bind address
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind_addr: String,
+
     /// Ollama model to use
     #[arg(short, long, default_value = "qwen3.5:4b")]
     pub model: String,

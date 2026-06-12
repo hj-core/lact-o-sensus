@@ -430,6 +430,7 @@ mod tests {
     fn test_args(think: bool) -> Args {
         Args {
             port: 50060,
+            bind_addr: "127.0.0.1".to_string(),
             model: "test-model".to_string(),
             ollama_host: "http://localhost".to_string(),
             ollama_port: 11434,
