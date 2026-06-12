@@ -21,7 +21,6 @@ use common::proto::v1::app::ingress_service_client::IngressServiceClient;
 use common::types::ClientId;
 use common::types::ClusterId;
 use common::types::LogIndex;
-use common::types::NodeId;
 use common::types::SequenceId;
 use common::types::errors::IdentityError;
 use common::types::trace::TraceId;
@@ -303,14 +302,8 @@ impl LactoClient {
             let mut request = Request::new(payload.clone());
             request.set_timeout(timeout);
 
-            // Inject identity headers (ADR 004/005).
-            if let Some(target_node_id) = self.current_node_id().await {
-                IdentityInterceptor::inject_identity_into_request(
-                    &mut request,
-                    &self.cluster_id,
-                    target_node_id,
-                )?;
-            }
+            // Inject cluster identity header (ADR 004/005).
+            IdentityInterceptor::inject_cluster_id_into_request(&mut request, &self.cluster_id)?;
 
             let r = rpc_fn(client, request).await;
 
@@ -469,27 +462,6 @@ impl LactoClient {
         self.handle_transport_error().await?;
         tokio::time::sleep(self.calculate_backoff(retry_count)).await;
         Ok(())
-    }
-
-    /// Helper to resolve the NodeId of the currently connected node.
-    ///
-    /// NOTE: In this phase, we use a heuristic based on the address string
-    /// to avoid breaking ClientState persistence.
-    async fn current_node_id(&self) -> Option<NodeId> {
-        let state = self.state.read().await;
-        let addr = state.known_nodes().first()?;
-
-        // Example: "127.0.0.1:50051" -> node_1 is configured for 50051.
-        // For tests, we use a simple mapping or just 0 if unknown.
-        if addr.contains("50051") {
-            NodeId::try_new(1).ok()
-        } else if addr.contains("50052") {
-            NodeId::try_new(2).ok()
-        } else if addr.contains("50053") {
-            NodeId::try_new(3).ok()
-        } else {
-            None
-        }
     }
 
     /// Calculates the exponential backoff for a given retry attempt.

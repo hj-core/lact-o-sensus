@@ -29,17 +29,33 @@ pub const HEADER_TRACE_ID: &str = "x-trace-id";
 /// Centralized interceptor for verifying cluster and node identity (ADR 004).
 ///
 /// This interceptor ensures that every incoming RPC contains the correct
-/// `x-cluster-id` and `x-target-node-id` headers, preventing logical
-/// misrouting and cross-cluster traffic leakage.
+/// `x-cluster-id` header, preventing cross-cluster traffic leakage. It
+/// optionally verifies `x-target-node-id` for internal routing (consensus
+/// service); the ingress service skips the node check since external clients
+/// have no reliable way to derive the target NodeId from an address.
 #[derive(Debug, Clone)]
 pub struct IdentityInterceptor {
     identity: Arc<NodeIdentity>,
+    enforce_target_node: bool,
 }
 
 impl IdentityInterceptor {
     /// Constructs a new IdentityInterceptor with the local node's identity.
     pub fn new(identity: Arc<NodeIdentity>) -> Self {
-        Self { identity }
+        Self {
+            identity,
+            enforce_target_node: true,
+        }
+    }
+
+    /// Constructs an IdentityInterceptor that skips the target-node-id check.
+    /// Used by the ingress service where external clients connect by address
+    /// rather than by NodeId.
+    pub fn without_node_check(identity: Arc<NodeIdentity>) -> Self {
+        Self {
+            identity,
+            enforce_target_node: false,
+        }
     }
 }
 
@@ -59,13 +75,33 @@ impl Interceptor for IdentityInterceptor {
     )]
     fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
         self.verify_cluster_id(&request)?;
-        self.verify_target_node_id(&request)?;
+        if self.enforce_target_node {
+            self.verify_target_node_id(&request)?;
+        }
 
         Ok(request)
     }
 }
 
 impl IdentityInterceptor {
+    /// Injects only the cluster identity header into an outbound request.
+    ///
+    /// Used by external clients that connect by address and do not know the
+    /// target NodeId (the ingress interceptor no longer enforces it).
+    pub fn inject_cluster_id_into_request<T>(
+        request: &mut Request<T>,
+        cluster_id: &ClusterId,
+    ) -> Result<(), Status> {
+        let cluster_val = cluster_id
+            .as_str()
+            .parse()
+            .map_err(|_| Status::internal("Failed to parse cluster_id for outbound header"))?;
+        request
+            .metadata_mut()
+            .insert(HEADER_CLUSTER_ID, cluster_val);
+        Ok(())
+    }
+
     /// Injects identity headers into an outbound request for cluster isolation.
     pub fn inject_identity_into_request<T>(
         request: &mut Request<T>,
@@ -389,6 +425,50 @@ mod tests {
                 assert!(result.is_err());
                 assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
             }
+
+            #[test]
+            fn accepts_request_without_node_id_when_node_check_disabled() {
+                let mut interceptor =
+                    IdentityInterceptor::without_node_check(mock_identity("test-cluster", 1));
+                let mut request = authenticated_request("test-cluster", 1);
+                request.metadata_mut().remove(HEADER_TARGET_NODE_ID);
+
+                let result = interceptor.call(request);
+                assert!(result.is_ok());
+            }
+
+            #[test]
+            fn accepts_request_with_wrong_node_id_when_node_check_disabled() {
+                let mut interceptor =
+                    IdentityInterceptor::without_node_check(mock_identity("test-cluster", 1));
+                let request = authenticated_request("test-cluster", 999);
+
+                let result = interceptor.call(request);
+                assert!(result.is_ok());
+            }
+
+            #[test]
+            fn still_rejects_missing_cluster_id_when_node_check_disabled() {
+                let mut interceptor =
+                    IdentityInterceptor::without_node_check(mock_identity("test-cluster", 1));
+                let mut request = authenticated_request("test-cluster", 1);
+                request.metadata_mut().remove(HEADER_CLUSTER_ID);
+
+                let result = interceptor.call(request);
+                assert!(result.is_err());
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+            }
+
+            #[test]
+            fn still_rejects_wrong_cluster_id_when_node_check_disabled() {
+                let mut interceptor =
+                    IdentityInterceptor::without_node_check(mock_identity("test-cluster", 1));
+                let request = authenticated_request("WRONG-cluster", 1);
+
+                let result = interceptor.call(request);
+                assert!(result.is_err());
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+            }
         }
 
         mod inject_identity_into_request {
@@ -426,6 +506,29 @@ mod tests {
                     "42"
                 );
             }
+        }
+    }
+
+    mod inject_cluster_id_into_request {
+        use super::*;
+
+        #[test]
+        fn injects_only_cluster_id_header() {
+            let mut request = Request::new(());
+            let cluster_id = ClusterId::try_new("test-cluster").unwrap();
+
+            IdentityInterceptor::inject_cluster_id_into_request(&mut request, &cluster_id).unwrap();
+
+            assert_eq!(
+                request
+                    .metadata()
+                    .get(HEADER_CLUSTER_ID)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "test-cluster"
+            );
+            assert!(request.metadata().get(HEADER_TARGET_NODE_ID).is_none());
         }
     }
 

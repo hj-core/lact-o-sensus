@@ -406,6 +406,7 @@ async fn run_server(
         };
 
         let identity_interceptor = IdentityInterceptor::new(identity.clone());
+        let ingress_identity_interceptor = IdentityInterceptor::without_node_check(identity);
         // TraceInterceptor MUST be registered before any services are added.
         // Gateway dispatcher's require_trace_id() depends on this interceptor
         // to populate request extensions per ADR 010 (see dispatcher.rs:88, 103).
@@ -424,7 +425,7 @@ async fn run_server(
             .add_service(IngressServiceServer::with_interceptor(
                 ingress_dispatcher,
                 {
-                    let mut identity = identity_interceptor;
+                    let mut identity = ingress_identity_interceptor;
                     let mut trace = ingress_trace_interceptor;
                     move |req| identity.call(req).and_then(|req| trace.call(req))
                 },
