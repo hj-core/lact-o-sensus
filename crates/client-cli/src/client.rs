@@ -209,8 +209,12 @@ impl LactoClient {
 
         let request_payload = ProposeMutationRequest::new(&self.client_id, sequence_id, intent);
 
-        // ADR 001: Persist before network egress
-        self.wal.append(sequence_id, &request_payload)?;
+        // ADR 001: Persist before network egress (offloaded to blocking pool for fsync)
+        let wal = self.wal.clone();
+        let payload = request_payload.clone();
+        tokio::task::spawn_blocking(move || wal.append(sequence_id, &payload))
+            .await
+            .map_err(|e| ClientError::Transport(format!("WAL append failed: {}", e)))??;
 
         self.execute_mutation(sequence_id, request_payload).await
     }
@@ -239,7 +243,10 @@ impl LactoClient {
         // REJECTED (redirection) is NOT terminal and will continue in the retry loop.
         match MutationStatus::try_from(response.status) {
             Ok(MutationStatus::Committed) | Ok(MutationStatus::Vetoed) => {
-                self.wal.remove(sequence_id)?;
+                let wal = self.wal.clone();
+                tokio::task::spawn_blocking(move || wal.remove(sequence_id))
+                    .await
+                    .map_err(|e| ClientError::Transport(format!("WAL remove failed: {}", e)))??;
             }
             _ => {}
         }
