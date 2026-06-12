@@ -311,7 +311,6 @@ impl LogStorage for SledStorage {
         Ok(entries)
     }
 
-    #[instrument(name = "storage_write_hard_state", target = "clinical::foundation", skip_all, fields(term = %term, vote = ?vote))]
     fn save_hard_state(&self, term: Term, vote: Option<NodeId>) -> Result<(), LogStorageError> {
         let data = Self::serialize_hard_state(term, vote);
         self.meta.insert(Self::KEY_HARD_STATE, data).map_err(|e| {
@@ -328,7 +327,6 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    #[instrument(name = "storage_write_committed", target = "raft::replication", skip_all, fields(index = %index))]
     fn save_last_committed(&self, index: LogIndex) -> Result<(), LogStorageError> {
         self.meta
             .insert(Self::KEY_LAST_COMMITTED, &index.as_u64().to_be_bytes())
@@ -346,7 +344,6 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    #[instrument(name = "storage_write_append", target = "raft::replication", skip_all, fields(count = entries.len()))]
     fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for entry in entries {
@@ -368,7 +365,6 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    #[instrument(name = "storage_write_truncate", target = "raft::replication", skip_all, fields(index = %index))]
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError> {
         let last_idx = self.last_log_index()?;
         if index > last_idx {
@@ -393,7 +389,6 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    #[instrument(name = "storage_write_truncate_front", target = "raft::replication", skip_all, fields(up_to_index = %up_to_index))]
     fn truncate_log_front(&self, up_to_index: LogIndex) -> Result<(), LogStorageError> {
         let mut batch = sled::Batch::default();
         for i in 1..=up_to_index.as_u64() {
@@ -416,7 +411,6 @@ impl LogStorage for SledStorage {
         Ok(())
     }
 
-    #[instrument(name = "storage_write_snapshot_meta", target = "raft::compaction", skip_all, fields(index = %last_included_index, term = %last_included_term))]
     fn save_snapshot_metadata(
         &self,
         last_included_index: LogIndex,
