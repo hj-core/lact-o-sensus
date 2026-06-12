@@ -346,18 +346,8 @@ impl PolicyService for RealPolicyService {
                 "LLM evaluation completed"
             );
 
-            let message_content = res.message.content.trim();
-
-            // Scrub markdown backticks if present
-            let clean_json = if message_content.starts_with("```") {
-                message_content
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                message_content
-            };
+            let message_content = res.message.content.as_str();
+            let clean_json = scrub_json_response(message_content);
 
             if clean_json.is_empty() {
                 error!(
@@ -418,6 +408,23 @@ impl PolicyService for RealPolicyService {
         }
         .instrument(span)
         .await
+    }
+}
+
+/// Scrubs markdown code-block fences from an LLM response string.
+///
+/// Strips leading/trailing whitespace and removes ```json / ``` markers
+/// if present. Returns the cleaned string (which may be empty).
+pub(crate) fn scrub_json_response(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("```") {
+        trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        trimmed
     }
 }
 
@@ -711,15 +718,7 @@ mod tests {
             use super::*;
 
             fn scrub_and_parse(message_content: &str) -> Result<LlmResponse, Status> {
-                let clean_json = if message_content.starts_with("```") {
-                    message_content
-                        .trim_start_matches("```json")
-                        .trim_start_matches("```")
-                        .trim_end_matches("```")
-                        .trim()
-                } else {
-                    message_content
-                };
+                let clean_json = scrub_json_response(message_content);
 
                 if clean_json.is_empty() {
                     return Err(Status::internal("AI Hallucination: Empty response"));
