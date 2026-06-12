@@ -246,6 +246,130 @@ impl LactoStore {
         }
         Ok(())
     }
+
+    fn validate_log_monotonicity(&self, index: LogIndex) -> Result<(), FsmError> {
+        let current_applied = self.last_applied_index()?;
+        if index != (current_applied + 1)? {
+            error!(
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                last_applied = %current_applied,
+                got = %index,
+                "HALT MANDATE (ADR 009): Non-sequential LogIndex apply attempted. Log regression or divergence suspected."
+            );
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Err(FsmError::invariant(format!(
+                "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
+                current_applied, index
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_client_id(&self, raw_client_id: &str, index: LogIndex) -> Result<ClientId, FsmError> {
+        ClientId::from_str(raw_client_id).map_err(|e| {
+            error!(
+                target: ClinicalTarget::ClinicalFsm.as_str(),
+                raw_id = %raw_client_id,
+                error = %e,
+                "HALT MANDATE (ADR 004): Invalid client_id in ledger. Identity metadata is corrupted."
+            );
+            self.poisoned.store(true, Ordering::SeqCst);
+            FsmError::invariant(format!(
+                "Invalid client_id '{}' in ledger at index {}. Identity metadata is corrupted: {}",
+                raw_client_id, index, e
+            ))
+        })
+    }
+
+    fn advance_last_applied_for_duplicate(&self, index: LogIndex) -> Result<(), FsmError> {
+        self.meta
+            .insert(Self::KEY_LAST_APPLIED, &index.as_u64().to_be_bytes())
+            .map_err(|e| {
+                FsmError::persistence(format!("Failed to persist last_applied index: {}", e))
+            })?;
+        self.db.flush().map_err(|e| {
+            FsmError::persistence(format!("FSM flush failure during deduplication: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn set_restoration_tombstone(&self) -> Result<(), FsmError> {
+        self.meta
+            .insert(Self::KEY_RESTORE_IN_PROGRESS, b"true")
+            .map_err(|e| FsmError::persistence(format!("Failed to set restore flag: {}", e)))?;
+        self.db.flush().map_err(|e| {
+            FsmError::persistence(format!("FSM flush failure during dirty-marking: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn clear_state_except_tombstone(&self) -> Result<(), FsmError> {
+        self.inventory
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to clear inventory: {}", e)))?;
+        self.sessions
+            .clear()
+            .map_err(|e| FsmError::persistence(format!("Failed to clear sessions: {}", e)))?;
+        for res in self.meta.iter() {
+            let (k, _) = res.map_err(|e| {
+                FsmError::persistence(format!("Meta iteration failure during clear: {}", e))
+            })?;
+            if k.as_ref() != Self::KEY_RESTORE_IN_PROGRESS {
+                self.meta.remove(k).map_err(|e| {
+                    FsmError::persistence(format!("Failed to remove meta key: {}", e))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_inventory_batch(&self, inventory: &[GroceryItem]) -> Result<(), FsmError> {
+        let mut inv_batch = sled::Batch::default();
+        for item in inventory {
+            inv_batch.insert(item.item_key.as_bytes(), item.encode_to_vec());
+        }
+        self.inventory.apply_batch(inv_batch).map_err(|e| {
+            FsmError::persistence(format!("Failed to apply inventory batch: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn restore_session_batch(&self, sessions: &[SessionRecord]) -> Result<(), FsmError> {
+        let mut sess_batch = sled::Batch::default();
+        for record in sessions {
+            sess_batch.insert(record.client_id.as_bytes(), record.encode_to_vec());
+        }
+        self.sessions
+            .apply_batch(sess_batch)
+            .map_err(|e| FsmError::persistence(format!("Failed to apply session batch: {}", e)))?;
+        Ok(())
+    }
+
+    fn finalize_restoration(
+        &self,
+        last_included_index: LogIndex,
+        last_effective_time: Option<prost_types::Timestamp>,
+    ) -> Result<(), FsmError> {
+        let mut meta_batch = sled::Batch::default();
+        meta_batch.insert(
+            Self::KEY_LAST_APPLIED,
+            &last_included_index.as_u64().to_be_bytes(),
+        );
+        if let Some(time) = last_effective_time {
+            meta_batch.insert(Self::KEY_LAST_EFFECTIVE_TIME, time.encode_to_vec());
+        }
+        meta_batch.remove(Self::KEY_RESTORE_IN_PROGRESS);
+        self.meta
+            .apply_batch(meta_batch)
+            .map_err(|e| FsmError::persistence(format!("Failed to apply meta batch: {}", e)))?;
+        self.db.flush().map_err(|e| {
+            FsmError::persistence(format!(
+                "FSM flush failure after snapshot restoration: {}",
+                e
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 impl SessionProvider for LactoStore {
@@ -320,48 +444,16 @@ impl StateMachine for LactoStore {
             ))
         })?;
 
-        // 1. Physical Log Monotonicity (Physical Fence)
-        let current_applied = self.last_applied_index()?;
-        if index != (current_applied + 1)? {
-            error!(
-                target: ClinicalTarget::ClinicalFsm.as_str(),
-                last_applied = %current_applied,
-                got = %index,
-                "HALT MANDATE (ADR 009): Non-sequential LogIndex apply attempted. Log regression or divergence suspected."
-            );
-            self.poisoned.store(true, Ordering::SeqCst);
-            return Err(FsmError::invariant(format!(
-                "Non-sequential LogIndex apply attempted. last_applied={}, got {}",
-                current_applied, index
-            )));
-        }
+        self.validate_log_monotonicity(index)?;
 
         let client_id = mutation.client_id.clone();
         let seq = SequenceId::new(mutation.sequence_id);
+        let client_id_obj = self.parse_client_id(&client_id, index)?;
 
-        let client_id_obj = match ClientId::from_str(&client_id) {
-            Ok(id) => id,
-            Err(e) => {
-                error!(
-                    target: ClinicalTarget::ClinicalFsm.as_str(),
-                    raw_id = %client_id,
-                    error = %e,
-                    "HALT MANDATE (ADR 004): Invalid client_id in ledger. Identity metadata is corrupted."
-                );
-                self.poisoned.store(true, Ordering::SeqCst);
-                return Err(FsmError::invariant(format!(
-                    "Invalid client_id '{}' in ledger at index {}. Identity metadata is \
-                     corrupted: {}",
-                    client_id, index, e
-                )));
-            }
-        };
-
-        // Record truncated client_id in the span context
         tracing::Span::current().record("client_id", client_id_obj.truncated());
         tracing::Span::current().record("seq", seq.as_u64());
 
-        // 2. Client Sequence Validation (ADR 006)
+        // Client Sequence Validation (ADR 006)
         let last_seen = SequenceId::new(
             self.get_session_record(&client_id)?
                 .map(|r| r.last_sequence_id)
@@ -375,21 +467,10 @@ impl StateMachine for LactoStore {
                 last_seen = %last_seen,
                 "Deduplicating stale/retry sequence. State advancement only."
             );
-            // Even for duplicates, we must advance last_applied to ensure
-            // the Raft engine stays in sync with the log.
-            self.meta
-                .insert(Self::KEY_LAST_APPLIED, &index.as_u64().to_be_bytes())
-                .map_err(|e| {
-                    FsmError::persistence(format!("Failed to persist last_applied index: {}", e))
-                })?;
-            self.db.flush().map_err(|e| {
-                FsmError::persistence(format!("FSM flush failure during deduplication: {}", e))
-            })?;
-            return Ok(());
+            return self.advance_last_applied_for_duplicate(index);
         }
 
         if seq > expected_seq {
-            // ADR 006: Invariant Enforcement
             error!(
                 target: ClinicalTarget::ClinicalFsm.as_str(),
                 expected_seq = %expected_seq,
@@ -402,7 +483,7 @@ impl StateMachine for LactoStore {
             )));
         }
 
-        // --- Phase 2: Atomic Commitment (Inventory + Session + Index + Time) ---
+        // Phase 2: Atomic Commitment (Inventory + Session + Index + Time)
         let inventory_tree = self.inventory.clone();
         let sessions_tree = self.sessions.clone();
         let meta_tree = self.meta.clone();
@@ -425,7 +506,6 @@ impl StateMachine for LactoStore {
         };
         let moral_justification = mutation.moral_justification.clone();
 
-        // Stateful Temporal Determinism (ADR 006)
         let event_time = match mutation.event_time {
             Some(t) => t,
             None => {
@@ -442,11 +522,9 @@ impl StateMachine for LactoStore {
             }
         };
 
-        // Global deterministic time update logic
         let current_effective = self.last_effective_time()?;
         let next_effective = Self::max_timestamp(event_time, current_effective);
 
-        // PII Trace: Log full AI output and raw intent at TRACE level only (ADR 010).
         trace!(
             target: ClinicalTarget::ClinicalFsm.as_str(),
             raw_client_id = %client_id,
@@ -458,7 +536,6 @@ impl StateMachine for LactoStore {
 
         let res: TransactionResult<(), ()> = (&inventory_tree, &sessions_tree, &meta_tree)
             .transaction(|(inventory, sessions, meta)| {
-                // 1. Update Physical Inventory (only if Committed)
                 if status == MutationStatus::Committed {
                     if mutation.is_delete {
                         inventory.remove(mutation.resolved_item_key.as_bytes())?;
@@ -471,7 +548,6 @@ impl StateMachine for LactoStore {
                     }
                 }
 
-                // 2. Update Session Table (ADR 006)
                 let record = SessionRecord::new(
                     &client_id_obj,
                     seq,
@@ -482,7 +558,6 @@ impl StateMachine for LactoStore {
                 );
                 sessions.insert(client_id.as_bytes(), record.encode_to_vec().as_slice())?;
 
-                // 3. Update Apply Index & Clinical Time
                 meta.insert(Self::KEY_LAST_APPLIED, &index.as_u64().to_be_bytes())?;
                 meta.insert(
                     Self::KEY_LAST_EFFECTIVE_TIME,
@@ -494,7 +569,6 @@ impl StateMachine for LactoStore {
 
         res.map_err(|e| FsmError::persistence(format!("Atomic transaction failure: {:?}", e)))?;
 
-        // Synchronous flush as mandated by ADR 001
         self.db.flush().map_err(|e| {
             FsmError::persistence(format!("FSM flush failure after commitment: {}", e))
         })?;
@@ -565,7 +639,6 @@ impl StateMachine for LactoStore {
     ) -> Result<(), Self::Error> {
         self.check_not_poisoned()?;
         let snapshot = SnapshotData::decode(data).map_err(|e| {
-            // HALT FORENSICS (Rule 15, ADR 010)
             error!(
                 target: ClinicalTarget::ClinicalTelemetry.as_str(),
                 index = %last_included_index,
@@ -576,76 +649,11 @@ impl StateMachine for LactoStore {
             FsmError::deserialization(format!("Failed to decode SnapshotData: {}", e))
         })?;
 
-        // 1. Mark as Dirty (The Tombstone)
-        self.meta
-            .insert(Self::KEY_RESTORE_IN_PROGRESS, b"true")
-            .map_err(|e| FsmError::persistence(format!("Failed to set restore flag: {}", e)))?;
-        self.db.flush().map_err(|e| {
-            FsmError::persistence(format!("FSM flush failure during dirty-marking: {}", e))
-        })?;
-
-        // 2. Clear existing state
-        self.inventory
-            .clear()
-            .map_err(|e| FsmError::persistence(format!("Failed to clear inventory: {}", e)))?;
-        self.sessions
-            .clear()
-            .map_err(|e| FsmError::persistence(format!("Failed to clear sessions: {}", e)))?;
-        // We clear everything EXCEPT the dirty flag in meta
-        for res in self.meta.iter() {
-            let (k, _) = res.map_err(|e| {
-                FsmError::persistence(format!("Meta iteration failure during clear: {}", e))
-            })?;
-            if k.as_ref() != Self::KEY_RESTORE_IN_PROGRESS {
-                self.meta.remove(k).map_err(|e| {
-                    FsmError::persistence(format!("Failed to remove meta key: {}", e))
-                })?;
-            }
-        }
-
-        // 3. Restore Inventory in Batch
-        let mut inv_batch = sled::Batch::default();
-        for item in &snapshot.inventory {
-            inv_batch.insert(item.item_key.as_bytes(), item.encode_to_vec());
-        }
-        self.inventory.apply_batch(inv_batch).map_err(|e| {
-            FsmError::persistence(format!("Failed to apply inventory batch: {}", e))
-        })?;
-
-        // 4. Restore Sessions in Batch
-        let mut sess_batch = sled::Batch::default();
-        for record in &snapshot.sessions {
-            sess_batch.insert(record.client_id.as_bytes(), record.encode_to_vec());
-        }
-        self.sessions
-            .apply_batch(sess_batch)
-            .map_err(|e| FsmError::persistence(format!("Failed to apply session batch: {}", e)))?;
-
-        // 5. Finalize Metadata and Mark as Clean
-        let mut meta_batch = sled::Batch::default();
-        meta_batch.insert(
-            Self::KEY_LAST_APPLIED,
-            &last_included_index.as_u64().to_be_bytes(),
-        );
-
-        if let Some(time) = snapshot.last_effective_time {
-            meta_batch.insert(Self::KEY_LAST_EFFECTIVE_TIME, time.encode_to_vec());
-        }
-
-        // Remove the Tombstone
-        meta_batch.remove(Self::KEY_RESTORE_IN_PROGRESS);
-
-        self.meta
-            .apply_batch(meta_batch)
-            .map_err(|e| FsmError::persistence(format!("Failed to apply meta batch: {}", e)))?;
-
-        // 6. Synchronous flush (ADR 001)
-        self.db.flush().map_err(|e| {
-            FsmError::persistence(format!(
-                "FSM flush failure after snapshot restoration: {}",
-                e
-            ))
-        })?;
+        self.set_restoration_tombstone()?;
+        self.clear_state_except_tombstone()?;
+        self.restore_inventory_batch(&snapshot.inventory)?;
+        self.restore_session_batch(&snapshot.sessions)?;
+        self.finalize_restoration(last_included_index, snapshot.last_effective_time)?;
 
         info!(
             target: ClinicalTarget::RaftCompaction.as_str(),
