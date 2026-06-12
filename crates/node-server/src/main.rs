@@ -45,6 +45,7 @@ use rand::SeedableRng;
 use sled::Db;
 use tonic::service::Interceptor;
 use tonic::transport::Server;
+use tonic::transport::server::Router;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::error;
@@ -375,10 +376,7 @@ async fn run_server(
     root_span: Span,
 ) -> Result<()> {
     async move {
-        // Spawn the unified deterministic Tick Loop
         spawn_tick_loop(config.clone(), shared_state.clone(), peer_manager.clone());
-
-        // Spawn the continuous background FSM applier
         spawn_background_applier(shared_state.clone());
 
         info!(
@@ -408,31 +406,9 @@ async fn run_server(
             }
         };
 
-        let identity_interceptor = IdentityInterceptor::new(identity.clone());
-        let ingress_identity_interceptor = IdentityInterceptor::without_node_check(identity);
-        // TraceInterceptor MUST be registered before any services are added.
-        // Gateway dispatcher's require_trace_id() depends on this interceptor
-        // to populate request extensions per ADR 010 (see dispatcher.rs:88, 103).
-        let ingress_trace_interceptor = TraceInterceptor::authoritative();
-        let consensus_trace_interceptor = TraceInterceptor::propagative();
+        let server = build_grpc_server(consensus_dispatcher, ingress_dispatcher, identity);
 
-        Server::builder()
-            .add_service(ConsensusServiceServer::with_interceptor(
-                consensus_dispatcher,
-                {
-                    let mut identity = identity_interceptor.clone();
-                    let mut trace = consensus_trace_interceptor;
-                    move |req| identity.call(req).and_then(|req| trace.call(req))
-                },
-            ))
-            .add_service(IngressServiceServer::with_interceptor(
-                ingress_dispatcher,
-                {
-                    let mut identity = ingress_identity_interceptor;
-                    let mut trace = ingress_trace_interceptor;
-                    move |req| identity.call(req).and_then(|req| trace.call(req))
-                },
-            ))
+        server
             .serve_with_shutdown(addr, shutdown)
             .await
             .map_err(|e| {
@@ -444,27 +420,7 @@ async fn run_server(
                 anyhow::Error::from(e)
             })?;
 
-        // Persistence Cleanup (ADR 001: Sync-before-ACK / Crash-Recovery)
-        let shutdown_span = info_span!(
-            target: ClinicalTarget::ClinicalFoundation.as_str(),
-            "persistence_shutdown"
-        );
-        async {
-            info!(
-                target: ClinicalTarget::ClinicalFoundation.as_str(),
-                "gRPC server stopped. Flushing databases to disk..."
-            );
-            system_db.flush_async().await.map_err(anyhow::Error::from)?;
-            log_db.flush_async().await.map_err(anyhow::Error::from)?;
-            fsm_db.flush_async().await.map_err(anyhow::Error::from)?;
-            info!(
-                target: ClinicalTarget::ClinicalFoundation.as_str(),
-                "Databases synchronized successfully."
-            );
-            Ok::<(), anyhow::Error>(())
-        }
-        .instrument(shutdown_span)
-        .await?;
+        shutdown_and_flush(&system_db, &log_db, &fsm_db).await?;
 
         info!(
             target: ClinicalTarget::ClinicalFoundation.as_str(),
@@ -473,6 +429,60 @@ async fn run_server(
         Ok(())
     }
     .instrument(root_span)
+    .await
+}
+
+/// Builds the gRPC server with consensus and ingress services.
+fn build_grpc_server(
+    consensus_dispatcher: ConsensusDispatcher<LactoStore>,
+    ingress_dispatcher: IngressDispatcher,
+    identity: Arc<NodeIdentity>,
+) -> Router {
+    let identity_interceptor = IdentityInterceptor::new(identity.clone());
+    let ingress_identity_interceptor = IdentityInterceptor::without_node_check(identity);
+    let ingress_trace_interceptor = TraceInterceptor::authoritative();
+    let consensus_trace_interceptor = TraceInterceptor::propagative();
+
+    Server::builder()
+        .add_service(ConsensusServiceServer::with_interceptor(
+            consensus_dispatcher,
+            {
+                let mut identity = identity_interceptor.clone();
+                let mut trace = consensus_trace_interceptor;
+                move |req| identity.call(req).and_then(|req| trace.call(req))
+            },
+        ))
+        .add_service(IngressServiceServer::with_interceptor(
+            ingress_dispatcher,
+            {
+                let mut identity = ingress_identity_interceptor;
+                let mut trace = ingress_trace_interceptor;
+                move |req| identity.call(req).and_then(|req| trace.call(req))
+            },
+        ))
+}
+
+/// Flushes all databases after gRPC server shutdown.
+async fn shutdown_and_flush(system_db: &Db, log_db: &Db, fsm_db: &Db) -> Result<()> {
+    let shutdown_span = info_span!(
+        target: ClinicalTarget::ClinicalFoundation.as_str(),
+        "persistence_shutdown"
+    );
+    async {
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "gRPC server stopped. Flushing databases to disk..."
+        );
+        system_db.flush_async().await.map_err(anyhow::Error::from)?;
+        log_db.flush_async().await.map_err(anyhow::Error::from)?;
+        fsm_db.flush_async().await.map_err(anyhow::Error::from)?;
+        info!(
+            target: ClinicalTarget::ClinicalFoundation.as_str(),
+            "Databases synchronized successfully."
+        );
+        Ok::<(), anyhow::Error>(())
+    }
+    .instrument(shutdown_span)
     .await
 }
 
