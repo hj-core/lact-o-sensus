@@ -20,6 +20,9 @@ use strum::EnumString;
 use thiserror::Error;
 use tracing::instrument;
 
+/// Precision (decimal places) for SI base unit stabilization (ADR 008).
+const SI_STABILIZATION_PRECISION: u32 = 4;
+
 /// Errors associated with physical quantity parsing and stabilization.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum UnitError {
@@ -346,7 +349,10 @@ impl UnitRegistry {
             .ok_or(UnitError::ArithmeticError)?;
 
         // Banker's Rounding is mandatory for SI stabilization (ADR 008)
-        Ok(result.round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven))
+        Ok(result.round_dp_with_strategy(
+            SI_STABILIZATION_PRECISION,
+            RoundingStrategy::MidpointNearestEven,
+        ))
     }
 
     /// Helper to wrap a raw Decimal value in the appropriate Dimension NewType.
@@ -377,9 +383,12 @@ impl UnitRegistry {
             return None;
         }
         let base = Decimal::from_str(base_quantity).ok()?;
-        let result = base
-            .checked_div(entry.multiplier)
-            .map(|r| r.round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven))?;
+        let result = base.checked_div(entry.multiplier).map(|r| {
+            r.round_dp_with_strategy(
+                SI_STABILIZATION_PRECISION,
+                RoundingStrategy::MidpointNearestEven,
+            )
+        })?;
         Some(result.to_string())
     }
 }

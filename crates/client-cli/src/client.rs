@@ -55,6 +55,8 @@ const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// ±20% jitter factor to disperse "thundering herd" retry waves.
 const JITTER_FACTOR: f64 = 0.2;
+/// Multiplier for exponential backoff base calculation.
+const BACKOFF_MULTIPLIER: u64 = 2;
 
 /// Errors associated with the LactoClient orchestration.
 #[derive(Debug, Error)]
@@ -277,6 +279,9 @@ impl LactoClient {
         R: Fn(&Res) -> (bool, String),
     {
         let mut retry_count = 0;
+        // Base retries = known_nodes.len() + MAX_KNOWN_NODES
+        // MAX_KNOWN_NODES provides a floor so retries never exhaust
+        // before the first discovery cycle completes.
         let max_retries = self.state.read().await.known_nodes().len() + MAX_KNOWN_NODES;
 
         loop {
@@ -493,7 +498,8 @@ impl LactoClient {
         let base_backoff_ms = self.initial_backoff.as_millis() as u64;
 
         // Calculate exponential part with saturation to prevent overflow before cap
-        let exponential_backoff_ms = base_backoff_ms.saturating_mul(2u64.pow(exponent));
+        let exponential_backoff_ms =
+            base_backoff_ms.saturating_mul(BACKOFF_MULTIPLIER.pow(exponent));
         let capped_backoff_ms = exponential_backoff_ms.min(self.max_backoff.as_millis() as u64);
 
         let mut rng = rand::rng();

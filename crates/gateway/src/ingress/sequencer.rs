@@ -9,6 +9,13 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+/// Reserved sequence ID — rejected at the firewall (protocol violation).
+const SEQUENCE_FIREWALL_ZERO: u64 = 0;
+/// Expected increment between consecutive sequence IDs.
+const SEQUENCE_STEP: u64 = 1;
+/// First valid sequence ID for a newly connected client.
+const NEW_CLIENT_FIRST_SEQUENCE: u64 = 1;
+
 /// Enforces Exactly-Once Semantics by validating request sequences against
 /// the authoritative session table.
 ///
@@ -19,7 +26,7 @@ pub(crate) async fn enforce_sequence_firewall(
     client_id: &ClientId,
     sequence_id: SequenceId,
 ) -> Result<Option<Response<ProposeMutationResponse>>, Status> {
-    if sequence_id.as_u64() == 0 {
+    if sequence_id.as_u64() == SEQUENCE_FIREWALL_ZERO {
         return Ok(Some(Response::new(ProposeMutationResponse {
             status: MutationStatus::Rejected as i32,
             state_version: 0,
@@ -68,12 +75,12 @@ pub(crate) async fn enforce_sequence_firewall(
             })));
         }
 
-        if sequence_id.as_u64() > record.last_sequence_id + 1 {
+        if sequence_id.as_u64() > record.last_sequence_id + SEQUENCE_STEP {
             warn!(
                 target: ClinicalTarget::ClinicalIngress.as_str(),
                 client_id = %client_id.truncated(),
                 seq = %sequence_id,
-                expected_seq = %(record.last_sequence_id + 1),
+                expected_seq = %(record.last_sequence_id + SEQUENCE_STEP),
                 "Rejecting sequence gap."
             );
             return Ok(Some(Response::new(ProposeMutationResponse {
@@ -83,13 +90,13 @@ pub(crate) async fn enforce_sequence_firewall(
                 error_message: "Secure Clinical: Sequence Continuity Violation".to_string(),
             })));
         }
-    } else if sequence_id.as_u64() != 1 {
+    } else if sequence_id.as_u64() != NEW_CLIENT_FIRST_SEQUENCE {
         // New client must start with sequence 1
         warn!(
             target: ClinicalTarget::ClinicalIngress.as_str(),
             client_id = %client_id.truncated(),
             seq = %sequence_id,
-            expected_seq = 1,
+            expected_seq = NEW_CLIENT_FIRST_SEQUENCE,
             "Rejecting session bootstrap gap."
         );
         return Ok(Some(Response::new(ProposeMutationResponse {

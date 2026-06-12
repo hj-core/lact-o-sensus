@@ -39,6 +39,9 @@ use tracing::warn;
 use crate::args::Args;
 use crate::model::LlmResponse;
 
+/// Default LLM context window size (tokens) for cache-optimized inference.
+const DEFAULT_CONTEXT_WINDOW: u64 = 4096;
+
 pub struct RealPolicyService {
     ollama: Ollama,
     args: Args,
@@ -85,7 +88,7 @@ impl RealPolicyService {
         // Cache-optimized options: lock context window to ensure prefix reuse.
         // Set hardware latency bound via num_predict.
         let options = ModelOptions::default()
-            .num_ctx(4096)
+            .num_ctx(DEFAULT_CONTEXT_WINDOW)
             .num_predict(self.args.max_tokens as i32);
 
         let mut chat_req = ChatMessageRequest::new(self.args.model.clone(), messages)

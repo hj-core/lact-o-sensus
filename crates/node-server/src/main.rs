@@ -53,6 +53,9 @@ use tracing::info_span;
 use tracing::instrument;
 use tracing_subscriber::EnvFilter;
 
+/// Size of a NodeId in bytes when encoded as big-endian u64.
+const NODE_ID_SIZE: usize = std::mem::size_of::<u64>();
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -481,10 +484,10 @@ fn generate_deterministic_seed(node_id: NodeId) -> [u8; 32] {
     let mut seed = [0u8; 32];
     // Mix in the NodeId to guarantee uniqueness between nodes
     let node_id_bytes = node_id.as_u64().to_be_bytes();
-    seed[0..8].copy_from_slice(&node_id_bytes);
+    seed[0..NODE_ID_SIZE].copy_from_slice(&node_id_bytes);
 
     // Mix in OS entropy for cross-restart uniqueness
-    rand::rng().fill(&mut seed[8..]);
+    rand::rng().fill(&mut seed[NODE_ID_SIZE..]);
     seed
 }
 
