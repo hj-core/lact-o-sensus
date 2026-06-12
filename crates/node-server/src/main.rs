@@ -498,7 +498,7 @@ mod tests {
     mod generate_deterministic_seed {
         use super::*;
 
-        mod behavior {
+        mod structure {
             use super::*;
 
             #[test]
