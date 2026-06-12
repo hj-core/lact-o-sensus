@@ -2,11 +2,11 @@
 
 A distributed ledger for grocery inventory management, powered by the Raft consensus protocol.
 
-**Status:** Phases 1–8 of the implementation roadmap are complete. The system works but is still evolving — Phase 9 (elastic membership, security, multi-tenancy) remains ahead.
+**Status:** Verified through Phase 8 (Pre-Vote Integrity). The cluster maintains safety under asymmetric network partitions and guarantees linearizability via a sled-backed replicated FSM. Phase 9 (Elastic membership, security, multi-tenancy) is pending.
 
 ## What it does
 
-Lact-O-Sensus treats physical grocery state with roughly the same rigor as financial transactions. Operators submit mutation intents through a CLI client (e.g. "receive 10 liters of whole milk"). The cluster resolves them through an AI oracle for semantic and moral evaluation, reaches consensus across nodes, and commits the result to a replicated sled-backed ledger — with exactly-once semantics and SI-normalized units.
+Lact-O-Sensus treats physical grocery state with roughly the same rigor as financial transactions. Operators submit mutation intents through a CLI client (e.g. `add milk 10 liter`). The cluster resolves them through an AI oracle for semantic and moral evaluation, reaches consensus across nodes, and commits the result to a replicated sled-backed ledger — with exactly-once semantics and SI-normalized units.
 
 ## Architecture
 
