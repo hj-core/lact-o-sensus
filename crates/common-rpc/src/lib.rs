@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use common::types::ClusterId;
 use common::types::NodeId;
 use common::types::NodeIdentity;
 use common::types::trace::ClinicalTarget;
@@ -68,8 +69,8 @@ impl IdentityInterceptor {
     /// Injects identity headers into an outbound request for cluster isolation.
     pub fn inject_identity_into_request<T>(
         request: &mut Request<T>,
-        cluster_id: &common::types::ClusterId,
-        target_node_id: common::types::NodeId,
+        cluster_id: &ClusterId,
+        target_node_id: NodeId,
     ) -> Result<(), Status> {
         let cluster_val = cluster_id
             .as_str()
