@@ -11,6 +11,7 @@ use clap::Parser;
 use client_cli::client::LactoClient;
 use client_cli::repl;
 use client_cli::state::ClientState;
+use common::proto::v1::app::MutationStatus;
 use common::types::ClusterId;
 use common::types::trace::ClinicalTarget;
 use tokio::io::BufReader;
@@ -109,10 +110,13 @@ async fn recover_pending_intents(client: &LactoClient) -> Result<()> {
         match client.repropose_mutation(seq, req).await {
             Ok((res, tid)) => {
                 let trace_info = tid.map(|t| format!(" [Trace: {}]", t)).unwrap_or_default();
+                let status_str = MutationStatus::try_from(res.status)
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|_| format!("{}", res.status));
                 info!(
                     target: ClinicalTarget::ClinicalFoundation.as_str(),
-                    "Successfully recovered intent {}. Status: {:?}{}",
-                    seq, res.status, trace_info
+                    "Successfully recovered intent {}. Status: {}{}",
+                    seq, status_str, trace_info
                 );
             }
             Err(e) => {
