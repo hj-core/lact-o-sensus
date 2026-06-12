@@ -14,12 +14,14 @@ use common::proto::v1::QueryStatus;
 use common::proto::v1::app::ProposeMutationResponse;
 use common::proto::v1::app::QueryStateResponse;
 use common::types::LogIndex;
+use common::types::trace::ClinicalTarget;
 use common::types::trace::TraceId;
 use thiserror::Error;
 use tokio::io::AsyncBufRead;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tracing::error;
 
 use crate::client::ClientError;
 use crate::client::LactoClient;
@@ -254,8 +256,13 @@ where
                 writer.write_all(format!("{}\n", output).as_bytes()).await?;
             }
             Err(e) => {
+                error!(
+                    target: ClinicalTarget::ClinicalFoundation.as_str(),
+                    error = %e,
+                    "Network error"
+                );
                 writer
-                    .write_all(format!("Network Error: {}\n", e).as_bytes())
+                    .write_all(b"Mutation failed. Contact cluster operator.\n")
                     .await?;
             }
         }
