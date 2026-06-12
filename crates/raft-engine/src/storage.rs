@@ -68,6 +68,22 @@ pub trait LogStorage: Send + Sync + Debug {
     /// MUST perform a synchronous flush to disk.
     fn append_entries(&self, entries: Vec<LogEntry>) -> Result<(), LogStorageError>;
 
+    /// Appends entries AND advances the commit index in a single operation.
+    ///
+    /// This is an optimization for the log reconciliation path (RAFT-11) to
+    /// reduce two sequential flushes to a single atomic flush. The default
+    /// implementation falls back to calling `append_entries` then
+    /// `save_last_committed` separately. Override this in storage backends
+    /// that can atomically combine both operations.
+    fn append_entries_and_advance_commit(
+        &self,
+        entries: Vec<LogEntry>,
+        commit_index: LogIndex,
+    ) -> Result<(), LogStorageError> {
+        self.append_entries(entries)?;
+        self.save_last_committed(commit_index)
+    }
+
     /// Truncates the log, removing all entries from `index` to the end.
     /// MUST perform a synchronous flush to disk.
     fn truncate_log(&self, index: LogIndex) -> Result<(), LogStorageError>;
@@ -361,6 +377,39 @@ impl LogStorage for SledStorage {
                 "Sled flush failure after log append"
             );
             LogStorageError::persistence(format!("Sled flush failure after log append: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn append_entries_and_advance_commit(
+        &self,
+        entries: Vec<LogEntry>,
+        commit_index: LogIndex,
+    ) -> Result<(), LogStorageError> {
+        let mut batch = sled::Batch::default();
+        for entry in entries {
+            let key = entry.index.to_be_bytes();
+            let val = entry.encode_to_vec();
+            batch.insert(&key, val);
+        }
+        self.log.apply_batch(batch).map_err(|e| {
+            LogStorageError::persistence(format!("Failed to apply log append batch: {}", e))
+        })?;
+        self.meta
+            .insert(
+                Self::KEY_LAST_COMMITTED,
+                &commit_index.as_u64().to_be_bytes(),
+            )
+            .map_err(|e| {
+                LogStorageError::persistence(format!("Failed to persist last_committed: {}", e))
+            })?;
+        self.db.flush().map_err(|e| {
+            debug!(
+                target: ClinicalTarget::RaftReplication.as_str(),
+                error = %e,
+                "Sled flush failure after combined log append and commit advance"
+            );
+            LogStorageError::persistence(format!("Sled flush failure: {}", e))
         })?;
         Ok(())
     }

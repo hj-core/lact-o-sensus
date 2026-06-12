@@ -140,7 +140,7 @@ impl RaftNode<Follower> {
     }
 
     /// Following Raft §5.3, reconciles the local log with entries from the
-    /// leader.
+    /// leader consolidated with commit advancement to minimize I/O.
     pub fn reconcile_log(
         &mut self,
         prev_log_index: LogIndex,
@@ -152,11 +152,77 @@ impl RaftNode<Follower> {
             return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
         }
 
-        if !self.append_entries_with_reconciliation(entries)? {
-            return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
+        // 1. Conflict detection and filtering.
+        for entry in &entries {
+            let entry_index = LogIndex::new(entry.index);
+            let local_term = self.get_term_at(entry_index)?;
+            if local_term != Term::ZERO && local_term != Term::new(entry.term) {
+                info!(
+                    target: ClinicalTarget::RaftReplication.as_str(),
+                    index = %entry_index,
+                    "Log conflict detected. Truncating log."
+                );
+                self.truncate_log(entry_index)?;
+                break;
+            }
         }
 
-        self.reconcile_last_committed(leader_commit)?;
+        let mut to_append = Vec::new();
+        let mut next_expected = (self.last_log_index()? + 1)?;
+
+        for entry in entries {
+            let entry_index = LogIndex::new(entry.index);
+            if entry_index >= next_expected {
+                if entry_index != next_expected {
+                    error!(
+                        target: ClinicalTarget::RaftReplication.as_str(),
+                        index = %entry_index,
+                        expected = %next_expected,
+                        "Non-contiguous log append attempted by Leader."
+                    );
+                    return Ok(ReconciliationResult::mismatch(self.last_log_index()?));
+                }
+                to_append.push(entry);
+                next_expected = (next_expected + 1)?;
+            }
+        }
+
+        // 2. Determine if commit index needs to advance, using the post-append horizon
+        //    as the cap.
+        let commit_advance = if leader_commit > self.last_committed() {
+            let last_new_idx = if let Some(last) = to_append.last() {
+                LogIndex::new(last.index)
+            } else {
+                self.last_log_index()?
+            };
+            Some(cmp::min(leader_commit, last_new_idx))
+        } else {
+            None
+        };
+
+        // 3. Single persistence operation — use the combined method when both log
+        //    append and commit advance are pending.
+        match (to_append.is_empty(), commit_advance) {
+            (true, None) => {} // nothing to persist
+            (true, Some(commit)) => {
+                self.log_store
+                    .save_last_committed(commit)
+                    .map_err(NodeError::from)?;
+                self.last_committed = commit;
+            }
+            (false, None) => {
+                self.log_store
+                    .append_entries(to_append)
+                    .map_err(NodeError::from)?;
+            }
+            (false, Some(commit)) => {
+                self.log_store
+                    .append_entries_and_advance_commit(to_append, commit)
+                    .map_err(NodeError::from)?;
+                self.last_committed = commit;
+            }
+        }
+
         Ok(ReconciliationResult::success(self.last_log_index()?))
     }
 
@@ -254,68 +320,6 @@ impl RaftNode<Follower> {
         }
 
         Ok(true)
-    }
-
-    pub(crate) fn append_entries_with_reconciliation(
-        &mut self,
-        entries: Vec<LogEntry>,
-    ) -> Result<bool, NodeError> {
-        for entry in &entries {
-            let entry_index = LogIndex::new(entry.index);
-            let local_term = self.get_term_at(entry_index)?;
-            if local_term != Term::ZERO && local_term != Term::new(entry.term) {
-                info!(
-                    target: ClinicalTarget::RaftReplication.as_str(),
-                    index = %entry_index,
-                    "Log conflict detected. Truncating log."
-                );
-                self.truncate_log(entry_index)?;
-                break;
-            }
-        }
-
-        let mut to_append = Vec::new();
-        let mut next_expected = (self.last_log_index()? + 1)?;
-
-        for entry in entries {
-            let entry_index = LogIndex::new(entry.index);
-            if entry_index >= next_expected {
-                if entry_index != next_expected {
-                    error!(
-                        target: ClinicalTarget::RaftReplication.as_str(),
-                        index = %entry_index,
-                        expected = %next_expected,
-                        "Non-contiguous log append attempted by Leader."
-                    );
-                    return Ok(false);
-                }
-                to_append.push(entry);
-                next_expected = (next_expected + 1)?;
-            }
-        }
-
-        if !to_append.is_empty() {
-            self.append_entries(to_append)?;
-        }
-
-        Ok(true)
-    }
-
-    pub(crate) fn reconcile_last_committed(
-        &mut self,
-        leader_commit: LogIndex,
-    ) -> Result<(), NodeError> {
-        if leader_commit > self.last_committed() {
-            let last_new_idx = self.last_log_index()?;
-            let new_commit = cmp::min(leader_commit, last_new_idx);
-            self.advance_last_committed(new_commit)?;
-            debug!(
-                target: ClinicalTarget::RaftReplication.as_str(),
-                index = %new_commit,
-                "Updated last_committed"
-            );
-        }
-        Ok(())
     }
 
     fn is_log_up_to_date(
