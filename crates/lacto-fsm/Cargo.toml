@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
-async-trait.workspace = true
 sled.workspace = true
 prost.workspace = true
 prost-types.workspace = true
